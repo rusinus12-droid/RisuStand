@@ -7,10 +7,11 @@ const vm = require('node:vm');
 const crypto = require('node:crypto');
 
 const { REPO } = require('./helpers.cjs');
+const CURRENT_VERSION = fs.readFileSync(path.join(REPO, 'VERSION'), 'utf8').trim();
 
-async function bootPluginWithMockRisu({ db, characters, initialStorage, requestPluginPermission, onSendChat, onReadImage }) {
+async function bootPluginWithMockRisu({ db, characters, initialStorage, requestPluginPermission, onSendChat, onReadImage, onGetDatabase, onSetDatabaseLite, onReadInlay }) {
     const storage = new Map(initialStorage || [
-        ['risustand_perms_prompted_v2', '1'],
+        ['risustand_perms_prompted_v3', `${CURRENT_VERSION}:${Date.now()}`],
         ['risustand_remote_bridge_v2', JSON.stringify({
             enabled: true,
             relayUrl: 'http://127.0.0.1:8787',
@@ -59,11 +60,15 @@ async function bootPluginWithMockRisu({ db, characters, initialStorage, requestP
         removeRisuChatListener: async () => {},
         onUnload: async (fn) => { unloadCb = fn; },
         getDatabase: async (keys) => {
+            if (typeof onGetDatabase === 'function') await onGetDatabase(keys);
             const out = {};
             for (const k of keys) out[k] = db[k];
             return out;
         },
-        setDatabaseLite: async (patch) => { Object.assign(db, patch); },
+        setDatabaseLite: async (patch) => {
+            if (typeof onSetDatabaseLite === 'function') await onSetDatabaseLite(patch);
+            Object.assign(db, patch);
+        },
         getCurrentCharacterIndex: async () => 0,
         getCurrentChatIndex: async () => 0,
         getCharacter: async () => characters[0],
@@ -72,7 +77,7 @@ async function bootPluginWithMockRisu({ db, characters, initialStorage, requestP
         getChatFromIndex: async (cIdx, chIdx) => (characters[cIdx] && characters[cIdx].chats[chIdx]) || null,
         setChatToIndex: async (cIdx, chIdx, chatObj) => { characters[cIdx].chats[chIdx] = chatObj; },
         readImage: async (p) => (typeof onReadImage === 'function' ? onReadImage(p, pngBytes) : (p && p.startsWith('assets/') ? pngBytes : null)),
-        readInlay: async () => null,
+        readInlay: async (id) => (typeof onReadInlay === 'function' ? onReadInlay(id) : null),
         sendChat: typeof onSendChat === 'function' ? onSendChat : async () => {},
         requestPluginPermission: typeof requestPluginPermission === 'function' ? requestPluginPermission : undefined,
         nativeFetch: async (_url, opts) => {
@@ -204,7 +209,7 @@ test('CBS #when multi-greeting, editdisplay regex, and <img src=...> module asse
         assert.doesNotMatch(fm1.text, /\{\{#when/);
         assert.doesNotMatch(fm1.text, /[◆▶]/);
         assert.equal(fm1.images.length, 1);
-        assert.match(fm1.images[0], /^data:image\/png;base64,/);
+        assert.equal(fm1.images[0], '[[RSASSET:a0]]');
         assert.match(fm1.html, /<div class="image-container"/);
         assert.match(fm1.html, /\[\[RSASSET:a0\]\]/);
         assert.match(fm1.html, /<button risu-trigger="setFirst1">시작 1<\/button>/);
@@ -471,16 +476,30 @@ test('upfront permission onboarding prompts mainDom, db, dbWrite, sendChat, inla
     }];
 
     const requestedFirst = [];
+    const callOrder = [];
     const h1 = await bootPluginWithMockRisu({
         db,
         characters,
         initialStorage: [],
-        requestPluginPermission: async (perm) => { requestedFirst.push(perm); return true; },
+        onGetDatabase: async (keys) => { callOrder.push(`getDatabase:${(keys || []).join(',')}`); },
+        onSetDatabaseLite: async (patch) => { callOrder.push(`setDatabaseLite:${Object.keys(patch || {}).join(',')}`); },
+        onReadInlay: async (id) => { callOrder.push(`readInlay:${id}`); return null; },
+        requestPluginPermission: async (perm) => {
+            requestedFirst.push(perm);
+            callOrder.push(`perm:${perm}`);
+            return true;
+        },
     });
     try {
         await new Promise((r) => setTimeout(r, 80));
         assert.deepEqual(requestedFirst, ['mainDom', 'db', 'dbWrite', 'sendChat', 'inlay']);
-        assert.equal(h1.storage.get('risustand_perms_prompted_v2'), '1');
+        const setLiteIdx = callOrder.indexOf('setDatabaseLite:');
+        const getDbIdx = callOrder.indexOf('getDatabase:enabledModules');
+        const inlayIdx = callOrder.indexOf('readInlay:__risustand_perm_probe__');
+        const firstPermIdx = callOrder.indexOf('perm:mainDom');
+        assert.ok(setLiteIdx >= 0 && getDbIdx >= 0 && inlayIdx >= 0 && firstPermIdx > setLiteIdx && firstPermIdx > getDbIdx && firstPermIdx > inlayIdx, `Expected periodic probes before requestPluginPermission, got: ${JSON.stringify(callOrder)}`);
+        const savedStamp = String(h1.storage.get('risustand_perms_prompted_v3') || '');
+        assert.ok(savedStamp.startsWith(`${CURRENT_VERSION}:`), `Expected versioned timestamp, got: ${savedStamp}`);
     } finally {
         await h1.cleanup();
     }
@@ -489,7 +508,7 @@ test('upfront permission onboarding prompts mainDom, db, dbWrite, sendChat, inla
     const h2 = await bootPluginWithMockRisu({
         db,
         characters,
-        initialStorage: [['risustand_perms_prompted_v2', '1']],
+        initialStorage: [['risustand_perms_prompted_v3', `${CURRENT_VERSION}:${Date.now()}`]],
         requestPluginPermission: async (perm) => { requestedSecond.push(perm); return true; },
     });
     try {
@@ -497,6 +516,22 @@ test('upfront permission onboarding prompts mainDom, db, dbWrite, sendChat, inla
         assert.deepEqual(requestedSecond, []);
     } finally {
         await h2.cleanup();
+    }
+
+    // Legacy v2 or expired (>3 days) stamp must re-prompt upfront
+    const requestedExpired = [];
+    const oldTs = Date.now() - Math.floor(3.1 * 24 * 60 * 60 * 1000);
+    const h3 = await bootPluginWithMockRisu({
+        db,
+        characters,
+        initialStorage: [['risustand_perms_prompted_v3', `${CURRENT_VERSION}:${oldTs}`]],
+        requestPluginPermission: async (perm) => { requestedExpired.push(perm); return true; },
+    });
+    try {
+        await new Promise((r) => setTimeout(r, 80));
+        assert.deepEqual(requestedExpired, ['mainDom', 'db', 'dbWrite', 'sendChat', 'inlay']);
+    } finally {
+        await h3.cleanup();
     }
 });
 

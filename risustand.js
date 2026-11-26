@@ -3707,15 +3707,29 @@
     // =========================================================================
     // 6. Bootstrap & Cleanup
     // =========================================================================
-    const PERMS_PROMPTED_KEY = 'risustand_perms_prompted_v2';
+    const PERMS_PROMPTED_KEY = 'risustand_perms_prompted_v3';
+    const PERMS_PROMPT_TTL_MS = Math.floor(2.9 * 24 * 60 * 60 * 1000);
 
     async function requestAllPermissionsOnce(force = false) {
         try {
             if (!force) {
                 const already = await risuai.pluginStorage.getItem(PERMS_PROMPTED_KEY);
-                if (already === '1') return;
+                const raw = String(already || '');
+                const sep = raw.lastIndexOf(':');
+                const ver = sep > 0 ? raw.slice(0, sep) : '';
+                const ts = sep > 0 ? Number(raw.slice(sep + 1)) : NaN;
+                if (ver === RISUSTAND_VERSION && Number.isFinite(ts) && (Date.now() - ts) < PERMS_PROMPT_TTL_MS) {
+                    return;
+                }
             }
         } catch (_) {}
+
+        try { await ensureRootDocument(); } catch (_) {}
+        try { await risuai.getDatabase(['enabledModules']); } catch (_) {}
+        try { await risuai.setDatabaseLite({}); } catch (_) {}
+        if (typeof risuai.readInlay === 'function') {
+            try { await risuai.readInlay('__risustand_perm_probe__'); } catch (_) {}
+        }
 
         if (typeof risuai.requestPluginPermission === 'function') {
             for (const perm of ['mainDom', 'db', 'dbWrite', 'sendChat', 'inlay']) {
@@ -3723,14 +3737,10 @@
                     await risuai.requestPluginPermission(perm);
                 } catch (_) {}
             }
-        } else {
-            try { await ensureRootDocument(); } catch (_) {}
-            try { await risuai.getDatabase(['enabledModules']); } catch (_) {}
-            try { await risuai.setDatabaseLite({}); } catch (_) {}
         }
 
         try {
-            await risuai.pluginStorage.setItem(PERMS_PROMPTED_KEY, '1');
+            await risuai.pluginStorage.setItem(PERMS_PROMPTED_KEY, `${RISUSTAND_VERSION}:${Date.now()}`);
         } catch (_) {}
     }
 
@@ -3783,7 +3793,15 @@
         let lastSyncTime = '';
         let lastSnapSig = '';
         let lastCatalogSig = '';
+        const CATALOG_POLL_INTERVAL_MS = 18000;
+        const SNAP_DB_TTL_MS = 10000;
+        let lastCatalogBuildAt = 0;
+        let lastCatalogPcChar = -2;
+        let lastCatalogPcChat = -2;
+        let cachedSnapDb = null;
+        let cachedSnapDbAt = 0;
         let pendingTriggerEvent = null;
+        let lastPcAlertSig = '';
         let viewCharIndex = -1;
         let viewChatIndex = -1;
         const assetDataCache = new Map();
@@ -4639,7 +4657,9 @@
                     : new Uint8Array(Object.values(raw));
                 if (!bytes.length || bytes.length > 2.5 * 1024 * 1024) return null;
                 const url = `data:${detectImageMime(bytes, assetPath)};base64,${uint8ToBase64(bytes)}`;
-                cacheSetBounded(assetDataCache, assetPath, url, 80);
+                if (url.length <= 2_000_000) {
+                    cacheSetBounded(assetDataCache, assetPath, url, 48);
+                }
                 return url;
             } catch (_) {
                 return null;
@@ -4653,7 +4673,9 @@
             try {
                 const res = await risuai.readInlay(inlayId);
                 if (res && res.data && String(res.data).startsWith('data:') && String(res.data).length <= 3.5 * 1024 * 1024) {
-                    cacheSetBounded(assetDataCache, cacheKey, res.data, 40);
+                    if (String(res.data).length <= 2_000_000) {
+                        cacheSetBounded(assetDataCache, cacheKey, res.data, 24);
+                    }
                     return res.data;
                 }
             } catch (_) {}
@@ -4799,7 +4821,7 @@
                 cursor = mt.end;
                 const entry = await collector.register(mt.name, mt.kind);
                 if (entry) {
-                    pushMsgImg(entry.url);
+                    pushMsgImg(entry.token);
                     html += mt.asImgTag ? `<img class="msg-img" src="${entry.token}" />` : entry.token;
                 }
             }
@@ -4813,7 +4835,7 @@
                 if (!srcVal) continue;
                 if (srcVal.startsWith('[[RSASSET:')) {
                     const assetId = srcVal.slice(10, -2);
-                    if (collector.assetMap[assetId]) pushMsgImg(collector.assetMap[assetId]);
+                    if (collector.assetMap[assetId]) pushMsgImg(srcVal);
                     continue;
                 }
                 if (/^(?:https?:\/\/|data:image\/)/i.test(srcVal)) {
@@ -4836,7 +4858,7 @@
                     c2 = im.end;
                     const entry = await collector.register(im.name, 'asset');
                     if (entry) {
-                        pushMsgImg(entry.url);
+                        pushMsgImg(entry.token);
                         nextHtml += `<img${im.beforeAttrs} src="${entry.token}"${im.afterAttrs}>`;
                     }
                 }
@@ -4900,7 +4922,35 @@
             return 'rs-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
         }
     
+        function isTrashedEntry(item) {
+            return !item || typeof item !== 'object' || Boolean(item.trashTime) || Boolean(item.removed) || Boolean(item.deleted) || Boolean(item.isTrash);
+        }
+
+        async function findFirstActiveCharIndex() {
+            try {
+                const db = await risuai.getDatabase(['characters']);
+                const list = db && Array.isArray(db.characters) ? db.characters : [];
+                for (let i = 0; i < list.length; i++) {
+                    if (!isTrashedEntry(list[i])) return i;
+                }
+            } catch (_) {}
+            return -1;
+        }
+
         async function buildCatalog(force = false) {
+            const pcActiveCharIndex = await risuai.getCurrentCharacterIndex();
+            const pcActiveChatIndex = pcActiveCharIndex >= 0 ? await risuai.getCurrentChatIndex() : -1;
+            const now = Date.now();
+            if (
+                !force &&
+                lastCatalogSig &&
+                (now - lastCatalogBuildAt) < CATALOG_POLL_INTERVAL_MS &&
+                pcActiveCharIndex === lastCatalogPcChar &&
+                pcActiveChatIndex === lastCatalogPcChat
+            ) {
+                return { catalog: null, sig: lastCatalogSig };
+            }
+
             let db = null;
             try {
                 db = await risuai.getDatabase([
@@ -4917,28 +4967,38 @@
                 return null;
             }
             if (!db) return null;
-    
-            const pcActiveCharIndex = await risuai.getCurrentCharacterIndex();
-            const pcActiveChatIndex = pcActiveCharIndex >= 0 ? await risuai.getCurrentChatIndex() : -1;
+
+            lastCatalogBuildAt = Date.now();
+            lastCatalogPcChar = pcActiveCharIndex;
+            lastCatalogPcChat = pcActiveChatIndex;
     
             const charsRaw = Array.isArray(db.characters) ? db.characters : [];
-            const characters = charsRaw.map((c, idx) => {
-                const chats = Array.isArray(c && c.chats) ? c.chats : [];
-                return {
+            const characters = [];
+            for (let idx = 0; idx < charsRaw.length; idx++) {
+                const c = charsRaw[idx];
+                if (isTrashedEntry(c)) continue;
+                const rawChats = Array.isArray(c && c.chats) ? c.chats : [];
+                const chats = [];
+                for (let cIdx = 0; cIdx < rawChats.length; cIdx++) {
+                    const ch = rawChats[cIdx];
+                    if (isTrashedEntry(ch)) continue;
+                    chats.push({
+                        index: cIdx,
+                        id: (ch && ch.id) || String(cIdx),
+                        name: (ch && ch.name) || `Chat ${cIdx + 1}`,
+                        msgCount: Array.isArray(ch && ch.message) ? ch.message.length : 0,
+                    });
+                }
+                characters.push({
                     index: idx,
                     chaId: (c && c.chaId) || String(idx),
                     name: (c && c.name) || `Character ${idx + 1}`,
                     type: (c && c.type) || 'character',
                     chatPage: typeof (c && c.chatPage) === 'number' ? c.chatPage : 0,
                     isPcActive: idx === pcActiveCharIndex,
-                    chats: chats.map((ch, cIdx) => ({
-                        index: cIdx,
-                        id: (ch && ch.id) || String(cIdx),
-                        name: (ch && ch.name) || `Chat ${cIdx + 1}`,
-                        msgCount: Array.isArray(ch && ch.message) ? ch.message.length : 0,
-                    })),
-                };
-            });
+                    chats,
+                });
+            }
     
             const enabledSet = new Set(Array.isArray(db.enabledModules) ? db.enabledModules : []);
             const modulesRaw = Array.isArray(db.modules) ? db.modules : [];
@@ -4980,16 +5040,21 @@
                 b: pcActiveChatIndex,
                 p: catalog.selectedPersona,
                 pr: params,
-                c: characters.map((x) => [x.index, x.name, x.chatPage, x.chats.length]),
+                c: characters.map((x) => [
+                    x.index,
+                    x.chaId,
+                    x.name,
+                    x.chatPage,
+                    x.chats.map((ch) => [ch.index, ch.id, ch.name, ch.msgCount]),
+                ]),
                 m: modules.map((x) => [x.id, x.enabled, x.assetCount]),
                 pe: personas.map((x) => x.name),
             });
     
             if (!force && sig === lastCatalogSig) {
-                return null;
+                return { catalog: null, sig };
             }
-            lastCatalogSig = sig;
-            return catalog;
+            return { catalog, sig };
         }
     
         async function buildSnapshot(forceFull = false) {
@@ -4997,21 +5062,47 @@
             const pcChatIdx = pcCharIdx >= 0 ? await risuai.getCurrentChatIndex() : -1;
     
             if (viewCharIndex < 0) {
-                viewCharIndex = pcCharIdx >= 0 ? pcCharIdx : 0;
-                viewChatIndex = pcChatIdx >= 0 ? pcChatIdx : 0;
+                if (pcCharIdx >= 0) {
+                    viewCharIndex = pcCharIdx;
+                    viewChatIndex = pcChatIdx >= 0 ? pcChatIdx : 0;
+                } else {
+                    const firstActive = await findFirstActiveCharIndex();
+                    viewCharIndex = firstActive >= 0 ? firstActive : 0;
+                    viewChatIndex = 0;
+                }
             }
     
             let charObj = await risuai.getCharacterFromIndex(viewCharIndex);
-            if (!charObj && pcCharIdx >= 0) {
-                viewCharIndex = pcCharIdx;
-                viewChatIndex = pcChatIdx >= 0 ? pcChatIdx : 0;
-                charObj = await risuai.getCharacterFromIndex(viewCharIndex);
+            if (!charObj || isTrashedEntry(charObj)) {
+                let resolved = false;
+                if (pcCharIdx >= 0 && pcCharIdx !== viewCharIndex) {
+                    const pcObj = await risuai.getCharacterFromIndex(pcCharIdx);
+                    if (pcObj && !isTrashedEntry(pcObj)) {
+                        viewCharIndex = pcCharIdx;
+                        viewChatIndex = pcChatIdx >= 0 ? pcChatIdx : 0;
+                        charObj = pcObj;
+                        resolved = true;
+                    }
+                }
+                if (!resolved) {
+                    const firstActive = await findFirstActiveCharIndex();
+                    if (firstActive >= 0) {
+                        viewCharIndex = firstActive;
+                        viewChatIndex = 0;
+                        charObj = await risuai.getCharacterFromIndex(viewCharIndex);
+                    }
+                }
             }
-            if (!charObj) return null;
+            if (!charObj || isTrashedEntry(charObj)) return null;
     
             const chats = Array.isArray(charObj.chats) ? charObj.chats : [];
-            if (viewChatIndex < 0 || viewChatIndex >= chats.length) {
-                viewChatIndex = typeof charObj.chatPage === 'number' && charObj.chatPage < chats.length ? charObj.chatPage : 0;
+            if (viewChatIndex < 0 || viewChatIndex >= chats.length || isTrashedEntry(chats[viewChatIndex])) {
+                if (typeof charObj.chatPage === 'number' && charObj.chatPage >= 0 && charObj.chatPage < chats.length && !isTrashedEntry(chats[charObj.chatPage])) {
+                    viewChatIndex = charObj.chatPage;
+                } else {
+                    const firstActiveChat = chats.findIndex((ch) => !isTrashedEntry(ch));
+                    viewChatIndex = firstActiveChat >= 0 ? firstActiveChat : 0;
+                }
             }
     
             const chatObj = chats[viewChatIndex] || { name: 'Chat 1', message: [] };
@@ -5042,14 +5133,22 @@
             let enabledModules = [];
             const enSet = new Set(chatModules);
             try {
-                db = await risuai.getDatabase([
-                    'modules',
-                    'enabledModules',
-                    'personas',
-                    'selectedPersona',
-                    'customscript',
-                    'globalChatVariables',
-                ]);
+                if (!forceFull && cachedSnapDb && (Date.now() - cachedSnapDbAt) < SNAP_DB_TTL_MS) {
+                    db = cachedSnapDb;
+                } else {
+                    db = await risuai.getDatabase([
+                        'modules',
+                        'enabledModules',
+                        'personas',
+                        'selectedPersona',
+                        'customscript',
+                        'globalChatVariables',
+                    ]);
+                    if (db) {
+                        cachedSnapDb = db;
+                        cachedSnapDbAt = Date.now();
+                    }
+                }
                 if (db && Array.isArray(db.enabledModules)) {
                     for (const mid of db.enabledModules) enSet.add(String(mid));
                 }
@@ -5069,17 +5168,24 @@
             }
 
             const enabledModIds = Array.from(enSet).sort().join(',');
+            const globalToggleValues = {};
+            if (db && db.globalChatVariables && typeof db.globalChatVariables === 'object') {
+                for (const [gk, gv] of Object.entries(db.globalChatVariables)) {
+                    if (String(gk).startsWith('toggle_') && gv !== undefined && gv !== null) {
+                        globalToggleValues[gk] = String(gv);
+                    }
+                }
+            }
             const swipeDigest = recent.map((_, i) => {
                 const sw = swipeHistory[makeSwipeKey(charObj, viewCharIndex, chatObj, viewChatIndex, startOffset + i)];
                 return sw && Array.isArray(sw.swipes) ? `${sw.index}/${sw.swipes.length}` : '0/1';
             }).join(',');
-            const toggleSig = `${useLocalToggles}:${Object.keys(localVars).length}:${JSON.stringify(localVars)}:${toggleBlocks.length}:${enabledModIds}`;
+            const toggleSig = `${useLocalToggles}:${Object.keys(localVars).length}:${JSON.stringify(localVars)}:${JSON.stringify(globalToggleValues)}:${toggleBlocks.length}:${enabledModIds}`;
             const stateSig = `${fmIdx}:${firstMessageCount}:${JSON.stringify(scriptState)}:${swipeDigest}`;
             const sig = `${viewCharIndex}:${viewChatIndex}:${isPcActive}:${allMsgs.length}:${recentDigest}:${chatObj.name || ''}:${toggleSig}:${stateSig}:${Boolean(cfg.includeImages)}`;
             if (!forceFull && sig === lastSnapSig) {
-                return null;
+                return { snapshot: null, sig };
             }
-            lastSnapSig = sig;
 
             let personaName = 'User';
             let personaPrompt = '';
@@ -5209,33 +5315,37 @@
             const moduleLore = collectLorebookSummary(charObj, enabledModules, recent);
 
             return {
-                charName: charObj.name || 'Character',
-                charIndex: viewCharIndex,
-                chatIndex: viewChatIndex,
-                chatName: chatObj.name || `Chat ${viewChatIndex + 1}`,
-                isPcActive,
-                totalMessages: allMsgs.length,
-                fmIndex: fmIdx,
-                firstMessageCount,
-                greetingControls,
-                chatModules,
-                chatVariables,
-                useLocallySetGlobalVariables: useLocalToggles,
-                localToggleValues: localVars,
-                customToggleBlocks: toggleBlocks,
-                backgroundHtml,
-                assetMap: collector.assetMap,
-                messages: outMsgs,
-                charContext: {
-                    name: charObj.name || 'Character',
-                    desc: String(charObj.desc || '').slice(0, 6000),
-                    personality: String(charObj.personality || '').slice(0, 2000),
-                    scenario: String(charObj.scenario || '').slice(0, 2000),
-                    systemPrompt: String(charObj.systemPrompt || '').slice(0, 3000),
-                    moduleLore,
-                    note: String(chatObj.note || '').slice(0, 2000),
-                    personaName,
-                    personaPrompt: String(personaPrompt || '').slice(0, 2000),
+                sig,
+                snapshot: {
+                    charName: charObj.name || 'Character',
+                    charIndex: viewCharIndex,
+                    chatIndex: viewChatIndex,
+                    chatName: chatObj.name || `Chat ${viewChatIndex + 1}`,
+                    isPcActive,
+                    totalMessages: allMsgs.length,
+                    fmIndex: fmIdx,
+                    firstMessageCount,
+                    greetingControls,
+                    chatModules,
+                    chatVariables,
+                    useLocallySetGlobalVariables: useLocalToggles,
+                    globalToggleValues,
+                    localToggleValues: localVars,
+                    customToggleBlocks: toggleBlocks,
+                    backgroundHtml,
+                    assetMap: collector.assetMap,
+                    messages: outMsgs,
+                    charContext: {
+                        name: charObj.name || 'Character',
+                        desc: String(charObj.desc || '').slice(0, 6000),
+                        personality: String(charObj.personality || '').slice(0, 2000),
+                        scenario: String(charObj.scenario || '').slice(0, 2000),
+                        systemPrompt: String(charObj.systemPrompt || '').slice(0, 3000),
+                        moduleLore,
+                        note: String(chatObj.note || '').slice(0, 2000),
+                        personaName,
+                        personaPrompt: String(personaPrompt || '').slice(0, 2000),
+                    },
                 },
             };
         }
@@ -6562,7 +6672,100 @@
             }
         }
 
-        async function runBotTrigger(cIdx, chIdx, triggerName, promptAnswers = []) {
+        async function readSafeElementText(el) {
+            if (!el) return '';
+            for (const fn of ['getTextContent', 'getInnerText']) {
+                if (typeof el[fn] === 'function') {
+                    try {
+                        const v = await el[fn]();
+                        if (typeof v === 'string') return v;
+                    } catch (_) {}
+                }
+            }
+            if (typeof el.getInnerHTML === 'function') {
+                try {
+                    const html = await el.getInnerHTML();
+                    if (typeof html === 'string') {
+                        return html
+                            .replace(/<br\s*\/?>/gi, '\n')
+                            .replace(/<[^>]+>/g, '')
+                            .replace(/&nbsp;/gi, ' ')
+                            .replace(/&amp;/gi, '&')
+                            .replace(/&lt;/gi, '<')
+                            .replace(/&gt;/gi, '>')
+                            .replace(/&quot;/gi, '"')
+                            .replace(/&#39;/gi, "'");
+                    }
+                } catch (_) {}
+            }
+            return '';
+        }
+
+        async function findSafePcAlertModal() {
+            if (!rootDoc || typeof rootDoc.querySelector !== 'function') return null;
+            try {
+                const card = await rootDoc.querySelector('.bg-darkbg.break-any.rounded-md');
+                if (!card) return null;
+
+                const h2 = await card.querySelector('h2');
+                const heading = h2 ? (await readSafeElementText(h2)).trim() : '';
+                if (heading !== '' && heading !== 'Error') return null;
+
+                if (typeof card.querySelector === 'function') {
+                    const interactive = await card.querySelector('input, iframe, select');
+                    if (interactive) return null;
+                }
+
+                const mainSpan = (await card.querySelector('span.whitespace-pre-wrap')) || (await card.querySelector('.chattext.prose'));
+                const msg = mainSpan ? (await readSafeElementText(mainSpan)).trim() : '';
+                const subSpan = await card.querySelector('span.text-sm');
+                const submsg = subSpan ? (await readSafeElementText(subSpan)).trim() : '';
+                const combinedMsg = submsg ? `${msg}\n\n${submsg}` : msg;
+                if (!combinedMsg.trim()) return null;
+
+                let okBtn = null;
+                if (typeof card.querySelectorAll === 'function') {
+                    const btns = await unwrapArray(await card.querySelectorAll('button'));
+                    for (const btn of btns) {
+                        const txt = (await readSafeElementText(btn)).trim().toUpperCase();
+                        if (txt === 'OK') {
+                            okBtn = btn;
+                            break;
+                        }
+                    }
+                }
+                if (!okBtn) return null;
+
+                return {
+                    heading,
+                    message: combinedMsg,
+                    okBtn,
+                    sig: `${heading}|${combinedMsg}`,
+                };
+            } catch (_) {
+                return null;
+            }
+        }
+
+        async function pollPcNativeAlert() {
+            const modal = await findSafePcAlertModal();
+            if (!modal) {
+                lastPcAlertSig = '';
+                return null;
+            }
+            if (modal.sig === lastPcAlertSig) return null;
+            lastPcAlertSig = modal.sig;
+            return {
+                id: makeUuid(),
+                at: Date.now(),
+                kind: modal.heading === 'Error' ? 'alert_error' : 'notice',
+                title: modal.heading === 'Error' ? 'Error' : '',
+                message: modal.message,
+                source: 'pc_alert',
+            };
+        }
+
+        async function runBotTrigger(cIdx, chIdx, triggerName, promptAnswers = [], opts = {}) {
             const charObj = await risuai.getCharacterFromIndex(cIdx);
             const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
             if (!charObj || !chatObj) {
@@ -6589,7 +6792,7 @@
             try { pcCharIdx = await risuai.getCurrentCharacterIndex(); } catch (_) {}
 
             // Layer 1: Try native RisuAI API or live DOM click if available on active PC chat
-            if (typeof risuai.runTrigger === 'function' && cIdx === pcCharIdx) {
+            if (!opts.skipNativeLayer1 && typeof risuai.runTrigger === 'function' && cIdx === pcCharIdx) {
                 try {
                     await risuai.runTrigger(triggerName);
                     lastSnapSig = '';
@@ -6829,13 +7032,16 @@
                     }
                     if (res.ran) {
                         ran = true;
-                        break;
+                        if (!opts.runAllGroups) break;
                     }
                 } catch (err) {
                     lastLuaErr = err;
                 }
             }
             if (!ran) {
+                if (opts.quietMissing) {
+                    return { kind: 'ok' };
+                }
                 if (lastLuaErr) {
                     return { kind: 'error', message: `트리거 오류: ${lastLuaErr && lastLuaErr.message ? lastLuaErr.message : String(lastLuaErr)}` };
                 }
@@ -6846,7 +7052,12 @@
                 lastSnapSig = '';
             }
             if (notices.length) {
-                return notices[notices.length - 1];
+                const lastNotice = notices[notices.length - 1];
+                return {
+                    kind: notices.some((n) => n.kind === 'error') ? 'alert_error' : 'notice',
+                    message: lastNotice.message,
+                    notices: notices.map((n) => ({ message: n.message, isError: n.kind === 'error' })),
+                };
             }
             return { kind: 'ok' };
         }
@@ -6964,9 +7175,32 @@
                     });
                 }
                 await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                if (list.some((m) => m.role !== 'user')) {
+                    try {
+                        const ev = await runBotTrigger(cIdx, chIdx, 'onOutput', [], {
+                            skipNativeLayer1: true,
+                            runAllGroups: true,
+                            quietMissing: true,
+                        });
+                        if (ev && (ev.kind === 'notice' || ev.kind === 'alert_error') && ev.message) {
+                            pendingTriggerEvent = { id: makeUuid(), at: Date.now(), ...ev, source: 'lua_output' };
+                        }
+                    } catch (_) {}
+                }
                 lastSnapSig = '';
                 lastCatalogSig = '';
                 setTimeout(() => pollOnce(true), 150);
+                return;
+            }
+
+            if (type === 'dismiss_pc_alert') {
+                try {
+                    const modal = await findSafePcAlertModal();
+                    if (modal && modal.okBtn && typeof modal.okBtn.click === 'function') {
+                        await modal.okBtn.click();
+                        lastPcAlertSig = '';
+                    }
+                } catch (_) {}
                 return;
             }
     
@@ -7073,12 +7307,12 @@
                 isGenerating = true;
                 void (async () => {
                     try {
-                        chatObj.message.splice(mIdx, 1);
-                        await risuai.setChatToIndex(cIdx, chIdx, chatObj);
                         if (charObj.chatPage !== chIdx) {
                             charObj.chatPage = chIdx;
                             await risuai.setCharacterToIndex(cIdx, charObj);
                         }
+                        chatObj.message.splice(mIdx, 1);
+                        await risuai.setChatToIndex(cIdx, chIdx, chatObj);
                         await risuai.sendChat('');
                         const afterChat = await risuai.getChatFromIndex(cIdx, chIdx);
                         if (afterChat && Array.isArray(afterChat.message) && afterChat.message[mIdx] && afterChat.message[mIdx].role !== 'user' && String(afterChat.message[mIdx].data || '').trim()) {
@@ -7153,19 +7387,32 @@
                 const cIdx = Number(p.charIndex);
                 const chIdx = Number(p.chatIndex);
                 if (Number.isNaN(cIdx) || Number.isNaN(chIdx)) return;
+                const charObj = await risuai.getCharacterFromIndex(cIdx);
                 const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
                 if (!chatObj) return;
-                chatObj.useLocallySetGlobalVariables = true;
-                if (!chatObj.GLGlobalVariables || typeof chatObj.GLGlobalVariables !== 'object') {
-                    chatObj.GLGlobalVariables = {};
-                }
                 const fullKey = String(p.key).startsWith('toggle_') ? String(p.key) : ('toggle_' + String(p.key));
-                if (p.value === null || p.value === undefined) {
-                    delete chatObj.GLGlobalVariables[fullKey];
+                const useGlobal = p.scope === 'global' || (p.scope !== 'local' && !chatObj.useLocallySetGlobalVariables);
+                if (useGlobal) {
+                    const db = await risuai.getDatabase(['globalChatVariables']);
+                    const nextGlobal = (db && db.globalChatVariables && typeof db.globalChatVariables === 'object') ? { ...db.globalChatVariables } : {};
+                    if (p.value === null || p.value === undefined || p.value === '') {
+                        delete nextGlobal[fullKey];
+                    } else {
+                        nextGlobal[fullKey] = String(p.value);
+                    }
+                    await risuai.setDatabaseLite({ globalChatVariables: nextGlobal });
                 } else {
-                    chatObj.GLGlobalVariables[fullKey] = String(p.value);
+                    chatObj.useLocallySetGlobalVariables = true;
+                    if (!chatObj.GLGlobalVariables || typeof chatObj.GLGlobalVariables !== 'object') {
+                        chatObj.GLGlobalVariables = {};
+                    }
+                    if (p.value === null || p.value === undefined || p.value === '') {
+                        delete chatObj.GLGlobalVariables[fullKey];
+                    } else {
+                        chatObj.GLGlobalVariables[fullKey] = String(p.value);
+                    }
+                    await risuai.setChatToIndex(cIdx, chIdx, chatObj);
                 }
-                await risuai.setChatToIndex(cIdx, chIdx, chatObj);
                 lastSnapSig = '';
                 setTimeout(() => pollOnce(true), 120);
                 return;
@@ -7177,7 +7424,21 @@
                 if (Number.isNaN(cIdx) || Number.isNaN(chIdx)) return;
                 const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
                 if (!chatObj) return;
-                chatObj.useLocallySetGlobalVariables = Boolean(p.enabled);
+                const nextEnabled = Boolean(p.enabled);
+                chatObj.useLocallySetGlobalVariables = nextEnabled;
+                if (nextEnabled && (!chatObj.GLGlobalVariables || Object.keys(chatObj.GLGlobalVariables).length === 0)) {
+                    try {
+                        const db = await risuai.getDatabase(['globalChatVariables']);
+                        if (db && db.globalChatVariables && typeof db.globalChatVariables === 'object') {
+                            chatObj.GLGlobalVariables = {};
+                            for (const [gk, gv] of Object.entries(db.globalChatVariables)) {
+                                if (String(gk).startsWith('toggle_') && gv !== undefined && gv !== null) {
+                                    chatObj.GLGlobalVariables[gk] = String(gv);
+                                }
+                            }
+                        }
+                    } catch (_) {}
+                }
                 await risuai.setChatToIndex(cIdx, chIdx, chatObj);
                 lastSnapSig = '';
                 setTimeout(() => pollOnce(true), 120);
@@ -7261,8 +7522,12 @@
             isPolling = true;
             try {
                 const endpoint = cfg.relayUrl.replace(/\/+$/, '') + '/api/pc/poll';
-                const catalog = await buildCatalog(forceFull);
-                const snapshot = await buildSnapshot(forceFull);
+                const catRes = await buildCatalog(forceFull);
+                const snapRes = await buildSnapshot(forceFull);
+                if (!pendingTriggerEvent) {
+                    const pcAlert = await pollPcNativeAlert();
+                    if (pcAlert) pendingTriggerEvent = pcAlert;
+                }
                 const triggerEvent = pendingTriggerEvent;
     
                 const res = await risuai.nativeFetch(endpoint, {
@@ -7276,8 +7541,8 @@
                         pluginVersion: RISUSTAND_VERSION,
                         generating: isGenerating,
                         supportsBatchCommands: true,
-                        catalog,
-                        snapshot,
+                        catalog: catRes ? catRes.catalog : null,
+                        snapshot: snapRes ? snapRes.snapshot : null,
                         triggerEvent,
                     }),
                 });
@@ -7286,6 +7551,8 @@
                     lastStatus = `연결 오류 (HTTP ${res ? res.status : '?'})`;
                     return;
                 }
+                if (catRes && catRes.catalog) lastCatalogSig = catRes.sig;
+                if (snapRes && snapRes.snapshot) lastSnapSig = snapRes.sig;
                 if (triggerEvent && pendingTriggerEvent && pendingTriggerEvent.id === triggerEvent.id) {
                     pendingTriggerEvent = null;
                 }
@@ -7293,6 +7560,12 @@
                 const data = await res.json();
                 lastStatus = data && data.relayVersion ? `🟢 중계 서버 v${data.relayVersion} 연결됨` : '🟢 중계 서버 연결됨';
                 lastSyncTime = new Date().toLocaleTimeString();
+
+                if (!forceFull && data && data.needFullSync) {
+                    lastCatalogSig = '';
+                    lastSnapSig = '';
+                    setTimeout(() => pollOnce(true), 120);
+                }
     
                 const cmds = Array.isArray(data && data.commands)
                     ? data.commands

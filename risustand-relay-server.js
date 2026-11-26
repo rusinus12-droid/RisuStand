@@ -424,6 +424,8 @@ const state = {
     directGenerating: false,
     lastDirectError: null,
     lastTriggerEvent: null,
+    catalogVersion: 0,
+    snapshotVersion: 0,
     catalog: {
         pcActiveCharIndex: -1,
         pcActiveChatIndex: -1,
@@ -450,6 +452,86 @@ const state = {
 };
 
 const translationCache = new Map();
+
+const ASSET_HMAC_KEY = crypto.randomBytes(32);
+const ASSET_STORE_MAX_ITEMS = 160;
+const ASSET_STORE_MAX_BYTES = 48 * 1024 * 1024;
+const assetStore = new Map(); // id (32 hex) -> { buf: Buffer, mime: string }
+let assetStoreBytes = 0;
+
+function storeDataUriAsset(dataUri) {
+    if (typeof dataUri !== 'string' || !dataUri.startsWith('data:image/')) return dataUri;
+    const m = dataUri.match(/^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i);
+    if (!m) return dataUri;
+    const mime = m[1].toLowerCase();
+    const buf = Buffer.from(m[2].replace(/\s+/g, ''), 'base64');
+    if (!buf.length) return dataUri;
+    const id = crypto.createHmac('sha256', ASSET_HMAC_KEY).update(mime + ':').update(buf).digest('hex').slice(0, 32);
+    if (assetStore.has(id)) {
+        const existing = assetStore.get(id);
+        assetStore.delete(id);
+        assetStore.set(id, existing);
+        return `/api/asset/${id}`;
+    }
+    if (buf.length <= ASSET_STORE_MAX_BYTES) {
+        while (
+            assetStore.size >= ASSET_STORE_MAX_ITEMS ||
+            assetStoreBytes + buf.length > ASSET_STORE_MAX_BYTES
+        ) {
+            const oldestKey = assetStore.keys().next().value;
+            if (!oldestKey) break;
+            const oldestVal = assetStore.get(oldestKey);
+            assetStoreBytes = Math.max(0, assetStoreBytes - (oldestVal && oldestVal.buf ? oldestVal.buf.length : 0));
+            assetStore.delete(oldestKey);
+        }
+        assetStore.set(id, { buf, mime });
+        assetStoreBytes += buf.length;
+    }
+    return `/api/asset/${id}`;
+}
+
+function externalizeSnapshotAssets(snap) {
+    if (!snap || typeof snap !== 'object') return snap;
+    const nextMap = {};
+    if (snap.assetMap && typeof snap.assetMap === 'object') {
+        for (const [k, v] of Object.entries(snap.assetMap)) {
+            nextMap[k] = (typeof v === 'string' && v.startsWith('data:image/')) ? storeDataUriAsset(v) : v;
+        }
+    }
+    const nextMsgs = Array.isArray(snap.messages)
+        ? snap.messages.map((msg) => {
+            if (!msg || !Array.isArray(msg.images) || !msg.images.length) return msg;
+            const nextImages = msg.images.map((im) => {
+                const s = String(im || '');
+                if (s.startsWith('[[RSASSET:') && s.endsWith(']]')) {
+                    const key = s.slice(10, -2);
+                    return nextMap[key] || s;
+                }
+                if (s.startsWith('data:image/')) return storeDataUriAsset(s);
+                return s;
+            });
+            return { ...msg, images: nextImages };
+        })
+        : [];
+    return {
+        ...snap,
+        assetMap: nextMap,
+        messages: nextMsgs,
+    };
+}
+
+function parseCookie(req, name) {
+    const raw = String((req && req.headers && req.headers.cookie) || '');
+    if (!raw) return '';
+    for (const part of raw.split(';')) {
+        const eq = part.indexOf('=');
+        if (eq <= 0) continue;
+        if (part.slice(0, eq).trim() === name) {
+            return part.slice(eq + 1).trim();
+        }
+    }
+    return '';
+}
 
 function maskKey(k) {
     if (!k) return '';
@@ -761,11 +843,148 @@ function mapUsageToOpenAI(usage) {
     return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
 }
 
+const REQUEST_LOG_MAX = 40;
+const REQUEST_LOG_MSG_CHAR_LIMIT = 40000;
+const REQUEST_LOG_BODY_CHAR_LIMIT = 140000;
+const REQUEST_LOG_RESP_CHAR_LIMIT = 80000;
+const requestLogs = [];
+let requestLogSeq = 0;
+
+function truncateLogText(val, maxLen) {
+    const s = String(val == null ? '' : val);
+    if (!maxLen || s.length <= maxLen) return s;
+    const overflow = s.length - maxLen;
+    return `${s.slice(0, maxLen)}\n... [truncated ${overflow} chars]`;
+}
+
+function stripDataUriBase64(val) {
+    return String(val == null ? '' : val).replace(/data:[a-z0-9.+/-]+;base64,[A-Za-z0-9+/=]{128,}/gi, '[base64 media omitted]');
+}
+
+function sanitizeLogHeaders(headers) {
+    const out = {};
+    if (!headers || typeof headers !== 'object') return out;
+    for (const [k, v] of Object.entries(headers)) {
+        const key = String(k);
+        const val = String(v == null ? '' : v);
+        if (/^(authorization|proxy-authorization|x-api-key|x-goog-api-key|x-risustand-token|cookie|set-cookie)$/i.test(key)) {
+            out[key] = /^Bearer\s+/i.test(val) ? 'Bearer [REDACTED]' : '[REDACTED]';
+        } else {
+            out[key] = val;
+        }
+    }
+    return out;
+}
+
+function flattenMessageContentForLog(content) {
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+        return content.map((part) => {
+            if (typeof part === 'string') return part;
+            if (!part || typeof part !== 'object') return String(part || '');
+            if (typeof part.text === 'string') return part.text;
+            if (part.type === 'image_url' && part.image_url) {
+                const url = typeof part.image_url === 'string' ? part.image_url : (part.image_url.url || '');
+                return `[image: ${stripDataUriBase64(url).slice(0, 120)}]`;
+            }
+            return safeJsonForLog(part, 2000);
+        }).join('\n');
+    }
+    if (content && typeof content === 'object') return safeJsonForLog(content, REQUEST_LOG_MSG_CHAR_LIMIT);
+    return String(content == null ? '' : content);
+}
+
+function sanitizeLogMessages(messages) {
+    if (!Array.isArray(messages)) return [];
+    const list = messages.slice(0, 200);
+    return list.map((m) => ({
+        role: String((m && m.role) || 'user'),
+        content: truncateLogText(stripDataUriBase64(flattenMessageContentForLog(m ? m.content : '')), REQUEST_LOG_MSG_CHAR_LIMIT),
+    }));
+}
+
+function safeJsonForLog(obj, maxLen) {
+    if (obj === undefined || obj === null) return '';
+    try {
+        const json = JSON.stringify(obj, (key, val) => {
+            if (key && /^(?:api[_-]?key|.*secret.*|.*password.*|authorization|x-api-key|x-goog-api-key|auth_?token|access_?token|refresh_?token|risustand_?token)$/i.test(key)) {
+                return '[REDACTED]';
+            }
+            if (typeof val === 'string') {
+                if (/^Bearer\s+\S+/i.test(val)) return 'Bearer [REDACTED]';
+                return stripDataUriBase64(val);
+            }
+            return val;
+        }, 2);
+        return truncateLogText(json, maxLen);
+    } catch (_) {
+        return '';
+    }
+}
+
+function recordRequestLog(entry) {
+    const item = {
+        id: `req-${++requestLogSeq}-${crypto.randomBytes(3).toString('hex')}`,
+        at: new Date().toISOString(),
+        source: entry.source || 'llm',
+        profileName: entry.profileName || '',
+        providerType: entry.providerType || 'openai_compat',
+        model: entry.model || '',
+        endpoint: entry.endpoint || '',
+        stream: Boolean(entry.stream),
+        status: Number(entry.status || 0),
+        ok: Boolean(entry.ok),
+        durationMs: Math.max(0, Number(entry.durationMs || 0)),
+        msgCount: Math.max(0, Number(entry.msgCount || 0)),
+        usage: entry.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        headers: entry.headers || {},
+        messages: Array.isArray(entry.messages) ? entry.messages : [],
+        requestJson: entry.requestJson || '',
+        responseText: entry.responseText || '',
+        responseJson: entry.responseJson || '',
+        error: entry.error || '',
+    };
+    requestLogs.unshift(item);
+    if (requestLogs.length > REQUEST_LOG_MAX) {
+        requestLogs.length = REQUEST_LOG_MAX;
+    }
+    return item;
+}
+
+function summarizeRequestLog(entry) {
+    const previewSrc = entry.error ? `오류: ${entry.error}` : (entry.responseText || '');
+    const responsePreview = String(previewSrc).replace(/\s+/g, ' ').trim().slice(0, 160);
+    return {
+        id: entry.id,
+        at: entry.at,
+        source: entry.source,
+        profileName: entry.profileName,
+        providerType: entry.providerType,
+        model: entry.model,
+        endpoint: entry.endpoint,
+        stream: entry.stream,
+        status: entry.status,
+        ok: entry.ok,
+        durationMs: entry.durationMs,
+        msgCount: entry.msgCount,
+        usage: entry.usage,
+        error: entry.error,
+        responsePreview,
+    };
+}
+
 async function callLLMNonStream(profile, messages, extraOpts = {}) {
     if (!profile) throw new Error('활성화된 모델 프로필이 없습니다. [모델/번역] 탭에서 프로필을 선택하세요.');
-    if (!profile.apiKey && profile.providerType !== 'openai_compat') {
-        throw new Error(`프로필 "${profile.name}"의 API 키가 비어 있습니다.`);
-    }
+
+    const startedAt = Date.now();
+    const source = extraOpts.source || 'llm';
+    const wantStreamFlag = Boolean(extraOpts.stream);
+    let logEndpoint = profile.baseUrl || '';
+    let logHeaders = {};
+    let logBodyObj = null;
+    let logStatus = 0;
+    let logRespData = null;
+    let logModel = profile.model || '';
 
     const tempVal = extraOpts.forceTemperature !== undefined
         ? extraOpts.forceTemperature
@@ -777,6 +996,10 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
     const { signal, cleanup } = createTimeoutSignal(timeoutMs, extraOpts.signal);
 
     try {
+        if (!profile.apiKey && profile.providerType !== 'openai_compat') {
+            throw new Error(`프로필 "${profile.name}"의 API 키가 비어 있습니다.`);
+        }
+
         if (profile.providerType === 'anthropic') {
             const { sysParts, turns } = normalizeTurnMessages(messages, { assistantRole: 'assistant', ensureUserFirst: true });
             const body = {
@@ -787,20 +1010,46 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
             if (sysParts.length) body.system = sysParts.join('\n\n');
             if (tempVal !== undefined) body.temperature = tempVal;
 
-            const resp = await fetch(profile.baseUrl || 'https://api.anthropic.com/v1/messages', {
+            logEndpoint = profile.baseUrl || 'https://api.anthropic.com/v1/messages';
+            logHeaders = {
+                'Content-Type': 'application/json',
+                'x-api-key': profile.apiKey,
+                'anthropic-version': '2023-06-01',
+            };
+            logBodyObj = body;
+
+            const resp = await fetch(logEndpoint, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-api-key': profile.apiKey,
-                    'anthropic-version': '2023-06-01',
-                },
+                headers: logHeaders,
                 body: JSON.stringify(body),
                 signal,
             });
+            logStatus = resp.status;
             const data = await resp.json().catch(() => ({}));
+            logRespData = data;
             if (!resp.ok) throw new Error(data.error?.message || `Anthropic HTTP ${resp.status}`);
             const out = Array.isArray(data.content) ? data.content.map((b) => b.text || '').join('') : '';
-            return { text: out, model: data.model || profile.model, usage: data.usage || null };
+            logModel = data.model || profile.model || '';
+            recordRequestLog({
+                source,
+                profileName: profile.name || '',
+                providerType: profile.providerType,
+                model: logModel,
+                endpoint: logEndpoint,
+                stream: wantStreamFlag,
+                status: resp.status,
+                ok: true,
+                durationMs: Date.now() - startedAt,
+                msgCount: Array.isArray(messages) ? messages.length : 0,
+                usage: mapUsageToOpenAI(data.usage || null),
+                headers: sanitizeLogHeaders(logHeaders),
+                messages: sanitizeLogMessages(messages),
+                requestJson: safeJsonForLog(body, REQUEST_LOG_BODY_CHAR_LIMIT),
+                responseText: truncateLogText(out, REQUEST_LOG_RESP_CHAR_LIMIT),
+                responseJson: safeJsonForLog(data, REQUEST_LOG_RESP_CHAR_LIMIT),
+                error: '',
+            });
+            return { text: out, model: logModel, usage: data.usage || null };
         }
 
         if (profile.providerType === 'gemini') {
@@ -815,19 +1064,44 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
             if (maxTokVal !== undefined) genCfg.maxOutputTokens = maxTokVal;
             if (Object.keys(genCfg).length) body.generationConfig = genCfg;
 
+            logEndpoint = endpoint;
+            logHeaders = {
+                'Content-Type': 'application/json',
+                'x-goog-api-key': profile.apiKey,
+            };
+            logBodyObj = body;
+
             const resp = await fetch(endpoint, {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'x-goog-api-key': profile.apiKey,
-                },
+                headers: logHeaders,
                 body: JSON.stringify(body),
                 signal,
             });
+            logStatus = resp.status;
             const data = await resp.json().catch(() => ({}));
+            logRespData = data;
             if (!resp.ok) throw new Error(data.error?.message || `Gemini HTTP ${resp.status}`);
             const parts = data.candidates?.[0]?.content?.parts || [];
             const out = parts.map((p) => p.text || '').join('');
+            recordRequestLog({
+                source,
+                profileName: profile.name || '',
+                providerType: profile.providerType,
+                model: profile.model || '',
+                endpoint,
+                stream: wantStreamFlag,
+                status: resp.status,
+                ok: true,
+                durationMs: Date.now() - startedAt,
+                msgCount: Array.isArray(messages) ? messages.length : 0,
+                usage: mapUsageToOpenAI(data.usageMetadata || null),
+                headers: sanitizeLogHeaders(logHeaders),
+                messages: sanitizeLogMessages(messages),
+                requestJson: safeJsonForLog(body, REQUEST_LOG_BODY_CHAR_LIMIT),
+                responseText: truncateLogText(out, REQUEST_LOG_RESP_CHAR_LIMIT),
+                responseJson: safeJsonForLog(data, REQUEST_LOG_RESP_CHAR_LIMIT),
+                error: '',
+            });
             return { text: out, model: profile.model, usage: data.usageMetadata || null };
         }
 
@@ -848,16 +1122,63 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
         if (tempVal !== undefined) body.temperature = tempVal;
         if (maxTokVal !== undefined) body.max_tokens = maxTokVal;
 
+        logEndpoint = endpoint;
+        logHeaders = headers;
+        logBodyObj = body;
+
         const resp = await fetch(endpoint, {
             method: 'POST',
             headers,
             body: JSON.stringify(body),
             signal,
         });
+        logStatus = resp.status;
         const data = await resp.json().catch(() => ({}));
+        logRespData = data;
         if (!resp.ok) throw new Error(data.error?.message || `Upstream HTTP ${resp.status}`);
         const out = data.choices?.[0]?.message?.content || '';
-        return { text: out, model: data.model || profile.model, usage: data.usage || null };
+        logModel = data.model || profile.model || '';
+        recordRequestLog({
+            source,
+            profileName: profile.name || '',
+            providerType: profile.providerType || 'openai_compat',
+            model: logModel,
+            endpoint,
+            stream: wantStreamFlag,
+            status: resp.status,
+            ok: true,
+            durationMs: Date.now() - startedAt,
+            msgCount: Array.isArray(messages) ? messages.length : 0,
+            usage: mapUsageToOpenAI(data.usage || null),
+            headers: sanitizeLogHeaders(headers),
+            messages: sanitizeLogMessages(messages),
+            requestJson: safeJsonForLog(body, REQUEST_LOG_BODY_CHAR_LIMIT),
+            responseText: truncateLogText(out, REQUEST_LOG_RESP_CHAR_LIMIT),
+            responseJson: safeJsonForLog(data, REQUEST_LOG_RESP_CHAR_LIMIT),
+            error: '',
+        });
+        return { text: out, model: logModel, usage: data.usage || null };
+    } catch (err) {
+        recordRequestLog({
+            source,
+            profileName: profile.name || '',
+            providerType: profile.providerType || 'openai_compat',
+            model: logModel,
+            endpoint: logEndpoint,
+            stream: wantStreamFlag,
+            status: logStatus,
+            ok: false,
+            durationMs: Date.now() - startedAt,
+            msgCount: Array.isArray(messages) ? messages.length : 0,
+            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            headers: sanitizeLogHeaders(logHeaders),
+            messages: sanitizeLogMessages(messages),
+            requestJson: logBodyObj ? safeJsonForLog(logBodyObj, REQUEST_LOG_BODY_CHAR_LIMIT) : '',
+            responseText: '',
+            responseJson: logRespData ? safeJsonForLog(logRespData, REQUEST_LOG_RESP_CHAR_LIMIT) : '',
+            error: err && err.message ? err.message : String(err),
+        });
+        throw err;
     } finally {
         cleanup();
     }
@@ -910,8 +1231,18 @@ async function handleOpenAIProxy(req, res) {
             if (profTemp !== undefined) upBody.temperature = profTemp;
             if (profMaxTok !== undefined) upBody.max_tokens = profMaxTok;
 
+            const startedAt = Date.now();
             const { signal, cleanup } = createTimeoutSignal(180000, clientAbort.signal);
             let reader = null;
+            let upStatus = 0;
+            let logged = false;
+            let streamText = '';
+            let streamTruncated = false;
+            let streamUsage = null;
+            let streamModel = profile.model || '';
+            let sseBuf = '';
+            let aborted = false;
+            let streamErr = '';
             try {
                 const upRes = await fetch(endpoint, {
                     method: 'POST',
@@ -919,11 +1250,33 @@ async function handleOpenAIProxy(req, res) {
                     body: JSON.stringify(upBody),
                     signal,
                 });
+                upStatus = upRes.status;
 
                 if (!upRes.ok || !upRes.body) {
                     const errText = await upRes.text().catch(() => '');
+                    const errMsg = errText || `Upstream HTTP ${upRes.status}`;
+                    logged = true;
+                    recordRequestLog({
+                        source: 'proxy',
+                        profileName: profile.name || '',
+                        providerType: profile.providerType || 'openai_compat',
+                        model: streamModel,
+                        endpoint,
+                        stream: true,
+                        status: upRes.status || 502,
+                        ok: false,
+                        durationMs: Date.now() - startedAt,
+                        msgCount: Array.isArray(messages) ? messages.length : 0,
+                        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+                        headers: sanitizeLogHeaders(headers),
+                        messages: sanitizeLogMessages(messages),
+                        requestJson: safeJsonForLog(upBody, REQUEST_LOG_BODY_CHAR_LIMIT),
+                        responseText: truncateLogText(errText, REQUEST_LOG_RESP_CHAR_LIMIT),
+                        responseJson: '',
+                        error: errMsg,
+                    });
                     return sendJson(res, upRes.status || 502, {
-                        error: { message: errText || `Upstream HTTP ${upRes.status}`, type: 'upstream_error' },
+                        error: { message: errMsg, type: 'upstream_error' },
                     }, req);
                 }
 
@@ -935,21 +1288,83 @@ async function handleOpenAIProxy(req, res) {
                 });
 
                 reader = upRes.body.getReader();
+                const decoder = new TextDecoder('utf-8');
+                const processSseLine = (line) => {
+                    const trimmed = line.trim();
+                    if (!trimmed.startsWith('data:')) return;
+                    const payload = trimmed.slice(5).trim();
+                    if (!payload || payload === '[DONE]') return;
+                    try {
+                        const parsed = JSON.parse(payload);
+                        if (parsed.model) streamModel = parsed.model;
+                        if (parsed.usage) streamUsage = parsed.usage;
+                        const choice = Array.isArray(parsed.choices) ? parsed.choices[0] : null;
+                        const delta = choice && choice.delta ? choice.delta : null;
+                        const piece = delta ? (delta.content || delta.reasoning_content || '') : '';
+                        if (piece) {
+                            if (streamText.length < REQUEST_LOG_RESP_CHAR_LIMIT) {
+                                const remain = REQUEST_LOG_RESP_CHAR_LIMIT - streamText.length;
+                                streamText += piece.length > remain ? piece.slice(0, remain) : piece;
+                                if (piece.length > remain) streamTruncated = true;
+                            } else {
+                                streamTruncated = true;
+                            }
+                        }
+                    } catch (_) {}
+                };
                 while (true) {
                     if (res.writableEnded || res.destroyed || clientAbort.signal.aborted) {
+                        aborted = true;
                         await reader.cancel().catch(() => {});
                         break;
                     }
                     const { done, value } = await reader.read();
                     if (done) break;
+                    sseBuf += decoder.decode(value, { stream: true });
+                    let nl = sseBuf.indexOf('\n');
+                    while (nl !== -1) {
+                        processSseLine(sseBuf.slice(0, nl));
+                        sseBuf = sseBuf.slice(nl + 1);
+                        nl = sseBuf.indexOf('\n');
+                    }
                     if (!res.writableEnded && !res.destroyed) {
                         res.write(Buffer.from(value));
                     }
                 }
+                sseBuf += decoder.decode();
+                if (sseBuf) processSseLine(sseBuf);
                 if (!res.writableEnded && !res.destroyed) res.end();
                 return;
+            } catch (err) {
+                streamErr = err && err.message ? err.message : String(err);
+                throw err;
             } finally {
                 cleanup();
+                if (!logged) {
+                    logged = true;
+                    const respFull = streamTruncated
+                        ? `${streamText}\n... [stream preview truncated]`
+                        : streamText;
+                    recordRequestLog({
+                        source: 'proxy',
+                        profileName: profile.name || '',
+                        providerType: profile.providerType || 'openai_compat',
+                        model: streamModel,
+                        endpoint,
+                        stream: true,
+                        status: upStatus || 0,
+                        ok: !streamErr && !aborted && upStatus >= 200 && upStatus < 300,
+                        durationMs: Date.now() - startedAt,
+                        msgCount: Array.isArray(messages) ? messages.length : 0,
+                        usage: mapUsageToOpenAI(streamUsage),
+                        headers: sanitizeLogHeaders(headers),
+                        messages: sanitizeLogMessages(messages),
+                        requestJson: safeJsonForLog(upBody, REQUEST_LOG_BODY_CHAR_LIMIT),
+                        responseText: respFull,
+                        responseJson: '',
+                        error: streamErr || (aborted ? 'Client disconnected' : ''),
+                    });
+                }
             }
         }
 
@@ -958,6 +1373,8 @@ async function handleOpenAIProxy(req, res) {
             temperature: reqBody.temperature,
             maxTokens: reqBody.max_tokens,
             signal: clientAbort.signal,
+            source: 'proxy',
+            stream: wantStream,
         });
 
         const id = 'chatcmpl-' + crypto.randomBytes(8).toString('hex');
@@ -1055,7 +1472,7 @@ async function translateText(text, direction = 'to_target') {
     const res = await callLLMNonStream(profile, [
         { role: 'system', content: sysPrompt },
         { role: 'user', content: clean },
-    ], { forceTemperature: 0.2, timeoutMs: 60000 });
+    ], { forceTemperature: 0.2, timeoutMs: 60000, source: 'translate' });
 
     const out = String(res.text || '').trim();
     if (out) {
@@ -1102,7 +1519,7 @@ async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = st
     state.directGenerating = true;
     try {
         console.log(`[DirectChat] char#${charIndex} chat#${chatIndex} via ${profile.name} (${profile.model})`);
-        const result = await callLLMNonStream(profile, finalMsgs);
+        const result = await callLLMNonStream(profile, finalMsgs, { source: 'direct_chat' });
         const appended = [];
         if (userText) appended.push({ role: 'user', data: userText });
         appended.push({ role: 'char', data: result.text });
@@ -1152,7 +1569,7 @@ async function runDirectRemoteReroll(charIndex, chatIndex, msgIndex, snapView = 
     state.directGenerating = true;
     try {
         console.log(`[DirectReroll] char#${charIndex} chat#${chatIndex} msg#${msgIndex} via ${profile.name} (${profile.model})`);
-        const result = await callLLMNonStream(profile, finalMsgs);
+        const result = await callLLMNonStream(profile, finalMsgs, { source: 'direct_reroll' });
         queueCommand('replace_message_with_swipe', {
             charIndex,
             chatIndex,
@@ -1524,7 +1941,14 @@ function renderWebApp() {
   .book-columns .rs-bot-html .image-container {
     width:100% !important; max-width:100% !important;
     height:min(38vh, 360px) !important; min-height:180px !important; max-height:46vh !important;
-    padding-bottom:0 !important; break-inside:avoid; margin:10px auto;
+    padding-bottom:0 !important; break-inside:avoid; margin:10px auto; cursor:pointer;
+  }
+  .book-img-preview {
+    position:absolute; z-index:16; display:none;
+    background-size:cover; background-position:center 10%; background-repeat:no-repeat;
+    border-radius:14px; cursor:pointer; pointer-events:none;
+    box-shadow: 0 20px 48px rgba(0, 0, 0, 0.52);
+    transition: top 0.45s cubic-bezier(0.22, 1, 0.36, 1), height 0.45s cubic-bezier(0.22, 1, 0.36, 1), background-position 0.45s ease, opacity 0.2s ease;
   }
   .book-columns .rs-bot-html > div { max-width:100%; }
   .rs-bot-html [risu-trigger], .rs-bot-html [risu-btn] { cursor:pointer; }
@@ -1560,7 +1984,9 @@ function renderWebApp() {
   body.asset-blur .rs-bot-html img:not(.revealed), body.asset-blur .rs-bot-html .image-container:not(.revealed) { filter:blur(22px) brightness(0.72); cursor:pointer; transition:filter 0.25s ease; }
   #bookBotOverlay:empty { display:none; }
   #bookBotOverlay [data-rs-bot-fab="1"] {
-    position:fixed !important; top:104px !important; right:12px !important; z-index:25 !important;
+    position:fixed !important; top:106px !important; right:12px !important; z-index:25 !important;
+    display:flex !important; flex-direction:column !important; align-items:center !important; gap:10px !important;
+    margin:0 !important; padding:0 !important;
     transition: transform 0.22s ease, opacity 0.2s ease;
   }
   #bookBotOverlay.bot-menu-collapsed [data-rs-bot-fab="1"] {
@@ -1568,13 +1994,31 @@ function renderWebApp() {
   }
   #botMenuFab {
     position:fixed; right:12px; top:62px; z-index:30;
-    min-height:32px; padding:0 11px; border-radius:999px;
-    border:1px solid var(--border); background:var(--elev); color:var(--text);
-    font-size:12px; font-weight:700; cursor:pointer; box-shadow:var(--shadow-sm);
-    opacity:0.65; transition: opacity 0.18s ease, background 0.18s ease, border-color 0.18s ease;
+    display:inline-flex; align-items:center; justify-content:center; gap:5px;
+    box-sizing:border-box; height:34px; min-height:34px; min-width:48px; padding:0 12px; margin:0;
+    border-radius:999px; border:1px solid var(--border); background:var(--elev); color:var(--text);
+    font-size:12px; font-weight:700; line-height:1; letter-spacing:-0.01em; white-space:nowrap;
+    cursor:pointer; box-shadow:var(--shadow-sm); opacity:0.78;
+    transition: opacity 0.18s ease, background 0.18s ease, border-color 0.18s ease, border-radius 0.18s ease, padding 0.18s ease, width 0.18s ease;
     -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
   }
+  #botMenuFab .bmf-ic {
+    display:inline-flex; align-items:center; justify-content:center;
+    font-size:11px; line-height:1;
+  }
+  #botMenuFab .bmf-lb {
+    display:inline-flex; align-items:center; justify-content:center; line-height:1;
+  }
   #botMenuFab:hover, #botMenuFab.expanded { opacity:1; border-color:var(--accent); }
+  #botMenuFab.expanded {
+    width:var(--bot-fab-w, 48px); min-width:var(--bot-fab-w, 48px); height:34px; padding:0 4px; gap:2px;
+    border-radius:12px; font-size:11px;
+  }
+  @media (max-width: 768px) {
+    #botMenuFab { right:12px; top:60px; height:32px; min-height:32px; }
+    #botMenuFab.expanded { width:var(--bot-fab-w, 44px); min-width:var(--bot-fab-w, 44px); height:32px; padding:0 3px; border-radius:12px; font-size:10.5px; }
+    #bookBotOverlay [data-rs-bot-fab="1"] { top:100px !important; right:12px !important; gap:8px !important; }
+  }
   .msg-swipe-grp { display:inline-flex; align-items:center; gap:2px; background:var(--surface); border:1px solid var(--border); border-radius:999px; padding:1px 4px; margin-right:2px; }
   .msg-swipe-cnt { font-size:11px; color:var(--sub); font-weight:700; padding:0 4px; font-variant-numeric:tabular-nums; }
   #triggerModal {
@@ -1591,6 +2035,80 @@ function renderWebApp() {
   .trig-msg { font-size:14px; line-height:1.55; white-space:pre-wrap; }
   .trig-opts { display:flex; flex-direction:column; gap:7px; }
   .trig-opt-btn { width:100%; justify-content:flex-start; text-align:left; padding:10px 13px; min-height:42px; }
+  .trig-alert-card { max-width:360px; padding:18px 20px; border-radius:14px; gap:14px; }
+  .trig-title { font-size:15px; font-weight:800; margin:0; color:var(--text); }
+  .trig-title.err { color:var(--danger); }
+  .trig-ok-btn { width:100%; min-height:42px; font-size:14px; font-weight:700; border-radius:10px; }
+
+  /* ===== Request Log Viewer ===== */
+  .req-log-filters { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-bottom:10px; }
+  .req-log-list { display:flex; flex-direction:column; gap:7px; max-height:420px; overflow:auto; }
+  .req-log-row {
+    width:100%; text-align:left; font-family:inherit; color:var(--text);
+    display:flex; flex-direction:column; gap:4px; padding:10px 12px;
+    border-radius:12px; border:1px solid var(--border); background:var(--bg);
+    cursor:pointer; transition:border-color 0.15s ease, background 0.15s ease;
+  }
+  .req-log-row:hover { border-color:var(--accent); background:var(--surface); }
+  .req-log-row-top { display:flex; align-items:center; gap:6px; flex-wrap:wrap; font-size:13px; font-weight:700; }
+  .req-log-row-meta { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:11.5px; color:var(--sub); font-variant-numeric:tabular-nums; }
+  .req-log-row-prev { font-size:12px; color:var(--sub); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .req-log-badge {
+    display:inline-flex; align-items:center; gap:3px; padding:2px 7px; border-radius:999px;
+    font-size:11px; font-weight:700; border:1px solid var(--border); background:var(--surface); color:var(--text);
+    font-variant-numeric:tabular-nums;
+  }
+  .req-log-badge.ok { border-color:color-mix(in srgb, #10b981 40%, var(--border)); background:color-mix(in srgb, #10b981 12%, transparent); color:#10b981; }
+  .req-log-badge.err { border-color:color-mix(in srgb, var(--danger) 45%, var(--border)); background:color-mix(in srgb, var(--danger) 12%, transparent); color:var(--danger); }
+  .req-log-badge.src { border-color:color-mix(in srgb, var(--accent) 35%, var(--border)); color:var(--accent); background:var(--accent-soft); }
+  #reqLogModal {
+    position:fixed; inset:0; z-index:160; background:rgba(0,0,0,0.64);
+    -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
+    display:flex; align-items:center; justify-content:center; padding:14px;
+  }
+  .req-log-dialog {
+    width:100%; max-width:860px; max-height:88vh; background:var(--elev); color:var(--text);
+    border:1px solid var(--border); border-radius:18px; box-shadow:var(--shadow);
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  .req-log-head {
+    display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
+    padding:12px 16px; border-bottom:1px solid var(--border); background:var(--surface); flex-shrink:0;
+  }
+  .req-log-title { font-size:14.5px; font-weight:800; display:flex; align-items:center; gap:6px; flex-wrap:wrap; min-width:0; }
+  .req-log-tabs {
+    display:flex; gap:6px; flex-wrap:wrap; padding:8px 16px; border-bottom:1px solid var(--border);
+    background:var(--elev); flex-shrink:0;
+  }
+  .req-log-body { flex:1; min-height:0; overflow:auto; padding:14px 16px; display:flex; flex-direction:column; gap:10px; }
+  .req-log-msg {
+    border:1px solid var(--border); border-radius:12px; background:var(--bg); overflow:hidden;
+  }
+  .req-log-msg-head {
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+    padding:6px 11px; background:var(--surface); border-bottom:1px solid var(--border); font-size:11.5px; color:var(--sub);
+  }
+  .req-log-msg-role { font-weight:800; text-transform:uppercase; letter-spacing:0.04em; color:var(--accent); }
+  .req-log-msg-body {
+    margin:0; padding:10px 12px; font-size:12.5px; line-height:1.58;
+    white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere; font-family:inherit;
+  }
+  .req-log-pre {
+    margin:0; padding:12px; border-radius:12px; border:1px solid var(--border); background:var(--surface);
+    font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; line-height:1.55;
+    white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere; max-height:60vh; overflow:auto;
+  }
+  .req-log-errbox {
+    padding:10px 12px; border-radius:12px; border:1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+    background:color-mix(in srgb, var(--danger) 10%, transparent); color:var(--danger);
+    font-size:12.5px; line-height:1.5; white-space:pre-wrap; word-break:break-word;
+  }
+  .req-log-meta-grid {
+    display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:8px;
+    padding:10px 12px; border-radius:12px; border:1px solid var(--border); background:var(--surface); font-size:12px;
+  }
+  .req-log-meta-item b { display:block; font-size:11px; color:var(--sub); margin-bottom:2px; }
+  .req-log-meta-item span { word-break:break-all; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 
   /* ===== Composer (capsule) ===== */
   .composer {
@@ -1682,7 +2200,12 @@ function renderWebApp() {
     display:inline-flex; align-items:center; justify-content:center; gap:5px;
     border:1px solid transparent; border-radius:var(--radius-sm); padding:0 14px; min-height:38px;
     font-size:13px; font-weight:700; cursor:pointer; background:var(--accent); color:var(--on-accent);
+    white-space:nowrap;
     transition: filter 0.15s ease, transform 0.1s ease, background 0.15s ease;
+  }
+  #refreshAllBtn {
+    width:auto; height:auto; min-width:fit-content; border-radius:var(--radius-sm);
+    padding:0 14px; white-space:nowrap;
   }
   .btn:hover { filter: brightness(1.06); }
   .btn:active { transform: scale(0.97); }
@@ -1778,6 +2301,7 @@ function renderWebApp() {
       --content-w: 1160px;
     }
     #tab-modules .panel-title, #tab-router .panel-title { grid-column: 1 / -1; }
+    #reqLogCard { grid-column: 1 / -1; }
     #tab-bots { --content-w: 760px; }
     .composer { margin-bottom: 16px; }
   }
@@ -1788,10 +2312,11 @@ function renderWebApp() {
 </head>
 <body>
 <div id="toast" role="status" aria-live="polite"></div>
-<div id="botBgHost" class="rs-bg-host"></div>
+<div id="botBgHost" class="rs-bg-host rs-bot-html"></div>
 <div id="bookBotOverlay" class="bot-menu-collapsed"></div>
 <button id="botMenuFab" type="button" style="display:none;" title="봇 메뉴 펼치기 / 접기">☰ 메뉴</button>
 <div id="triggerModal" style="display:none;" role="dialog" aria-modal="true"></div>
+<div id="reqLogModal" style="display:none;" role="dialog" aria-modal="true" aria-label="리퀘스트 로그"></div>
 
 <div id="login">
   <div class="login-card">
@@ -1814,6 +2339,7 @@ function renderWebApp() {
       </div>
     </div>
     <div class="h-right">
+      <button class="pill icon-pill" id="reqLogQuickBtn" title="리퀘스트 로그 보기" aria-label="리퀘스트 로그">📜</button>
       <button class="pill icon-pill" id="assetCycleBtn" title="에셋 표시 / 가리기 / 감추기" aria-label="에셋 표시 모드">🖼️</button>
       <button class="pill icon-pill" id="autoTrBtn" title="응답 자동 번역" aria-label="응답 자동 번역">🌐</button>
       <button class="pill icon-pill" id="readBarToggle" title="테마·글꼴·에셋 설정" aria-label="화면 설정" aria-expanded="false" style="font-weight:800;">Aa</button>
@@ -1920,7 +2446,7 @@ function renderWebApp() {
       </div>
       <div id="customToggleBody" style="font-size:12.5px; color:var(--sub);">활성화된 모듈에 커스텀 토글이 없습니다.</div>
       <label class="chk-row" style="margin-top:12px; border-top:1px solid var(--border); border-bottom:none; padding-bottom:0;">
-        <span>로컬 토글 사용 <span style="color:var(--sub); font-size:12px;">(원격 토글 제어에 필요)</span></span>
+        <span>이 방에만 로컬 토글 사용 <span style="color:var(--sub); font-size:12px;">(꺼두면 전역으로 계속 유지)</span></span>
         <input type="checkbox" id="localToggleChk" />
       </label>
     </div>
@@ -2062,6 +2588,26 @@ function renderWebApp() {
       <textarea class="f-inp" id="trPrompt" rows="2"></textarea>
       <div class="btn-row"><button class="btn" id="saveTrBtn">번역 설정 저장</button></div>
     </div>
+
+    <div class="card" id="reqLogCard">
+      <div style="display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; margin-bottom:8px;">
+        <h3 style="margin:0;">📜 리퀘스트 로그</h3>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <button type="button" class="pill" id="reqLogRefreshBtn">🔄 새로고침</button>
+          <button type="button" class="pill" id="reqLogClearBtn" style="color:var(--danger);">🗑️ 비우기</button>
+        </div>
+      </div>
+      <div class="hint" style="margin-bottom:8px;">
+        PC RisuAI 프록시(<code>/v1/chat/completions</code>), 원격 직접 채팅/리롤, 번역기에서 나간 최근 40건의 요청·응답 로그를 서버 메모리에 보관합니다. API 키와 인증 토큰은 자동 마스킹됩니다.
+      </div>
+      <div class="req-log-filters" id="reqLogFilters">
+        <button type="button" class="pill active" data-log-filter="all">전체</button>
+        <button type="button" class="pill" data-log-filter="proxy">프록시</button>
+        <button type="button" class="pill" data-log-filter="direct">원격 채팅/리롤</button>
+        <button type="button" class="pill" data-log-filter="translate">번역</button>
+      </div>
+      <div id="reqLogList" class="req-log-list"><div style="font-size:12.5px; color:var(--sub);">아직 기록된 요청이 없습니다.</div></div>
+    </div>
   </section>
 
   <nav class="tabbar">
@@ -2081,6 +2627,7 @@ function renderWebApp() {
   let expandedBotIdx = -1;
   let lastChatRenderSig = '';
   let lastBotsRenderSig = '';
+  let lastBotsSyncAt = 0;
   let lastModulesRenderSig = '';
   let lastChatVarsRenderSig = '';
   let lastBgHtmlSig = '';
@@ -2091,7 +2638,14 @@ function renderWebApp() {
   let localRequestPending = false;
   let localRequestTimer = null;
   let pollTimer = null;
+  let isStatePolling = false;
+  let knownCatalogVer = -1;
+  let knownSnapshotVer = -1;
   let bookSpreadIdx = -1; // -1 means auto-jump to latest spread
+  let bookDesiredSpreadIdx = -1;
+  let bookAnchorMode = 'last-user'; // 'last-user' | 'manual'
+  let pendingReplyTarget = null;
+  let pendingScrollToLastUser = false;
   let bookSpreadStride = 1;
   let bookTotalSpreads = 1;
   let bookTotalPages = 1;
@@ -2190,10 +2744,33 @@ function renderWebApp() {
     if (jBar && jBar.style.display !== 'none' && !jBar.contains(e.target) && (!jBtn || !jBtn.contains(e.target))) {
       jBar.style.display = 'none';
     }
+    const tgBody = document.getElementById('customToggleBody');
+    if (openToggleGroups.size > 0 && tgBody && !tgBody.contains(e.target)) {
+      openToggleGroups.clear();
+      tgBody.querySelectorAll('.tg-acc.open').forEach((acc) => {
+        acc.classList.remove('open');
+        const arrow = acc.querySelector('.tg-acc-head span:last-child');
+        if (arrow) arrow.textContent = '▸';
+      });
+      lastToggleRenderSig = '';
+    }
+    if (botMenuExpanded) {
+      const fab = document.getElementById('botMenuFab');
+      const ov = document.getElementById('bookBotOverlay');
+      const insideFab = fab && fab.contains(e.target);
+      const insideOv = ov && ov.contains(e.target);
+      const hasOpenPanel = ov && ov.querySelector('input[type="checkbox"]:checked');
+      if (!insideFab && !insideOv && !hasOpenPanel) {
+        botMenuExpanded = false;
+        syncBotMenuVisibility();
+      }
+    }
   });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
       setReadBar(false);
+      closeBookImgPreview(true);
+      if (typeof closeReqLogModal === 'function') closeReqLogModal();
       const jBar = document.getElementById('bookJumpBar');
       if (jBar) jBar.style.display = 'none';
     }
@@ -2205,7 +2782,10 @@ function renderWebApp() {
     uiPref.theme = key;
     if (uiPref.theme.startsWith('epub')) uiPref.font = 'serif';
     else if (uiPref.theme.startsWith('ai-')) uiPref.font = 'system';
+    bookAnchorMode = 'last-user';
     bookSpreadIdx = -1;
+    bookDesiredSpreadIdx = -1;
+    pendingReplyTarget = null;
     applyUiPrefs();
     renderChat();
   }
@@ -2262,7 +2842,7 @@ function renderWebApp() {
 
   function safeImgSrc(u) {
     const raw = String(u || '').trim();
-    if (/^(data:image\\/[a-z0-9.+-]+;base64,|https?:\\/\\/)/i.test(raw)) return raw;
+    if (/^(?:data:image\\/[a-z0-9.+-]+;base64,|https?:\\/\\/|\\/api\\/asset\\/[a-f0-9]{16,64}$)/i.test(raw)) return raw;
     return '';
   }
 
@@ -2286,6 +2866,95 @@ function renderWebApp() {
       .replace(/@import\\s+(?!url\\(\\s*["']?https:\\/\\/)/gi, '/* @import */ ');
   }
 
+  function splitCssSelectors(selText) {
+    const out = [];
+    let start = 0;
+    let pDepth = 0;
+    let bDepth = 0;
+    let quote = '';
+    for (let i = 0; i < selText.length; i++) {
+      const c = selText[i];
+      if (quote) {
+        if (c === '\\\\') { i++; continue; }
+        if (c === quote) quote = '';
+        continue;
+      }
+      if (c === '"' || c === "'") { quote = c; continue; }
+      if (c === '(') pDepth++;
+      else if (c === ')' && pDepth > 0) pDepth--;
+      else if (c === '[') bDepth++;
+      else if (c === ']' && bDepth > 0) bDepth--;
+      else if (c === ',' && pDepth === 0 && bDepth === 0) {
+        out.push(selText.slice(start, i));
+        start = i + 1;
+      }
+    }
+    out.push(selText.slice(start));
+    return out;
+  }
+
+  function scopeBotCss(css, scopeSel = '.rs-bot-html') {
+    const clean = String(css || '').replace(/\\/\\*[\\s\\S]*?\\*\\//g, '');
+    let out = '';
+    let start = 0;
+    let quote = '';
+    for (let i = 0; i < clean.length; i++) {
+      const c = clean[i];
+      if (quote) {
+        if (c === '\\\\') { i++; continue; }
+        if (c === quote) quote = '';
+        continue;
+      }
+      if (c === '"' || c === "'") { quote = c; continue; }
+      if (c === ';') {
+        const stmt = clean.slice(start, i + 1).trim();
+        if (stmt) out += stmt + '\\n';
+        start = i + 1;
+        continue;
+      }
+      if (c === '{') {
+        const header = clean.slice(start, i).trim();
+        let depth = 1;
+        let q2 = '';
+        let j = i + 1;
+        for (; j < clean.length && depth > 0; j++) {
+          const ch = clean[j];
+          if (q2) {
+            if (ch === '\\\\') { j++; continue; }
+            if (ch === q2) q2 = '';
+            continue;
+          }
+          if (ch === '"' || ch === "'") { q2 = ch; continue; }
+          if (ch === '{') depth++;
+          else if (ch === '}') depth--;
+        }
+        const body = clean.slice(i + 1, Math.max(i + 1, j - 1));
+        i = j - 1;
+        start = j;
+        if (!header) continue;
+        if (/^@(?:keyframes|-webkit-keyframes|font-face|property|counter-style|page)\\b/i.test(header)) {
+          out += header + '{' + body + '}\\n';
+        } else if (/^@(?:media|supports|layer|container|document)\\b/i.test(header)) {
+          out += header + '{\\n' + scopeBotCss(body, scopeSel) + '}\\n';
+        } else if (header.startsWith('@')) {
+          out += header + '{' + body + '}\\n';
+        } else {
+          const scoped = splitCssSelectors(header).map((sel) => {
+            const s = sel.trim();
+            if (!s) return '';
+            if (s.indexOf(scopeSel) === 0 || s.indexOf('#botBgHost') === 0 || s.indexOf('#bookBotOverlay') === 0) return s;
+            if (/^(?:html|body|:root)(?=[\\s.:#[>+~]|$)/i.test(s)) {
+              return s.replace(/^(?:html|body|:root)/i, scopeSel);
+            }
+            return scopeSel + ' ' + s;
+          }).filter(Boolean).join(', ');
+          if (scoped) out += scoped + '{' + body + '}\\n';
+        }
+      }
+    }
+    return out;
+  }
+
   function sanitizeBotNode(node) {
     const kids = Array.from(node.childNodes || []);
     for (const ch of kids) {
@@ -2300,7 +2969,7 @@ function renderWebApp() {
         continue;
       }
       if (tag === 'style') {
-        ch.textContent = sanitizeBotCss(ch.textContent || '');
+        ch.textContent = scopeBotCss(sanitizeBotCss(ch.textContent || ''));
         continue;
       }
       const attrs = Array.from(ch.attributes || []);
@@ -2322,6 +2991,10 @@ function renderWebApp() {
         if (name === 'style') {
           ch.setAttribute('style', sanitizeBotCss(val));
         }
+      }
+      if (tag === 'img') {
+        if (!ch.getAttribute('loading')) ch.setAttribute('loading', 'lazy');
+        if (!ch.getAttribute('decoding')) ch.setAttribute('decoding', 'async');
       }
       sanitizeBotNode(ch);
     }
@@ -2368,7 +3041,12 @@ function renderWebApp() {
     host.innerHTML = raw ? renderBotRichHtml(raw, assetMap) : '';
   }
 
+  let activeModalKeyHandler = null;
   function closeTriggerModal() {
+    if (activeModalKeyHandler) {
+      document.removeEventListener('keydown', activeModalKeyHandler);
+      activeModalKeyHandler = null;
+    }
     const m = document.getElementById('triggerModal');
     if (m) {
       m.style.display = 'none';
@@ -2379,6 +3057,55 @@ function renderWebApp() {
   function showTriggerModal(ev) {
     const modal = document.getElementById('triggerModal');
     if (!modal || !ev) return;
+
+    if (ev.kind === 'notice' || ev.kind === 'alert_error') {
+      const queue = Array.isArray(ev.notices) && ev.notices.length
+        ? ev.notices
+        : [{ title: ev.title || '', message: ev.message || '', isError: ev.kind === 'alert_error' }];
+      let idx = 0;
+
+      const advance = () => {
+        idx += 1;
+        if (idx < queue.length) {
+          renderNotice();
+          return;
+        }
+        closeTriggerModal();
+        if (ev.source === 'pc_alert') {
+          api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'dismiss_pc_alert' }) }).catch(() => {});
+        }
+      };
+
+      const renderNotice = () => {
+        const item = queue[idx] || {};
+        const title = item.title || (item.isError ? 'Error' : '');
+        modal.innerHTML =
+          '<div class="trig-card trig-alert-card">' +
+            (title ? '<h2 class="trig-title' + (item.isError ? ' err' : '') + '">' + esc(title) + '</h2>' : '') +
+            '<div class="trig-msg">' + esc(item.message || '') + '</div>' +
+            '<button class="btn sec trig-ok-btn" id="trigAlertOkBtn">OK</button>' +
+          '</div>';
+        modal.style.display = 'flex';
+        const okBtn = document.getElementById('trigAlertOkBtn');
+        if (okBtn) {
+          okBtn.onclick = advance;
+          setTimeout(() => { try { okBtn.focus(); } catch (_) {} }, 20);
+        }
+        modal.onclick = (e) => { if (e.target === modal) advance(); };
+      };
+
+      if (activeModalKeyHandler) document.removeEventListener('keydown', activeModalKeyHandler);
+      activeModalKeyHandler = (e) => {
+        if (e.key === 'Enter' || e.key === 'Escape') {
+          e.preventDefault();
+          advance();
+        }
+      };
+      document.addEventListener('keydown', activeModalKeyHandler);
+      renderNotice();
+      return;
+    }
+
     const baseAnswers = Array.isArray(ev.answersSoFar) ? ev.answersSoFar.slice() : [];
     const sendAnswer = async (ans) => {
       closeTriggerModal();
@@ -2440,20 +3167,27 @@ function renderWebApp() {
 
   function renderInlineBody(text, images) {
     const imgs = Array.isArray(images) ? images : [];
+    const resolveImg = (item) => {
+      const s = String(item || '');
+      if (s.startsWith('[[RSASSET:')) {
+        return resolveAssetTokens(s, lastState && lastState.snapshot && lastState.snapshot.assetMap);
+      }
+      return safeImgSrc(s);
+    };
     const used = new Set();
     let html = esc(text || '').replace(/\\[\\[RSIMG:(\\d+)\\]\\]/g, (_, nStr) => {
       const idx = Number(nStr);
-      const src = imgs[idx] ? safeImgSrc(imgs[idx]) : '';
+      const src = imgs[idx] ? resolveImg(imgs[idx]) : '';
       if (src) {
         used.add(idx);
-        return '<span class="msg-img-wrap" data-img-reveal="1"><img class="msg-img" src="' + esc(src) + '" /><span class="img-veil">🌫️ 터치해 보기</span></span>';
+        return '<span class="msg-img-wrap" data-img-reveal="1"><img class="msg-img" loading="lazy" decoding="async" src="' + esc(src) + '" /><span class="img-veil">🌫️ 터치해 보기</span></span>';
       }
       return '';
     });
     for (let i = 0; i < imgs.length; i++) {
-      const src = !used.has(i) && imgs[i] ? safeImgSrc(imgs[i]) : '';
+      const src = !used.has(i) && imgs[i] ? resolveImg(imgs[i]) : '';
       if (src) {
-        html += '<span class="msg-img-wrap" data-img-reveal="1"><img class="msg-img" src="' + esc(src) + '" /><span class="img-veil">🌫️ 터치해 보기</span></span>';
+        html += '<span class="msg-img-wrap" data-img-reveal="1"><img class="msg-img" loading="lazy" decoding="async" src="' + esc(src) + '" /><span class="img-veil">🌫️ 터치해 보기</span></span>';
       }
     }
     return html;
@@ -2485,6 +3219,9 @@ function renderWebApp() {
   function logoutToLogin(reason) {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     if (updPolling) { clearInterval(updPolling); updPolling = null; }
+    isStatePolling = false;
+    knownCatalogVer = -1;
+    knownSnapshotVer = -1;
     token = '';
     localStorage.removeItem('rs_token');
     setReadBar(false);
@@ -2505,15 +3242,25 @@ function renderWebApp() {
     document.getElementById('composerBar').style.display = tab === 'chat' ? 'flex' : 'none';
     if (tab === 'chat' && isBookMode()) setTimeout(() => layoutBookSpreads(false), 30);
     syncBotMenuVisibility();
-    if (tab === 'router') loadRouterConfig();
-    if (tab === 'bots') renderBots();
+    if (tab === 'router') { loadRouterConfig(); if (typeof loadRequestLogs === 'function') loadRequestLogs(); }
+    if (tab === 'bots') {
+      renderBots();
+      if (Date.now() - lastBotsSyncAt > 4000) {
+        lastBotsSyncAt = Date.now();
+        api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'sync_all' }) }).catch(() => {});
+      }
+    }
     if (tab === 'modules') { renderModules(); refreshUpdateStatus(); }
   }
 
   async function tryLogin(t) {
     token = t.trim();
+    knownCatalogVer = -1;
+    knownSnapshotVer = -1;
     try {
       const st = await api('/api/state');
+      if (typeof st.catalogVersion === 'number') knownCatalogVer = st.catalogVersion;
+      if (typeof st.snapshotVersion === 'number') knownSnapshotVer = st.snapshotVersion;
       localStorage.setItem('rs_token', token);
       document.getElementById('login').style.display = 'none';
       document.getElementById('app').style.display = 'grid';
@@ -2532,12 +3279,21 @@ function renderWebApp() {
   document.getElementById('tokInput').onkeydown = (e) => { if (e.key === 'Enter') document.getElementById('loginBtn').click(); };
 
   async function pollState() {
+    if (isStatePolling) return;
+    isStatePolling = true;
     try {
-      applyState(await api('/api/state'));
+      const st = await api('/api/state?cv=' + knownCatalogVer + '&sv=' + knownSnapshotVer);
+      if (typeof st.catalogVersion === 'number') knownCatalogVer = st.catalogVersion;
+      if (typeof st.snapshotVersion === 'number') knownSnapshotVer = st.snapshotVersion;
+      if (!('catalog' in st) && lastState && lastState.catalog) st.catalog = lastState.catalog;
+      if (!('snapshot' in st) && lastState && lastState.snapshot) st.snapshot = lastState.snapshot;
+      applyState(st);
     } catch (e) {
       if (e && e.status === 401) {
         logoutToLogin('세션 토큰이 만료되었거나 변경되었습니다. 다시 입력해 주세요.');
       }
+    } finally {
+      isStatePolling = false;
     }
   }
 
@@ -2564,6 +3320,35 @@ function renderWebApp() {
     syncComposerBusy(Boolean(localRequestPending || (lastState && (lastState.generating || lastState.directGenerating))));
   }
 
+  function getLatestCharMsgInfo(msgs) {
+    const list = Array.isArray(msgs) ? msgs : [];
+    for (let i = list.length - 1; i >= 0; i--) {
+      const m = list[i];
+      if (m && m.role !== 'user' && Number(m.index) >= 0) {
+        return {
+          index: Number(m.index),
+          digest: hashStr((m.text || '') + ':' + (m.html || '')),
+        };
+      }
+    }
+    return { index: -1, digest: '' };
+  }
+
+  function armPendingReplyFollow(snap) {
+    if (!snap || snap.charIndex < 0) return;
+    if (bookSpreadIdx >= 0) {
+      bookAnchorMode = 'manual';
+      bookDesiredSpreadIdx = bookSpreadIdx;
+    }
+    const latest = getLatestCharMsgInfo(snap.messages || []);
+    pendingReplyTarget = {
+      chatKey: snap.charIndex + ':' + snap.chatIndex,
+      prevLastCharIndex: latest.index,
+      prevLastCharDigest: latest.digest,
+      at: Date.now(),
+    };
+  }
+
   function applyState(st) {
     lastState = st;
     const snap = st.snapshot || {};
@@ -2582,6 +3367,7 @@ function renderWebApp() {
     if (st.lastDirectError && st.lastDirectError.at && st.lastDirectError.at > lastDirectErrAt) {
       lastDirectErrAt = st.lastDirectError.at;
       localRequestPending = false;
+      pendingReplyTarget = null;
       if (localRequestTimer) { clearTimeout(localRequestTimer); localRequestTimer = null; }
       toast('응답 오류: ' + (st.lastDirectError.message || '실패'));
     }
@@ -2590,19 +3376,37 @@ function renderWebApp() {
       const tev = st.lastTriggerEvent;
       if (tev.kind === 'error') {
         localRequestPending = false;
+        pendingReplyTarget = null;
         if (localRequestTimer) { clearTimeout(localRequestTimer); localRequestTimer = null; }
       }
-      if (tev.kind === 'prompt_select' || tev.kind === 'prompt_input') showTriggerModal(tev);
+      if (tev.kind === 'prompt_select' || tev.kind === 'prompt_input' || tev.kind === 'notice' || tev.kind === 'alert_error') showTriggerModal(tev);
       else if (tev.kind === 'error') toast('⚠️ ' + (tev.message || '트리거 오류'));
-      else if (tev.kind === 'notice' && tev.message) toast(tev.message);
     }
     syncComposerBusy(Boolean(isBusy || localRequestPending));
 
     syncBotBackground(snap.backgroundHtml || '', snap.assetMap || {});
 
     const msgs = snap.messages || [];
+    if (pendingReplyTarget) {
+      const chatKey = snap.charIndex + ':' + snap.chatIndex;
+      if (Date.now() - pendingReplyTarget.at > 300000 || chatKey !== pendingReplyTarget.chatKey) {
+        pendingReplyTarget = null;
+      } else {
+        const latestChar = getLatestCharMsgInfo(msgs);
+        if (
+          latestChar.index > pendingReplyTarget.prevLastCharIndex ||
+          (latestChar.index >= 0 && latestChar.index === pendingReplyTarget.prevLastCharIndex && latestChar.digest !== pendingReplyTarget.prevLastCharDigest)
+        ) {
+          pendingReplyTarget = null;
+          bookAnchorMode = 'last-user';
+          bookSpreadIdx = -1;
+          bookDesiredSpreadIdx = -1;
+          pendingScrollToLastUser = true;
+        }
+      }
+    }
     const msgDigest = hashStr(msgs.map((m) => m.index + ':' + (m.text || '') + ':' + (m.html || '') + ':' + (m.swipeCount || 1) + ':' + (m.swipeIndex || 0) + ':' + (m.images ? m.images.length : 0)).join('\\x01'));
-    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, snap.fmIndex, snap.firstMessageCount, snap.greetingControls || [], snap.backgroundHtml || '', Object.keys(snap.assetMap || {}).length, msgs.length, msgDigest, st.generating, st.directGenerating, uiPref.theme, uiPref.assetMode, uiPref.richHtml]);
+    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, snap.fmIndex, snap.firstMessageCount, snap.greetingControls || [], snap.backgroundHtml || '', Object.keys(snap.assetMap || {}).length, msgs.length, msgDigest, uiPref.theme, uiPref.assetMode, uiPref.richHtml]);
     if (sig !== lastChatRenderSig) {
       lastChatRenderSig = sig;
       renderChat();
@@ -2747,11 +3551,93 @@ function renderWebApp() {
     }
   }
 
-  function goToBookSpread(nextIdx, animate = false) {
+  const bookImgPreviewState = { el: null, pinned: false, closeTimer: null };
+
+  function closeBookImgPreview(immediate = false) {
+    if (bookImgPreviewState.closeTimer) {
+      clearTimeout(bookImgPreviewState.closeTimer);
+      bookImgPreviewState.closeTimer = null;
+    }
+    const preview = document.getElementById('bookImgPreview');
+    const frame = document.getElementById('bookFrame');
+    const srcEl = bookImgPreviewState.el;
+    bookImgPreviewState.el = null;
+    bookImgPreviewState.pinned = false;
+    if (!preview) return;
+    preview.style.pointerEvents = 'none';
+    if (immediate || !frame || !srcEl || !srcEl.isConnected) {
+      preview.style.display = 'none';
+      return;
+    }
+    const fr = frame.getBoundingClientRect();
+    const r = srcEl.getBoundingClientRect();
+    preview.style.left = (r.left - fr.left) + 'px';
+    preview.style.width = r.width + 'px';
+    preview.style.top = (r.top - fr.top) + 'px';
+    preview.style.height = r.height + 'px';
+    preview.style.backgroundPosition = 'center 10%';
+    bookImgPreviewState.closeTimer = setTimeout(() => {
+      bookImgPreviewState.closeTimer = null;
+      preview.style.display = 'none';
+    }, 360);
+  }
+
+  function openBookImgPreview(el, pinned = false) {
+    if (!el) return;
+    if (document.body.classList.contains('asset-blur') && !el.classList.contains('revealed')) return;
+    const frame = document.getElementById('bookFrame');
+    const preview = document.getElementById('bookImgPreview');
+    if (!frame || !preview) return;
+    const bg = getComputedStyle(el).backgroundImage;
+    if (!bg || bg === 'none') return;
+    if (bookImgPreviewState.closeTimer) {
+      clearTimeout(bookImgPreviewState.closeTimer);
+      bookImgPreviewState.closeTimer = null;
+    }
+    if (bookImgPreviewState.el === el && preview.style.display === 'block') {
+      if (pinned) bookImgPreviewState.pinned = true;
+      return;
+    }
+    const fr = frame.getBoundingClientRect();
+    const r = el.getBoundingClientRect();
+    if (!fr.height || !r.width || !r.height) return;
+    const left = r.left - fr.left;
+    const width = r.width;
+    const startTop = r.top - fr.top;
+    const startH = r.height;
+    const targetH = Math.min(fr.height - 24, Math.max(startH * 1.85, width * 1.65));
+    const endTop = (startTop + targetH > fr.height - 12) ? Math.max(12, fr.height - 12 - targetH) : startTop;
+
+    bookImgPreviewState.el = el;
+    bookImgPreviewState.pinned = Boolean(pinned);
+
+    const savedTrans = preview.style.transition;
+    preview.style.transition = 'none';
+    preview.style.backgroundImage = bg;
+    preview.style.left = left + 'px';
+    preview.style.width = width + 'px';
+    preview.style.top = startTop + 'px';
+    preview.style.height = startH + 'px';
+    preview.style.backgroundPosition = 'center 10%';
+    preview.style.display = 'block';
+    void preview.offsetWidth;
+    preview.style.transition = savedTrans || '';
+    preview.style.top = endTop + 'px';
+    preview.style.height = targetH + 'px';
+    preview.style.backgroundPosition = 'center 5%';
+    preview.style.pointerEvents = 'auto';
+  }
+
+  function goToBookSpread(nextIdx, animate = false, fromLayout = false) {
+    closeBookImgPreview(true);
     const vp = document.getElementById('bookViewport');
     const flipLeaf = document.getElementById('flipLeaf');
     if (!vp) return;
     const prev = bookSpreadIdx < 0 ? 0 : bookSpreadIdx;
+    if (!fromLayout) {
+      bookAnchorMode = 'manual';
+      bookDesiredSpreadIdx = Math.max(0, nextIdx);
+    }
     const clamped = Math.max(0, Math.min(bookTotalSpreads - 1, nextIdx));
     bookSpreadIdx = clamped;
 
@@ -2806,24 +3692,27 @@ function renderWebApp() {
     const colStride = bookSinglePage ? bookSpreadStride : (evenW + colGap) / 2;
     bookTotalPages = Math.max(1, Math.ceil((cols.scrollWidth - 4) / colStride));
 
-    if (jumpAuto && bookSpreadIdx < 0) {
+    if (bookAnchorMode === 'last-user') {
       const msgs = (lastState && lastState.snapshot && lastState.snapshot.messages) || [];
-      if (msgs.length <= 1) {
-        bookSpreadIdx = 0;
-      } else {
+      let targetSpread = 0;
+      if (msgs.length > 1) {
         const userBlocks = cols.querySelectorAll('.book-user-block');
         const targetEl = userBlocks.length ? userBlocks[userBlocks.length - 1] : cols.querySelector('.book-char-block:last-of-type');
         if (targetEl) {
           const vpRect = vp.getBoundingClientRect();
-          const tRect = targetEl.getBoundingClientRect();
+          const tRect = (targetEl.getClientRects && targetEl.getClientRects()[0]) || targetEl.getBoundingClientRect();
           const absLeft = (tRect.left - vpRect.left) + vp.scrollLeft;
-          bookSpreadIdx = Math.floor(Math.max(0, absLeft + 4) / bookSpreadStride);
+          targetSpread = Math.floor(Math.max(0, absLeft + 4) / bookSpreadStride);
         } else {
-          bookSpreadIdx = bookTotalSpreads - 1;
+          targetSpread = bookTotalSpreads - 1;
         }
       }
+      bookDesiredSpreadIdx = targetSpread;
+      goToBookSpread(targetSpread, false, true);
+      return;
     }
-    goToBookSpread(bookSpreadIdx < 0 ? 0 : bookSpreadIdx, false);
+    const target = bookDesiredSpreadIdx >= 0 ? bookDesiredSpreadIdx : (bookSpreadIdx < 0 ? 0 : bookSpreadIdx);
+    goToBookSpread(target, false, true);
   }
 
   function flipBook(delta) {
@@ -2853,30 +3742,27 @@ function renderWebApp() {
     const overlay = document.getElementById('bookBotOverlay');
     const fab = document.getElementById('botMenuFab');
     if (!overlay || !fab) return;
-    const hasFab = Boolean(overlay.querySelector('[data-rs-bot-fab="1"]'));
-    if (!hasFab || currentTab !== 'chat') {
+    const fabCol = overlay.querySelector('[data-rs-bot-fab="1"]');
+    if (!fabCol || currentTab !== 'chat') {
       fab.style.display = 'none';
       if (botMenuAutoTimer) { clearTimeout(botMenuAutoTimer); botMenuAutoTimer = null; }
       return;
     }
+    if (fabCol.offsetWidth >= 42 && fabCol.offsetWidth <= 72) {
+      fab.style.setProperty('--bot-fab-w', fabCol.offsetWidth + 'px');
+    } else {
+      fab.style.removeProperty('--bot-fab-w');
+    }
     fab.style.display = 'inline-flex';
     overlay.classList.toggle('bot-menu-collapsed', !botMenuExpanded);
     fab.classList.toggle('expanded', botMenuExpanded);
-    fab.textContent = botMenuExpanded ? '▸ 접기' : '☰ 메뉴';
+    fab.innerHTML = botMenuExpanded
+      ? '<span class="bmf-ic">▸</span><span class="bmf-lb">접기</span>'
+      : '<span class="bmf-ic">☰</span><span class="bmf-lb">메뉴</span>';
   }
 
   function scheduleBotMenuAutoHide() {
     if (botMenuAutoTimer) { clearTimeout(botMenuAutoTimer); botMenuAutoTimer = null; }
-    if (!botMenuExpanded) return;
-    botMenuAutoTimer = setTimeout(() => {
-      const overlay = document.getElementById('bookBotOverlay');
-      if (overlay && overlay.querySelector('input[type="checkbox"]:checked')) {
-        scheduleBotMenuAutoHide();
-        return;
-      }
-      botMenuExpanded = false;
-      syncBotMenuVisibility();
-    }, 6000);
   }
 
   document.getElementById('botMenuFab').onclick = () => {
@@ -2937,6 +3823,7 @@ function renderWebApp() {
             '<div class="book-viewport" id="bookViewport">' +
               '<div class="book-columns" id="bookColumns">' + renderBookContent(msgs, snap) + '</div>' +
             '</div>' +
+            '<div class="book-img-preview" id="bookImgPreview"></div>' +
             '<div class="epub-flip-leaf" id="flipLeaf"></div>' +
           '</div>' +
           '<div class="book-jump-bar" id="bookJumpBar" style="display:none;">' +
@@ -3020,6 +3907,38 @@ function renderWebApp() {
 
       const frame = document.getElementById('bookFrame');
       const vp = document.getElementById('bookViewport');
+      const preview = document.getElementById('bookImgPreview');
+      closeBookImgPreview(true);
+      if (window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches) {
+        frame.addEventListener('mouseover', (e) => {
+          const ic = e.target.closest('.book-columns .rs-bot-html .image-container');
+          if (ic) openBookImgPreview(ic, false);
+        });
+      }
+      if (preview) {
+        preview.onmouseleave = (e) => {
+          if (e.relatedTarget && bookImgPreviewState.el && (e.relatedTarget === bookImgPreviewState.el || bookImgPreviewState.el.contains(e.relatedTarget))) return;
+          if (!bookImgPreviewState.pinned) closeBookImgPreview(false);
+        };
+        preview.onclick = (e) => {
+          e.stopPropagation();
+          closeBookImgPreview(false);
+        };
+      }
+      frame.onmouseleave = () => {
+        if (!bookImgPreviewState.pinned) closeBookImgPreview(false);
+      };
+      frame.addEventListener('click', (e) => {
+        const ic = e.target.closest('.book-columns .rs-bot-html .image-container');
+        if (!ic) {
+          if (bookImgPreviewState.pinned && !e.target.closest('#bookImgPreview')) closeBookImgPreview(false);
+          return;
+        }
+        if (document.body.classList.contains('asset-blur') && !ic.classList.contains('revealed')) return;
+        e.stopPropagation();
+        if (bookImgPreviewState.el === ic && bookImgPreviewState.pinned) closeBookImgPreview(false);
+        else openBookImgPreview(ic, true);
+      });
       let sx = 0, sy = 0;
       frame.ontouchstart = (e) => { sx = e.touches[0].clientX; sy = e.touches[0].clientY; };
       frame.ontouchend = (e) => {
@@ -3040,17 +3959,22 @@ function renderWebApp() {
         }
       };
       frame.querySelectorAll('img').forEach((img) => {
-        if (!img.complete) img.addEventListener('load', () => layoutBookSpreads(false), { once: true });
+        if (!img.complete) {
+          img.addEventListener('load', () => layoutBookSpreads(false), { once: true });
+          img.addEventListener('error', () => layoutBookSpreads(false), { once: true });
+        }
       });
 
       requestAnimationFrame(() => layoutBookSpreads(true));
       setTimeout(() => layoutBookSpreads(false), 80);
+      setTimeout(() => layoutBookSpreads(false), 260);
       return;
     }
 
     // Standard Scroll Mode (Gemini / Claude / ChatGPT / EPUB 1p / Glass / Sakura / Moss)
     if (overlay) overlay.innerHTML = '';
-    const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 140;
+    const prevScrollTop = box.scrollTop;
+    const nearBottom = box.scrollHeight - prevScrollTop - box.clientHeight < 140;
     const autoTr = Boolean(routerCfg && routerCfg.translator && routerCfg.translator.autoTranslateOutput);
 
     let html = '';
@@ -3081,7 +4005,14 @@ function renderWebApp() {
     box.innerHTML = html;
     hoistBotFixedWidgets(box);
     restoreCheckedBotIds(checkedBotIds);
-    if (nearBottom) box.scrollTop = box.scrollHeight;
+    if (pendingScrollToLastUser) {
+      pendingScrollToLastUser = false;
+      const userEls = box.querySelectorAll('.msg-wrap.user');
+      const lastUserEl = userEls.length ? userEls[userEls.length - 1] : null;
+      box.scrollTop = lastUserEl ? Math.max(0, lastUserEl.offsetTop - 12) : box.scrollHeight;
+    } else {
+      box.scrollTop = nearBottom ? box.scrollHeight : prevScrollTop;
+    }
   }
 
   document.getElementById('bookBotOverlay').addEventListener('change', () => {
@@ -3100,7 +4031,7 @@ function renderWebApp() {
       if (!snap || snap.charIndex < 0) return true;
       const trig = trigEl.getAttribute('risu-trigger');
       if (!trig) return true;
-      if (/^setFirst\\d+$/i.test(trig)) bookSpreadIdx = 0;
+      if (/^setFirst\\d+$/i.test(trig)) { bookAnchorMode = 'manual'; bookSpreadIdx = 0; bookDesiredSpreadIdx = 0; }
       await api('/api/command', {
         method: 'POST',
         body: JSON.stringify({
@@ -3122,6 +4053,7 @@ function renderWebApp() {
       const txt = (btnEl.getAttribute('risu-btn') || btnEl.textContent || '').trim();
       if (!snap || snap.charIndex < 0 || !txt) return true;
       markLocalRequestPending(true);
+      armPendingReplyFollow(snap);
       try {
         await api('/api/chat/send', {
           method: 'POST',
@@ -3131,6 +4063,7 @@ function renderWebApp() {
         setTimeout(pollState, 350);
         setTimeout(pollState, 1200);
       } catch (err) {
+        pendingReplyTarget = null;
         markLocalRequestPending(false);
         toast('전송 오류: ' + err.message);
       }
@@ -3158,7 +4091,9 @@ function renderWebApp() {
       const curPos = (typeof snap.fmIndex === 'number' && snap.fmIndex >= 0) ? snap.fmIndex + 1 : 0;
       const nextPos = (curPos + step + total) % total;
       const nextFmIndex = nextPos - 1;
+      bookAnchorMode = 'manual';
       bookSpreadIdx = 0;
+      bookDesiredSpreadIdx = 0;
       await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'set_first_message', payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, fmIndex: nextFmIndex } }) });
       toast('퍼스트 메시지 전환 중...');
       setTimeout(pollState, 350);
@@ -3174,7 +4109,9 @@ function renderWebApp() {
       if (!ctrl || !Array.isArray(ctrl.options) || ctrl.options.length <= 1) return;
       const curIdx = Math.max(0, ctrl.options.findIndex((o) => String(o) === String(ctrl.value)));
       const nextVal = ctrl.options[(curIdx + step + ctrl.options.length) % ctrl.options.length];
+      bookAnchorMode = 'manual';
       bookSpreadIdx = 0;
+      bookDesiredSpreadIdx = 0;
       await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'set_chat_var', payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, key: gKey, value: nextVal } }) });
       toast('퍼스트 전환: ' + (curIdx + 1) + ' → ' + (ctrl.options.indexOf(nextVal) + 1));
       setTimeout(pollState, 350);
@@ -3223,7 +4160,9 @@ function renderWebApp() {
     const snap = lastState && lastState.snapshot;
     if (!snap || snap.charIndex < 0) return;
     const key = sel.getAttribute('data-chat-var-key');
+    bookAnchorMode = 'manual';
     bookSpreadIdx = 0;
+    bookDesiredSpreadIdx = 0;
     await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'set_chat_var', payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, key, value: sel.value } }) });
     toast(key + ' = ' + sel.value + ' 반영 중...');
     setTimeout(pollState, 350);
@@ -3281,6 +4220,7 @@ function renderWebApp() {
     inp.value = '';
     autoGrowInput();
     markLocalRequestPending(true);
+    armPendingReplyFollow(snap);
     try {
       if (text && routerCfg && routerCfg.translator && routerCfg.translator.autoTranslateInput) {
         toast('영어로 번역 후 전송 중...');
@@ -3288,11 +4228,11 @@ function renderWebApp() {
         if (tr.translated) text = tr.translated;
       }
       await api('/api/chat/send', { method: 'POST', body: JSON.stringify({ charIndex: snap.charIndex, chatIndex: snap.chatIndex, text }) });
-      bookSpreadIdx = -1;
       toast(text ? '전송됨' : '응답 재요청 중...');
       setTimeout(pollState, 350);
       setTimeout(pollState, 1200);
     } catch (e) {
+      pendingReplyTarget = null;
       markLocalRequestPending(false);
       toast('전송 오류: ' + e.message);
     }
@@ -3334,7 +4274,7 @@ function renderWebApp() {
     const curChar = lastState && lastState.snapshot ? lastState.snapshot.charIndex : -1;
     const curChat = lastState && lastState.snapshot ? lastState.snapshot.chatIndex : -1;
     const filtered = chars.filter((c) => !q || String(c.name).toLowerCase().includes(q));
-    const sig = JSON.stringify([q, curChar, curChat, expandedBotIdx, filtered.map((c) => [c.index, c.name, c.isPcActive, (c.chats || []).map((ch) => [ch.index, ch.name, ch.msgCount])])]);
+    const sig = JSON.stringify([q, curChar, curChat, expandedBotIdx, filtered.map((c) => [c.index, c.chaId || '', c.name, c.isPcActive, (c.chats || []).map((ch) => [ch.index, ch.id || '', ch.name, ch.msgCount])])]);
     if (!force && sig === lastBotsRenderSig) return;
     lastBotsRenderSig = sig;
     if (!filtered.length) {
@@ -3373,10 +4313,14 @@ function renderWebApp() {
     await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'sync_all' }) });
     toast('PC 전체 목록 동기화 중...');
     setTimeout(pollState, 900);
+    setTimeout(pollState, 2300);
   };
   window.toggleBot = (idx) => { expandedBotIdx = expandedBotIdx === idx ? -2 : idx; renderBots(true); };
   window.selectTarget = async (charIndex, chatIndex) => {
+    bookAnchorMode = 'last-user';
     bookSpreadIdx = -1;
+    bookDesiredSpreadIdx = -1;
+    pendingReplyTarget = null;
     await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'select_target', payload: { charIndex, chatIndex } }) });
     toast('채팅방 전환 중...');
     switchTab('chat');
@@ -3385,7 +4329,10 @@ function renderWebApp() {
   window.createChat = async (charIndex) => {
     const name = prompt('새 채팅방 이름 (비우면 자동 생성):', '');
     if (name === null) return;
+    bookAnchorMode = 'last-user';
     bookSpreadIdx = -1;
+    bookDesiredSpreadIdx = -1;
+    pendingReplyTarget = null;
     await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'create_chat', payload: { charIndex, name } }) });
     toast('새 방 생성 중...');
     switchTab('chat');
@@ -3474,6 +4421,7 @@ function renderWebApp() {
   }
 
   let lastToggleRenderSig = '';
+  let lastToggleChatKey = '';
   let optimisticUntil = 0;
   let optimisticUseLocal = null;
   const optimisticVars = {};
@@ -3570,42 +4518,60 @@ function renderWebApp() {
     const presetBlocks = ((routerCfg && routerCfg.presetToggles) || []).filter((p) => p.enabled !== false).map((p) => ({ id: p.id, source: p.name, syntax: p.syntax, isPreset: true }));
     const blocks = [...presetBlocks, ...modBlocks];
 
+    const chatKey = (snap.charIndex ?? -1) + ':' + (snap.chatIndex ?? -1);
+    if (chatKey !== lastToggleChatKey) {
+      lastToggleChatKey = chatKey;
+      for (const k of Object.keys(optimisticVars)) delete optimisticVars[k];
+      optimisticUseLocal = null;
+      optimisticUntil = 0;
+    }
+
     const now = Date.now();
-    const vals = { ...(snap.localToggleValues || {}), ...(now < optimisticUntil ? optimisticVars : {}) };
     const useLocal = (now < optimisticUntil && optimisticUseLocal !== null) ? optimisticUseLocal : Boolean(snap.useLocallySetGlobalVariables);
-    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, useLocal, vals, blocks.map((b) => b.source + ':' + b.syntax.length), Array.from(openToggleGroups)]);
+    const baseVals = useLocal
+      ? { ...(snap.globalToggleValues || {}), ...(snap.localToggleValues || {}) }
+      : { ...(snap.globalToggleValues || {}) };
+    const vals = { ...baseVals, ...(now < optimisticUntil ? optimisticVars : {}) };
+    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, useLocal, vals, blocks.map((b) => (b.id || '') + ':' + b.source + ':' + b.syntax.length), Array.from(openToggleGroups)]);
     if (!force && sig === lastToggleRenderSig) return;
+
+    const body = document.getElementById('customToggleBody');
+    const activeEl = document.activeElement;
+    if (!force && activeEl && body && body.contains(activeEl) && /^(SELECT|INPUT|TEXTAREA)$/i.test(activeEl.tagName)) return;
     lastToggleRenderSig = sig;
 
     const badge = document.getElementById('localToggleBadge');
-    badge.textContent = useLocal ? '로컬 토글 ON' : '전역 모드';
+    badge.textContent = useLocal ? '이 방 로컬' : '전역 유지';
     badge.className = 'badge' + (useLocal ? ' pc' : '');
     const chk = document.getElementById('localToggleChk');
     chk.checked = useLocal;
     chk.onchange = async () => {
       optimisticUseLocal = chk.checked;
-      optimisticUntil = Date.now() + 3500;
-      badge.textContent = chk.checked ? '로컬 토글 ON' : '전역 모드';
+      optimisticUntil = Date.now() + 4500;
+      lastToggleRenderSig = '';
+      badge.textContent = chk.checked ? '이 방 로컬' : '전역 유지';
       badge.className = 'badge' + (chk.checked ? ' pc' : '');
       await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'set_local_toggle_mode', payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, enabled: chk.checked } }) });
-      toast('로컬 토글 ' + (chk.checked ? '켜짐' : '꺼짐'));
+      toast(chk.checked ? '이 방 로컬 토글 켜짐' : '전역 토글 모드로 전환됨');
+      setTimeout(pollState, 350);
+      setTimeout(pollState, 1100);
     };
 
-    const body = document.getElementById('customToggleBody');
     if (!blocks.length) {
       body.innerHTML = '<div style="color:var(--sub); font-size:12.5px;">표시할 토글이 없습니다. 프리셋 토글은 우측 상단 <b>+ 프리셋 토글</b>로 한 번만 등록해 주세요.</div>';
       return;
     }
     let html = '';
-    blocks.forEach((b, bi) => {
+    blocks.forEach((b) => {
       const parsed = parseToggleSyntax(b.syntax);
       if (!parsed.length) return;
+      const blockKey = b.isPreset ? ('p:' + (b.id || b.source)) : ('m:' + b.source);
       html += '<div style="margin-bottom:10px;">';
       html += '<div style="display:flex; align-items:center; justify-content:space-between; font-size:12px; font-weight:700; color:var(--accent); margin-bottom:4px;">';
       html += '<span>' + (b.isPreset ? '📘 ' : '🌿 ') + esc(b.source) + '</span>';
       if (b.isPreset) html += '<button class="act-btn" data-del-preset="' + esc(b.id) + '">삭제</button>';
       html += '</div>';
-      html += renderToggleItemsHtml(parsed, vals, (b.isPreset ? 'p' : 'm') + bi);
+      html += renderToggleItemsHtml(parsed, vals, blockKey);
       html += '</div>';
     });
     body.innerHTML = html || '<div style="color:var(--sub); font-size:12.5px;">표시할 토글 항목이 없습니다.</div>';
@@ -3615,7 +4581,7 @@ function renderWebApp() {
     const delBtn = e.target.closest('[data-del-preset]');
     if (delBtn) { deletePresetToggle(delBtn.getAttribute('data-del-preset')); return; }
     const accHead = e.target.closest('[data-acc-gid]');
-    if (accHead) { toggleAccGroup(accHead.getAttribute('data-acc-gid')); }
+    if (accHead) { toggleAccGroup(accHead.getAttribute('data-acc-gid'), accHead); }
   });
   document.getElementById('customToggleBody').addEventListener('change', (e) => {
     const el = e.target.closest('[data-toggle-key]');
@@ -3625,9 +4591,18 @@ function renderWebApp() {
     setCustomToggle(key, val);
   });
 
-  window.toggleAccGroup = (gid) => {
-    if (openToggleGroups.has(gid)) openToggleGroups.delete(gid);
-    else openToggleGroups.add(gid);
+  window.toggleAccGroup = (gid, headEl) => {
+    const opening = !openToggleGroups.has(gid);
+    if (opening) openToggleGroups.add(gid);
+    else openToggleGroups.delete(gid);
+    lastToggleRenderSig = '';
+    const acc = headEl && headEl.closest ? headEl.closest('.tg-acc') : null;
+    if (acc) {
+      acc.classList.toggle('open', opening);
+      const arrow = headEl.querySelector('span:last-child');
+      if (arrow) arrow.textContent = opening ? '▾' : '▸';
+      return;
+    }
     renderCustomToggles(true);
   };
 
@@ -3635,18 +4610,20 @@ function renderWebApp() {
     const snap = lastState && lastState.snapshot;
     if (!snap || snap.charIndex < 0) return;
     const fullKey = String(key).startsWith('toggle_') ? String(key) : ('toggle_' + String(key));
-    optimisticUseLocal = true;
+    const curUseLocal = (Date.now() < optimisticUntil && optimisticUseLocal !== null) ? optimisticUseLocal : Boolean(snap.useLocallySetGlobalVariables);
     optimisticVars[fullKey] = String(value);
-    optimisticUntil = Date.now() + 3500;
-    renderCustomToggles(true);
+    optimisticUntil = Date.now() + 4500;
+    lastToggleRenderSig = '';
     await api('/api/command', {
       method: 'POST',
       body: JSON.stringify({
         type: 'set_custom_toggle',
-        payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, key, value },
+        payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, key, value, scope: curUseLocal ? 'local' : 'global' },
       }),
     });
-    toast('토글 반영됨 (로컬 토글)');
+    toast(curUseLocal ? '토글 반영됨 (이 방 로컬)' : '토글 반영됨 (전역 유지)');
+    setTimeout(pollState, 350);
+    setTimeout(pollState, 1100);
   };
 
   function renderChatVariables(force = false) {
@@ -4164,6 +5141,354 @@ function renderWebApp() {
     }, 1500);
   }
 
+  // ---------- Request Log Viewer ----------
+  let reqLogsCache = [];
+  let reqLogFilter = 'all';
+  let reqLogModalOpen = false;
+  let reqLogActiveDetail = null;
+  let reqLogDetailLoading = false;
+  let reqLogDetailTab = 'messages';
+
+  function formatLogSource(src) {
+    if (src === 'proxy') return '프록시';
+    if (src === 'direct_chat') return '원격채팅';
+    if (src === 'direct_reroll') return '원격리롤';
+    if (src === 'translate') return '번역';
+    return src || 'LLM';
+  }
+
+  function formatLogTime(iso) {
+    if (!iso) return '-';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return String(iso);
+    return d.toLocaleTimeString('ko-KR', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  }
+
+  function formatLogDuration(ms) {
+    const n = Number(ms || 0);
+    if (n >= 1000) return (n / 1000).toFixed(2) + 's';
+    return Math.round(n) + 'ms';
+  }
+
+  function filterRequestLogs(list) {
+    const arr = Array.isArray(list) ? list : [];
+    if (reqLogFilter === 'proxy') return arr.filter((x) => x.source === 'proxy');
+    if (reqLogFilter === 'direct') return arr.filter((x) => x.source === 'direct_chat' || x.source === 'direct_reroll');
+    if (reqLogFilter === 'translate') return arr.filter((x) => x.source === 'translate');
+    return arr;
+  }
+
+  function buildRequestLogRowsHtml(list) {
+    const filtered = filterRequestLogs(list);
+    if (!filtered.length) {
+      return '<div style="font-size:12.5px; color:var(--sub); padding:8px 2px;">' +
+        (reqLogsCache.length ? '선택한 필터에 해당하는 로그가 없습니다.' : '아직 기록된 요청이 없습니다.') +
+        '</div>';
+    }
+    return filtered.map((item) => {
+      const u = item.usage || {};
+      const tokText = u.total_tokens ? ('토큰 ' + u.total_tokens + ' (' + (u.prompt_tokens || 0) + '→' + (u.completion_tokens || 0) + ')') : '';
+      const statusText = item.status ? ('HTTP ' + item.status) : (item.ok ? 'OK' : 'ERR');
+      return '<button type="button" class="req-log-row" data-log-id="' + esc(item.id) + '">' +
+        '<div class="req-log-row-top">' +
+          '<span class="req-log-badge ' + (item.ok ? 'ok' : 'err') + '">' + (item.ok ? '✓ ' : '⚠ ') + esc(statusText) + '</span>' +
+          '<span class="req-log-badge src">' + esc(formatLogSource(item.source)) + (item.stream ? ' · stream' : '') + '</span>' +
+          '<span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + esc(item.model || item.profileName || 'Unknown') + '</span>' +
+          '<span style="margin-left:auto; font-size:11.5px; font-weight:500; color:var(--sub);">' + esc(formatLogTime(item.at)) + '</span>' +
+        '</div>' +
+        '<div class="req-log-row-meta">' +
+          '<span>' + esc(formatLogDuration(item.durationMs)) + '</span>' +
+          '<span>메시지 ' + Number(item.msgCount || 0) + '개</span>' +
+          (tokText ? '<span>' + esc(tokText) + '</span>' : '') +
+          (item.profileName ? '<span>프로필: ' + esc(item.profileName) + '</span>' : '') +
+        '</div>' +
+        (item.responsePreview ? '<div class="req-log-row-prev">' + esc(item.responsePreview) + '</div>' : '') +
+      '</button>';
+    }).join('');
+  }
+
+  function renderRequestLogsList() {
+    const el = document.getElementById('reqLogList');
+    if (el) el.innerHTML = buildRequestLogRowsHtml(reqLogsCache);
+    document.querySelectorAll('#reqLogFilters [data-log-filter]').forEach((btn) => {
+      btn.classList.toggle('active', btn.getAttribute('data-log-filter') === reqLogFilter);
+    });
+  }
+
+  async function loadRequestLogs() {
+    try {
+      const res = await api('/api/logs');
+      reqLogsCache = Array.isArray(res && res.logs) ? res.logs : [];
+      renderRequestLogsList();
+      if (reqLogModalOpen && !reqLogActiveDetail && !reqLogDetailLoading) renderReqLogModal();
+    } catch (e) {
+      if (reqLogModalOpen && !reqLogActiveDetail) {
+        const modal = document.getElementById('reqLogModal');
+        if (modal) {
+          const body = modal.querySelector('.req-log-body');
+          if (body) body.innerHTML = '<div class="req-log-errbox">로그를 불러오지 못했습니다: ' + esc(e && e.message ? e.message : '오류') + '</div>';
+        }
+      }
+    }
+  }
+
+  function getReqLogCopyPayload() {
+    const d = reqLogActiveDetail;
+    if (!d) return '';
+    if (reqLogDetailTab === 'request') return d.requestJson || '';
+    if (reqLogDetailTab === 'response') {
+      if (d.responseText && d.responseJson) return d.responseText + '\\n\\n--- RAW JSON ---\\n' + d.responseJson;
+      return d.responseText || d.responseJson || d.error || '';
+    }
+    if (reqLogDetailTab === 'meta') {
+      return JSON.stringify({
+        id: d.id,
+        at: d.at,
+        source: d.source,
+        profileName: d.profileName,
+        providerType: d.providerType,
+        model: d.model,
+        endpoint: d.endpoint,
+        stream: d.stream,
+        status: d.status,
+        ok: d.ok,
+        durationMs: d.durationMs,
+        usage: d.usage,
+        headers: d.headers,
+        error: d.error,
+      }, null, 2);
+    }
+    return (d.messages || []).map((m, i) => '[' + (i + 1) + ' ' + String(m.role || 'user').toUpperCase() + ']\\n' + (m.content || '')).join('\\n\\n---\\n\\n');
+  }
+
+  async function copyReqLogActiveText() {
+    const txt = getReqLogCopyPayload();
+    if (!txt) { toast('복사할 내용이 없습니다'); return; }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(txt);
+        toast('복사됨');
+        return;
+      }
+    } catch (_) {}
+    const ta = document.createElement('textarea');
+    ta.value = txt;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); toast('복사됨'); } catch (_) { toast('복사 실패'); }
+    document.body.removeChild(ta);
+  }
+
+  function renderReqLogModal() {
+    const modal = document.getElementById('reqLogModal');
+    if (!modal) return;
+    if (!reqLogModalOpen) {
+      modal.style.display = 'none';
+      modal.innerHTML = '';
+      return;
+    }
+
+    if (reqLogDetailLoading) {
+      modal.innerHTML =
+        '<div class="req-log-dialog">' +
+          '<div class="req-log-head">' +
+            '<div class="req-log-title">📜 리퀘스트 로그 불러오는 중...</div>' +
+            '<button type="button" class="pill" data-log-close="1">✕ 닫기</button>' +
+          '</div>' +
+          '<div class="req-log-body"><div style="color:var(--sub); font-size:13px;">로그 상세 정보를 가져오는 중입니다...</div></div>' +
+        '</div>';
+      modal.style.display = 'flex';
+      return;
+    }
+
+    if (!reqLogActiveDetail) {
+      modal.innerHTML =
+        '<div class="req-log-dialog">' +
+          '<div class="req-log-head">' +
+            '<div class="req-log-title">📜 리퀘스트 로그 <span class="badge">' + reqLogsCache.length + '건</span></div>' +
+            '<div style="display:flex; gap:6px; align-items:center;">' +
+              '<button type="button" class="pill" data-log-refresh="1">🔄 새로고침</button>' +
+              '<button type="button" class="pill" data-log-clear="1" style="color:var(--danger);">🗑️ 비우기</button>' +
+              '<button type="button" class="pill" data-log-close="1">✕ 닫기</button>' +
+            '</div>' +
+          '</div>' +
+          '<div class="req-log-tabs">' +
+            '<button type="button" class="pill' + (reqLogFilter === 'all' ? ' active' : '') + '" data-modal-filter="all">전체</button>' +
+            '<button type="button" class="pill' + (reqLogFilter === 'proxy' ? ' active' : '') + '" data-modal-filter="proxy">프록시</button>' +
+            '<button type="button" class="pill' + (reqLogFilter === 'direct' ? ' active' : '') + '" data-modal-filter="direct">원격 채팅/리롤</button>' +
+            '<button type="button" class="pill' + (reqLogFilter === 'translate' ? ' active' : '') + '" data-modal-filter="translate">번역</button>' +
+          '</div>' +
+          '<div class="req-log-body">' +
+            '<div class="req-log-list" style="max-height:none;">' + buildRequestLogRowsHtml(reqLogsCache) + '</div>' +
+          '</div>' +
+        '</div>';
+      modal.style.display = 'flex';
+      return;
+    }
+
+    const d = reqLogActiveDetail;
+    const msgs = Array.isArray(d.messages) ? d.messages : [];
+    const u = d.usage || {};
+    const statusText = d.status ? ('HTTP ' + d.status) : (d.ok ? 'OK' : 'ERR');
+    let tabBody = '';
+    if (reqLogDetailTab === 'messages') {
+      tabBody = msgs.length
+        ? msgs.map((m, idx) =>
+            '<div class="req-log-msg">' +
+              '<div class="req-log-msg-head">' +
+                '<span class="req-log-msg-role">#' + (idx + 1) + ' ' + esc(m.role || 'user') + '</span>' +
+                '<span>' + String((m.content || '').length) + '자</span>' +
+              '</div>' +
+              '<pre class="req-log-msg-body">' + esc(m.content || '') + '</pre>' +
+            '</div>'
+          ).join('')
+        : '<div style="font-size:13px; color:var(--sub);">저장된 메시지가 없습니다.</div>';
+    } else if (reqLogDetailTab === 'request') {
+      tabBody = '<pre class="req-log-pre">' + esc(d.requestJson || '(요청 본문 없음)') + '</pre>';
+    } else if (reqLogDetailTab === 'response') {
+      tabBody =
+        (d.error ? '<div class="req-log-errbox">' + esc(d.error) + '</div>' : '') +
+        '<div><div class="f-label" style="margin-top:0;">응답 텍스트</div><pre class="req-log-pre">' + esc(d.responseText || '(응답 본문 없음)') + '</pre></div>' +
+        (d.responseJson ? '<details><summary style="cursor:pointer; font-size:12.5px; font-weight:700; color:var(--sub);">원본 응답 JSON 보기</summary><pre class="req-log-pre" style="margin-top:6px;">' + esc(d.responseJson) + '</pre></details>' : '');
+    } else {
+      tabBody =
+        '<div class="req-log-meta-grid">' +
+          '<div class="req-log-meta-item"><b>시각</b><span>' + esc(d.at || '-') + '</span></div>' +
+          '<div class="req-log-meta-item"><b>출처 / 방식</b><span>' + esc(formatLogSource(d.source) + (d.stream ? ' (stream)' : ' (non-stream)')) + '</span></div>' +
+          '<div class="req-log-meta-item"><b>프로필 / 포맷</b><span>' + esc((d.profileName || '-') + ' / ' + (d.providerType || '-')) + '</span></div>' +
+          '<div class="req-log-meta-item"><b>모델</b><span>' + esc(d.model || '-') + '</span></div>' +
+          '<div class="req-log-meta-item"><b>소요 시간</b><span>' + esc(formatLogDuration(d.durationMs)) + '</span></div>' +
+          '<div class="req-log-meta-item"><b>토큰 사용량</b><span>' + esc('총 ' + (u.total_tokens || 0) + ' (입력 ' + (u.prompt_tokens || 0) + ' / 출력 ' + (u.completion_tokens || 0) + ')') + '</span></div>' +
+          '<div class="req-log-meta-item" style="grid-column:1 / -1;"><b>엔드포인트</b><span>' + esc(d.endpoint || '-') + '</span></div>' +
+        '</div>' +
+        '<div><div class="f-label">요청 헤더 (인증 정보 마스킹됨)</div><pre class="req-log-pre">' + esc(JSON.stringify(d.headers || {}, null, 2)) + '</pre></div>';
+    }
+
+    modal.innerHTML =
+      '<div class="req-log-dialog">' +
+        '<div class="req-log-head">' +
+          '<div class="req-log-title">' +
+            '<button type="button" class="pill" data-log-back="1">← 목록</button>' +
+            '<span class="req-log-badge ' + (d.ok ? 'ok' : 'err') + '">' + esc(statusText) + '</span>' +
+            '<span class="req-log-badge src">' + esc(formatLogSource(d.source)) + '</span>' +
+            '<span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + esc(d.model || d.profileName || 'Request') + '</span>' +
+            '<span style="font-size:11.5px; font-weight:500; color:var(--sub);">' + esc(formatLogDuration(d.durationMs)) + '</span>' +
+          '</div>' +
+          '<div style="display:flex; gap:6px; align-items:center;">' +
+            '<button type="button" class="pill" data-log-copy="1">📋 복사</button>' +
+            '<button type="button" class="pill" data-log-close="1">✕ 닫기</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="req-log-tabs">' +
+          '<button type="button" class="pill' + (reqLogDetailTab === 'messages' ? ' active' : '') + '" data-log-tab="messages">메시지 (' + msgs.length + ')</button>' +
+          '<button type="button" class="pill' + (reqLogDetailTab === 'request' ? ' active' : '') + '" data-log-tab="request">요청 JSON</button>' +
+          '<button type="button" class="pill' + (reqLogDetailTab === 'response' ? ' active' : '') + '" data-log-tab="response">응답</button>' +
+          '<button type="button" class="pill' + (reqLogDetailTab === 'meta' ? ' active' : '') + '" data-log-tab="meta">헤더 · 정보</button>' +
+        '</div>' +
+        '<div class="req-log-body">' + tabBody + '</div>' +
+      '</div>';
+    modal.style.display = 'flex';
+  }
+
+  function closeReqLogModal() {
+    reqLogModalOpen = false;
+    reqLogActiveDetail = null;
+    reqLogDetailLoading = false;
+    renderReqLogModal();
+  }
+
+  async function openRequestLogModal() {
+    reqLogModalOpen = true;
+    reqLogActiveDetail = null;
+    reqLogDetailLoading = false;
+    renderReqLogModal();
+    await loadRequestLogs();
+  }
+
+  async function openRequestLogDetail(id) {
+    if (!id) return;
+    reqLogModalOpen = true;
+    reqLogDetailLoading = true;
+    reqLogActiveDetail = null;
+    reqLogDetailTab = 'messages';
+    renderReqLogModal();
+    try {
+      const res = await api('/api/logs/' + encodeURIComponent(id));
+      reqLogDetailLoading = false;
+      reqLogActiveDetail = res && res.log ? res.log : null;
+      renderReqLogModal();
+    } catch (e) {
+      reqLogDetailLoading = false;
+      toast('로그 상세 조회 실패: ' + (e && e.message ? e.message : '오류'));
+      renderReqLogModal();
+    }
+  }
+
+  async function clearRequestLogs() {
+    await api('/api/logs', { method: 'DELETE' });
+    reqLogsCache = [];
+    reqLogActiveDetail = null;
+    renderRequestLogsList();
+    if (reqLogModalOpen) renderReqLogModal();
+    toast('리퀘스트 로그를 비웠습니다');
+  }
+
+  document.getElementById('reqLogQuickBtn').onclick = openRequestLogModal;
+  document.getElementById('reqLogRefreshBtn').onclick = loadRequestLogs;
+  document.getElementById('reqLogClearBtn').onclick = clearRequestLogs;
+  document.getElementById('reqLogFilters').addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-log-filter]');
+    if (!btn) return;
+    reqLogFilter = btn.getAttribute('data-log-filter') || 'all';
+    renderRequestLogsList();
+  });
+  document.getElementById('reqLogList').addEventListener('click', (e) => {
+    const row = e.target.closest('[data-log-id]');
+    if (row) openRequestLogDetail(row.getAttribute('data-log-id'));
+  });
+  document.getElementById('reqLogModal').addEventListener('click', (e) => {
+    const modal = document.getElementById('reqLogModal');
+    if (e.target === modal || e.target.closest('[data-log-close]')) {
+      closeReqLogModal();
+      return;
+    }
+    if (e.target.closest('[data-log-back]')) {
+      reqLogActiveDetail = null;
+      renderReqLogModal();
+      loadRequestLogs();
+      return;
+    }
+    if (e.target.closest('[data-log-refresh]')) {
+      loadRequestLogs();
+      return;
+    }
+    if (e.target.closest('[data-log-clear]')) {
+      clearRequestLogs();
+      return;
+    }
+    if (e.target.closest('[data-log-copy]')) {
+      copyReqLogActiveText();
+      return;
+    }
+    const tabBtn = e.target.closest('[data-log-tab]');
+    if (tabBtn) {
+      reqLogDetailTab = tabBtn.getAttribute('data-log-tab') || 'messages';
+      renderReqLogModal();
+      return;
+    }
+    const mfBtn = e.target.closest('[data-modal-filter]');
+    if (mfBtn) {
+      reqLogFilter = mfBtn.getAttribute('data-modal-filter') || 'all';
+      renderRequestLogsList();
+      renderReqLogModal();
+      return;
+    }
+    const row = e.target.closest('[data-log-id]');
+    if (row) openRequestLogDetail(row.getAttribute('data-log-id'));
+  });
+
   if (token) tryLogin(token);
 </script>
 </body>
@@ -4344,6 +5669,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
     const resolvedToken = token !== undefined ? String(token) : (TOKEN || (TOKEN = loadOrCreateToken(ROOT_DIR)));
     const requireAuth = makeRequireAuth(resolvedToken, limiter);
     const requireProxyAuth = makeRequireProxyAuth(resolvedToken, limiter);
+    const assetCookieVal = crypto.createHmac('sha256', ASSET_HMAC_KEY).update(String(resolvedToken)).digest('hex').slice(0, 32);
     const prevConfig = configOverride ? config : null;
     if (configOverride) config = configOverride;
 
@@ -4361,6 +5687,28 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
             res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
             res.end(renderWebApp());
+            return;
+        }
+
+        // 1b) Cached Binary Image Asset Endpoint (avoids multi-MB base64 repeats in /api/state)
+        const assetMatch = req.method === 'GET' && pathname.match(/^\/api\/asset\/([a-f0-9]{32})$/);
+        if (assetMatch) {
+            const headerOk = safeTokenEqual(getRequestToken(req), resolvedToken);
+            const cookieOk = safeTokenEqual(parseCookie(req, 'rs_asset_sid'), assetCookieVal);
+            if (!headerOk && !cookieOk) {
+                return sendJson(res, 401, { error: 'Unauthorized: Invalid token' }, req);
+            }
+            const entry = assetStore.get(assetMatch[1]);
+            if (!entry) {
+                return sendJson(res, 404, { error: 'Asset not found' }, req);
+            }
+            res.writeHead(200, {
+                'Content-Type': entry.mime,
+                'Content-Length': String(entry.buf.length),
+                'Cache-Control': 'private, max-age=86400, immutable',
+                'X-Content-Type-Options': 'nosniff',
+            });
+            res.end(entry.buf);
             return;
         }
 
@@ -4396,9 +5744,16 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     state.nativeRequestPendingSince = 0;
                     state.nativeRequestDispatched = false;
                 }
-                if (body.catalog) state.catalog = body.catalog;
-                if (body.snapshot) state.snapshot = body.snapshot;
+                if (body.catalog) {
+                    state.catalog = body.catalog;
+                    state.catalogVersion += 1;
+                }
+                if (body.snapshot) {
+                    state.snapshot = externalizeSnapshotAssets(body.snapshot);
+                    state.snapshotVersion += 1;
+                }
                 if (body.triggerEvent) state.lastTriggerEvent = body.triggerEvent;
+                const needFullSync = !state.catalog || !Array.isArray(state.catalog.characters) || state.catalog.characters.length === 0 || !state.snapshot || typeof state.snapshot.charIndex !== 'number' || state.snapshot.charIndex < 0;
 
                 pruneCommandQueue();
                 if (body.supportsBatchCommands === true) {
@@ -4412,14 +5767,14 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                             break;
                         }
                     }
-                    return sendJson(res, 200, { ok: true, command: commands[0] || null, commands, relayVersion: RELAY_VERSION }, req);
+                    return sendJson(res, 200, { ok: true, command: commands[0] || null, commands, needFullSync, relayVersion: RELAY_VERSION }, req);
                 }
                 const nextCmd = state.commandQueue.shift() || null;
                 if (nextCmd && (nextCmd.type === 'send_chat' || nextCmd.type === 'reroll_message')) {
                     state.nativeRequestDispatched = true;
                     if (!state.nativeRequestPendingSince) state.nativeRequestPendingSince = Date.now();
                 }
-                return sendJson(res, 200, { ok: true, command: nextCmd, relayVersion: RELAY_VERSION }, req);
+                return sendJson(res, 200, { ok: true, command: nextCmd, needFullSync, relayVersion: RELAY_VERSION }, req);
             } catch (e) {
                 return sendJson(res, 400, { error: e.message }, req);
             }
@@ -4462,7 +5817,14 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 connected &&
                 (Date.now() - state.nativeRequestPendingSince < 180000)
             );
-            return sendJson(res, 200, {
+            const parseRev = (raw) => {
+                if (raw === null || raw === '') return null;
+                const n = Number(raw);
+                return Number.isInteger(n) && n >= 0 ? n : null;
+            };
+            const reqCv = parseRev(urlObj.searchParams.get('cv'));
+            const reqSv = parseRev(urlObj.searchParams.get('sv'));
+            const payload = {
                 pcConnected: connected,
                 bridgeVersion: state.bridgeVersion,
                 relayVersion: RELAY_VERSION,
@@ -4472,9 +5834,14 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 directGenerating: state.directGenerating,
                 lastDirectError: state.lastDirectError,
                 lastTriggerEvent: state.lastTriggerEvent,
-                catalog: state.catalog,
-                snapshot: state.snapshot,
-            }, req);
+                catalogVersion: state.catalogVersion,
+                snapshotVersion: state.snapshotVersion,
+            };
+            if (reqCv === null || reqCv !== state.catalogVersion) payload.catalog = state.catalog;
+            if (reqSv === null || reqSv !== state.snapshotVersion) payload.snapshot = state.snapshot;
+            return sendJson(res, 200, payload, req, {
+                'Set-Cookie': `rs_asset_sid=${assetCookieVal}; Path=/api/asset; HttpOnly; SameSite=Strict`,
+            });
         }
 
         // 5) Generic Bridge Command
@@ -4678,6 +6045,34 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             } catch (e) {
                 return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
             }
+        }
+
+        // 8b-2) LLM Request Log Viewer API
+        if (pathname === '/api/logs' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            return sendJson(res, 200, {
+                ok: true,
+                max: REQUEST_LOG_MAX,
+                logs: requestLogs.map(summarizeRequestLog),
+            }, req);
+        }
+
+        if (pathname === '/api/logs' && req.method === 'DELETE') {
+            if (!requireAuth(req, res)) return;
+            requestLogs.length = 0;
+            return sendJson(res, 200, { ok: true }, req);
+        }
+
+        const logDetailMatch = pathname.match(/^\/api\/logs\/([^/]+)$/);
+        if (logDetailMatch && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            let reqId = logDetailMatch[1];
+            try { reqId = decodeURIComponent(reqId); } catch (_) {}
+            const found = requestLogs.find((item) => item.id === reqId);
+            if (!found) {
+                return sendJson(res, 404, { error: '요청 로그를 찾을 수 없습니다.' }, req);
+            }
+            return sendJson(res, 200, { ok: true, log: found }, req);
         }
 
         // 8c) Bundled Leave Preset API

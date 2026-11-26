@@ -396,3 +396,423 @@ test('risustand-admin: token rotation/revocation and port file management', () =
         fs.rmSync(dir, { recursive: true, force: true });
     }
 });
+
+test('pc poll needFullSync signal & risustand.js trash filtering / post-ACK signature commit', async () => {
+    const server = relay.createRelayServer({ token: 'sync-check-token' });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    try {
+        const hdrs = { 'X-RisuStand-Token': 'sync-check-token', 'Content-Type': 'application/json' };
+
+        // Empty relay asks PC bridge for full sync (both batch and legacy mode)
+        const emptyPoll = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({ supportsBatchCommands: true, catalog: null, snapshot: null }),
+        });
+        assert.equal(emptyPoll.status, 200);
+        assert.equal(JSON.parse(emptyPoll.body).needFullSync, true);
+
+        // Catalog present, snapshot missing -> still needs full sync
+        const catOnlyPoll = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({
+                supportsBatchCommands: false,
+                catalog: { characters: [{ index: 0, name: 'Bot', chats: [] }] },
+                snapshot: null,
+            }),
+        });
+        assert.equal(catOnlyPoll.status, 200);
+        assert.equal(JSON.parse(catOnlyPoll.body).needFullSync, true);
+
+        // Once both catalog (non-empty characters) and snapshot are populated -> needFullSync is false
+        const populatedPoll = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({
+                supportsBatchCommands: true,
+                catalog: { characters: [{ index: 0, name: 'Bot', chats: [{ index: 0, id: 'c1', name: 'Chat 1', msgCount: 0 }] }] },
+                snapshot: { charIndex: 0, chatIndex: 0, charName: 'Bot', chatName: 'Chat 1', messages: [] },
+            }),
+        });
+        assert.equal(populatedPoll.status, 200);
+        assert.equal(JSON.parse(populatedPoll.body).needFullSync, false);
+
+        // Verify inline webapp compiles after client JS edits & includes aligned bot menu FAB styles
+        const html = await requestHttp(port, { path: '/' });
+        assert.equal(html.status, 200);
+        assert.ok(html.body.includes('lastBotsSyncAt'));
+        assert.ok(html.body.includes('align-items:center; justify-content:center;'));
+        assert.ok(html.body.includes('bmf-ic'));
+        assert.ok(html.body.includes('--bot-fab-w'));
+        assert.ok(html.body.includes('.trig-alert-card'));
+        assert.ok(html.body.includes('.trig-ok-btn'));
+        assert.ok(html.body.includes('dismiss_pc_alert'));
+        assert.ok(html.body.includes("tev.kind === 'notice' || tev.kind === 'alert_error'"));
+        assert.ok(html.body.includes('lastToggleChatKey'));
+        assert.ok(html.body.includes("scope: curUseLocal ? 'local' : 'global'"));
+        assert.ok(html.body.includes('openToggleGroups.clear()'));
+        assert.ok(html.body.includes('/^(SELECT|INPUT|TEXTAREA)$/i.test(activeEl.tagName)'));
+        assert.ok(!html.body.includes('}, 6000);'), 'Floating bot menu should not auto-hide on a 6s timer');
+        assert.ok(html.body.includes('bookDesiredSpreadIdx'));
+        assert.ok(html.body.includes('fromLayout = false'));
+        assert.ok(html.body.includes('bookAnchorMode'));
+        assert.ok(html.body.includes('armPendingReplyFollow'));
+        assert.ok(html.body.includes('pendingReplyTarget'));
+        assert.ok(html.body.includes('pendingScrollToLastUser'));
+        assert.ok(html.body.includes('function scopeBotCss'));
+        assert.ok(html.body.includes('scopeBotCss(sanitizeBotCss('));
+        assert.ok(html.body.includes('class="rs-bg-host rs-bot-html"'));
+        assert.ok(html.body.includes('#refreshAllBtn'));
+        assert.ok(html.body.includes('.book-img-preview'));
+        assert.ok(html.body.includes('openBookImgPreview'));
+        assert.ok(html.body.includes('closeBookImgPreview'));
+        assert.ok(html.body.includes('bookImgPreview'));
+        const sigMatch = html.body.match(/const sig = JSON\.stringify\(\[snap\.charIndex,[\s\S]*?\]\);/);
+        assert.ok(sigMatch && !sigMatch[0].includes('st.generating') && !sigMatch[0].includes('st.directGenerating'), 'lastChatRenderSig should not include generating flags');
+        const sendMatch = html.body.match(/async function sendMessage\(\) \{[\s\S]*?document\.getElementById\('sendBtn'\)/);
+        assert.ok(sendMatch && !sendMatch[0].includes('bookSpreadIdx = -1'), 'sendMessage should preserve current bookSpreadIdx');
+        const scriptMatch = html.body.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(scriptMatch);
+        new vm.Script(scriptMatch[1], { filename: 'webapp-bots-sync-inline.js' });
+
+        // Verify scopeBotCss behavior directly
+        const fnMatch = scriptMatch[1].match(/function splitCssSelectors[\s\S]*?function sanitizeBotNode/);
+        assert.ok(fnMatch);
+        const scopeCtx = {};
+        vm.runInNewContext(fnMatch[0].replace(/function sanitizeBotNode$/, ''), scopeCtx);
+        const scopedBtn = scopeCtx.scopeBotCss('.btn { width: 44px; border-radius: 50%; }');
+        assert.match(scopedBtn, /^\s*\.rs-bot-html \.btn\s*\{/);
+        const scopedKf = scopeCtx.scopeBotCss('@keyframes spin { from { opacity: 0; } to { opacity: 1; } }');
+        assert.ok(scopedKf.includes('@keyframes spin') && !scopedKf.includes('.rs-bot-html from'));
+        const scopedMedia = scopeCtx.scopeBotCss('@media (max-width: 768px) { .btn { width: 40px; } }');
+        assert.ok(scopedMedia.includes('@media (max-width: 768px)') && scopedMedia.includes('.rs-bot-html .btn'));
+        const scopedRoot = scopeCtx.scopeBotCss(':root { --x: 1; }');
+        assert.ok(scopedRoot.includes('.rs-bot-html{') || scopedRoot.includes('.rs-bot-html {'));
+        const scopedIs = scopeCtx.scopeBotCss(':is(.a, .b) { color: red; }');
+        assert.ok(scopedIs.includes('.rs-bot-html :is(.a, .b)'));
+    } finally {
+        await new Promise((r) => server.close(r));
+    }
+
+    const pluginSrc = fs.readFileSync(path.join(REPO, 'risustand.js'), 'utf8');
+    assert.ok(pluginSrc.includes('function isTrashedEntry('));
+    assert.ok(pluginSrc.includes('Boolean(item.trashTime)'));
+    assert.ok(pluginSrc.includes('findFirstActiveCharIndex'));
+    assert.ok(pluginSrc.includes('if (isTrashedEntry(c)) continue;'));
+    assert.ok(pluginSrc.includes('if (isTrashedEntry(ch)) continue;'));
+    assert.ok(pluginSrc.includes('x.chats.map((ch) => [ch.index, ch.id, ch.name, ch.msgCount])'));
+    assert.ok(pluginSrc.includes('if (catRes && catRes.catalog) lastCatalogSig = catRes.sig;'));
+    assert.ok(pluginSrc.includes('if (snapRes && snapRes.snapshot) lastSnapSig = snapRes.sig;'));
+    assert.ok(pluginSrc.includes('data && data.needFullSync'));
+    assert.ok(pluginSrc.includes('findSafePcAlertModal'));
+    assert.ok(pluginSrc.includes('pollPcNativeAlert'));
+    assert.ok(pluginSrc.includes("if (heading !== '' && heading !== 'Error') return null;"));
+    assert.ok(pluginSrc.includes("if (type === 'dismiss_pc_alert')"));
+    assert.ok(pluginSrc.includes("runBotTrigger(cIdx, chIdx, 'onOutput'"));
+    assert.ok(pluginSrc.includes('globalToggleValues'));
+    assert.ok(pluginSrc.includes('setDatabaseLite({ globalChatVariables: nextGlobal })'));
+    assert.ok(pluginSrc.includes('CATALOG_POLL_INTERVAL_MS'));
+    assert.ok(pluginSrc.includes('cachedSnapDb'));
+});
+
+test('OOM optimizations: /api/asset binary cache, cookie auth, and /api/state revision delta polling', async () => {
+    const server = relay.createRelayServer({ token: 'oom-opt-token' });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    try {
+        const hdrs = { 'X-RisuStand-Token': 'oom-opt-token', 'Content-Type': 'application/json' };
+        const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02, 0x03, 0x04]);
+        const dataUri = 'data:image/png;base64,' + pngBytes.toString('base64');
+
+        // 1) PC poll with base64 in assetMap and deduplicated [[RSASSET:a0]] token in messages[0].images
+        const poll1 = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({
+                supportsBatchCommands: true,
+                catalog: { characters: [{ index: 0, name: 'Bot', chats: [{ index: 0, id: 'c0', name: 'Chat 1', msgCount: 1 }] }] },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: 'Bot',
+                    chatName: 'Chat 1',
+                    assetMap: { a0: dataUri },
+                    messages: [{ index: 0, role: 'char', text: 'hi', html: '<img src="[[RSASSET:a0]]">', images: ['[[RSASSET:a0]]'] }],
+                },
+            }),
+        });
+        assert.equal(poll1.status, 200);
+
+        // 2) Full /api/state returns externalized /api/asset/<32hex> URLs and sets rs_asset_sid HttpOnly cookie
+        const st1Res = await requestHttp(port, { path: '/api/state', headers: { 'X-RisuStand-Token': 'oom-opt-token' } });
+        assert.equal(st1Res.status, 200);
+        const setCookie = [].concat(st1Res.headers['set-cookie'] || []).join('; ');
+        assert.match(setCookie, /rs_asset_sid=[a-f0-9]{32}/);
+        assert.match(setCookie, /HttpOnly/);
+        const st1 = JSON.parse(st1Res.body);
+        assert.ok(typeof st1.catalogVersion === 'number' && st1.catalogVersion > 0);
+        assert.ok(typeof st1.snapshotVersion === 'number' && st1.snapshotVersion > 0);
+        const assetUrl = st1.snapshot.assetMap.a0;
+        assert.match(assetUrl, /^\/api\/asset\/[a-f0-9]{32}$/);
+        assert.equal(st1.snapshot.messages[0].images[0], assetUrl);
+
+        // 3) /api/asset/<id> requires token header or rs_asset_sid cookie
+        const unauthAsset = await requestHttp(port, { path: assetUrl });
+        assert.equal(unauthAsset.status, 401);
+
+        const cookiePair = setCookie.match(/rs_asset_sid=[a-f0-9]{32}/)[0];
+        const assetBin = await new Promise((resolve, reject) => {
+            http.get({ host: '127.0.0.1', port, path: assetUrl, headers: { Cookie: cookiePair } }, (res) => {
+                const chunks = [];
+                res.on('data', (c) => chunks.push(c));
+                res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, buf: Buffer.concat(chunks) }));
+            }).on('error', reject);
+        });
+        assert.equal(assetBin.status, 200);
+        assert.equal(assetBin.headers['content-type'], 'image/png');
+        assert.match(assetBin.headers['cache-control'] || '', /immutable/);
+        assert.deepEqual(assetBin.buf, pngBytes);
+
+        // 4) Unchanged revision poll omits catalog and snapshot
+        const stDelta = await requestHttp(port, {
+            path: `/api/state?cv=${st1.catalogVersion}&sv=${st1.snapshotVersion}`,
+            headers: { 'X-RisuStand-Token': 'oom-opt-token' },
+        });
+        assert.equal(stDelta.status, 200);
+        const deltaJson = JSON.parse(stDelta.body);
+        assert.equal('catalog' in deltaJson, false);
+        assert.equal('snapshot' in deltaJson, false);
+
+        // 5) Snapshot-only update increments snapshotVersion without catalog
+        await requestHttp(port, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({
+                catalog: null,
+                snapshot: { charIndex: 0, chatIndex: 0, charName: 'Bot', chatName: 'Chat 1', assetMap: {}, messages: [] },
+            }),
+        });
+        const stSnapOnly = await requestHttp(port, {
+            path: `/api/state?cv=${st1.catalogVersion}&sv=${st1.snapshotVersion}`,
+            headers: { 'X-RisuStand-Token': 'oom-opt-token' },
+        });
+        const snapOnlyJson = JSON.parse(stSnapOnly.body);
+        assert.equal('catalog' in snapOnlyJson, false);
+        assert.equal('snapshot' in snapOnlyJson, true);
+        assert.equal(snapOnlyJson.snapshotVersion, st1.snapshotVersion + 1);
+
+        // 6) Client webapp includes in-flight poll guard, revision params, /api/asset support, and compiles
+        const htmlRes = await requestHttp(port, { path: '/' });
+        assert.equal(htmlRes.status, 200);
+        for (const marker of ['isStatePolling', 'knownCatalogVer', 'knownSnapshotVer', String.raw`\/api\/asset\/`]) {
+            assert.ok(htmlRes.body.includes(marker), `Expected client OOM marker: ${marker}`);
+        }
+        const scriptMatch = htmlRes.body.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(scriptMatch);
+        new vm.Script(scriptMatch[1], { filename: 'webapp-oom-inline.js' });
+    } finally {
+        await new Promise((r) => server.close(r));
+    }
+});
+
+test('request logs API records proxy non-stream, stream & error calls, redacts secrets, and serves UI', async () => {
+    const upstream = http.createServer((req, res) => {
+        if (req.method === 'POST' && req.url === '/v1/chat/completions') {
+            const chunks = [];
+            req.on('data', (c) => chunks.push(c));
+            req.on('end', () => {
+                const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+                const lastText = Array.isArray(body.messages) && body.messages.length
+                    ? String(body.messages[body.messages.length - 1].content || '')
+                    : '';
+                if (lastText.includes('FORCE_ERR')) {
+                    res.writeHead(429, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: { message: 'Rate limited upstream' } }));
+                    return;
+                }
+                if (body.stream) {
+                    res.writeHead(200, {
+                        'Content-Type': 'text/event-stream; charset=utf-8',
+                        'Cache-Control': 'no-cache',
+                    });
+                    res.write('data: ' + JSON.stringify({
+                        id: 'c1',
+                        model: 'mock-gpt-stream',
+                        choices: [{ index: 0, delta: { role: 'assistant', content: 'Hello ' }, finish_reason: null }],
+                    }) + '\n\n');
+                    res.write('data: ' + JSON.stringify({
+                        id: 'c1',
+                        model: 'mock-gpt-stream',
+                        choices: [{ index: 0, delta: { content: 'streamed world!' }, finish_reason: 'stop' }],
+                        usage: { prompt_tokens: 9, completion_tokens: 3, total_tokens: 12 },
+                    }) + '\n\n');
+                    res.write('data: [DONE]\n\n');
+                    res.end();
+                    return;
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    id: 'c0',
+                    model: 'mock-gpt',
+                    choices: [{ index: 0, message: { role: 'assistant', content: 'Non-stream hello' }, finish_reason: 'stop' }],
+                    usage: { prompt_tokens: 12, completion_tokens: 5, total_tokens: 17 },
+                }));
+            });
+            return;
+        }
+        res.writeHead(404).end();
+    });
+    await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+    const { port: upstreamPort } = upstream.address();
+
+    const secretApiKey = 'sk-top-secret-key-9999';
+    const tok = 'log-test-token-42';
+    const server = relay.createRelayServer({
+        token: tok,
+        configOverride: {
+            activeProfileId: 'p1',
+            presetToggles: [],
+            profiles: [{
+                id: 'p1',
+                name: 'TestMock',
+                provider: 'custom',
+                providerType: 'openai_compat',
+                baseUrl: `http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
+                apiKey: secretApiKey,
+                model: 'mock-gpt',
+                temperature: '',
+                maxTokens: '',
+                overrideMode: 'off',
+                systemOverride: '',
+            }],
+            translator: {
+                useActiveProfile: true,
+                autoTranslateOutput: false,
+                autoTranslateInput: false,
+            },
+        },
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    try {
+        const authHdr = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+
+        // 1) Auth guard
+        const unauthLogs = await requestHttp(port, { path: '/api/logs' });
+        assert.equal(unauthLogs.status, 401);
+
+        // Start clean
+        const clr0 = await requestHttp(port, { method: 'DELETE', path: '/api/logs', headers: authHdr });
+        assert.equal(clr0.status, 200);
+
+        // 2) Non-stream proxy call
+        const nonStreamRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/v1/chat/completions',
+            headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model: 'risustand-router',
+                stream: false,
+                messages: [
+                    { role: 'system', content: 'You are a test system.' },
+                    { role: 'user', content: 'Say hi cleanly' },
+                ],
+            }),
+        });
+        assert.equal(nonStreamRes.status, 200);
+        assert.equal(JSON.parse(nonStreamRes.body).choices[0].message.content, 'Non-stream hello');
+
+        const list1 = JSON.parse((await requestHttp(port, { path: '/api/logs', headers: authHdr })).body);
+        assert.equal(list1.logs.length, 1);
+        assert.equal(list1.logs[0].ok, true);
+        assert.equal(list1.logs[0].status, 200);
+        assert.equal(list1.logs[0].source, 'proxy');
+        assert.equal(list1.logs[0].stream, false);
+        assert.equal(list1.logs[0].usage.total_tokens, 17);
+
+        const detail1Res = await requestHttp(port, {
+            path: `/api/logs/${encodeURIComponent(list1.logs[0].id)}`,
+            headers: authHdr,
+        });
+        assert.equal(detail1Res.status, 200);
+        assert.ok(!detail1Res.body.includes(secretApiKey), 'API key must not leak in request log detail');
+        const detail1 = JSON.parse(detail1Res.body).log;
+        assert.equal(detail1.headers.Authorization, 'Bearer [REDACTED]');
+        assert.equal(detail1.responseText, 'Non-stream hello');
+        assert.equal(detail1.messages.length, 2);
+        assert.equal(detail1.messages[1].content, 'Say hi cleanly');
+
+        // 3) Stream passthrough proxy call
+        const streamRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/v1/chat/completions',
+            headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model: 'risustand-router',
+                stream: true,
+                messages: [{ role: 'user', content: 'Stream something' }],
+            }),
+        });
+        assert.equal(streamRes.status, 200);
+        assert.ok(streamRes.body.includes('streamed world!'));
+
+        const list2 = JSON.parse((await requestHttp(port, { path: '/api/logs', headers: authHdr })).body);
+        assert.equal(list2.logs.length, 2);
+        assert.equal(list2.logs[0].stream, true);
+        assert.equal(list2.logs[0].ok, true);
+        assert.equal(list2.logs[0].status, 200);
+        const detail2Res = await requestHttp(port, {
+            path: `/api/logs/${encodeURIComponent(list2.logs[0].id)}`,
+            headers: authHdr,
+        });
+        assert.ok(!detail2Res.body.includes(secretApiKey));
+        const detail2 = JSON.parse(detail2Res.body).log;
+        assert.equal(detail2.responseText, 'Hello streamed world!');
+        assert.equal(detail2.usage.total_tokens, 12);
+
+        // 4) Error upstream call
+        const errRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/v1/chat/completions',
+            headers: { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model: 'risustand-router',
+                stream: false,
+                messages: [{ role: 'user', content: 'FORCE_ERR' }],
+            }),
+        });
+        assert.equal(errRes.status, 502);
+
+        const list3 = JSON.parse((await requestHttp(port, { path: '/api/logs', headers: authHdr })).body);
+        assert.equal(list3.logs.length, 3);
+        assert.equal(list3.logs[0].ok, false);
+        assert.equal(list3.logs[0].status, 429);
+        assert.ok(list3.logs[0].error.includes('Rate limited upstream'));
+
+        // 5) Clear logs
+        const clr1 = await requestHttp(port, { method: 'DELETE', path: '/api/logs', headers: authHdr });
+        assert.equal(clr1.status, 200);
+        const list4 = JSON.parse((await requestHttp(port, { path: '/api/logs', headers: authHdr })).body);
+        assert.equal(list4.logs.length, 0);
+
+        // 6) Web UI includes Request Log viewer markers & compiles
+        const htmlRes = await requestHttp(port, { path: '/' });
+        assert.equal(htmlRes.status, 200);
+        for (const marker of ['reqLogQuickBtn', 'reqLogModal', 'reqLogCard', 'reqLogList', 'loadRequestLogs', 'openRequestLogDetail']) {
+            assert.ok(htmlRes.body.includes(marker), `Expected Request Log UI marker: ${marker}`);
+        }
+        const scriptMatch = htmlRes.body.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(scriptMatch);
+        new vm.Script(scriptMatch[1], { filename: 'webapp-reqlogs-inline.js' });
+    } finally {
+        await new Promise((r) => server.close(r));
+        await new Promise((r) => upstream.close(r));
+    }
+});
