@@ -3707,7 +3707,35 @@
     // =========================================================================
     // 6. Bootstrap & Cleanup
     // =========================================================================
+    const PERMS_PROMPTED_KEY = 'risustand_perms_prompted_v1';
+
+    async function requestAllPermissionsOnce(force = false) {
+        try {
+            if (!force) {
+                const already = await risuai.pluginStorage.getItem(PERMS_PROMPTED_KEY);
+                if (already === '1') return;
+            }
+        } catch (_) {}
+
+        if (typeof risuai.requestPluginPermission === 'function') {
+            for (const perm of ['mainDom', 'db', 'dbWrite']) {
+                try {
+                    await risuai.requestPluginPermission(perm);
+                } catch (_) {}
+            }
+        } else {
+            try { await ensureRootDocument(); } catch (_) {}
+            try { await risuai.getDatabase(['enabledModules']); } catch (_) {}
+            try { await risuai.setDatabaseLite({}); } catch (_) {}
+        }
+
+        try {
+            await risuai.pluginStorage.setItem(PERMS_PROMPTED_KEY, '1');
+        } catch (_) {}
+    }
+
     await loadConfig();
+    await requestAllPermissionsOnce(false);
     await ensureRootDocument();
     await setupDragDocumentListeners();
     await setupAntiFlickerEngine();
@@ -3738,6 +3766,7 @@
     
         const STORAGE_KEY = 'risustand_remote_bridge_v2';
         const LEGACY_KEY = 'risustand_remote_bridge_v1';
+        const SWIPE_STORE_KEY = 'risustand_swipe_history_v1';
         const DEFAULT_CFG = {
             enabled: false,
             relayUrl: 'http://127.0.0.1:8787',
@@ -3754,9 +3783,51 @@
         let lastSyncTime = '';
         let lastSnapSig = '';
         let lastCatalogSig = '';
+        let pendingTriggerEvent = null;
         let viewCharIndex = -1;
         let viewChatIndex = -1;
         const assetDataCache = new Map();
+        let swipeHistory = Object.create(null);
+
+        function makeSwipeKey(charObj, cIdx, chatObj, chIdx, msgIdx) {
+            return `${(charObj && charObj.chaId) || cIdx}:${(chatObj && chatObj.id) || chIdx}:${msgIdx}`;
+        }
+
+        function recordSwipeVersion(key, prevText, nextText) {
+            let entry = swipeHistory[key];
+            if (!entry || !Array.isArray(entry.swipes)) {
+                entry = { swipes: [], index: 0 };
+            }
+            const prev = String(prevText ?? '');
+            if (prev && !entry.swipes.includes(prev)) {
+                entry.swipes.push(prev);
+            }
+            if (nextText !== undefined && nextText !== null) {
+                const nxt = String(nextText);
+                const existingIdx = entry.swipes.indexOf(nxt);
+                if (existingIdx >= 0) {
+                    entry.index = existingIdx;
+                } else {
+                    entry.swipes.push(nxt);
+                    entry.index = entry.swipes.length - 1;
+                }
+            } else {
+                entry.index = Math.max(0, entry.swipes.length - 1);
+            }
+            delete swipeHistory[key];
+            swipeHistory[key] = entry;
+            const keys = Object.keys(swipeHistory);
+            while (keys.length > 60) {
+                delete swipeHistory[keys.shift()];
+            }
+            return entry;
+        }
+
+        async function saveSwipeHistory() {
+            try {
+                await risuai.pluginStorage.setItem(SWIPE_STORE_KEY, JSON.stringify(swipeHistory));
+            } catch (_) {}
+        }
     
         async function loadCfg() {
             try {
@@ -3765,6 +3836,15 @@
                 if (raw) {
                     const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
                     cfg = { ...DEFAULT_CFG, ...parsed };
+                }
+            } catch (_) {}
+            try {
+                const swRaw = await risuai.pluginStorage.getItem(SWIPE_STORE_KEY);
+                if (swRaw) {
+                    const parsedSw = typeof swRaw === 'string' ? JSON.parse(swRaw) : swRaw;
+                    if (parsedSw && typeof parsedSw === 'object') {
+                        swipeHistory = Object.assign(Object.create(null), parsedSw);
+                    }
                 }
             } catch (_) {}
         }
@@ -4075,6 +4155,86 @@
             return null;
         }
 
+        function parseEachHeader(argStr) {
+            const topParts = splitTopLevel(argStr, '::');
+            if (topParts.length >= 2) {
+                return {
+                    iterExpr: topParts.slice(0, -1).join('::').trim(),
+                    slotName: topParts[topParts.length - 1].trim(),
+                };
+            }
+            let depth = 0;
+            let lastWsStart = -1;
+            let lastWsEnd = -1;
+            let i = 0;
+            while (i < argStr.length) {
+                if (argStr[i] === '{' && argStr[i + 1] === '{') {
+                    depth += 1;
+                    i += 2;
+                    continue;
+                }
+                if (argStr[i] === '}' && argStr[i + 1] === '}') {
+                    depth = Math.max(0, depth - 1);
+                    i += 2;
+                    continue;
+                }
+                if (depth === 0 && /\s/.test(argStr[i])) {
+                    const start = i;
+                    while (i < argStr.length && /\s/.test(argStr[i])) i += 1;
+                    if (i < argStr.length) {
+                        lastWsStart = start;
+                        lastWsEnd = i;
+                    }
+                    continue;
+                }
+                i += 1;
+            }
+            if (lastWsStart >= 0) {
+                return {
+                    iterExpr: argStr.slice(0, lastWsStart).trim(),
+                    slotName: argStr.slice(lastWsEnd).trim(),
+                };
+            }
+            return { iterExpr: argStr.trim(), slotName: '' };
+        }
+
+        function getModuleAssetListJson(ns, ctx) {
+            const nsLower = String(ns || '').trim().toLowerCase();
+            const mods = Array.isArray(ctx && ctx.enabledModules) ? ctx.enabledModules : [];
+            let matched = mods.filter((m) => {
+                if (!m) return false;
+                if (!nsLower) return true;
+                return String(m.namespace || '').trim().toLowerCase() === nsLower;
+            });
+            if (!matched.length && nsLower) {
+                matched = mods.filter((m) => m && (
+                    String(m.id || '').trim().toLowerCase() === nsLower ||
+                    String(m.name || '').trim().toLowerCase() === nsLower
+                ));
+            }
+            const out = [];
+            const seen = new Set();
+            for (const m of matched) {
+                if (!Array.isArray(m.assets)) continue;
+                for (const a of m.assets) {
+                    if (!Array.isArray(a) || !a[0]) continue;
+                    const name = String(a[0]);
+                    if (!seen.has(name)) {
+                        seen.add(name);
+                        out.push(name);
+                    }
+                    if (a[2] && !name.includes('.')) {
+                        const withExt = `${name}.${String(a[2])}`;
+                        if (!seen.has(withExt)) {
+                            seen.add(withExt);
+                            out.push(withExt);
+                        }
+                    }
+                }
+            }
+            return JSON.stringify(out);
+        }
+
         function evalCBS(input, ctx, depth = 0) {
             const str = String(input ?? '');
             if (!str || depth > 24 || !str.includes('{{')) return str;
@@ -4122,8 +4282,47 @@
                     }
                 }
 
-                // Unsupported block tags like {{#each ...}}...{{/each}} -> skip cleanly in remote prose
-                if (/^#(?:each|func)(?:[\s:]|$)/i.test(trimmed)) {
+                // Loop block: {{#each arrayExpr slotName}}...{{/each}}
+                const eachMatch = trimmed.match(/^#each(?:::|\s+)([\s\S]*)$/i);
+                if (eachMatch) {
+                    const parsed = findBlockBranches(str, closeAt + 2);
+                    if (parsed) {
+                        const { iterExpr, slotName } = parseEachHeader(eachMatch[1]);
+                        const rawList = evalCBS(iterExpr, ctx, depth + 1).trim();
+                        let arr = [];
+                        if (rawList.startsWith('[')) {
+                            try {
+                                const parsedArr = JSON.parse(rawList);
+                                if (Array.isArray(parsedArr)) arr = parsedArr;
+                            } catch (_) {}
+                        }
+                        if (!arr.length && rawList && !rawList.startsWith('[')) {
+                            arr = rawList.split('::').filter(Boolean);
+                        }
+                        let bodyToRender = parsed.branches.length ? parsed.branches[0].body : '';
+                        if (bodyToRender.startsWith('\r\n')) bodyToRender = bodyToRender.slice(2);
+                        else if (bodyToRender.startsWith('\n')) bodyToRender = bodyToRender.slice(1);
+
+                        const slots = ctx.slots || (ctx.slots = Object.create(null));
+                        const hadPrev = slotName && Object.prototype.hasOwnProperty.call(slots, slotName);
+                        const prevVal = hadPrev ? slots[slotName] : undefined;
+                        const limit = Math.min(arr.length, 20000);
+                        for (let i = 0; i < limit; i++) {
+                            if (slotName) slots[slotName] = String(arr[i] ?? '');
+                            const iterOut = evalCBS(bodyToRender, ctx, depth + 1);
+                            if (/\S/.test(iterOut)) out += iterOut;
+                        }
+                        if (slotName) {
+                            if (hadPrev) slots[slotName] = prevVal;
+                            else delete slots[slotName];
+                        }
+                        pos = parsed.endPos;
+                        continue;
+                    }
+                }
+
+                // Unsupported block tags like {{#func ...}}...{{/func}} -> skip cleanly
+                if (/^#func(?:[\s:]|$)/i.test(trimmed)) {
                     const parsed = findBlockBranches(str, closeAt + 2);
                     if (parsed) {
                         pos = parsed.endPos;
@@ -4131,7 +4330,7 @@
                     }
                 }
 
-                // Preserve asset/inlay macros for extractInlineImages (resolve nested CBS inside arguments)
+                // Preserve asset/inlay macros for inline resolution (resolve nested CBS inside arguments)
                 const assetMacro = rawInner.match(/^\s*(img|raw|asset|image|emotion|inlay|inlayed)::([\s\S]+)$/i);
                 if (assetMacro) {
                     const resolvedArg = evalCBS(assetMacro[2], ctx, depth + 1).trim();
@@ -4161,7 +4360,25 @@
                     out += String(ctx.chatIndex ?? 0);
                 } else if (cmd === 'lastmessageid') {
                     out += String(ctx.lastMessageId ?? 0);
-                } else if (cmd === 'comment' || cmd === 'hidden_key' || cmd === 'button' || cmd.startsWith('//')) {
+                } else if (cmd === 'slot') {
+                    const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
+                    const slots = ctx.slots || {};
+                    if (k && Object.prototype.hasOwnProperty.call(slots, k)) {
+                        out += String(slots[k]);
+                    } else if (!k) {
+                        const first = Object.values(slots)[0];
+                        out += first !== undefined ? String(first) : '';
+                    }
+                } else if (cmd === 'module_assetlist' || cmd === 'moduleassetlist') {
+                    const ns = evalCBS(parts.slice(1).join('::'), ctx, depth + 1);
+                    out += getModuleAssetListJson(ns, ctx);
+                } else if (cmd === 'button') {
+                    const lbl = evalCBS(parts[1] || '', ctx, depth + 1).trim();
+                    const trig = evalCBS(parts[2] || '', ctx, depth + 1).trim();
+                    if (trig) {
+                        out += `<button type="button" class="risu-cbs-btn" risu-trigger="${escapeHtml(trig)}">${escapeHtml(lbl || trig)}</button>`;
+                    }
+                } else if (cmd === 'comment' || cmd === 'hidden_key' || cmd.startsWith('//')) {
                     // hidden / non-prose
                 } else if (cmd === 'getvar' || cmd === 'getchatvar') {
                     const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
@@ -4224,6 +4441,15 @@
                     out += vals.some((v) => isCbsTruthy(v)) ? '1' : '0';
                 } else if (cmd === 'not') {
                     out += isCbsTruthy(evalCBS(parts[1] || '', ctx, depth + 1)) ? '0' : '1';
+                } else if (cmd === 'abs') {
+                    const v = Number(evalCBS(parts.slice(1).join('::'), ctx, depth + 1).trim()) || 0;
+                    out += String(Math.abs(v));
+                } else if (cmd === 'sum') {
+                    let s = 0;
+                    for (const p of parts.slice(1)) {
+                        s += Number(evalCBS(p, ctx, depth + 1).trim()) || 0;
+                    }
+                    out += String(s);
                 } else if (cmd === 'calc') {
                     out += evalSimpleExpr(evalCBS(parts.slice(1).join('::'), ctx, depth + 1));
                 } else if (cmd === 'trim') {
@@ -4316,11 +4542,13 @@
                 vars,
                 globalVars,
                 tempVars: Object.create(null),
+                slots: Object.create(null),
+                enabledModules: Array.isArray(enabledModules) ? enabledModules : [],
                 displayScripts,
                 charName: (charObj && charObj.name) || 'Character',
                 userName: personaName || 'User',
                 chatIndex: msgIndex,
-                lastMessageId: Math.max(0, Number(totalMsgs || 0) - 1),
+                lastMessageId: Number(totalMsgs || 0) - 1,
             };
         }
 
@@ -4334,23 +4562,23 @@
                 const hasCbsFlag = rawFlag.includes('<cbs>');
                 const jsFlags = rawFlag.replace(/<[^>]+>/g, '').replace(/[^gimsu]/g, '') || 'g';
                 const patternStr = hasCbsFlag ? evalCBS(rawIn, ctx) : rawIn;
-                const isWidgetOut = /<(?:style|input|button)\b|risu-(?:trigger|btn)/i.test(rawOut);
 
-                if (isWidgetOut) {
-                    if (/<img/i.test(patternStr)) {
-                        continue; // Let extractInlineImages resolve <img src=...> directly
-                    }
-                    if (!patternStr.includes('(') && patternStr.length <= 12) {
-                        try {
-                            out = out.replace(new RegExp(patternStr, jsFlags), '');
-                        } catch (_) {}
-                    }
-                    continue;
-                }
-
-                const replStr = hasCbsFlag ? evalCBS(rawOut, ctx) : rawOut;
                 try {
-                    out = out.replace(new RegExp(patternStr, jsFlags), replStr);
+                    const rx = new RegExp(patternStr, jsFlags);
+                    out = out.replace(rx, (...args) => {
+                        const fullMatch = args[0];
+                        const caps = args.slice(1, -2);
+                        const substituted = rawOut.replace(/\$(\$|&|\d{1,2})/g, (_, tok) => {
+                            if (tok === '$') return '$';
+                            if (tok === '&') return fullMatch;
+                            const n = parseInt(tok, 10);
+                            if (n === 0) return fullMatch;
+                            if (n >= 1 && n <= caps.length) return caps[n - 1] ?? '';
+                            return '';
+                        });
+                        if (!substituted.includes('{{')) return substituted;
+                        return evalCBS(substituted, ctx).replace(/(?:[ \t]*\r?\n){3,}/g, '\n\n');
+                    });
                 } catch (_) {}
             }
             return out;
@@ -4396,7 +4624,7 @@
                     : new Uint8Array(Object.values(raw));
                 if (!bytes.length || bytes.length > 2.5 * 1024 * 1024) return null;
                 const url = `data:${detectImageMime(bytes, assetPath)};base64,${uint8ToBase64(bytes)}`;
-                cacheSetBounded(assetDataCache, assetPath, url, 40);
+                cacheSetBounded(assetDataCache, assetPath, url, 80);
                 return url;
             } catch (_) {
                 return null;
@@ -4419,32 +4647,47 @@
     
         function buildLookup(charObj, enabledModules = []) {
             const list = [];
+            const pushEntry = (rawName, rawPath, ext) => {
+                if (!rawName || !rawPath) return;
+                const name = String(rawName).trim();
+                const pathStr = String(rawPath).trim();
+                list.push({ n: name.toLowerCase(), p: pathStr });
+                if (ext && !name.includes('.')) {
+                    list.push({ n: `${name}.${String(ext).trim()}`.toLowerCase(), p: pathStr });
+                }
+            };
             if (charObj && Array.isArray(charObj.additionalAssets)) {
                 for (const a of charObj.additionalAssets) {
-                    if (Array.isArray(a) && a[0] && a[1]) list.push({ n: String(a[0]).toLowerCase(), p: String(a[1]) });
+                    if (Array.isArray(a)) pushEntry(a[0], a[1], a[2]);
                 }
             }
             if (charObj && Array.isArray(charObj.emotionImages)) {
                 for (const e of charObj.emotionImages) {
-                    if (Array.isArray(e) && e[0] && e[1]) list.push({ n: String(e[0]).toLowerCase(), p: String(e[1]) });
+                    if (Array.isArray(e)) pushEntry(e[0], e[1], e[2]);
                 }
             }
             for (const m of enabledModules || []) {
                 if (m && Array.isArray(m.assets)) {
                     for (const a of m.assets) {
-                        if (Array.isArray(a) && a[0] && a[1]) list.push({ n: String(a[0]).toLowerCase(), p: String(a[1]) });
+                        if (Array.isArray(a)) pushEntry(a[0], a[1], a[2]);
                     }
                 }
             }
             const norm = (s) => String(s || '').replace(/\.[a-z0-9]{2,5}$/i, '').replace(/[\s_\-]+/g, '').toLowerCase();
             const findSingle = (rawName) => {
-                const k = norm(rawName);
+                const rawLower = String(rawName || '').trim().toLowerCase();
+                if (!rawLower) return null;
+                for (const item of list) {
+                    if (item.n === rawLower) return item.p;
+                }
+                const k = norm(rawLower);
                 if (!k) return null;
                 for (const item of list) {
                     if (norm(item.n) === k) return item.p;
                 }
                 for (const item of list) {
-                    if (norm(item.n).includes(k) || k.includes(norm(item.n))) return item.p;
+                    const nk = norm(item.n);
+                    if (nk && (nk.includes(k) || k.includes(nk))) return item.p;
                 }
                 return null;
             };
@@ -4456,46 +4699,185 @@
                 return findSingle(rawName);
             };
         }
-    
-        async function extractInlineImages(rawMsg, findPath, allowImages, seasonSuffix = '') {
-            if (!rawMsg) return { text: '', images: [] };
-            const imgs = [];
-            const re = /<img\s*=\s*["']?([^"'\s>]+)["']?\s*\/?>|<img\b[^>]*\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))[^>]*>|\{\{(?:img|raw|asset|image|emotion)::([^}]+)\}\}|\{\{(?:inlay|inlayed)::([a-f0-9-]+)\}\}/gi;
-            const rawStr = String(rawMsg);
-            const matches = [];
+
+        function createAssetCollector(findPath, allowImages, seasonSuffix = '') {
+            const assetMap = Object.create(null);
+            const urlToId = new Map();
+            let seq = 0;
+            let totalBytes = 0;
+            const MAX_ASSETS = 64;
+            const MAX_TOTAL_BYTES = 12 * 1024 * 1024;
+
+            const addDataUrl = (url) => {
+                if (!url) return null;
+                if (urlToId.has(url)) return urlToId.get(url);
+                if (seq >= MAX_ASSETS) return null;
+                const size = String(url).length;
+                if (totalBytes + size > MAX_TOTAL_BYTES) return null;
+                const id = `a${seq++}`;
+                totalBytes += size;
+                urlToId.set(url, id);
+                assetMap[id] = url;
+                return id;
+            };
+
+            const resolveUrl = async (name, kind = 'asset') => {
+                if (!allowImages || !cfg.includeImages || !name) return null;
+                if (kind === 'inlay') return await readInlayDataUrl(name);
+                if (/^(?:data:image\/|https?:\/\/)/i.test(name)) return name;
+                const p = findPath(name, seasonSuffix);
+                return p ? await readAssetDataUrl(p) : null;
+            };
+
+            return {
+                assetMap,
+                async register(name, kind = 'asset') {
+                    const url = await resolveUrl(name, kind);
+                    if (!url) return null;
+                    const id = addDataUrl(url);
+                    if (!id) return null;
+                    return { id, url, token: `[[RSASSET:${id}]]` };
+                },
+            };
+        }
+
+        function stripDangerousNonHtml(raw) {
+            return String(raw || '')
+                .replace(/<!--[\s\S]*?-->/gi, '')
+                .replace(/<Thoughts>[\s\S]*?<\/Thoughts>/gi, '')
+                .replace(/<think>[\s\S]*?<\/think>/gi, '')
+                .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
+                .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '');
+        }
+
+        async function resolveHtmlAssetRefs(rawStr, collector) {
+            const src = stripDangerousNonHtml(rawStr);
+            const msgImgs = [];
+            const pushMsgImg = (url) => {
+                if (url && !msgImgs.includes(url)) msgImgs.push(url);
+            };
+            const isInsideAttrOrCssUrl = (index) => {
+                const before = src.slice(Math.max(0, index - 80), index);
+                if (/(?:src|href|background|poster)\s*=\s*["']?[^"'>]*$/i.test(before)) return true;
+                if (/url\(\s*["']?[^"')]*$/i.test(before)) return true;
+                return false;
+            };
+
+            // Pass 1: Resolve {{raw/img/asset/image/emotion/inlay/inlayed::...}} and <img=...>
+            const macroRe = /<img\s*=\s*["']?([^"'\s>]+)["']?\s*\/?>|\{\{(?:(inlay|inlayed)|(img|raw|asset|image|emotion))::([^}]+)\}\}/gi;
+            const macroMatches = [];
             let m;
-            while ((m = re.exec(rawStr)) !== null) {
-                if (m[6]) {
-                    matches.push({ start: m.index, end: re.lastIndex, kind: 'inlay', name: m[6].trim() });
+            while ((m = macroRe.exec(src)) !== null) {
+                const isAttrTag = !m[1] && isInsideAttrOrCssUrl(m.index);
+                if (m[1]) {
+                    macroMatches.push({ start: m.index, end: macroRe.lastIndex, kind: 'asset', name: m[1].trim(), asImgTag: true });
+                } else if (m[2]) {
+                    macroMatches.push({ start: m.index, end: macroRe.lastIndex, kind: 'inlay', name: m[4].trim(), asImgTag: !isAttrTag });
                 } else {
-                    const name = (m[1] || m[2] || m[3] || m[4] || m[5] || '').trim();
-                    if (name) matches.push({ start: m.index, end: re.lastIndex, kind: 'asset', name });
+                    macroMatches.push({ start: m.index, end: macroRe.lastIndex, kind: 'asset', name: m[4].trim(), asImgTag: !isAttrTag });
                 }
             }
-            let out = '';
+            let html = '';
             let cursor = 0;
-            for (const mt of matches) {
-                out += rawStr.slice(cursor, mt.start);
+            for (const mt of macroMatches) {
+                html += src.slice(cursor, mt.start);
                 cursor = mt.end;
-                if (allowImages && cfg.includeImages && imgs.length < 6) {
-                    let url = null;
-                    if (mt.kind === 'inlay') {
-                        url = await readInlayDataUrl(mt.name);
-                    } else if (/^(?:data:image\/|https?:\/\/)/i.test(mt.name)) {
-                        url = mt.name;
-                    } else {
-                        const p = findPath(mt.name, seasonSuffix);
-                        if (p) url = await readAssetDataUrl(p);
-                    }
-                    if (url) {
-                        const idx = imgs.length;
-                        imgs.push(url);
-                        out += `\n[[RSIMG:${idx}]]\n`;
-                    }
+                const entry = await collector.register(mt.name, mt.kind);
+                if (entry) {
+                    pushMsgImg(entry.url);
+                    html += mt.asImgTag ? `<img class="msg-img" src="${entry.token}" />` : entry.token;
                 }
             }
-            out += rawStr.slice(cursor);
-            return { text: cleanProse(out), images: imgs };
+            html += src.slice(cursor);
+
+            // Pass 2: Resolve bare <img src=foo> where src is not http(s), data:, or already [[RSASSET:...]]
+            const imgTagRe = /<img\b([^>]*?)\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))([^>]*)>/gi;
+            const imgMatches = [];
+            while ((m = imgTagRe.exec(html)) !== null) {
+                const srcVal = (m[2] || m[3] || m[4] || '').trim();
+                if (!srcVal) continue;
+                if (srcVal.startsWith('[[RSASSET:')) {
+                    const assetId = srcVal.slice(10, -2);
+                    if (collector.assetMap[assetId]) pushMsgImg(collector.assetMap[assetId]);
+                    continue;
+                }
+                if (/^(?:https?:\/\/|data:image\/)/i.test(srcVal)) {
+                    pushMsgImg(srcVal);
+                    continue;
+                }
+                imgMatches.push({
+                    start: m.index,
+                    end: imgTagRe.lastIndex,
+                    beforeAttrs: m[1] || '',
+                    afterAttrs: m[5] || '',
+                    name: srcVal,
+                });
+            }
+            if (imgMatches.length) {
+                let nextHtml = '';
+                let c2 = 0;
+                for (const im of imgMatches) {
+                    nextHtml += html.slice(c2, im.start);
+                    c2 = im.end;
+                    const entry = await collector.register(im.name, 'asset');
+                    if (entry) {
+                        pushMsgImg(entry.url);
+                        nextHtml += `<img${im.beforeAttrs} src="${entry.token}"${im.afterAttrs}>`;
+                    }
+                }
+                nextHtml += html.slice(c2);
+                html = nextHtml;
+            }
+            return { html: html.replace(/(?:[ \t]*\r?\n){3,}/g, '\n\n').trim(), images: msgImgs };
+        }
+
+        async function renderMessageHtmlAndText(rawMsg, collector) {
+            if (!rawMsg) return { text: '', html: '', images: [] };
+            const { html, images } = await resolveHtmlAssetRefs(rawMsg, collector);
+            let prose = cleanProse(html);
+            if (!prose && images.length) {
+                prose = images.map((_, i) => `[[RSIMG:${i}]]`).join('\n');
+            }
+            return { text: prose, html, images };
+        }
+
+        async function extractInlineImages(rawMsg, findPath, allowImages, seasonSuffix = '') {
+            const collector = createAssetCollector(findPath, allowImages, seasonSuffix);
+            const res = await renderMessageHtmlAndText(rawMsg, collector);
+            return { text: res.text, images: res.images };
+        }
+
+        function collectLorebookSummary(charObj, enabledModules, recentMessages) {
+            const recentText = (Array.isArray(recentMessages) ? recentMessages : [])
+                .slice(-6)
+                .map((m) => String(m && m.data ? m.data : ''))
+                .join('\n')
+                .toLowerCase();
+            const out = [];
+            let total = 0;
+            const MAX_LORE_CHARS = 6000;
+            const addEntries = (entries) => {
+                if (!Array.isArray(entries)) return;
+                for (const e of entries) {
+                    if (!e || e.enabled === false || !e.content) continue;
+                    const keyRaw = String(e.key || '');
+                    if (keyRaw.includes('folder:')) continue;
+                    const content = String(e.content || '').trim();
+                    if (!content) continue;
+                    const keys = keyRaw.split(',').map((k) => k.trim().toLowerCase()).filter(Boolean);
+                    const hit = Boolean(e.alwaysActive) || (recentText && keys.some((k) => recentText.includes(k)));
+                    if (!hit) continue;
+                    const chunk = e.comment ? `[${e.comment}]\n${content}` : content;
+                    if (total + chunk.length > MAX_LORE_CHARS) break;
+                    out.push(chunk);
+                    total += chunk.length;
+                }
+            };
+            for (const m of enabledModules || []) {
+                if (m && Array.isArray(m.lorebook)) addEntries(m.lorebook);
+            }
+            if (charObj && Array.isArray(charObj.globalLore)) addEntries(charObj.globalLore);
+            return out.join('\n\n');
         }
     
         function makeUuid() {
@@ -4548,6 +4930,8 @@
             const modules = modulesRaw.map((m) => ({
                 id: m.id,
                 name: m.name || m.id,
+                namespace: String(m.namespace || ''),
+                assetCount: Array.isArray(m.assets) ? m.assets.length : 0,
                 description: String(m.description || '').slice(0, 140),
                 enabled: enabledSet.has(m.id),
                 hasToggles: Boolean(m.customModuleToggle && String(m.customModuleToggle).trim()),
@@ -4582,7 +4966,7 @@
                 p: catalog.selectedPersona,
                 pr: params,
                 c: characters.map((x) => [x.index, x.name, x.chatPage, x.chats.length]),
-                m: modules.map((x) => [x.id, x.enabled]),
+                m: modules.map((x) => [x.id, x.enabled, x.assetCount]),
                 pe: personas.map((x) => x.name),
             });
     
@@ -4636,10 +5020,12 @@
             const fmIdx = typeof chatObj.fmIndex === 'number' ? chatObj.fmIndex : -1;
             const altGreetings = Array.isArray(charObj.alternateGreetings) ? charObj.alternateGreetings : [];
             const firstMessageCount = (charObj.firstMessage ? 1 : 0) + altGreetings.length;
+            const chatModules = Array.isArray(chatObj && chatObj.modules) ? chatObj.modules.map(String) : [];
 
             let db = null;
             let toggleBlocks = [];
             let enabledModules = [];
+            const enSet = new Set(chatModules);
             try {
                 db = await risuai.getDatabase([
                     'modules',
@@ -4649,13 +5035,12 @@
                     'customscript',
                     'globalChatVariables',
                 ]);
+                if (db && Array.isArray(db.enabledModules)) {
+                    for (const mid of db.enabledModules) enSet.add(String(mid));
+                }
                 if (db && Array.isArray(db.modules)) {
-                    const enSet = new Set(Array.isArray(db.enabledModules) ? db.enabledModules : []);
-                    if (Array.isArray(chatObj && chatObj.modules)) {
-                        for (const mid of chatObj.modules) enSet.add(mid);
-                    }
                     for (const m of db.modules) {
-                        if (m && enSet.has(m.id)) {
+                        if (m && enSet.has(String(m.id))) {
                             enabledModules.push(m);
                             if (m.customModuleToggle && String(m.customModuleToggle).trim()) {
                                 toggleBlocks.push({ source: m.name || m.id, syntax: String(m.customModuleToggle) });
@@ -4668,9 +5053,14 @@
                 toggleBlocks.push({ source: charObj.name || 'Character', syntax: String(charObj.customModuleToggle) });
             }
 
-            const toggleSig = `${useLocalToggles}:${Object.keys(localVars).length}:${JSON.stringify(localVars)}:${toggleBlocks.length}`;
-            const stateSig = `${fmIdx}:${firstMessageCount}:${JSON.stringify(scriptState)}`;
-            const sig = `${viewCharIndex}:${viewChatIndex}:${isPcActive}:${allMsgs.length}:${recentDigest}:${chatObj.name || ''}:${toggleSig}:${stateSig}`;
+            const enabledModIds = Array.from(enSet).sort().join(',');
+            const swipeDigest = recent.map((_, i) => {
+                const sw = swipeHistory[makeSwipeKey(charObj, viewCharIndex, chatObj, viewChatIndex, startOffset + i)];
+                return sw && Array.isArray(sw.swipes) ? `${sw.index}/${sw.swipes.length}` : '0/1';
+            }).join(',');
+            const toggleSig = `${useLocalToggles}:${Object.keys(localVars).length}:${JSON.stringify(localVars)}:${toggleBlocks.length}:${enabledModIds}`;
+            const stateSig = `${fmIdx}:${firstMessageCount}:${JSON.stringify(scriptState)}:${swipeDigest}`;
+            const sig = `${viewCharIndex}:${viewChatIndex}:${isPcActive}:${allMsgs.length}:${recentDigest}:${chatObj.name || ''}:${toggleSig}:${stateSig}:${Boolean(cfg.includeImages)}`;
             if (!forceFull && sig === lastSnapSig) {
                 return null;
             }
@@ -4688,6 +5078,7 @@
 
             const findPath = buildLookup(charObj, enabledModules);
             const renderCtx = buildRenderContext(charObj, chatObj, db, personaName, enabledModules, -1, allMsgs.length);
+            const collector = createAssetCollector(findPath, Boolean(cfg.includeImages), renderCtx.vars.current_season_suffix || '');
             const outMsgs = [];
 
             let greetingControls = [];
@@ -4702,10 +5093,11 @@
                         ...renderCtx,
                         vars: { ...renderCtx.vars },
                         tempVars: Object.create(null),
+                        slots: Object.create(null),
                         chatIndex: -1,
                     };
                     let renderedFirst = renderRemoteMessage(firstStr, firstCtx);
-                    let parsedFirst = await extractInlineImages(renderedFirst, findPath, true, firstCtx.vars.current_season_suffix || '');
+                    let parsedFirst = await renderMessageHtmlAndText(renderedFirst, collector);
                     if (!parsedFirst.text && !parsedFirst.images.length && /\{\{#(?:when|if|if_pure)/i.test(firstStr)) {
                         let filled = false;
                         for (const [k, v] of Object.entries(greetingMeta.defaults)) {
@@ -4717,7 +5109,7 @@
                         }
                         if (filled) {
                             renderedFirst = renderRemoteMessage(firstStr, firstCtx);
-                            parsedFirst = await extractInlineImages(renderedFirst, findPath, true, firstCtx.vars.current_season_suffix || '');
+                            parsedFirst = await renderMessageHtmlAndText(renderedFirst, collector);
                         }
                     }
                     greetingControls = Object.entries(greetingMeta.options)
@@ -4733,6 +5125,7 @@
                         index: -1,
                         role: 'char',
                         text: parsedFirst.text,
+                        html: parsedFirst.html,
                         raw: firstStr,
                         images: parsedFirst.images,
                         isFirstMessage: true,
@@ -4755,19 +5148,36 @@
                 }
             }
 
+            const recentAssetStart = Math.max(0, recent.length - 8);
+            const fallbackCollector = createAssetCollector(findPath, false, renderCtx.vars.current_season_suffix || '');
             for (let i = 0; i < recent.length; i++) {
                 const msg = recent[i];
-                const isRecent = i >= recent.length - 8;
-                const msgCtx = { ...renderCtx, tempVars: Object.create(null), chatIndex: startOffset + i };
+                const isRecent = i >= recentAssetStart;
+                const msgCtx = { ...renderCtx, tempVars: Object.create(null), slots: Object.create(null), chatIndex: startOffset + i };
                 const renderedMsg = renderRemoteMessage(msg.data, msgCtx);
-                const parsed = await extractInlineImages(renderedMsg, findPath, isRecent, msgCtx.vars.current_season_suffix || '');
+                const parsed = await renderMessageHtmlAndText(renderedMsg, isRecent ? collector : fallbackCollector);
+                const swEntry = swipeHistory[makeSwipeKey(charObj, viewCharIndex, chatObj, viewChatIndex, startOffset + i)];
                 outMsgs.push({
                     index: startOffset + i,
                     role: msg.role,
                     text: parsed.text,
+                    html: parsed.html,
                     raw: String(msg.data || ''),
                     images: parsed.images,
+                    swipeCount: swEntry && Array.isArray(swEntry.swipes) ? swEntry.swipes.length : 1,
+                    swipeIndex: swEntry && typeof swEntry.index === 'number' ? swEntry.index : 0,
                 });
+            }
+
+            const bgParts = [];
+            if (charObj.backgroundHTML) bgParts.push(String(charObj.backgroundHTML));
+            for (const m of enabledModules) {
+                if (m && m.backgroundEmbedding) bgParts.push(String(m.backgroundEmbedding));
+            }
+            let backgroundHtml = '';
+            if (bgParts.length) {
+                const evaluatedBg = evalCBS(bgParts.join('\n'), { ...renderCtx, tempVars: Object.create(null), slots: Object.create(null) });
+                backgroundHtml = (await resolveHtmlAssetRefs(evaluatedBg, collector)).html;
             }
 
             const chatVariables = {};
@@ -4781,6 +5191,8 @@
                 chatVariables[k] = val;
             }
 
+            const moduleLore = collectLorebookSummary(charObj, enabledModules, recent);
+
             return {
                 charName: charObj.name || 'Character',
                 charIndex: viewCharIndex,
@@ -4791,10 +5203,13 @@
                 fmIndex: fmIdx,
                 firstMessageCount,
                 greetingControls,
+                chatModules,
                 chatVariables,
                 useLocallySetGlobalVariables: useLocalToggles,
                 localToggleValues: localVars,
                 customToggleBlocks: toggleBlocks,
+                backgroundHtml,
+                assetMap: collector.assetMap,
                 messages: outMsgs,
                 charContext: {
                     name: charObj.name || 'Character',
@@ -4802,11 +5217,1623 @@
                     personality: String(charObj.personality || '').slice(0, 2000),
                     scenario: String(charObj.scenario || '').slice(0, 2000),
                     systemPrompt: String(charObj.systemPrompt || '').slice(0, 3000),
+                    moduleLore,
                     note: String(chatObj.note || '').slice(0, 2000),
                     personaName,
                     personaPrompt: String(personaPrompt || '').slice(0, 2000),
                 },
             };
+        }
+
+        // ================= Embedded RisuAI Lua Trigger Subset VM =================
+        class LuaReturnSignal {
+            constructor(vals) { this.vals = vals; }
+        }
+        class LuaBreakSignal {}
+        class LuaMultiRet {
+            constructor(vals) { this.vals = vals; }
+        }
+        class LuaPromptPause {
+            constructor(info) { this.info = info; }
+        }
+        class LuaTable {
+            constructor() { this.map = new Map(); }
+            get(k) { return this.map.has(k) ? this.map.get(k) : null; }
+            set(k, v) {
+                if (v === null || v === undefined) this.map.delete(k);
+                else this.map.set(k, v);
+            }
+            length() {
+                let n = 0;
+                while (this.map.has(n + 1)) n++;
+                return n;
+            }
+        }
+
+        function luaIsTruthy(v) {
+            return v !== null && v !== undefined && v !== false;
+        }
+        function luaFirstVal(v) {
+            return v instanceof LuaMultiRet ? (v.vals.length ? v.vals[0] : null) : (v === undefined ? null : v);
+        }
+        function luaExpandVals(rawVals) {
+            const out = [];
+            for (let i = 0; i < rawVals.length; i++) {
+                const v = rawVals[i];
+                if (v instanceof LuaMultiRet) {
+                    if (i === rawVals.length - 1) out.push(...v.vals);
+                    else out.push(v.vals.length ? v.vals[0] : null);
+                } else {
+                    out.push(v === undefined ? null : v);
+                }
+            }
+            return out;
+        }
+        function luaToNum(v) {
+            if (typeof v === 'number') return v;
+            if (typeof v === 'string') {
+                const t = v.trim();
+                if (!t) return NaN;
+                const n = Number(t);
+                return Number.isFinite(n) ? n : NaN;
+            }
+            return NaN;
+        }
+        function luaToStr(v) {
+            if (v === null || v === undefined) return 'nil';
+            if (typeof v === 'boolean') return v ? 'true' : 'false';
+            if (typeof v === 'number') return String(v);
+            if (typeof v === 'string') return v;
+            if (v instanceof LuaTable) return 'table';
+            if (typeof v === 'function') return 'function';
+            return String(v);
+        }
+        function toLuaValue(jsVal) {
+            if (jsVal === null || jsVal === undefined) return null;
+            if (Array.isArray(jsVal)) {
+                const t = new LuaTable();
+                for (let i = 0; i < jsVal.length; i++) t.set(i + 1, toLuaValue(jsVal[i]));
+                return t;
+            }
+            if (typeof jsVal === 'object' && !(jsVal instanceof LuaTable)) {
+                const t = new LuaTable();
+                for (const [k, v] of Object.entries(jsVal)) t.set(k, toLuaValue(v));
+                return t;
+            }
+            return jsVal;
+        }
+        function luaTableToArray(tbl) {
+            if (Array.isArray(tbl)) return tbl.map((x) => luaToStr(x));
+            if (!(tbl instanceof LuaTable)) return [];
+            const out = [];
+            const len = tbl.length();
+            for (let i = 1; i <= len; i++) out.push(luaToStr(tbl.get(i)));
+            return out;
+        }
+
+        function luaPatternClassChar(ch) {
+            switch (ch) {
+                case 'a': return 'A-Za-z';
+                case 'A': return '^A-Za-z';
+                case 'd': return '0-9';
+                case 'D': return '^0-9';
+                case 'l': return 'a-z';
+                case 'L': return '^a-z';
+                case 'u': return 'A-Z';
+                case 'U': return '^A-Z';
+                case 'w': return 'A-Za-z0-9';
+                case 'W': return '^A-Za-z0-9';
+                case 's': return '\\s';
+                case 'S': return '\\S';
+                case 'x': return '0-9A-Fa-f';
+                case 'X': return '^0-9A-Fa-f';
+                case 'c': return '\\x00-\\x1f\\x7f';
+                case 'C': return '^\\x00-\\x1f\\x7f';
+                case 'p': return '\\x21-\\x2f\\x3a-\\x40\\x5b-\\x60\\x7b-\\x7e';
+                case 'P': return '^\\x21-\\x2f\\x3a-\\x40\\x5b-\\x60\\x7b-\\x7e';
+                case 'z': return '\\x00';
+                default: return null;
+            }
+        }
+        function luaEscapeRegex(ch) {
+            return ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        }
+        function luaPatternToRegExp(pat, global = false) {
+            const s = String(pat || '');
+            let rs = '';
+            let i = 0;
+            while (i < s.length) {
+                const c = s[i];
+                if (c === '^' && i === 0) {
+                    rs += '^';
+                    i++;
+                    continue;
+                }
+                if (c === '$' && i === s.length - 1) {
+                    rs += '$';
+                    i++;
+                    continue;
+                }
+                let atom = '';
+                if (c === '%' && i + 1 < s.length) {
+                    const nxt = s[i + 1];
+                    const cls = luaPatternClassChar(nxt);
+                    atom = cls ? `[${cls}]` : luaEscapeRegex(nxt);
+                    i += 2;
+                } else if (c === '[') {
+                    let j = i + 1;
+                    let cls = '[';
+                    if (s[j] === '^') { cls += '^'; j++; }
+                    if (s[j] === ']') { cls += '\\]'; j++; }
+                    while (j < s.length && s[j] !== ']') {
+                        if (s[j] === '%' && j + 1 < s.length) {
+                            const pCls = luaPatternClassChar(s[j + 1]);
+                            cls += pCls ? pCls : luaEscapeRegex(s[j + 1]);
+                            j += 2;
+                        } else if (s[j] === '\\' || s[j] === '[') {
+                            cls += '\\' + s[j++];
+                        } else {
+                            cls += s[j++];
+                        }
+                    }
+                    cls += ']';
+                    atom = cls;
+                    i = j < s.length ? j + 1 : s.length;
+                } else if (c === '.') {
+                    atom = '[\\s\\S]';
+                    i++;
+                } else if (c === '(' || c === ')') {
+                    rs += c;
+                    i++;
+                    continue;
+                } else {
+                    atom = luaEscapeRegex(c);
+                    i++;
+                }
+
+                const q = s[i];
+                if (q === '-') {
+                    rs += atom + '*?';
+                    i++;
+                } else if (q === '*' || q === '+' || q === '?') {
+                    rs += atom + q;
+                    i++;
+                } else {
+                    rs += atom;
+                }
+            }
+            return new RegExp(rs, global ? 'g' : '');
+        }
+        function luaStringFormat(fmt, args) {
+            let idx = 0;
+            return String(fmt || '').replace(/%(%|[-+0 #]*\d*(?:\.\d+)?[diuoxXeEfFgGsScq])/g, (m, spec) => {
+                if (spec === '%') return '%';
+                const val = args[idx++];
+                const type = spec[spec.length - 1];
+                const flagsMatch = spec.slice(0, -1).match(/^([-+0 #]*)(\d*)(?:\.(\d+))?$/);
+                const flags = (flagsMatch && flagsMatch[1]) || '';
+                const width = (flagsMatch && flagsMatch[2]) ? parseInt(flagsMatch[2], 10) : 0;
+                const prec = (flagsMatch && flagsMatch[3] !== undefined) ? parseInt(flagsMatch[3], 10) : null;
+                let out = '';
+                if (type === 'd' || type === 'i' || type === 'u') {
+                    const n = Math.trunc(Number(val) || 0);
+                    const neg = n < 0;
+                    let digits = String(Math.abs(n));
+                    const padLen = prec !== null ? prec : (flags.includes('0') ? Math.max(0, width - (neg ? 1 : 0)) : 0);
+                    if (digits.length < padLen) digits = digits.padStart(padLen, '0');
+                    out = (neg ? '-' : '') + digits;
+                } else if (type === 'x' || type === 'X') {
+                    const n = Math.trunc(Number(val) || 0) >>> 0;
+                    out = n.toString(16);
+                    if (type === 'X') out = out.toUpperCase();
+                } else if (type === 'o') {
+                    out = (Math.trunc(Number(val) || 0) >>> 0).toString(8);
+                } else if (type === 'f' || type === 'F' || type === 'g' || type === 'G') {
+                    const n = Number(val) || 0;
+                    out = prec !== null ? n.toFixed(prec) : String(n);
+                } else if (type === 'c') {
+                    out = String.fromCharCode(Number(val) || 0);
+                } else if (type === 'q') {
+                    out = JSON.stringify(luaToStr(val));
+                } else {
+                    out = luaToStr(val);
+                    if (prec !== null) out = out.slice(0, prec);
+                }
+                if (width && out.length < width) {
+                    const padChar = (flags.includes('0') && 'diuoxXfFgG'.includes(type) && !flags.includes('-')) ? '0' : ' ';
+                    out = flags.includes('-') ? out.padEnd(width, ' ') : out.padStart(width, padChar);
+                }
+                return out;
+            });
+        }
+
+        function tokenizeLua(src) {
+            const keywords = new Set([
+                'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for', 'function',
+                'goto', 'if', 'in', 'local', 'nil', 'not', 'or', 'repeat', 'return',
+                'then', 'true', 'until', 'while',
+            ]);
+            const tokens = [];
+            let i = 0;
+            const len = src.length;
+
+            const readLongBracket = (startIdx) => {
+                if (src[startIdx] !== '[') return null;
+                let j = startIdx + 1;
+                while (j < len && src[j] === '=') j++;
+                if (src[j] !== '[') return null;
+                const eqCount = j - startIdx - 1;
+                const closeSeq = ']' + '='.repeat(eqCount) + ']';
+                let bodyStart = j + 1;
+                if (src[bodyStart] === '\r' && src[bodyStart + 1] === '\n') bodyStart += 2;
+                else if (src[bodyStart] === '\n') bodyStart += 1;
+                const closeIdx = src.indexOf(closeSeq, bodyStart);
+                if (closeIdx < 0) throw new Error('Unclosed long bracket in Lua');
+                return { text: src.slice(bodyStart, closeIdx), end: closeIdx + closeSeq.length };
+            };
+
+            while (i < len) {
+                const c = src[i];
+                if (c === ' ' || c === '\t' || c === '\r' || c === '\n' || c === '\u00A0') {
+                    i++;
+                    continue;
+                }
+                if (c === '-' && src[i + 1] === '-') {
+                    if (src[i + 2] === '[') {
+                        const lb = readLongBracket(i + 2);
+                        if (lb) { i = lb.end; continue; }
+                    }
+                    while (i < len && src[i] !== '\n') i++;
+                    continue;
+                }
+                if (c === '[') {
+                    const lb = readLongBracket(i);
+                    if (lb) {
+                        tokens.push({ t: 'str', v: lb.text });
+                        i = lb.end;
+                        continue;
+                    }
+                }
+                if (c === '"' || c === "'") {
+                    const q = c;
+                    i++;
+                    let out = '';
+                    while (i < len && src[i] !== q) {
+                        if (src[i] === '\\' && i + 1 < len) {
+                            const n = src[++i];
+                            if (n === 'n') out += '\n';
+                            else if (n === 'r') out += '\r';
+                            else if (n === 't') out += '\t';
+                            else if (n === 'a') out += '\x07';
+                            else if (n === 'b') out += '\b';
+                            else if (n === 'f') out += '\f';
+                            else if (n === 'v') out += '\v';
+                            else if (n === '\r') { if (src[i + 1] === '\n') i++; out += '\n'; }
+                            else if (n === '\n') out += '\n';
+                            else if (n === 'z') { while (i + 1 < len && /\s/.test(src[i + 1])) i++; }
+                            else if (n === 'x' && /^[0-9a-fA-F]{2}/.test(src.slice(i + 1, i + 3))) {
+                                out += String.fromCharCode(parseInt(src.slice(i + 1, i + 3), 16));
+                                i += 2;
+                            } else if (n === 'u' && src[i + 1] === '{') {
+                                const endU = src.indexOf('}', i + 2);
+                                if (endU > i + 2) {
+                                    out += String.fromCodePoint(parseInt(src.slice(i + 2, endU), 16));
+                                    i = endU;
+                                }
+                            } else if (/[0-9]/.test(n)) {
+                                let digits = n;
+                                if (/[0-9]/.test(src[i + 1] || '')) digits += src[++i];
+                                if (/[0-9]/.test(src[i + 1] || '')) digits += src[++i];
+                                out += String.fromCharCode(parseInt(digits, 10));
+                            } else {
+                                out += n;
+                            }
+                            i++;
+                        } else {
+                            out += src[i++];
+                        }
+                    }
+                    if (src[i] === q) i++;
+                    tokens.push({ t: 'str', v: out });
+                    continue;
+                }
+                if (/[0-9]/.test(c) || (c === '.' && /[0-9]/.test(src[i + 1] || ''))) {
+                    const hex = src.slice(i).match(/^0[xX][0-9a-fA-F]+/);
+                    if (hex) {
+                        tokens.push({ t: 'num', v: parseInt(hex[0], 16) });
+                        i += hex[0].length;
+                        continue;
+                    }
+                    const num = src.slice(i).match(/^(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?/);
+                    if (num) {
+                        tokens.push({ t: 'num', v: Number(num[0]) });
+                        i += num[0].length;
+                        continue;
+                    }
+                }
+                if (/[a-zA-Z_]/.test(c)) {
+                    let j = i + 1;
+                    while (j < len && /[a-zA-Z0-9_]/.test(src[j])) j++;
+                    const w = src.slice(i, j);
+                    tokens.push({ t: keywords.has(w) ? 'kw' : 'id', v: w });
+                    i = j;
+                    continue;
+                }
+                const three = src.slice(i, i + 3);
+                if (three === '...') {
+                    tokens.push({ t: 'op', v: '...' });
+                    i += 3;
+                    continue;
+                }
+                const two = src.slice(i, i + 2);
+                if (two === '..' || two === '==' || two === '~=' || two === '<=' || two === '>=' || two === '//' || two === '<<' || two === '>>') {
+                    tokens.push({ t: 'op', v: two });
+                    i += 2;
+                    continue;
+                }
+                tokens.push({ t: 'op', v: c });
+                i++;
+            }
+            tokens.push({ t: 'eof', v: '' });
+            return tokens;
+        }
+
+        function parseLua(src) {
+            const toks = tokenizeLua(src);
+            let pos = 0;
+            const peek = (offset = 0) => toks[Math.min(pos + offset, toks.length - 1)];
+            const at = (t, v) => {
+                const tk = peek();
+                return tk.t === t && (v === undefined || tk.v === v);
+            };
+            const consume = (t, v) => {
+                const tk = peek();
+                if (t && tk.t !== t) throw new Error(`Lua parse error: expected ${t} ${v || ''}, got ${tk.t} '${tk.v}'`);
+                if (v !== undefined && tk.v !== v) throw new Error(`Lua parse error: expected '${v}', got '${tk.v}'`);
+                pos++;
+                return tk;
+            };
+            const tryOp = (v) => {
+                if (at('op', v)) { pos++; return true; }
+                return false;
+            };
+            const tryKw = (v) => {
+                if (at('kw', v)) { pos++; return true; }
+                return false;
+            };
+
+            function parseBlock(stopKws) {
+                const stmts = [];
+                while (!at('eof') && !(peek().t === 'kw' && stopKws.has(peek().v))) {
+                    while (tryOp(';')) {}
+                    if (at('eof') || (peek().t === 'kw' && stopKws.has(peek().v))) break;
+                    const st = parseStmt();
+                    if (st) stmts.push(st);
+                    if (st && st.type === 'return') {
+                        while (tryOp(';')) {}
+                        break;
+                    }
+                }
+                return stmts;
+            }
+
+            function parseNameList() {
+                const names = [consume('id').v];
+                while (at('op', ',') && peek(1).t === 'id') {
+                    pos++;
+                    names.push(consume('id').v);
+                }
+                return names;
+            }
+
+            function parseExprList() {
+                const exprs = [parseExpr()];
+                while (tryOp(',')) exprs.push(parseExpr());
+                return exprs;
+            }
+
+            function parseParams() {
+                consume('op', '(');
+                const params = [];
+                let vararg = false;
+                if (!at('op', ')')) {
+                    while (true) {
+                        if (tryOp('...')) {
+                            vararg = true;
+                            break;
+                        }
+                        params.push(consume('id').v);
+                        if (!tryOp(',')) break;
+                    }
+                }
+                consume('op', ')');
+                return { params, vararg };
+            }
+
+            function parseFuncBody(addSelf = false) {
+                const { params, vararg } = parseParams();
+                const finalParams = addSelf ? ['self', ...params] : params;
+                const body = parseBlock(new Set(['end']));
+                consume('kw', 'end');
+                return { type: 'funcExpr', params: finalParams, vararg, body };
+            }
+
+            function parseTable() {
+                consume('op', '{');
+                const fields = [];
+                while (!at('op', '}')) {
+                    if (tryOp('[')) {
+                        const key = parseExpr();
+                        consume('op', ']');
+                        consume('op', '=');
+                        fields.push({ key, val: parseExpr() });
+                    } else if (peek().t === 'id' && peek(1).t === 'op' && peek(1).v === '=') {
+                        const keyName = consume('id').v;
+                        consume('op', '=');
+                        fields.push({ key: { type: 'lit', val: keyName }, val: parseExpr() });
+                    } else {
+                        fields.push({ key: null, val: parseExpr() });
+                    }
+                    if (!tryOp(',') && !tryOp(';')) break;
+                }
+                consume('op', '}');
+                return { type: 'table', fields };
+            }
+
+            function parsePrimary() {
+                const tk = peek();
+                if (tryOp('(')) {
+                    const expr = parseExpr();
+                    consume('op', ')');
+                    return { type: 'paren', expr };
+                }
+                if (tk.t === 'id') {
+                    pos++;
+                    return { type: 'var', name: tk.v };
+                }
+                throw new Error(`Lua parse error: unexpected token '${tk.v}'`);
+            }
+
+            function parseCallArgs() {
+                if (at('op', '(')) {
+                    pos++;
+                    const args = at('op', ')') ? [] : parseExprList();
+                    consume('op', ')');
+                    return args;
+                }
+                if (at('op', '{')) return [parseTable()];
+                if (at('str')) return [{ type: 'lit', val: consume('str').v }];
+                throw new Error(`Lua parse error: expected call args, got '${peek().v}'`);
+            }
+
+            function parseSuffixed() {
+                let node = parsePrimary();
+                while (true) {
+                    if (tryOp('.')) {
+                        const prop = consume('id').v;
+                        node = { type: 'index', obj: node, key: { type: 'lit', val: prop } };
+                    } else if (tryOp('[')) {
+                        const key = parseExpr();
+                        consume('op', ']');
+                        node = { type: 'index', obj: node, key };
+                    } else if (tryOp(':')) {
+                        const method = consume('id').v;
+                        const args = parseCallArgs();
+                        node = { type: 'methodCall', obj: node, method, args };
+                    } else if (at('op', '(') || at('op', '{') || at('str')) {
+                        const args = parseCallArgs();
+                        node = { type: 'call', fn: node, args };
+                    } else {
+                        break;
+                    }
+                }
+                return node;
+            }
+
+            function parseSimpleExpr() {
+                const tk = peek();
+                if (tk.t === 'num' || tk.t === 'str') { pos++; return { type: 'lit', val: tk.v }; }
+                if (tryKw('nil')) return { type: 'lit', val: null };
+                if (tryKw('true')) return { type: 'lit', val: true };
+                if (tryKw('false')) return { type: 'lit', val: false };
+                if (tryOp('...')) return { type: 'vararg' };
+                if (tryKw('function')) return parseFuncBody(false);
+                if (at('op', '{')) return parseTable();
+                return parseSuffixed();
+            }
+
+            const BIN_PREC = {
+                or: [1, 1],
+                and: [2, 2],
+                '<': [3, 3], '>': [3, 3], '<=': [3, 3], '>=': [3, 3], '~=': [3, 3], '==': [3, 3],
+                '|': [4, 4],
+                '~': [5, 5],
+                '&': [6, 6],
+                '<<': [7, 7], '>>': [7, 7],
+                '..': [8, 7],
+                '+': [10, 10], '-': [10, 10],
+                '*': [11, 11], '/': [11, 11], '//': [11, 11], '%': [11, 11],
+                '^': [14, 13],
+            };
+
+            function parseSubExpr(minPrec) {
+                let left;
+                const tk = peek();
+                if (tk.t === 'kw' && tk.v === 'not') {
+                    pos++;
+                    left = { type: 'unary', op: 'not', arg: parseSubExpr(12) };
+                } else if (tk.t === 'op' && (tk.v === '-' || tk.v === '#' || tk.v === '~')) {
+                    pos++;
+                    left = { type: 'unary', op: tk.v, arg: parseSubExpr(12) };
+                } else {
+                    left = parseSimpleExpr();
+                }
+
+                while (true) {
+                    const opTk = peek();
+                    const opName = (opTk.t === 'op' || opTk.t === 'kw') ? opTk.v : '';
+                    const prec = BIN_PREC[opName];
+                    if (!prec || prec[0] < minPrec) break;
+                    pos++;
+                    const right = parseSubExpr(prec[1]);
+                    left = { type: 'binary', op: opName, left, right };
+                }
+                return left;
+            }
+
+            function parseExpr() {
+                return parseSubExpr(1);
+            }
+
+            function parseStmt() {
+                if (tryKw('do')) {
+                    const body = parseBlock(new Set(['end']));
+                    consume('kw', 'end');
+                    return { type: 'do', body };
+                }
+                if (tryKw('while')) {
+                    const cond = parseExpr();
+                    consume('kw', 'do');
+                    const body = parseBlock(new Set(['end']));
+                    consume('kw', 'end');
+                    return { type: 'while', cond, body };
+                }
+                if (tryKw('repeat')) {
+                    const body = parseBlock(new Set(['until']));
+                    consume('kw', 'until');
+                    const cond = parseExpr();
+                    return { type: 'repeat', body, cond };
+                }
+                if (tryKw('if')) {
+                    const branches = [];
+                    const cond0 = parseExpr();
+                    consume('kw', 'then');
+                    const body0 = parseBlock(new Set(['elseif', 'else', 'end']));
+                    branches.push({ cond: cond0, body: body0 });
+                    while (tryKw('elseif')) {
+                        const c = parseExpr();
+                        consume('kw', 'then');
+                        const b = parseBlock(new Set(['elseif', 'else', 'end']));
+                        branches.push({ cond: c, body: b });
+                    }
+                    let elseBody = null;
+                    if (tryKw('else')) {
+                        elseBody = parseBlock(new Set(['end']));
+                    }
+                    consume('kw', 'end');
+                    return { type: 'if', branches, elseBody };
+                }
+                if (tryKw('for')) {
+                    const firstVar = consume('id').v;
+                    if (tryOp('=')) {
+                        const start = parseExpr();
+                        consume('op', ',');
+                        const limit = parseExpr();
+                        const step = tryOp(',') ? parseExpr() : { type: 'lit', val: 1 };
+                        consume('kw', 'do');
+                        const body = parseBlock(new Set(['end']));
+                        consume('kw', 'end');
+                        return { type: 'forNum', varName: firstVar, start, limit, step, body };
+                    }
+                    const names = [firstVar];
+                    while (tryOp(',')) names.push(consume('id').v);
+                    consume('kw', 'in');
+                    const iters = parseExprList();
+                    consume('kw', 'do');
+                    const body = parseBlock(new Set(['end']));
+                    consume('kw', 'end');
+                    return { type: 'forIn', names, iters, body };
+                }
+                if (tryKw('function')) {
+                    let target = { type: 'var', name: consume('id').v };
+                    let isMethod = false;
+                    while (tryOp('.')) {
+                        const prop = consume('id').v;
+                        target = { type: 'index', obj: target, key: { type: 'lit', val: prop } };
+                    }
+                    if (tryOp(':')) {
+                        const prop = consume('id').v;
+                        target = { type: 'index', obj: target, key: { type: 'lit', val: prop } };
+                        isMethod = true;
+                    }
+                    const fnExpr = parseFuncBody(isMethod);
+                    return { type: 'assign', targets: [target], values: [fnExpr] };
+                }
+                if (tryKw('local')) {
+                    if (tryKw('function')) {
+                        const name = consume('id').v;
+                        const fnExpr = parseFuncBody(false);
+                        return { type: 'local', names: [name], values: [fnExpr], isFuncDecl: true };
+                    }
+                    const names = parseNameList();
+                    const values = tryOp('=') ? parseExprList() : [];
+                    return { type: 'local', names, values };
+                }
+                if (tryKw('return')) {
+                    const stop = at('eof') || at('op', ';') || (peek().t === 'kw' && (peek().v === 'end' || peek().v === 'else' || peek().v === 'elseif' || peek().v === 'until'));
+                    const values = stop ? [] : parseExprList();
+                    return { type: 'return', values };
+                }
+                if (tryKw('break')) {
+                    return { type: 'break' };
+                }
+                const first = parseSuffixed();
+                if (first.type === 'call' || first.type === 'methodCall') {
+                    return { type: 'exprStmt', expr: first };
+                }
+                const targets = [first];
+                while (tryOp(',')) {
+                    const nxt = parseSuffixed();
+                    if (nxt.type === 'call' || nxt.type === 'methodCall') {
+                        throw new Error('Lua parse error: syntax error in assignment');
+                    }
+                    targets.push(nxt);
+                }
+                consume('op', '=');
+                const values = parseExprList();
+                return { type: 'assign', targets, values };
+            }
+
+            return parseBlock(new Set());
+        }
+
+        async function executeRisuLuaTrigger(luaCodes, triggerName, hostApi) {
+            const MAX_STEPS = 500000;
+            let steps = 0;
+
+            const makeScope = (parent, isVararg = false, varargList = []) => ({
+                vars: Object.create(null),
+                parent,
+                varargList: isVararg ? varargList : (parent ? parent.varargList : []),
+            });
+            const resolveVar = (scope, name) => {
+                let cur = scope;
+                while (cur) {
+                    if (Object.prototype.hasOwnProperty.call(cur.vars, name)) return cur.vars[name];
+                    cur = cur.parent;
+                }
+                return null;
+            };
+            const assignVar = (scope, name, val) => {
+                let cur = scope;
+                while (cur) {
+                    if (Object.prototype.hasOwnProperty.call(cur.vars, name)) {
+                        cur.vars[name] = val;
+                        return;
+                    }
+                    if (!cur.parent) {
+                        cur.vars[name] = val;
+                        return;
+                    }
+                    cur = cur.parent;
+                }
+            };
+
+            const rootEnv = makeScope(null);
+            const strLib = new LuaTable();
+            strLib.set('len', (s) => luaToStr(s).length);
+            strLib.set('lower', (s) => luaToStr(s).toLowerCase());
+            strLib.set('upper', (s) => luaToStr(s).toUpperCase());
+            strLib.set('rep', (s, n) => luaToStr(s).repeat(Math.max(0, Math.trunc(Number(n) || 0))));
+            strLib.set('sub', (s, i, j) => {
+                const str = luaToStr(s);
+                const len = str.length;
+                let a = Math.trunc(Number(i) || 1);
+                let b = j === null || j === undefined ? len : Math.trunc(Number(j));
+                if (a < 0) a = len + a + 1;
+                if (b < 0) b = len + b + 1;
+                a = Math.max(1, a);
+                b = Math.min(len, b);
+                if (a > b) return '';
+                return str.slice(a - 1, b);
+            });
+            strLib.set('byte', (s, i = 1) => {
+                const str = luaToStr(s);
+                let idx = Math.trunc(Number(i) || 1);
+                if (idx < 0) idx = str.length + idx + 1;
+                if (idx < 1 || idx > str.length) return null;
+                return str.charCodeAt(idx - 1);
+            });
+            strLib.set('char', (...codes) => String.fromCharCode(...codes.map((c) => Number(c) || 0)));
+            strLib.set('format', (fmt, ...args) => luaStringFormat(fmt, args));
+            strLib.set('find', (s, pat, init = 1, plain = false) => {
+                const str = luaToStr(s);
+                let start = Math.trunc(Number(init) || 1);
+                if (start < 0) start = Math.max(1, str.length + start + 1);
+                if (plain) {
+                    const p = luaToStr(pat);
+                    const idx = str.indexOf(p, start - 1);
+                    if (idx < 0) return null;
+                    return new LuaMultiRet([idx + 1, idx + p.length]);
+                }
+                const rx = luaPatternToRegExp(pat, false);
+                const slice = str.slice(Math.max(0, start - 1));
+                const m = rx.exec(slice);
+                if (!m) return null;
+                const sIdx = (start - 1) + m.index + 1;
+                const eIdx = sIdx + m[0].length - 1;
+                const caps = m.slice(1).map((x) => (x === undefined ? null : x));
+                return new LuaMultiRet([sIdx, eIdx, ...caps]);
+            });
+            strLib.set('match', (s, pat, init = 1) => {
+                const str = luaToStr(s);
+                let start = Math.trunc(Number(init) || 1);
+                if (start < 0) start = Math.max(1, str.length + start + 1);
+                const rx = luaPatternToRegExp(pat, false);
+                const m = rx.exec(str.slice(Math.max(0, start - 1)));
+                if (!m) return null;
+                if (m.length > 1) return new LuaMultiRet(m.slice(1).map((x) => (x === undefined ? null : x)));
+                return m[0];
+            });
+            strLib.set('gmatch', (s, pat) => {
+                const str = luaToStr(s);
+                const rx = luaPatternToRegExp(pat, true);
+                const all = [];
+                let m;
+                while ((m = rx.exec(str)) !== null) {
+                    if (m[0].length === 0) rx.lastIndex++;
+                    all.push(m.length > 1 ? new LuaMultiRet(m.slice(1).map((x) => (x === undefined ? null : x))) : m[0]);
+                }
+                let idx = 0;
+                return () => (idx < all.length ? all[idx++] : null);
+            });
+            strLib.set('gsub', async (s, pat, repl, maxSub) => {
+                const str = luaToStr(s);
+                const rx = luaPatternToRegExp(pat, true);
+                const limit = maxSub === null || maxSub === undefined ? Infinity : Math.max(0, Math.trunc(Number(maxSub) || 0));
+                let count = 0;
+                let out = '';
+                let last = 0;
+                let m;
+                while (count < limit && (m = rx.exec(str)) !== null) {
+                    out += str.slice(last, m.index);
+                    const full = m[0];
+                    const caps = m.slice(1);
+                    let repVal = null;
+                    if (typeof repl === 'function') {
+                        repVal = luaFirstVal(await repl(...(caps.length ? caps : [full])));
+                    } else if (repl instanceof LuaTable) {
+                        repVal = repl.get(caps.length ? caps[0] : full);
+                    } else {
+                        repVal = luaToStr(repl).replace(/%([0-9%])/g, (_, d) => {
+                            if (d === '%') return '%';
+                            const n = parseInt(d, 10);
+                            return n === 0 ? full : (caps[n - 1] ?? '');
+                        });
+                    }
+                    out += (repVal === null || repVal === undefined || repVal === false) ? full : luaToStr(repVal);
+                    count++;
+                    last = m.index + full.length;
+                    if (full.length === 0) rx.lastIndex++;
+                }
+                out += str.slice(last);
+                return new LuaMultiRet([out, count]);
+            });
+
+            const tblLib = new LuaTable();
+            tblLib.set('insert', (tbl, posOrVal, maybeVal) => {
+                if (!(tbl instanceof LuaTable)) return;
+                const len = tbl.length();
+                if (maybeVal === undefined) {
+                    tbl.set(len + 1, posOrVal);
+                } else {
+                    const p = Math.max(1, Math.min(len + 1, Math.trunc(Number(posOrVal) || (len + 1))));
+                    for (let i = len; i >= p; i--) tbl.set(i + 1, tbl.get(i));
+                    tbl.set(p, maybeVal);
+                }
+            });
+            tblLib.set('remove', (tbl, posArg) => {
+                if (!(tbl instanceof LuaTable)) return null;
+                const len = tbl.length();
+                if (len === 0) return null;
+                const p = posArg === null || posArg === undefined ? len : Math.trunc(Number(posArg) || len);
+                const removed = tbl.get(p);
+                for (let i = p; i < len; i++) tbl.set(i, tbl.get(i + 1));
+                tbl.set(len, null);
+                return removed;
+            });
+            tblLib.set('concat', (tbl, sep = '', i = 1, j) => {
+                if (!(tbl instanceof LuaTable)) return '';
+                const s = sep === null || sep === undefined ? '' : luaToStr(sep);
+                const start = Math.trunc(Number(i) || 1);
+                const end = j === null || j === undefined ? tbl.length() : Math.trunc(Number(j));
+                const arr = [];
+                for (let k = start; k <= end; k++) arr.push(luaToStr(tbl.get(k)));
+                return arr.join(s);
+            });
+            tblLib.set('sort', async (tbl, comp) => {
+                if (!(tbl instanceof LuaTable)) return;
+                const len = tbl.length();
+                const arr = [];
+                for (let i = 1; i <= len; i++) arr.push(tbl.get(i));
+                if (typeof comp === 'function') {
+                    for (let i = 1; i < arr.length; i++) {
+                        const cur = arr[i];
+                        let j = i - 1;
+                        while (j >= 0 && luaIsTruthy(luaFirstVal(await comp(cur, arr[j])))) {
+                            arr[j + 1] = arr[j];
+                            j--;
+                        }
+                        arr[j + 1] = cur;
+                    }
+                } else {
+                    arr.sort((a, b) => (typeof a === 'number' && typeof b === 'number' ? a - b : luaToStr(a).localeCompare(luaToStr(b))));
+                }
+                for (let i = 1; i <= len; i++) tbl.set(i, arr[i - 1]);
+            });
+            tblLib.set('unpack', (tbl, i = 1, j) => {
+                if (!(tbl instanceof LuaTable)) return new LuaMultiRet([]);
+                const start = Math.trunc(Number(i) || 1);
+                const end = j === null || j === undefined ? tbl.length() : Math.trunc(Number(j));
+                const vals = [];
+                for (let k = start; k <= end; k++) vals.push(tbl.get(k));
+                return new LuaMultiRet(vals);
+            });
+            tblLib.set('shuffle', (tbl) => {
+                if (!(tbl instanceof LuaTable)) return tbl;
+                const len = tbl.length();
+                for (let i = len; i >= 2; i--) {
+                    const j = Math.floor(Math.random() * i) + 1;
+                    const tmp = tbl.get(i);
+                    tbl.set(i, tbl.get(j));
+                    tbl.set(j, tmp);
+                }
+                return tbl;
+            });
+            tblLib.set('copy', (tbl) => {
+                if (!(tbl instanceof LuaTable)) return tbl;
+                const c = new LuaTable();
+                for (const [k, v] of tbl.map.entries()) c.set(k, v);
+                return c;
+            });
+            tblLib.set('contains', (tbl, val) => {
+                if (!(tbl instanceof LuaTable)) return false;
+                for (const v of tbl.map.values()) {
+                    if (v === val) return true;
+                }
+                return false;
+            });
+
+            const mathLib = new LuaTable();
+            mathLib.set('floor', (n) => Math.floor(Number(n) || 0));
+            mathLib.set('ceil', (n) => Math.ceil(Number(n) || 0));
+            mathLib.set('abs', (n) => Math.abs(Number(n) || 0));
+            mathLib.set('sqrt', (n) => Math.sqrt(Number(n) || 0));
+            mathLib.set('pow', (a, b) => Math.pow(Number(a) || 0, Number(b) || 0));
+            mathLib.set('max', (...xs) => Math.max(...xs.map(Number)));
+            mathLib.set('min', (...xs) => Math.min(...xs.map(Number)));
+            mathLib.set('random', (m, n) => {
+                if (m === null || m === undefined) return Math.random();
+                if (n === null || n === undefined) return Math.floor(Math.random() * Math.trunc(Number(m))) + 1;
+                const a = Math.trunc(Number(m));
+                const b = Math.trunc(Number(n));
+                return Math.floor(Math.random() * (b - a + 1)) + a;
+            });
+            mathLib.set('pi', Math.PI);
+            mathLib.set('huge', Infinity);
+
+            const pairsFn = (tbl) => {
+                const entries = tbl instanceof LuaTable ? Array.from(tbl.map.entries()) : [];
+                let idx = 0;
+                const iter = () => {
+                    if (idx >= entries.length) return null;
+                    const [k, v] = entries[idx++];
+                    return new LuaMultiRet([k, v]);
+                };
+                return new LuaMultiRet([iter, tbl, null]);
+            };
+            const ipairsFn = (tbl) => {
+                const iter = (_t, cur) => {
+                    const nxt = (Number(cur) || 0) + 1;
+                    if (!(tbl instanceof LuaTable)) return null;
+                    const v = tbl.get(nxt);
+                    if (v === null || v === undefined) return null;
+                    return new LuaMultiRet([nxt, v]);
+                };
+                return new LuaMultiRet([iter, tbl, 0]);
+            };
+
+            const luaValToJsForJson = (val, depth = 0) => {
+                if (val === null || val === undefined || depth > 12) return null;
+                if (val instanceof LuaTable) {
+                    const arrLen = val.length();
+                    if (arrLen > 0 && arrLen === val.map.size) {
+                        const arr = [];
+                        for (let i = 1; i <= arrLen; i++) arr.push(luaValToJsForJson(val.get(i), depth + 1));
+                        return arr;
+                    }
+                    const obj = {};
+                    for (const [k, v] of val.map.entries()) {
+                        obj[String(k)] = luaValToJsForJson(v, depth + 1);
+                    }
+                    return obj;
+                }
+                return val;
+            };
+            const jsonLib = new LuaTable();
+            jsonLib.set('encode', (v) => JSON.stringify(luaValToJsForJson(v)));
+            jsonLib.set('decode', (s) => {
+                try {
+                    return toLuaValue(JSON.parse(String(s ?? '')));
+                } catch (_) {
+                    return null;
+                }
+            });
+
+            rootEnv.vars.string = strLib;
+            rootEnv.vars.table = tblLib;
+            rootEnv.vars.math = mathLib;
+            rootEnv.vars.json = jsonLib;
+            rootEnv.vars.require = (modName) => {
+                const name = String(modName || '').trim().toLowerCase();
+                if (name === 'json' || name === 'dkjson' || name === 'cjson' || name === 'rxi.json') return jsonLib;
+                if (name === 'math') return mathLib;
+                if (name === 'string') return strLib;
+                if (name === 'table') return tblLib;
+                if (name === 'utf8') return rootEnv.vars.utf8 || new LuaTable();
+                if (name === 'os') return rootEnv.vars.os || new LuaTable();
+                return new LuaTable();
+            };
+            rootEnv.vars.tostring = (v) => luaToStr(v);
+            rootEnv.vars.tonumber = (v, base) => {
+                if (typeof v === 'number') return v;
+                const s = String(v ?? '').trim();
+                if (!s) return null;
+                const n = base ? parseInt(s, Number(base)) : Number(s);
+                return Number.isFinite(n) ? n : null;
+            };
+            rootEnv.vars.type = (v) => {
+                if (v === null || v === undefined) return 'nil';
+                if (typeof v === 'boolean') return 'boolean';
+                if (typeof v === 'number') return 'number';
+                if (typeof v === 'string') return 'string';
+                if (typeof v === 'function') return 'function';
+                if (v instanceof LuaTable) return 'table';
+                return 'userdata';
+            };
+            rootEnv.vars.pairs = pairsFn;
+            rootEnv.vars.ipairs = ipairsFn;
+            rootEnv.vars.next = (tbl, key) => {
+                if (!(tbl instanceof LuaTable)) return null;
+                const entries = Array.from(tbl.map.entries());
+                if (key === null || key === undefined) {
+                    return entries.length ? new LuaMultiRet(entries[0]) : null;
+                }
+                const i = entries.findIndex(([k]) => k === key);
+                if (i >= 0 && i + 1 < entries.length) return new LuaMultiRet(entries[i + 1]);
+                return null;
+            };
+            rootEnv.vars.unpack = tblLib.get('unpack');
+            rootEnv.vars.select = (idx, ...args) => {
+                if (idx === '#') return args.length;
+                const n = Math.trunc(Number(idx) || 1);
+                if (n < 1) return null;
+                return new LuaMultiRet(args.slice(n - 1));
+            };
+            rootEnv.vars.pcall = async (fn, ...args) => {
+                try {
+                    const res = await fn(...args);
+                    if (res instanceof LuaMultiRet) return new LuaMultiRet([true, ...res.vals]);
+                    return new LuaMultiRet([true, res === undefined ? null : res]);
+                } catch (err) {
+                    if (err instanceof LuaPromptPause) throw err;
+                    return new LuaMultiRet([false, err && err.message ? err.message : String(err)]);
+                }
+            };
+            rootEnv.vars.error = (msg) => { throw new Error(luaToStr(msg)); };
+            rootEnv.vars.assert = (cond, msg) => {
+                if (!luaIsTruthy(cond)) throw new Error(msg ? luaToStr(msg) : 'assertion failed');
+                return cond;
+            };
+            rootEnv.vars.async = (fn) => async (...args) => fn(...args);
+            rootEnv.vars.print = () => {};
+            rootEnv.vars.log = () => {};
+
+            for (const [k, fn] of Object.entries(hostApi || {})) {
+                rootEnv.vars[k] = fn;
+            }
+
+            async function evalExprRaw(node, scope) {
+                if (++steps > MAX_STEPS) throw new Error('Lua step budget exceeded');
+                switch (node.type) {
+                    case 'lit': return node.val;
+                    case 'var': return resolveVar(scope, node.name);
+                    case 'vararg': return new LuaMultiRet(scope.varargList || []);
+                    case 'paren': return luaFirstVal(await evalExprRaw(node.expr, scope));
+                    case 'table': {
+                        const tbl = new LuaTable();
+                        let arrIdx = 1;
+                        for (let i = 0; i < node.fields.length; i++) {
+                            const f = node.fields[i];
+                            if (f.key === null) {
+                                const v = await evalExprRaw(f.val, scope);
+                                if (v instanceof LuaMultiRet && i === node.fields.length - 1) {
+                                    for (const item of v.vals) tbl.set(arrIdx++, item);
+                                } else {
+                                    tbl.set(arrIdx++, luaFirstVal(v));
+                                }
+                            } else {
+                                const k = luaFirstVal(await evalExprRaw(f.key, scope));
+                                const v = luaFirstVal(await evalExprRaw(f.val, scope));
+                                tbl.set(k, v);
+                            }
+                        }
+                        return tbl;
+                    }
+                    case 'funcExpr': {
+                        return async (...callArgs) => {
+                            const fnScope = makeScope(scope, node.vararg, callArgs.slice(node.params.length));
+                            for (let i = 0; i < node.params.length; i++) {
+                                fnScope.vars[node.params[i]] = callArgs[i] === undefined ? null : callArgs[i];
+                            }
+                            try {
+                                await execStmts(node.body, fnScope);
+                                return null;
+                            } catch (sig) {
+                                if (sig instanceof LuaReturnSignal) {
+                                    if (sig.vals.length === 0) return null;
+                                    if (sig.vals.length === 1) return sig.vals[0];
+                                    return new LuaMultiRet(sig.vals);
+                                }
+                                throw sig;
+                            }
+                        };
+                    }
+                    case 'index': {
+                        const obj = luaFirstVal(await evalExprRaw(node.obj, scope));
+                        const key = luaFirstVal(await evalExprRaw(node.key, scope));
+                        if (obj instanceof LuaTable) return obj.get(key);
+                        if (typeof obj === 'string') return strLib.get(key);
+                        if (obj && typeof obj === 'object') return obj[key] ?? null;
+                        return null;
+                    }
+                    case 'call': {
+                        const fn = luaFirstVal(await evalExprRaw(node.fn, scope));
+                        if (typeof fn !== 'function') {
+                            const fnLabel = node.fn && node.fn.type === 'var' ? node.fn.name : (node.fn && node.fn.key && node.fn.key.val ? String(node.fn.key.val) : (node.fn && node.fn.type));
+                            const typeDesc = fn === null || fn === undefined ? 'nil' : (fn instanceof LuaTable ? 'table' : typeof fn);
+                            throw new Error(`Attempt to call '${fnLabel}' (${typeDesc})`);
+                        }
+                        const rawArgs = [];
+                        for (const a of node.args) rawArgs.push(await evalExprRaw(a, scope));
+                        const args = luaExpandVals(rawArgs);
+                        return await fn(...args);
+                    }
+                    case 'methodCall': {
+                        const obj = luaFirstVal(await evalExprRaw(node.obj, scope));
+                        if (node.method === 'await') {
+                            return await obj;
+                        }
+                        let methodFn = null;
+                        if (typeof obj === 'string') methodFn = strLib.get(node.method);
+                        else if (obj instanceof LuaTable) methodFn = obj.get(node.method);
+                        else if (obj && typeof obj === 'object') methodFn = obj[node.method];
+                        if (typeof methodFn !== 'function') {
+                            throw new Error(`Attempt to call method '${node.method}' (nil)`);
+                        }
+                        const rawArgs = [];
+                        for (const a of node.args) rawArgs.push(await evalExprRaw(a, scope));
+                        const args = luaExpandVals(rawArgs);
+                        return await methodFn(obj, ...args);
+                    }
+                    case 'unary': {
+                        const v = luaFirstVal(await evalExprRaw(node.arg, scope));
+                        if (node.op === 'not') return !luaIsTruthy(v);
+                        if (node.op === '#') {
+                            if (typeof v === 'string') return v.length;
+                            if (v instanceof LuaTable) return v.length();
+                            return 0;
+                        }
+                        if (node.op === '-') return -luaToNum(v);
+                        if (node.op === '~') return ~Math.trunc(luaToNum(v));
+                        return null;
+                    }
+                    case 'binary': {
+                        if (node.op === 'and') {
+                            const l = luaFirstVal(await evalExprRaw(node.left, scope));
+                            return luaIsTruthy(l) ? luaFirstVal(await evalExprRaw(node.right, scope)) : l;
+                        }
+                        if (node.op === 'or') {
+                            const l = luaFirstVal(await evalExprRaw(node.left, scope));
+                            return luaIsTruthy(l) ? l : luaFirstVal(await evalExprRaw(node.right, scope));
+                        }
+                        const l = luaFirstVal(await evalExprRaw(node.left, scope));
+                        const r = luaFirstVal(await evalExprRaw(node.right, scope));
+                        switch (node.op) {
+                            case '..': return luaToStr(l) + luaToStr(r);
+                            case '==': return l === r;
+                            case '~=': return l !== r;
+                            case '<': return (typeof l === 'string' && typeof r === 'string') ? (l < r) : (luaToNum(l) < luaToNum(r));
+                            case '>': return (typeof l === 'string' && typeof r === 'string') ? (l > r) : (luaToNum(l) > luaToNum(r));
+                            case '<=': return (typeof l === 'string' && typeof r === 'string') ? (l <= r) : (luaToNum(l) <= luaToNum(r));
+                            case '>=': return (typeof l === 'string' && typeof r === 'string') ? (l >= r) : (luaToNum(l) >= luaToNum(r));
+                            case '+': return luaToNum(l) + luaToNum(r);
+                            case '-': return luaToNum(l) - luaToNum(r);
+                            case '*': return luaToNum(l) * luaToNum(r);
+                            case '/': return luaToNum(l) / luaToNum(r);
+                            case '//': return Math.floor(luaToNum(l) / luaToNum(r));
+                            case '%': {
+                                const a = luaToNum(l), b = luaToNum(r);
+                                return a - Math.floor(a / b) * b;
+                            }
+                            case '^': return Math.pow(luaToNum(l), luaToNum(r));
+                            case '&': return Math.trunc(luaToNum(l)) & Math.trunc(luaToNum(r));
+                            case '|': return Math.trunc(luaToNum(l)) | Math.trunc(luaToNum(r));
+                            case '~': return Math.trunc(luaToNum(l)) ^ Math.trunc(luaToNum(r));
+                            case '<<': return Math.trunc(luaToNum(l)) << Math.trunc(luaToNum(r));
+                            case '>>': return Math.trunc(luaToNum(l)) >> Math.trunc(luaToNum(r));
+                            default: return null;
+                        }
+                    }
+                    default:
+                        return null;
+                }
+            }
+
+            async function evalList(exprs, scope) {
+                const raw = [];
+                for (const e of exprs) raw.push(await evalExprRaw(e, scope));
+                return luaExpandVals(raw);
+            }
+
+            async function execStmts(stmts, scope) {
+                for (const st of stmts) {
+                    if (++steps > MAX_STEPS) throw new Error('Lua step budget exceeded');
+                    switch (st.type) {
+                        case 'do':
+                            await execStmts(st.body, makeScope(scope));
+                            break;
+                        case 'local': {
+                            if (st.isFuncDecl) {
+                                scope.vars[st.names[0]] = null;
+                                scope.vars[st.names[0]] = luaFirstVal(await evalExprRaw(st.values[0], scope));
+                            } else {
+                                const vals = st.values.length ? await evalList(st.values, scope) : [];
+                                for (let i = 0; i < st.names.length; i++) {
+                                    scope.vars[st.names[i]] = vals[i] === undefined ? null : vals[i];
+                                }
+                            }
+                            break;
+                        }
+                        case 'assign': {
+                            const vals = await evalList(st.values, scope);
+                            const pairsToSet = [];
+                            for (let i = 0; i < st.targets.length; i++) {
+                                const tgt = st.targets[i];
+                                const val = vals[i] === undefined ? null : vals[i];
+                                if (tgt.type === 'var') {
+                                    pairsToSet.push({ kind: 'var', name: tgt.name, val });
+                                } else if (tgt.type === 'index') {
+                                    const obj = luaFirstVal(await evalExprRaw(tgt.obj, scope));
+                                    const key = luaFirstVal(await evalExprRaw(tgt.key, scope));
+                                    pairsToSet.push({ kind: 'index', obj, key, val });
+                                }
+                            }
+                            for (const pSet of pairsToSet) {
+                                if (pSet.kind === 'var') assignVar(scope, pSet.name, pSet.val);
+                                else if (pSet.obj instanceof LuaTable) pSet.obj.set(pSet.key, pSet.val);
+                            }
+                            break;
+                        }
+                        case 'exprStmt':
+                            await evalExprRaw(st.expr, scope);
+                            break;
+                        case 'if': {
+                            let ran = false;
+                            for (const br of st.branches) {
+                                if (luaIsTruthy(luaFirstVal(await evalExprRaw(br.cond, scope)))) {
+                                    await execStmts(br.body, makeScope(scope));
+                                    ran = true;
+                                    break;
+                                }
+                            }
+                            if (!ran && st.elseBody) await execStmts(st.elseBody, makeScope(scope));
+                            break;
+                        }
+                        case 'while': {
+                            while (luaIsTruthy(luaFirstVal(await evalExprRaw(st.cond, scope)))) {
+                                try {
+                                    await execStmts(st.body, makeScope(scope));
+                                } catch (sig) {
+                                    if (sig instanceof LuaBreakSignal) break;
+                                    throw sig;
+                                }
+                            }
+                            break;
+                        }
+                        case 'repeat': {
+                            while (true) {
+                                const rScope = makeScope(scope);
+                                try {
+                                    await execStmts(st.body, rScope);
+                                } catch (sig) {
+                                    if (sig instanceof LuaBreakSignal) break;
+                                    throw sig;
+                                }
+                                if (luaIsTruthy(luaFirstVal(await evalExprRaw(st.cond, rScope)))) break;
+                            }
+                            break;
+                        }
+                        case 'forNum': {
+                            const start = luaToNum(luaFirstVal(await evalExprRaw(st.start, scope)));
+                            const limit = luaToNum(luaFirstVal(await evalExprRaw(st.limit, scope)));
+                            const step = luaToNum(luaFirstVal(await evalExprRaw(st.step, scope)));
+                            for (let v = start; step >= 0 ? v <= limit : v >= limit; v += step) {
+                                const loopScope = makeScope(scope);
+                                loopScope.vars[st.varName] = v;
+                                try {
+                                    await execStmts(st.body, loopScope);
+                                } catch (sig) {
+                                    if (sig instanceof LuaBreakSignal) break;
+                                    throw sig;
+                                }
+                            }
+                            break;
+                        }
+                        case 'forIn': {
+                            const initVals = await evalList(st.iters, scope);
+                            const iterFn = initVals[0];
+                            const stateVal = initVals[1] === undefined ? null : initVals[1];
+                            let varVal = initVals[2] === undefined ? null : initVals[2];
+                            if (typeof iterFn !== 'function') break;
+                            while (true) {
+                                const rawNext = await iterFn(stateVal, varVal);
+                                const nextVals = rawNext instanceof LuaMultiRet ? rawNext.vals : [rawNext === undefined ? null : rawNext];
+                                if (nextVals[0] === null || nextVals[0] === undefined) break;
+                                varVal = nextVals[0];
+                                const loopScope = makeScope(scope);
+                                for (let i = 0; i < st.names.length; i++) {
+                                    loopScope.vars[st.names[i]] = nextVals[i] === undefined ? null : nextVals[i];
+                                }
+                                try {
+                                    await execStmts(st.body, loopScope);
+                                } catch (sig) {
+                                    if (sig instanceof LuaBreakSignal) break;
+                                    throw sig;
+                                }
+                            }
+                            break;
+                        }
+                        case 'return': {
+                            const vals = st.values.length ? await evalList(st.values, scope) : [];
+                            throw new LuaReturnSignal(vals);
+                        }
+                        case 'break':
+                            throw new LuaBreakSignal();
+                    }
+                }
+            }
+
+            const combined = Array.isArray(luaCodes) ? luaCodes.join('\n') : String(luaCodes || '');
+            if (!combined.trim()) return { ran: false, pause: null };
+
+            const ast = parseLua(combined);
+            try {
+                await execStmts(ast, rootEnv);
+                const targetFn = rootEnv.vars[triggerName];
+                if (typeof targetFn !== 'function') {
+                    return { ran: false, pause: null };
+                }
+                await targetFn('risustand_trigger');
+                return { ran: true, pause: null };
+            } catch (sig) {
+                if (sig instanceof LuaPromptPause) {
+                    return { ran: true, pause: sig.info };
+                }
+                if (sig instanceof LuaReturnSignal) {
+                    return { ran: true, pause: null };
+                }
+                throw sig;
+            }
+        }
+
+        async function runBotTrigger(cIdx, chIdx, triggerName, promptAnswers = []) {
+            const charObj = await risuai.getCharacterFromIndex(cIdx);
+            const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
+            if (!charObj || !chatObj) {
+                return { kind: 'error', message: '캐릭터 또는 채팅방을 찾을 수 없습니다.' };
+            }
+            if (!chatObj.scriptstate || typeof chatObj.scriptstate !== 'object') {
+                chatObj.scriptstate = {};
+            }
+
+            let db = null;
+            let enabledModules = [];
+            try {
+                db = await risuai.getDatabase(['modules', 'enabledModules', 'personas', 'selectedPersona', 'globalChatVariables']);
+                if (db && Array.isArray(db.modules)) {
+                    const enSet = new Set([
+                        ...(Array.isArray(db.enabledModules) ? db.enabledModules.map(String) : []),
+                        ...(Array.isArray(chatObj.modules) ? chatObj.modules.map(String) : []),
+                    ]);
+                    enabledModules = db.modules.filter((m) => m && enSet.has(String(m.id)));
+                }
+            } catch (_) {}
+
+            let pcCharIdx = -1;
+            try { pcCharIdx = await risuai.getCurrentCharacterIndex(); } catch (_) {}
+
+            // Layer 1: Try native RisuAI API or live DOM click if available on active PC chat
+            if (typeof risuai.runTrigger === 'function' && cIdx === pcCharIdx) {
+                try {
+                    await risuai.runTrigger(triggerName);
+                    lastSnapSig = '';
+                    return { kind: 'ok' };
+                } catch (_) {}
+            }
+
+            // Collect non-Lua manual triggers and isolated Lua trigger code groups
+            const luaGroups = [];
+            const allTriggers = [];
+            const extractLuaCodes = (trList) => {
+                const codes = [];
+                for (const tr of trList || []) {
+                    if (!tr || !Array.isArray(tr.effect)) continue;
+                    for (const ef of tr.effect) {
+                        if (ef && ef.type === 'triggerlua' && ef.code) {
+                            codes.push(String(ef.code));
+                        }
+                    }
+                }
+                return codes;
+            };
+            if (Array.isArray(charObj.triggerscript)) {
+                allTriggers.push(...charObj.triggerscript);
+                const charLua = extractLuaCodes(charObj.triggerscript);
+                if (charLua.length) luaGroups.push({ source: charObj.name || 'character', codes: charLua });
+            }
+            for (const m of enabledModules) {
+                if (m && Array.isArray(m.trigger)) {
+                    allTriggers.push(...m.trigger);
+                    const modLua = extractLuaCodes(m.trigger);
+                    if (modLua.length) luaGroups.push({ source: m.name || m.id || 'module', codes: modLua });
+                }
+            }
+
+            // Layer 2: Non-Lua manual trigger matching comment/name
+            for (const tr of allTriggers) {
+                if (!tr || tr.type !== 'manual') continue;
+                if (tr.comment === triggerName || tr.id === triggerName) {
+                    let applied = false;
+                    for (const ef of tr.effect || []) {
+                        if (!ef) continue;
+                        if ((ef.type === 'setvar' || ef.type === 'v2SetVar') && ef.var) {
+                            const key = String(ef.var).startsWith('$') ? String(ef.var).slice(1) : String(ef.var);
+                            if (ef.operator === '+=') {
+                                chatObj.scriptstate['$' + key] = String((Number(chatObj.scriptstate['$' + key]) || 0) + (Number(ef.value) || 0));
+                            } else if (ef.operator === '-=') {
+                                chatObj.scriptstate['$' + key] = String((Number(chatObj.scriptstate['$' + key]) || 0) - (Number(ef.value) || 0));
+                            } else {
+                                chatObj.scriptstate['$' + key] = String(ef.value ?? '');
+                            }
+                            applied = true;
+                        }
+                    }
+                    if (applied) {
+                        await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                        lastSnapSig = '';
+                        return { kind: 'ok' };
+                    }
+                }
+            }
+
+            // Layer 3: Execute Lua trigger script groups independently
+            if (!luaGroups.length) {
+                if (cIdx === pcCharIdx && rootDoc) {
+                    try {
+                        const el = await rootDoc.querySelector(`[risu-trigger="${String(triggerName).replace(/"/g, '\\"')}"]`);
+                        if (el && typeof el.click === 'function') {
+                            await el.click();
+                            lastSnapSig = '';
+                            return { kind: 'ok' };
+                        }
+                    } catch (_) {}
+                }
+                return { kind: 'error', message: `트리거 '${triggerName}' 를 실행할 스크립트를 찾지 못했습니다.` };
+            }
+
+            let dirty = false;
+            const notices = [];
+            let promptCursor = 0;
+            const answers = Array.isArray(promptAnswers) ? promptAnswers : [];
+            const globalVars = {
+                ...(db && db.globalChatVariables ? db.globalChatVariables : {}),
+                ...(chatObj.useLocallySetGlobalVariables && chatObj.GLGlobalVariables ? chatObj.GLGlobalVariables : {}),
+            };
+            let personaName = 'User';
+            if (db && Array.isArray(db.personas)) {
+                const per = db.personas[db.selectedPersona || 0];
+                if (per && per.name) personaName = per.name;
+            }
+
+            const luaValueToJs = (val, depth = 0) => {
+                if (val === null || val === undefined || depth > 12) return null;
+                if (val instanceof LuaTable) {
+                    const arrLen = val.length();
+                    if (arrLen > 0 && arrLen === val.map.size) {
+                        const arr = [];
+                        for (let i = 1; i <= arrLen; i++) arr.push(luaValueToJs(val.get(i), depth + 1));
+                        return arr;
+                    }
+                    const obj = {};
+                    for (const [k, v] of val.map.entries()) {
+                        obj[String(k)] = luaValueToJs(v, depth + 1);
+                    }
+                    return obj;
+                }
+                return val;
+            };
+
+            const hostApi = {
+                getChatVar: (_tid, k) => {
+                    const clean = String(k || '').replace(/^\$/, '');
+                    const key = '$' + clean;
+                    if (!Object.prototype.hasOwnProperty.call(chatObj.scriptstate, key)) return null;
+                    const v = chatObj.scriptstate[key];
+                    return typeof v === 'object' && v !== null ? toLuaValue(v) : v;
+                },
+                getState: (_tid, k) => {
+                    const clean = String(k || '').replace(/^\$/, '');
+                    const key = '$' + clean;
+                    if (!Object.prototype.hasOwnProperty.call(chatObj.scriptstate, key)) return null;
+                    const v = chatObj.scriptstate[key];
+                    if (typeof v === 'object' && v !== null) return toLuaValue(v);
+                    if (typeof v === 'string' && ((v.startsWith('{') && v.endsWith('}')) || (v.startsWith('[') && v.endsWith(']')))) {
+                        try { return toLuaValue(JSON.parse(v)); } catch (_) {}
+                    }
+                    return v;
+                },
+                setChatVar: (_tid, k, v) => {
+                    const clean = String(k || '').replace(/^\$/, '');
+                    if (v === null || v === undefined) chatObj.scriptstate['$' + clean] = '';
+                    else if (v instanceof LuaTable) chatObj.scriptstate['$' + clean] = JSON.stringify(luaValueToJs(v));
+                    else chatObj.scriptstate['$' + clean] = String(v);
+                    dirty = true;
+                },
+                setState: (_tid, k, v) => {
+                    const clean = String(k || '').replace(/^\$/, '');
+                    const key = '$' + clean;
+                    if (v === null || v === undefined) delete chatObj.scriptstate[key];
+                    else chatObj.scriptstate[key] = luaValueToJs(v);
+                    dirty = true;
+                },
+                getGlobalVar: (_tid, k) => {
+                    const key = String(k || '');
+                    if (Object.prototype.hasOwnProperty.call(globalVars, key)) return globalVars[key];
+                    if (Object.prototype.hasOwnProperty.call(globalVars, 'toggle_' + key)) return globalVars['toggle_' + key];
+                    return null;
+                },
+                listenEdit: () => {},
+                getName: () => charObj.name || 'Character',
+                getPersonaName: () => personaName,
+                getFullChat: () => {
+                    const list = Array.isArray(chatObj.message) ? chatObj.message : [];
+                    return toLuaValue(list.map((m) => ({ role: m.role || 'char', data: String(m.data || '') })));
+                },
+                getChat: (_tid, idx) => {
+                    const list = Array.isArray(chatObj.message) ? chatObj.message : [];
+                    const m = list[Number(idx)];
+                    return m ? toLuaValue({ role: m.role || 'char', data: String(m.data || '') }) : null;
+                },
+                getChatLength: () => (Array.isArray(chatObj.message) ? chatObj.message.length : 0),
+                setChat: (_tid, idx, data) => {
+                    if (!Array.isArray(chatObj.message)) chatObj.message = [];
+                    const i = Number(idx);
+                    if (i >= 0 && chatObj.message[i]) {
+                        chatObj.message[i].data = String(data ?? '');
+                        dirty = true;
+                    }
+                },
+                addChat: (_tid, role, data) => {
+                    if (!Array.isArray(chatObj.message)) chatObj.message = [];
+                    chatObj.message.push({ role: role === 'user' ? 'user' : 'char', data: String(data ?? ''), time: Date.now() });
+                    dirty = true;
+                },
+                removeChat: (_tid, idx) => {
+                    if (!Array.isArray(chatObj.message)) return;
+                    const i = Number(idx);
+                    if (i >= 0 && i < chatObj.message.length) {
+                        chatObj.message.splice(i, 1);
+                        dirty = true;
+                    }
+                },
+                getAuthorsNote: () => String(chatObj.note || ''),
+                setAuthorsNote: (_tid, note) => { chatObj.note = String(note ?? ''); dirty = true; },
+                getLoreBooks: () => toLuaValue([]),
+                upsertLocalLoreBook: () => {},
+                reloadDisplay: () => { dirty = true; },
+                reloadChat: () => { dirty = true; },
+                stopChat: () => {},
+                alertNormal: (_tid, msg) => { notices.push({ kind: 'notice', message: String(msg ?? '') }); },
+                alertError: (_tid, msg) => { notices.push({ kind: 'error', message: String(msg ?? '') }); },
+                alertConfirm: (_tid, msg) => {
+                    if (promptCursor < answers.length) return answers[promptCursor++] === '0';
+                    throw new LuaPromptPause({
+                        kind: 'prompt_select',
+                        message: String(msg ?? '계속할까요?'),
+                        options: ['확인', '취소'],
+                        trigger: triggerName,
+                        charIndex: cIdx,
+                        chatIndex: chIdx,
+                        answersSoFar: answers.slice(),
+                    });
+                },
+                alertInput: (_tid, msg) => {
+                    if (promptCursor < answers.length) return String(answers[promptCursor++] ?? '');
+                    throw new LuaPromptPause({
+                        kind: 'prompt_input',
+                        message: String(msg ?? '값을 입력하세요'),
+                        options: [],
+                        trigger: triggerName,
+                        charIndex: cIdx,
+                        chatIndex: chIdx,
+                        answersSoFar: answers.slice(),
+                    });
+                },
+                alertSelect: (_tid, options, msg) => {
+                    if (promptCursor < answers.length) return String(answers[promptCursor++] ?? '0');
+                    throw new LuaPromptPause({
+                        kind: 'prompt_select',
+                        message: String(msg ?? '항목을 선택하세요'),
+                        options: luaTableToArray(options),
+                        trigger: triggerName,
+                        charIndex: cIdx,
+                        chatIndex: chIdx,
+                        answersSoFar: answers.slice(),
+                    });
+                },
+            };
+
+            let ran = false;
+            let lastLuaErr = null;
+            for (const grp of luaGroups) {
+                try {
+                    const res = await executeRisuLuaTrigger(grp.codes, triggerName, hostApi);
+                    if (res.pause) {
+                        return res.pause;
+                    }
+                    if (res.ran) {
+                        ran = true;
+                        break;
+                    }
+                } catch (err) {
+                    lastLuaErr = err;
+                }
+            }
+            if (!ran) {
+                if (lastLuaErr) {
+                    return { kind: 'error', message: `트리거 오류: ${lastLuaErr && lastLuaErr.message ? lastLuaErr.message : String(lastLuaErr)}` };
+                }
+                return { kind: 'error', message: `트리거 함수 '${triggerName}' 를 찾지 못했습니다.` };
+            }
+            if (dirty) {
+                await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                lastSnapSig = '';
+            }
+            if (notices.length) {
+                return notices[notices.length - 1];
+            }
+            return { kind: 'ok' };
         }
     
         async function handleCommand(cmd) {
@@ -4936,24 +6963,149 @@
                 const chIdx = Number(p.chatIndex);
                 const mIdx = Number(p.msgIndex);
                 if (Number.isNaN(cIdx) || Number.isNaN(chIdx) || Number.isNaN(mIdx) || mIdx < 0) return;
+                const charObj = await risuai.getCharacterFromIndex(cIdx);
                 const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
                 if (!chatObj || !Array.isArray(chatObj.message) || !chatObj.message[mIdx]) return;
+                const prevLen = chatObj.message.length;
                 chatObj.message.splice(mIdx, 1);
                 await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                const prefix = `${(charObj && charObj.chaId) || cIdx}:${(chatObj && chatObj.id) || chIdx}:`;
+                delete swipeHistory[`${prefix}${mIdx}`];
+                for (let k = mIdx + 1; k < prevLen; k++) {
+                    if (swipeHistory[`${prefix}${k}`]) {
+                        swipeHistory[`${prefix}${k - 1}`] = swipeHistory[`${prefix}${k}`];
+                        delete swipeHistory[`${prefix}${k}`];
+                    }
+                }
+                await saveSwipeHistory();
                 lastSnapSig = '';
                 lastCatalogSig = '';
                 setTimeout(() => pollOnce(true), 120);
                 return;
             }
+
+            if (type === 'swipe_message') {
+                const cIdx = Number(p.charIndex);
+                const chIdx = Number(p.chatIndex);
+                const mIdx = Number(p.msgIndex);
+                const delta = Number(p.delta) || 0;
+                if (Number.isNaN(cIdx) || Number.isNaN(chIdx) || Number.isNaN(mIdx) || mIdx < 0 || !delta) return;
+                const charObj = await risuai.getCharacterFromIndex(cIdx);
+                const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
+                if (!chatObj || !Array.isArray(chatObj.message) || !chatObj.message[mIdx]) return;
+                const key = makeSwipeKey(charObj, cIdx, chatObj, chIdx, mIdx);
+                const entry = swipeHistory[key];
+                if (!entry || !Array.isArray(entry.swipes) || entry.swipes.length <= 1) return;
+                const nextIdx = (entry.index + delta + entry.swipes.length) % entry.swipes.length;
+                entry.index = nextIdx;
+                chatObj.message[mIdx].data = String(entry.swipes[nextIdx] || '');
+                await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                await saveSwipeHistory();
+                lastSnapSig = '';
+                setTimeout(() => pollOnce(true), 120);
+                return;
+            }
+
+            if (type === 'replace_message_with_swipe') {
+                const cIdx = Number(p.charIndex);
+                const chIdx = Number(p.chatIndex);
+                const mIdx = Number(p.msgIndex);
+                if (Number.isNaN(cIdx) || Number.isNaN(chIdx) || Number.isNaN(mIdx) || mIdx < 0) return;
+                const charObj = await risuai.getCharacterFromIndex(cIdx);
+                const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
+                if (!chatObj || !Array.isArray(chatObj.message) || !chatObj.message[mIdx]) return;
+                const prevData = String(chatObj.message[mIdx].data || '');
+                const newData = String(p.newData || '');
+                if (!newData) return;
+                const key = makeSwipeKey(charObj, cIdx, chatObj, chIdx, mIdx);
+                recordSwipeVersion(key, prevData, newData);
+                chatObj.message[mIdx].data = newData;
+                await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                await saveSwipeHistory();
+                lastSnapSig = '';
+                setTimeout(() => pollOnce(true), 120);
+                return;
+            }
+
+            if (type === 'reroll_message') {
+                const cIdx = Number(p.charIndex);
+                const chIdx = Number(p.chatIndex);
+                const mIdx = Number(p.msgIndex);
+                const pcCharIdx = await risuai.getCurrentCharacterIndex();
+                if (Number.isNaN(cIdx) || Number.isNaN(chIdx) || Number.isNaN(mIdx) || mIdx < 0) return;
+                if (cIdx !== pcCharIdx || pcCharIdx < 0) return;
+
+                const charObj = await risuai.getCharacterFromIndex(cIdx);
+                const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
+                if (!charObj || !chatObj || !Array.isArray(chatObj.message) || !chatObj.message[mIdx]) return;
+                if (chatObj.message[mIdx].role === 'user' || mIdx !== chatObj.message.length - 1) return;
+
+                const prevMsg = { ...chatObj.message[mIdx] };
+                const key = makeSwipeKey(charObj, cIdx, chatObj, chIdx, mIdx);
+                recordSwipeVersion(key, prevMsg.data);
+                isGenerating = true;
+                try {
+                    chatObj.message.splice(mIdx, 1);
+                    await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                    if (charObj.chatPage !== chIdx) {
+                        charObj.chatPage = chIdx;
+                        await risuai.setCharacterToIndex(cIdx, charObj);
+                    }
+                    await risuai.sendChat('');
+                    const afterChat = await risuai.getChatFromIndex(cIdx, chIdx);
+                    if (afterChat && Array.isArray(afterChat.message) && afterChat.message[mIdx] && afterChat.message[mIdx].role !== 'user' && String(afterChat.message[mIdx].data || '').trim()) {
+                        recordSwipeVersion(key, prevMsg.data, afterChat.message[mIdx].data);
+                    } else if (afterChat && Array.isArray(afterChat.message) && afterChat.message.length <= mIdx) {
+                        afterChat.message.push(prevMsg);
+                        await risuai.setChatToIndex(cIdx, chIdx, afterChat);
+                    }
+                    await saveSwipeHistory();
+                } catch (err) {
+                    try {
+                        const fallbackChat = await risuai.getChatFromIndex(cIdx, chIdx);
+                        if (fallbackChat && Array.isArray(fallbackChat.message) && fallbackChat.message.length <= mIdx) {
+                            fallbackChat.message.push(prevMsg);
+                            await risuai.setChatToIndex(cIdx, chIdx, fallbackChat);
+                        }
+                    } catch (_) {}
+                    pendingTriggerEvent = {
+                        id: makeUuid(),
+                        at: Date.now(),
+                        kind: 'error',
+                        message: `리롤 오류: ${err && err.message ? err.message : '실패'}`,
+                    };
+                } finally {
+                    isGenerating = false;
+                    lastSnapSig = '';
+                    lastCatalogSig = '';
+                    setTimeout(() => pollOnce(true), 350);
+                }
+                return;
+            }
     
             if (type === 'toggle_module' && p.moduleId) {
-                const db = await risuai.getDatabase(['enabledModules']);
-                if (!db) return;
-                const set = new Set(Array.isArray(db.enabledModules) ? db.enabledModules : []);
-                if (p.enabled) set.add(String(p.moduleId));
-                else set.delete(String(p.moduleId));
-                await risuai.setDatabaseLite({ enabledModules: Array.from(set) });
+                const modId = String(p.moduleId);
+                if (p.scope === 'chat') {
+                    const cIdx = Number.isNaN(Number(p.charIndex)) ? viewCharIndex : Number(p.charIndex);
+                    const chIdx = Number.isNaN(Number(p.chatIndex)) ? viewChatIndex : Number(p.chatIndex);
+                    if (cIdx < 0 || chIdx < 0) return;
+                    const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
+                    if (!chatObj) return;
+                    const set = new Set(Array.isArray(chatObj.modules) ? chatObj.modules.map(String) : []);
+                    if (p.enabled) set.add(modId);
+                    else set.delete(modId);
+                    chatObj.modules = Array.from(set);
+                    await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                } else {
+                    const db = await risuai.getDatabase(['enabledModules']);
+                    if (!db) return;
+                    const set = new Set(Array.isArray(db.enabledModules) ? db.enabledModules.map(String) : []);
+                    if (p.enabled) set.add(modId);
+                    else set.delete(modId);
+                    await risuai.setDatabaseLite({ enabledModules: Array.from(set) });
+                }
                 lastCatalogSig = '';
+                lastSnapSig = '';
                 setTimeout(() => pollOnce(true), 150);
                 return;
             }
@@ -5041,6 +7193,26 @@
                 return;
             }
 
+            if (type === 'run_trigger' && p.trigger) {
+                const cIdx = Number.isNaN(Number(p.charIndex)) ? viewCharIndex : Number(p.charIndex);
+                const chIdx = Number.isNaN(Number(p.chatIndex)) ? viewChatIndex : Number(p.chatIndex);
+                try {
+                    const ev = await runBotTrigger(cIdx, chIdx, String(p.trigger), p.promptAnswers || []);
+                    if (ev && ev.kind !== 'ok') {
+                        pendingTriggerEvent = { id: makeUuid(), at: Date.now(), ...ev };
+                    }
+                } catch (err) {
+                    pendingTriggerEvent = {
+                        id: makeUuid(),
+                        at: Date.now(),
+                        kind: 'error',
+                        message: `트리거 오류: ${err && err.message ? err.message : String(err)}`,
+                    };
+                }
+                setTimeout(() => pollOnce(true), 80);
+                return;
+            }
+
             if (type === 'update_params') {
                 const patch = {};
                 if (typeof p.temperature === 'number' && !Number.isNaN(p.temperature)) patch.temperature = p.temperature;
@@ -5062,6 +7234,7 @@
                 const endpoint = cfg.relayUrl.replace(/\/+$/, '') + '/api/pc/poll';
                 const catalog = await buildCatalog(forceFull);
                 const snapshot = await buildSnapshot(forceFull);
+                const triggerEvent = pendingTriggerEvent;
     
                 const res = await risuai.nativeFetch(endpoint, {
                     method: 'POST',
@@ -5076,12 +7249,16 @@
                         supportsBatchCommands: true,
                         catalog,
                         snapshot,
+                        triggerEvent,
                     }),
                 });
     
                 if (!res || !res.ok) {
                     lastStatus = `연결 오류 (HTTP ${res ? res.status : '?'})`;
                     return;
+                }
+                if (triggerEvent && pendingTriggerEvent && pendingTriggerEvent.id === triggerEvent.id) {
+                    pendingTriggerEvent = null;
                 }
     
                 const data = await res.json();
@@ -5174,6 +7351,7 @@
                     <div class="btns">
                         <button class="btn btn-primary" id="saveBtn">저장 및 연결</button>
                         <button class="btn btn-ghost" id="syncBtn">전체 동기화</button>
+                        <button class="btn btn-ghost" id="permBtn">🔐 권한 요청</button>
                         <button class="btn btn-ghost" id="closeBtn">닫기</button>
                     </div>
                     <div class="tip">
@@ -5190,6 +7368,9 @@
                 cfg.includeImages = document.getElementById('includeImages').checked;
                 cfg.pollIntervalMs = Number(document.getElementById('pollIntervalMs').value) || 1800;
                 await saveCfg();
+                if (cfg.enabled) {
+                    await requestAllPermissionsOnce(false);
+                }
                 lastSnapSig = '';
                 lastCatalogSig = '';
                 restartPolling();
@@ -5200,6 +7381,12 @@
                 lastSnapSig = '';
                 lastCatalogSig = '';
                 await pollOnce(true);
+                renderSettingsUI();
+            };
+
+            document.getElementById('permBtn').onclick = async () => {
+                await requestAllPermissionsOnce(true);
+                lastStatus = '🔐 권한 요청 완료';
                 renderSettingsUI();
             };
     

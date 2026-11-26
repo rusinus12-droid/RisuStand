@@ -151,6 +151,7 @@ const state = {
     generating: false,
     directGenerating: false,
     lastDirectError: null,
+    lastTriggerEvent: null,
     catalog: {
         pcActiveCharIndex: -1,
         pcActiveChatIndex: -1,
@@ -167,6 +168,9 @@ const state = {
         chatName: '',
         isPcActive: false,
         totalMessages: 0,
+        chatModules: [],
+        backgroundHtml: '',
+        assetMap: {},
         messages: [],
         charContext: null,
     },
@@ -801,6 +805,7 @@ async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = st
     if (ctx.desc) sysParts.push(`[Character Description]\n${ctx.desc}`);
     if (ctx.personality) sysParts.push(`[Personality]\n${ctx.personality}`);
     if (ctx.scenario) sysParts.push(`[Scenario]\n${ctx.scenario}`);
+    if (ctx.moduleLore) sysParts.push(`[World / Module Lorebook]\n${ctx.moduleLore}`);
     if (ctx.personaName || ctx.personaPrompt) {
         sysParts.push(`[User Persona: ${ctx.personaName || 'User'}]\n${ctx.personaPrompt || ''}`);
     }
@@ -828,6 +833,54 @@ async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = st
                 { role: 'user', data: userText },
                 { role: 'char', data: result.text },
             ],
+        });
+        return result.text;
+    } finally {
+        state.directGenerating = false;
+    }
+}
+
+async function runDirectRemoteReroll(charIndex, chatIndex, msgIndex, snapView = state.snapshot) {
+    const profile = getActiveProfile();
+    if (!profile) {
+        throw new Error('PC에서 현재 열려있지 않은 봇을 리롤하려면 [모델/번역] 탭에서 활성 모델 프로필을 먼저 설정해야 합니다.');
+    }
+    const snap = snapView || state.snapshot;
+    const ctx = snap && snap.charContext ? snap.charContext : { name: (snap && snap.charName) || 'Character' };
+
+    const sysParts = [];
+    sysParts.push(`You are roleplaying as ${ctx.name}. Stay in character and respond naturally.`);
+    if (ctx.systemPrompt) sysParts.push(ctx.systemPrompt);
+    if (ctx.desc) sysParts.push(`[Character Description]\n${ctx.desc}`);
+    if (ctx.personality) sysParts.push(`[Personality]\n${ctx.personality}`);
+    if (ctx.scenario) sysParts.push(`[Scenario]\n${ctx.scenario}`);
+    if (ctx.moduleLore) sysParts.push(`[World / Module Lorebook]\n${ctx.moduleLore}`);
+    if (ctx.personaName || ctx.personaPrompt) {
+        sysParts.push(`[User Persona: ${ctx.personaName || 'User'}]\n${ctx.personaPrompt || ''}`);
+    }
+    if (ctx.note) sysParts.push(`[Author's Note]\n${ctx.note}`);
+
+    const msgs = [{ role: 'system', content: sysParts.join('\n\n') }];
+    const prior = (Array.isArray(snap.messages) ? snap.messages : [])
+        .filter((m) => m.index < msgIndex)
+        .slice(-20);
+    for (const m of prior) {
+        msgs.push({
+            role: m.role === 'user' ? 'user' : 'assistant',
+            content: m.raw || m.text || '',
+        });
+    }
+
+    const finalMsgs = applyPromptOverride(msgs, profile);
+    state.directGenerating = true;
+    try {
+        console.log(`[DirectReroll] char#${charIndex} chat#${chatIndex} msg#${msgIndex} via ${profile.name} (${profile.model})`);
+        const result = await callLLMNonStream(profile, finalMsgs);
+        queueCommand('replace_message_with_swipe', {
+            charIndex,
+            chatIndex,
+            msgIndex,
+            newData: result.text,
         });
         return result.text;
     } finally {
@@ -1112,26 +1165,49 @@ function renderWebApp() {
   .tg-cap { font-size:12px; color:var(--sub); line-height:1.5; margin:2px 0; }
   .tg-div { height:1px; background:var(--border); margin:4px 0; }
 
+  .greeting-top-bar { display:flex; align-items:center; flex-wrap:wrap; gap:6px; flex-shrink:0; padding:0 2px; }
+  body.book-mode .greeting-top-bar { padding:0 2px 8px; }
+
   /* ===== EPUB 2-Page Book Mode + 640ms 3D Paper Flip ===== */
   body.book-mode #tab-chat { --content-w: 1240px; padding-top:14px; padding-bottom:8px; }
   .book-shell { flex:1; display:flex; flex-direction:column; min-height:0; position:relative; }
   .book-frame {
-    flex:1; display:grid; grid-template-columns:1fr 1fr; gap:0;
+    flex:1; display:flex; flex-direction:column;
     background:var(--book-bg); border:1px solid var(--border); border-radius:12px;
     box-shadow: var(--shadow); overflow:hidden; position:relative;
     perspective:1800px; min-height:0;
   }
-  .book-frame.single-page { grid-template-columns:1fr; }
-  .book-page {
-    padding: clamp(20px, 4vw, 40px) clamp(18px, 4vw, 44px); overflow-y:auto;
-    font-family: var(--font); font-size:var(--fsize); line-height:var(--lh);
-    white-space:pre-wrap; word-break:keep-all; overflow-wrap:anywhere; position:relative; text-align:justify;
+  .book-frame:not(.single-page)::before {
+    content:''; position:absolute; top:0; bottom:0; left:50%; width:1px;
+    background:var(--border); pointer-events:none; z-index:3;
   }
-  .book-frame:not(.single-page) .book-page.left { border-right:1px solid var(--border); box-shadow:inset -22px 0 26px -22px var(--book-spine); }
-  .book-frame:not(.single-page) .book-page.right { box-shadow:inset 22px 0 26px -22px var(--book-spine); }
-  .book-turn-tag { font-family: var(--ui-font); font-size:11px; color:var(--accent); margin-bottom:6px; font-weight:700; letter-spacing:0.04em; }
-  .book-user-block { background:var(--user-bg); color:var(--user-text); padding:10px 14px; border-radius:8px; border-left:3px solid var(--accent); margin:10px 0 16px; text-align:left; }
+  .book-frame:not(.single-page)::after {
+    content:''; position:absolute; top:0; bottom:0; left:50%; width:48px;
+    transform:translateX(-50%); pointer-events:none; z-index:2;
+    background:linear-gradient(90deg, transparent, var(--book-spine) 50%, transparent);
+  }
+  .book-viewport {
+    flex:1; min-height:0; overflow:hidden; margin: clamp(18px, 3vw, 34px) auto; padding:0; position:relative;
+  }
+  .book-tap-zone {
+    position:absolute; top:0; bottom:0; width:12%; min-width:44px; max-width:100px;
+    z-index:6; cursor:pointer; background:transparent; user-select:none;
+  }
+  .book-tap-left { left:0; }
+  .book-tap-right { right:0; }
+  .book-tap-zone.disabled { cursor:default; }
+  .book-columns {
+    height:100%; column-fill:auto;
+    font-family: var(--font); font-size:var(--fsize); line-height:var(--lh);
+    white-space:pre-wrap; word-break:keep-all; overflow-wrap:anywhere; text-align:justify;
+  }
+  .book-frame.single-page .book-columns { text-align:left; }
+  .book-columns .msg-img-wrap { break-inside:avoid; max-width:100%; margin:10px auto; }
+  .book-columns .msg-img { max-height:38vh; max-width:100%; width:auto; height:auto; }
+  .book-turn-tag { font-family: var(--ui-font); font-size:11px; color:var(--accent); margin-bottom:6px; font-weight:700; letter-spacing:0.04em; break-after:avoid; }
+  .book-user-block { background:var(--user-bg); color:var(--user-text); padding:10px 14px; border-radius:8px; border-left:3px solid var(--accent); margin:10px 0 16px; text-align:left; break-inside:avoid; }
   .book-char-block { margin:6px 0 18px; }
+  .book-char-block .msg-actions { opacity:1; flex-wrap:wrap; align-items:center; }
 
   .epub-flip-leaf {
     position:absolute; top:0; bottom:0; width:50%; pointer-events:none; opacity:0;
@@ -1144,11 +1220,74 @@ function renderWebApp() {
   @keyframes rsFlipNext { 0% { opacity:0.95; transform:rotateY(0deg); } 50% { opacity:0.98; transform:rotateY(-90deg); } 100% { opacity:0; transform:rotateY(-180deg); } }
   @keyframes rsFlipPrev { 0% { opacity:0.95; transform:rotateY(0deg); } 50% { opacity:0.98; transform:rotateY(90deg); } 100% { opacity:0; transform:rotateY(180deg); } }
 
-  .book-nav { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:10px 2px 2px; flex-shrink:0; font-size:12.5px; color:var(--sub); font-variant-numeric: tabular-nums; }
+  .book-nav { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:10px 2px 2px; flex-shrink:0; font-size:12.5px; color:var(--sub); font-variant-numeric: tabular-nums; position:relative; }
+  .book-page-btn { min-height:30px; padding:0 12px; font-size:12px; font-variant-numeric: tabular-nums; background:var(--surface); }
+  .book-jump-bar {
+    position:absolute; left:50%; bottom:56px; transform:translateX(-50%); z-index:28;
+    width:min(360px, calc(100% - 16px)); padding:12px 14px; border-radius:14px;
+    background:var(--elev); border:1px solid var(--border); box-shadow:var(--shadow);
+    display:flex; flex-direction:column; gap:10px;
+  }
+  .book-jump-head { display:flex; align-items:center; justify-content:space-between; font-size:12px; font-weight:700; color:var(--sub); font-variant-numeric: tabular-nums; }
+  .book-jump-range { width:100%; accent-color:var(--accent); cursor:pointer; }
+  .book-jump-row { display:flex; align-items:center; gap:6px; }
+  .book-jump-row .f-inp { flex:1; min-width:0; min-height:34px; padding:6px 10px; font-size:13px; text-align:center; font-variant-numeric: tabular-nums; }
+  .book-jump-row .btn, .book-jump-row .pill { min-height:34px; padding:0 11px; flex-shrink:0; font-size:12px; }
   .turn-ruler { display:flex; align-items:center; justify-content:center; gap:5px; padding:6px 8px 2px; overflow:hidden; flex-shrink:0; }
   .ruler-tick { width:3px; height:10px; border-radius:2px; background:var(--border); cursor:pointer; transition:all 0.15s; }
   .ruler-tick:hover { background: var(--sub); }
   .ruler-tick.active { height:16px; width:4px; background:var(--accent); }
+
+  /* ===== Bot Regex HTML / Module Widgets & Trigger Modal ===== */
+  .rs-bg-host { display:contents; }
+  .rs-bot-html { white-space:normal; word-break:keep-all; overflow-wrap:anywhere; width:100%; }
+  .rs-bot-html .rs-prose-seg { white-space:pre-wrap; }
+  .rs-bot-html img { max-width:100%; height:auto; border-radius:12px; }
+  .rs-bot-html .image-container { max-width:100% !important; min-height:200px; background-size:cover; background-position:center 15%; border-radius:14px; }
+  .book-columns .rs-bot-html .image-container {
+    width:100% !important; max-width:100% !important;
+    height:min(38vh, 360px) !important; min-height:180px !important; max-height:46vh !important;
+    padding-bottom:0 !important; break-inside:avoid; margin:10px auto;
+  }
+  .book-columns .rs-bot-html > div { max-width:100%; }
+  .rs-bot-html [risu-trigger], .rs-bot-html [risu-btn] { cursor:pointer; }
+  .risu-cbs-btn { padding:6px 12px; border-radius:8px; border:1px solid var(--border); background:var(--surface); color:var(--text); font-size:12.5px; font-weight:600; cursor:pointer; margin:4px 4px 4px 0; }
+  .risu-cbs-btn:hover { border-color:var(--accent); }
+  body.asset-hide .rs-bot-html img, body.asset-hide .rs-bot-html .image-container { display:none !important; }
+  body.asset-blur .rs-bot-html img:not(.revealed), body.asset-blur .rs-bot-html .image-container:not(.revealed) { filter:blur(22px) brightness(0.72); cursor:pointer; transition:filter 0.25s ease; }
+  #bookBotOverlay:empty { display:none; }
+  #bookBotOverlay [data-rs-bot-fab="1"] {
+    position:fixed !important; top:104px !important; right:12px !important; z-index:25 !important;
+    transition: transform 0.22s ease, opacity 0.2s ease;
+  }
+  #bookBotOverlay.bot-menu-collapsed [data-rs-bot-fab="1"] {
+    opacity:0 !important; pointer-events:none !important; transform:translateX(90px) !important;
+  }
+  #botMenuFab {
+    position:fixed; right:12px; top:62px; z-index:30;
+    min-height:32px; padding:0 11px; border-radius:999px;
+    border:1px solid var(--border); background:var(--elev); color:var(--text);
+    font-size:12px; font-weight:700; cursor:pointer; box-shadow:var(--shadow-sm);
+    opacity:0.65; transition: opacity 0.18s ease, background 0.18s ease, border-color 0.18s ease;
+    -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+  }
+  #botMenuFab:hover, #botMenuFab.expanded { opacity:1; border-color:var(--accent); }
+  .msg-swipe-grp { display:inline-flex; align-items:center; gap:2px; background:var(--surface); border:1px solid var(--border); border-radius:999px; padding:1px 4px; margin-right:2px; }
+  .msg-swipe-cnt { font-size:11px; color:var(--sub); font-weight:700; padding:0 4px; font-variant-numeric:tabular-nums; }
+  #triggerModal {
+    position:fixed; inset:0; z-index:150; background:rgba(0,0,0,0.62);
+    -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
+    display:flex; align-items:center; justify-content:center; padding:18px;
+  }
+  .trig-card {
+    width:100%; max-width:420px; max-height:82vh; overflow:auto;
+    background:var(--elev); color:var(--text); border:1px solid var(--border);
+    border-radius:18px; padding:18px; box-shadow:var(--shadow);
+    display:flex; flex-direction:column; gap:12px;
+  }
+  .trig-msg { font-size:14px; line-height:1.55; white-space:pre-wrap; }
+  .trig-opts { display:flex; flex-direction:column; gap:7px; }
+  .trig-opt-btn { width:100%; justify-content:flex-start; text-align:left; padding:10px 13px; min-height:42px; }
 
   /* ===== Composer (capsule) ===== */
   .composer {
@@ -1205,18 +1344,18 @@ function renderWebApp() {
     background-position: calc(100% - 17px) 52%, calc(100% - 12px) 52%;
     background-size: 5px 5px, 5px 5px; background-repeat:no-repeat;
   }
-  input[type="checkbox"] {
+  #tab-modules input[type="checkbox"], #tab-router input[type="checkbox"] {
     -webkit-appearance:none; appearance:none; flex-shrink:0; cursor:pointer; margin:0;
     width:44px !important; height:26px !important; border-radius:999px; position:relative;
     background: var(--surface2); border:1px solid var(--border);
     transition: background 0.18s ease, border-color 0.18s ease;
   }
-  input[type="checkbox"]::after {
+  #tab-modules input[type="checkbox"]::after, #tab-router input[type="checkbox"]::after {
     content:''; position:absolute; top:2px; left:2px; width:20px; height:20px; border-radius:50%;
     background:#fff; box-shadow: 0 1px 3px rgba(0,0,0,0.3); transition: transform 0.18s ease;
   }
-  input[type="checkbox"]:checked { background:var(--accent); border-color:var(--accent); }
-  input[type="checkbox"]:checked::after { transform: translateX(18px); background: var(--on-accent); }
+  #tab-modules input[type="checkbox"]:checked, #tab-router input[type="checkbox"]:checked { background:var(--accent); border-color:var(--accent); }
+  #tab-modules input[type="checkbox"]:checked::after, #tab-router input[type="checkbox"]:checked::after { transform: translateX(18px); background: var(--on-accent); }
   .chk-row { display:flex; align-items:center; justify-content:space-between; gap:12px; font-size:13.5px; padding:9px 0; cursor:pointer; border-bottom:1px solid var(--border); }
   .chk-row:last-of-type { border-bottom:none; }
 
@@ -1291,7 +1430,7 @@ function renderWebApp() {
   }
   /* Korean keep-all + justify leaves wide gaps on narrow columns */
   @media (max-width: 600px) {
-    .book-page, [data-theme^="epub-1p"] .msg-wrap.char .msg-bubble { text-align:left !important; }
+    .book-columns, [data-theme^="epub-1p"] .msg-wrap.char .msg-bubble { text-align:left !important; }
   }
   @media (max-width: 380px) {
     .h-right { gap:4px; }
@@ -1345,6 +1484,10 @@ function renderWebApp() {
 </head>
 <body>
 <div id="toast" role="status" aria-live="polite"></div>
+<div id="botBgHost" class="rs-bg-host"></div>
+<div id="bookBotOverlay" class="bot-menu-collapsed"></div>
+<button id="botMenuFab" type="button" style="display:none;" title="봇 메뉴 펼치기 / 접기">☰ 메뉴</button>
+<div id="triggerModal" style="display:none;" role="dialog" aria-modal="true"></div>
 
 <div id="login">
   <div class="login-card">
@@ -1409,6 +1552,10 @@ function renderWebApp() {
           <button class="pill" id="amBlur" onclick="setAssetMode('blur')">🌫️ 가리기</button>
           <button class="pill" id="amHide" onclick="setAssetMode('hide')">🙈 감추기</button>
         </div>
+      </div>
+      <div class="rb-sec">
+        <div class="rb-label">봇 정규식 UI (HTML)</div>
+        <button class="pill" id="richHtmlBtn" style="align-self:flex-start;">✨ 봇 정규식 UI: 켜짐</button>
       </div>
       <div class="rb-sec" style="border-top:1px solid var(--border); padding-top:10px;">
         <button class="btn sec" id="logoutBtn" style="width:100%;">🔒 로그아웃 / 토큰 변경</button>
@@ -1604,9 +1751,21 @@ function renderWebApp() {
   let lastBotsRenderSig = '';
   let lastModulesRenderSig = '';
   let lastChatVarsRenderSig = '';
+  let lastBgHtmlSig = '';
+  let lastHandledTriggerEventId = '';
+  let botMenuExpanded = false;
+  let botMenuAutoTimer = null;
   let lastDirectErrAt = 0;
   let pollTimer = null;
   let bookSpreadIdx = -1; // -1 means auto-jump to latest spread
+  let bookSpreadStride = 1;
+  let bookTotalSpreads = 1;
+  let bookTotalPages = 1;
+  let bookSinglePage = false;
+  let bookFlipMidTimer = null;
+  let bookFlipEndTimer = null;
+  let bookWheelLock = false;
+  let bookResizeTimer = null;
   const localTranslations = new Map();
   const shownTranslations = new Set();
 
@@ -1617,6 +1776,7 @@ function renderWebApp() {
     fsize: Number(localStorage.getItem('rs_fsize')) || 15.5,
     lh: Number(localStorage.getItem('rs_lh')) || 1.75,
     assetMode: localStorage.getItem('rs_asset_mode') || (localStorage.getItem('rs_stealth') === '1' ? 'hide' : 'show'),
+    richHtml: localStorage.getItem('rs_rich_html') !== '0',
   };
   const openToggleGroups = new Set();
 
@@ -1645,12 +1805,24 @@ function renderWebApp() {
     document.getElementById('amShow').className = 'pill' + (uiPref.assetMode === 'show' ? ' active' : '');
     document.getElementById('amBlur').className = 'pill' + (uiPref.assetMode === 'blur' ? ' active' : '');
     document.getElementById('amHide').className = 'pill' + (uiPref.assetMode === 'hide' ? ' active' : '');
+    const rhb = document.getElementById('richHtmlBtn');
+    if (rhb) {
+      rhb.textContent = '✨ 봇 정규식 UI: ' + (uiPref.richHtml ? '켜짐' : '꺼짐');
+      rhb.className = 'pill' + (uiPref.richHtml ? ' active' : '');
+    }
     localStorage.setItem('rs_theme', uiPref.theme);
     localStorage.setItem('rs_font', uiPref.font);
     localStorage.setItem('rs_fsize', String(uiPref.fsize));
     localStorage.setItem('rs_lh', String(uiPref.lh));
     localStorage.setItem('rs_asset_mode', uiPref.assetMode);
+    localStorage.setItem('rs_rich_html', uiPref.richHtml ? '1' : '0');
   }
+  document.getElementById('richHtmlBtn').onclick = () => {
+    uiPref.richHtml = !uiPref.richHtml;
+    applyUiPrefs();
+    renderChat();
+    toast('봇 정규식 UI: ' + (uiPref.richHtml ? '켜짐' : '꺼짐'));
+  };
   window.toggleImgReveal = (el) => { if (el) el.classList.toggle('revealed'); };
   window.setAssetMode = (mode) => {
     uiPref.assetMode = mode;
@@ -1679,8 +1851,19 @@ function renderWebApp() {
   document.addEventListener('click', (e) => {
     const bar = document.getElementById('readBar');
     if (bar.classList.contains('open') && !bar.contains(e.target)) setReadBar(false);
+    const jBar = document.getElementById('bookJumpBar');
+    const jBtn = document.getElementById('bookPageJumpBtn');
+    if (jBar && jBar.style.display !== 'none' && !jBar.contains(e.target) && (!jBtn || !jBtn.contains(e.target))) {
+      jBar.style.display = 'none';
+    }
   });
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') setReadBar(false); });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      setReadBar(false);
+      const jBar = document.getElementById('bookJumpBar');
+      if (jBar) jBar.style.display = 'none';
+    }
+  });
   document.querySelectorAll('.theme-chip').forEach((chip) => {
     chip.onclick = () => setTheme(chip.getAttribute('data-theme-key'));
   });
@@ -1692,17 +1875,29 @@ function renderWebApp() {
     applyUiPrefs();
     renderChat();
   }
-  document.getElementById('fontSel').onchange = (e) => { uiPref.font = e.target.value; applyUiPrefs(); };
-  document.getElementById('fsDec').onclick = () => { uiPref.fsize = Math.max(12, uiPref.fsize - 0.5); applyUiPrefs(); };
-  document.getElementById('fsInc').onclick = () => { uiPref.fsize = Math.min(24, uiPref.fsize + 0.5); applyUiPrefs(); };
+  document.getElementById('fontSel').onchange = (e) => { uiPref.font = e.target.value; applyUiPrefs(); if (isBookMode()) requestAnimationFrame(() => layoutBookSpreads(false)); };
+  document.getElementById('fsDec').onclick = () => { uiPref.fsize = Math.max(12, uiPref.fsize - 0.5); applyUiPrefs(); if (isBookMode()) requestAnimationFrame(() => layoutBookSpreads(false)); };
+  document.getElementById('fsInc').onclick = () => { uiPref.fsize = Math.min(24, uiPref.fsize + 0.5); applyUiPrefs(); if (isBookMode()) requestAnimationFrame(() => layoutBookSpreads(false)); };
   document.getElementById('lhBtn').onclick = () => {
     const steps = [1.55, 1.75, 1.95, 2.1];
     const idx = steps.findIndex((v) => Math.abs(v - uiPref.lh) < 0.05);
     uiPref.lh = steps[(idx + 1) % steps.length];
     applyUiPrefs();
+    if (isBookMode()) requestAnimationFrame(() => layoutBookSpreads(false));
   };
 
-  window.addEventListener('resize', () => { if (isBookMode()) renderChat(); });
+  window.addEventListener('resize', () => {
+    if (!isBookMode()) return;
+    if (bookResizeTimer) clearTimeout(bookResizeTimer);
+    bookResizeTimer = setTimeout(() => layoutBookSpreads(false), 100);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (currentTab !== 'chat' || !isBookMode()) return;
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (e.key === 'ArrowRight') flipBook(1);
+    else if (e.key === 'ArrowLeft') flipBook(-1);
+  });
   applyUiPrefs();
 
   function toast(msg) {
@@ -1739,6 +1934,174 @@ function renderWebApp() {
 
   function stripImgTokens(t) {
     return String(t || '').replace(/\\[\\[RSIMG:\\d+\\]\\]/g, '').replace(/\\n{3,}/g, '\\n\\n').trim();
+  }
+
+  function resolveAssetTokens(str, assetMap) {
+    const map = assetMap || {};
+    return String(str || '').replace(/\\[\\[RSASSET:([a-zA-Z0-9_-]+)\\]\\]/g, (_, id) => {
+      return map[id] ? safeImgSrc(map[id]) : '';
+    });
+  }
+
+  function sanitizeBotCss(css) {
+    return String(css || '')
+      .replace(/expression\\s*\\(/gi, 'blocked(')
+      .replace(/javascript\\s*:/gi, 'blocked:')
+      .replace(/vbscript\\s*:/gi, 'blocked:')
+      .replace(/-moz-binding\\s*:/gi, 'blocked:')
+      .replace(/@import\\s+(?!url\\(\\s*["']?https:\\/\\/)/gi, '/* @import */ ');
+  }
+
+  function sanitizeBotNode(node) {
+    const kids = Array.from(node.childNodes || []);
+    for (const ch of kids) {
+      if (ch.nodeType === 8) {
+        node.removeChild(ch);
+        continue;
+      }
+      if (ch.nodeType !== 1) continue;
+      const tag = (ch.tagName || '').toLowerCase();
+      if (tag === 'script' || tag === 'iframe' || tag === 'object' || tag === 'embed' || tag === 'applet' || tag === 'base' || tag === 'meta' || tag === 'link' || tag === 'form') {
+        node.removeChild(ch);
+        continue;
+      }
+      if (tag === 'style') {
+        ch.textContent = sanitizeBotCss(ch.textContent || '');
+        continue;
+      }
+      const attrs = Array.from(ch.attributes || []);
+      for (const a of attrs) {
+        const name = a.name.toLowerCase();
+        const val = String(a.value || '').trim();
+        if (name.startsWith('on')) {
+          ch.removeAttribute(a.name);
+          continue;
+        }
+        if ((name === 'src' || name === 'href' || name === 'xlink:href' || name === 'poster' || name === 'background' || name === 'formaction') && /^(?:javascript|vbscript):/i.test(val)) {
+          ch.removeAttribute(a.name);
+          continue;
+        }
+        if (name === 'src' && tag === 'img' && val && !safeImgSrc(val)) {
+          ch.removeAttribute('src');
+          continue;
+        }
+        if (name === 'style') {
+          ch.setAttribute('style', sanitizeBotCss(val));
+        }
+      }
+      sanitizeBotNode(ch);
+    }
+  }
+
+  function renderBotRichHtml(rawHtml, assetMap) {
+    const withAssets = resolveAssetTokens(rawHtml || '', assetMap);
+    if (!withAssets) return '';
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString('<div id="__rs_root">' + withAssets + '</div>', 'text/html');
+      const root = doc.getElementById('__rs_root');
+      if (!root) return esc(withAssets);
+      sanitizeBotNode(root);
+      for (const ch of Array.from(root.childNodes)) {
+        if (ch.nodeType === 3) {
+          const collapsed = (ch.textContent || '')
+            .replace(/(?:[ \\t]*\\r?\\n){3,}/g, '\\n\\n')
+            .replace(/^(?:[ \\t]*\\r?\\n){2,}/, '\\n')
+            .replace(/(?:\\r?\\n[ \\t]*){2,}$/, '\\n');
+          if (/\\S/.test(collapsed)) {
+            const sp = doc.createElement('span');
+            sp.className = 'rs-prose-seg';
+            sp.textContent = collapsed;
+            root.replaceChild(sp, ch);
+          } else {
+            root.removeChild(ch);
+          }
+        }
+      }
+      return root.innerHTML;
+    } catch (_) {
+      return esc(withAssets);
+    }
+  }
+
+  function syncBotBackground(bgHtml, assetMap) {
+    const host = document.getElementById('botBgHost');
+    if (!host) return;
+    const raw = uiPref.richHtml ? String(bgHtml || '') : '';
+    const sig = raw ? (hashStr(raw) + ':' + Object.keys(assetMap || {}).length) : '';
+    if (sig === lastBgHtmlSig) return;
+    lastBgHtmlSig = sig;
+    host.innerHTML = raw ? renderBotRichHtml(raw, assetMap) : '';
+  }
+
+  function closeTriggerModal() {
+    const m = document.getElementById('triggerModal');
+    if (m) {
+      m.style.display = 'none';
+      m.innerHTML = '';
+    }
+  }
+
+  function showTriggerModal(ev) {
+    const modal = document.getElementById('triggerModal');
+    if (!modal || !ev) return;
+    const baseAnswers = Array.isArray(ev.answersSoFar) ? ev.answersSoFar.slice() : [];
+    const sendAnswer = async (ans) => {
+      closeTriggerModal();
+      await api('/api/command', {
+        method: 'POST',
+        body: JSON.stringify({
+          type: 'run_trigger',
+          payload: {
+            charIndex: ev.charIndex,
+            chatIndex: ev.chatIndex,
+            trigger: ev.trigger,
+            promptAnswers: baseAnswers.concat([String(ans)]),
+          },
+        }),
+      });
+      toast('적용 중...');
+      setTimeout(pollState, 300);
+      setTimeout(pollState, 850);
+    };
+
+    if (ev.kind === 'prompt_select') {
+      const opts = Array.isArray(ev.options) ? ev.options : [];
+      modal.innerHTML =
+        '<div class="trig-card">' +
+          '<div class="trig-msg">' + esc(ev.message || '선택하세요') + '</div>' +
+          '<div class="trig-opts">' +
+            opts.map((opt, idx) => '<button class="btn sec trig-opt-btn" data-trig-opt="' + idx + '">' + esc(opt) + '</button>').join('') +
+          '</div>' +
+          '<div class="btn-row" style="margin-top:4px;"><button class="btn danger" id="trigCancelBtn" style="margin-left:auto;">취소</button></div>' +
+        '</div>';
+      modal.style.display = 'flex';
+      modal.querySelectorAll('[data-trig-opt]').forEach((b) => {
+        b.onclick = () => sendAnswer(b.getAttribute('data-trig-opt'));
+      });
+      document.getElementById('trigCancelBtn').onclick = closeTriggerModal;
+      modal.onclick = (e) => { if (e.target === modal) closeTriggerModal(); };
+      return;
+    }
+
+    if (ev.kind === 'prompt_input') {
+      modal.innerHTML =
+        '<div class="trig-card">' +
+          '<div class="trig-msg">' + esc(ev.message || '값을 입력하세요') + '</div>' +
+          '<input class="f-inp" id="trigPromptInp" placeholder="입력..." />' +
+          '<div class="btn-row">' +
+            '<button class="btn" id="trigOkBtn">확인</button>' +
+            '<button class="btn sec" id="trigCancelBtn">취소</button>' +
+          '</div>' +
+        '</div>';
+      modal.style.display = 'flex';
+      const inp = document.getElementById('trigPromptInp');
+      setTimeout(() => { try { inp.focus(); } catch (_) {} }, 30);
+      document.getElementById('trigOkBtn').onclick = () => sendAnswer(inp.value);
+      inp.onkeydown = (e) => { if (e.key === 'Enter') sendAnswer(inp.value); };
+      document.getElementById('trigCancelBtn').onclick = closeTriggerModal;
+      modal.onclick = (e) => { if (e.target === modal) closeTriggerModal(); };
+    }
   }
 
   function renderInlineBody(text, images) {
@@ -1806,6 +2169,8 @@ function renderWebApp() {
     document.getElementById('tab-' + tab).classList.add('active');
     document.querySelector('.tab-btn[data-tab="' + tab + '"]').classList.add('active');
     document.getElementById('composerBar').style.display = tab === 'chat' ? 'flex' : 'none';
+    if (tab === 'chat' && isBookMode()) setTimeout(() => layoutBookSpreads(false), 30);
+    syncBotMenuVisibility();
     if (tab === 'router') loadRouterConfig();
     if (tab === 'bots') renderBots();
     if (tab === 'modules') { renderModules(); refreshUpdateStatus(); }
@@ -1857,10 +2222,19 @@ function renderWebApp() {
       lastDirectErrAt = st.lastDirectError.at;
       toast('응답 오류: ' + (st.lastDirectError.message || '실패'));
     }
+    if (st.lastTriggerEvent && st.lastTriggerEvent.id && st.lastTriggerEvent.id !== lastHandledTriggerEventId) {
+      lastHandledTriggerEventId = st.lastTriggerEvent.id;
+      const tev = st.lastTriggerEvent;
+      if (tev.kind === 'prompt_select' || tev.kind === 'prompt_input') showTriggerModal(tev);
+      else if (tev.kind === 'error') toast('⚠️ ' + (tev.message || '트리거 오류'));
+      else if (tev.kind === 'notice' && tev.message) toast(tev.message);
+    }
+
+    syncBotBackground(snap.backgroundHtml || '', snap.assetMap || {});
 
     const msgs = snap.messages || [];
-    const msgDigest = hashStr(msgs.map((m) => m.index + ':' + (m.text || '') + ':' + (m.images ? m.images.length : 0)).join('\\x01'));
-    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, snap.fmIndex, snap.firstMessageCount, snap.greetingControls || [], msgs.length, msgDigest, st.generating, st.directGenerating, uiPref.theme, uiPref.assetMode]);
+    const msgDigest = hashStr(msgs.map((m) => m.index + ':' + (m.text || '') + ':' + (m.html || '') + ':' + (m.swipeCount || 1) + ':' + (m.swipeIndex || 0) + ':' + (m.images ? m.images.length : 0)).join('\\x01'));
+    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, snap.fmIndex, snap.firstMessageCount, snap.greetingControls || [], snap.backgroundHtml || '', Object.keys(snap.assetMap || {}).length, msgs.length, msgDigest, st.generating, st.directGenerating, uiPref.theme, uiPref.assetMode, uiPref.richHtml]);
     if (sig !== lastChatRenderSig) {
       lastChatRenderSig = sig;
       renderChat();
@@ -1869,168 +2243,536 @@ function renderWebApp() {
     if (currentTab === 'modules') renderModules();
   }
 
-  function renderGreetingControlsHtml(snap) {
-    let out = '';
+  function renderFirstMessageSwipeHtml(snap) {
     const total = Number(snap.firstMessageCount || 0);
     const fmIdx = typeof snap.fmIndex === 'number' ? snap.fmIndex : -1;
     if (total > 1) {
       const pos = fmIdx < 0 ? 1 : Math.min(total, fmIdx + 2);
-      out += '<button class="act-btn" data-fm-step="-1" title="이전 인사말">◀</button>';
-      out += '<span style="font-size:11.5px; color:var(--sub); font-weight:700; padding:0 4px;">' + pos + ' / ' + total + '</span>';
-      out += '<button class="act-btn" data-fm-step="1" title="다음 인사말">▶</button>';
+      return '<span class="msg-swipe-grp">' +
+        '<button class="act-btn" data-fm-step="-1" title="이전 인사말">◀</button>' +
+        '<span class="msg-swipe-cnt">' + pos + ' / ' + total + '</span>' +
+        '<button class="act-btn" data-fm-step="1" title="다음 인사말">▶</button>' +
+      '</span>';
     }
     const ctrls = Array.isArray(snap.greetingControls) ? snap.greetingControls : [];
-    for (const c of ctrls) {
-      out += '<select class="pill" data-chat-var-key="' + esc(c.key) + '" title="' + esc(c.key) + '" style="min-height:26px; height:26px; font-size:11.5px; padding:0 24px 0 8px;">';
-      for (const opt of (c.options || [])) {
-        const sel = String(c.value) === String(opt) ? ' selected' : '';
-        out += '<option value="' + esc(opt) + '"' + sel + '>' + esc(c.key + ': ' + opt) + '</option>';
-      }
-      out += '</select>';
+    const firstCtrl = ctrls.find((c) => c.key === 'first' && Array.isArray(c.options) && c.options.length > 1)
+      || ctrls.find((c) => Array.isArray(c.options) && c.options.length > 1);
+    if (firstCtrl) {
+      const opts = firstCtrl.options;
+      const curIdx = Math.max(0, opts.findIndex((o) => String(o) === String(firstCtrl.value)));
+      return '<span class="msg-swipe-grp">' +
+        '<button class="act-btn" data-greet-var-key="' + esc(firstCtrl.key) + '" data-greet-var-step="-1" title="이전 퍼스트">◀</button>' +
+        '<span class="msg-swipe-cnt">' + (curIdx + 1) + ' / ' + opts.length + '</span>' +
+        '<button class="act-btn" data-greet-var-key="' + esc(firstCtrl.key) + '" data-greet-var-step="1" title="다음 퍼스트">▶</button>' +
+      '</span>';
     }
-    return out;
+    return '';
   }
 
-  function buildBookPages(msgs) {
-    // Group messages into comfortable book pages (~900 chars per page)
-    const pages = [];
-    let cur = [];
-    let curLen = 0;
-    for (const m of msgs) {
-      const len = (m.text || '').length + 120;
-      if (cur.length && curLen + len > 950) {
-        pages.push(cur);
-        cur = [];
-        curLen = 0;
-      }
-      cur.push(m);
-      curLen += len;
+  function renderMsgActionBarHtml(m, snap, key, showTr, isLatestChar, isBook) {
+    let acts = '';
+    if (m.isFirstMessage) {
+      acts += renderFirstMessageSwipeHtml(snap);
     }
-    if (cur.length) pages.push(cur);
-    if (!pages.length) pages.push([]);
-    return pages;
+    if (m.index >= 0) {
+      const swCount = Number(m.swipeCount || 1);
+      const swIdx = Number(m.swipeIndex || 0);
+      if (m.role !== 'user' && swCount > 1) {
+        acts += '<span class="msg-swipe-grp">' +
+          '<button class="act-btn" data-swipe-msg="' + m.index + '" data-swipe-delta="-1" title="이전 응답(롤백)">◀</button>' +
+          '<span class="msg-swipe-cnt">' + (swIdx + 1) + ' / ' + swCount + '</span>' +
+          '<button class="act-btn" data-swipe-msg="' + m.index + '" data-swipe-delta="1" title="다음 응답">▶</button>' +
+        '</span>';
+      }
+      if (isLatestChar) {
+        acts += '<button class="act-btn" data-reroll-msg="' + m.index + '" title="다시 생성 (리롤)">🔄 리롤</button>';
+      }
+    }
+    if (m.text) {
+      acts += '<button class="act-btn" data-tr-key="' + esc(key) + '" data-tr-idx="' + m.index + '">🌐 ' + (showTr ? (isBook ? '원문' : '번역 숨김') : '번역') + '</button>';
+    }
+    if (m.index >= 0) {
+      acts += '<button class="act-btn" data-edit-msg="' + m.index + '">✏️ 수정</button>';
+      acts += '<button class="act-btn" data-del-msg="' + m.index + '">🗑️ 삭제</button>';
+    }
+    return acts ? '<div class="msg-actions" style="flex-wrap:wrap; align-items:center;">' + acts + '</div>' : '';
   }
 
-  function renderBookPageContent(pageMsgs, snap) {
-    if (!pageMsgs || !pageMsgs.length) return '<div style="color:var(--sub); font-size:13px; text-align:center; margin-top:30px;">빈 페이지</div>';
+  function renderBookContent(msgs, snap) {
+    if (!msgs || !msgs.length) return '<div style="color:var(--sub); font-size:13px; text-align:center; margin-top:30px;">대화가 비어 있습니다.</div>';
+    const lastIdx = Number(snap.totalMessages || 0) - 1;
     let out = '';
-    for (const m of pageMsgs) {
+    for (let mi = 0; mi < msgs.length; mi++) {
+      const m = msgs[mi];
       const isUser = m.role === 'user';
       const key = snap.charIndex + ':' + snap.chatIndex + ':' + m.index;
       const trText = localTranslations.get(key);
       const showTr = shownTranslations.has(key);
+      const useRich = uiPref.richHtml && m.html;
+      const bodyHtml = (showTr && trText)
+        ? esc(trText)
+        : (useRich ? '<div class="rs-bot-html">' + renderBotRichHtml(m.html, snap.assetMap) + '</div>' : renderInlineBody(m.text, m.images));
+      const isLatestChar = m.index >= 0 && !isUser && (m.index === lastIdx || (lastIdx < 0 && mi === msgs.length - 1));
       out += '<div class="' + (isUser ? 'book-user-block' : 'book-char-block') + '">';
       out += '<div class="book-turn-tag">' + esc(isUser ? '나' : displayBotName(snap.charName)) + '</div>';
-      out += '<div>' + (showTr && trText ? esc(trText) : renderInlineBody(m.text, m.images)) + '</div>';
-      if (m.text || m.isFirstMessage) {
-        out += '<div class="msg-actions">';
-        if (m.isFirstMessage) out += renderGreetingControlsHtml(snap);
-        if (m.text) out += '<button class="act-btn" data-tr-key="' + esc(key) + '" data-tr-idx="' + m.index + '">🌐 ' + (showTr ? '원문' : '번역') + '</button>';
-        out += '</div>';
-      }
+      out += '<div>' + bodyHtml + '</div>';
+      out += renderMsgActionBarHtml(m, snap, key, showTr, isLatestChar, true);
       out += '</div>';
     }
     return out;
   }
 
-  let flipDirPending = '';
-  function flipBook(delta) {
-    flipDirPending = delta > 0 ? 'flip-next' : 'flip-prev';
-    bookSpreadIdx += delta;
-    renderChat(true);
+  function updateBookNavUI() {
+    const prevBtn = document.getElementById('bookPrevBtn');
+    const nextBtn = document.getElementById('bookNextBtn');
+    const tapPrev = document.getElementById('bookTapPrev');
+    const tapNext = document.getElementById('bookTapNext');
+    const labelEl = document.getElementById('bookPageLabel');
+    const rulerEl = document.getElementById('bookTurnRuler');
+    if (prevBtn) prevBtn.disabled = bookSpreadIdx <= 0;
+    if (nextBtn) nextBtn.disabled = bookSpreadIdx >= bookTotalSpreads - 1;
+    if (tapPrev) tapPrev.classList.toggle('disabled', bookSpreadIdx <= 0);
+    if (tapNext) tapNext.classList.toggle('disabled', bookSpreadIdx >= bookTotalSpreads - 1);
+    if (labelEl) {
+      if (bookSinglePage) {
+        labelEl.textContent = (bookSpreadIdx + 1) + ' / ' + bookTotalSpreads + '쪽';
+      } else {
+        const leftP = bookSpreadIdx * 2 + 1;
+        const rightP = Math.min(bookTotalPages, leftP + 1);
+        labelEl.textContent = (leftP === rightP ? leftP : (leftP + '-' + rightP)) + '쪽 (' + (bookSpreadIdx + 1) + ' / ' + bookTotalSpreads + ' 펼침)';
+      }
+    }
+    if (rulerEl) {
+      let ruler = '';
+      const maxTicks = 48;
+      if (bookTotalSpreads <= maxTicks) {
+        for (let i = 0; i < bookTotalSpreads; i++) {
+          ruler += '<div class="ruler-tick' + (i === bookSpreadIdx ? ' active' : '') + '" data-book-spread="' + i + '"></div>';
+        }
+      } else {
+        const activeTick = Math.round((bookSpreadIdx / Math.max(1, bookTotalSpreads - 1)) * (maxTicks - 1));
+        for (let t = 0; t < maxTicks; t++) {
+          const sp = Math.round((t / (maxTicks - 1)) * (bookTotalSpreads - 1));
+          ruler += '<div class="ruler-tick' + (t === activeTick ? ' active' : '') + '" data-book-spread="' + sp + '"></div>';
+        }
+      }
+      rulerEl.innerHTML = ruler;
+    }
+    const jBar = document.getElementById('bookJumpBar');
+    if (jBar && jBar.style.display !== 'none') {
+      const jRange = document.getElementById('bookJumpRange');
+      const jInp = document.getElementById('bookJumpInp');
+      const jPrev = document.getElementById('bookJumpPreview');
+      const curPage = bookSinglePage ? (bookSpreadIdx + 1) : (bookSpreadIdx * 2 + 1);
+      if (jRange) {
+        jRange.min = '1';
+        jRange.max = String(Math.max(1, bookTotalSpreads));
+        jRange.value = String(Math.min(Math.max(1, bookTotalSpreads), bookSpreadIdx + 1));
+      }
+      if (jInp) {
+        jInp.max = String(Math.max(1, bookTotalPages));
+        if (document.activeElement !== jInp) jInp.value = String(curPage);
+      }
+      if (jPrev) {
+        jPrev.textContent = (bookSpreadIdx + 1) + ' / ' + bookTotalSpreads + ' 펼침 (총 ' + bookTotalPages + '쪽)';
+      }
+    }
   }
 
-  function renderChat(animateFlip = false) {
+  function goToBookSpread(nextIdx, animate = false) {
+    const vp = document.getElementById('bookViewport');
+    const flipLeaf = document.getElementById('flipLeaf');
+    if (!vp) return;
+    const prev = bookSpreadIdx < 0 ? 0 : bookSpreadIdx;
+    const clamped = Math.max(0, Math.min(bookTotalSpreads - 1, nextIdx));
+    bookSpreadIdx = clamped;
+
+    if (bookFlipMidTimer) { clearTimeout(bookFlipMidTimer); bookFlipMidTimer = null; }
+    if (bookFlipEndTimer) { clearTimeout(bookFlipEndTimer); bookFlipEndTimer = null; }
+
+    if (animate && flipLeaf && clamped !== prev) {
+      const dirClass = clamped > prev ? 'flip-next' : 'flip-prev';
+      flipLeaf.classList.remove('flip-next', 'flip-prev');
+      void flipLeaf.offsetWidth;
+      flipLeaf.classList.add(dirClass);
+      bookFlipMidTimer = setTimeout(() => {
+        bookFlipMidTimer = null;
+        vp.scrollLeft = bookSpreadIdx * bookSpreadStride;
+        updateBookNavUI();
+      }, 300);
+      bookFlipEndTimer = setTimeout(() => {
+        bookFlipEndTimer = null;
+        flipLeaf.classList.remove('flip-next', 'flip-prev');
+      }, 650);
+    } else {
+      if (flipLeaf) flipLeaf.classList.remove('flip-next', 'flip-prev');
+      vp.scrollLeft = bookSpreadIdx * bookSpreadStride;
+      updateBookNavUI();
+    }
+  }
+
+  function layoutBookSpreads(jumpAuto = false) {
+    const frame = document.getElementById('bookFrame');
+    const vp = document.getElementById('bookViewport');
+    const cols = document.getElementById('bookColumns');
+    if (!frame || !vp || !cols) return;
+    const frameW = frame.clientWidth;
+    if (!frameW || frameW < 100) return;
+
+    bookSinglePage = frameW < 700;
+    frame.classList.toggle('single-page', bookSinglePage);
+    const colsPerSpread = bookSinglePage ? 1 : 2;
+    const colGap = bookSinglePage ? 32 : 84;
+    const sideMargin = bookSinglePage ? 36 : 84;
+    const evenW = Math.floor(Math.max(220, frameW - sideMargin) / 2) * 2;
+
+    vp.style.width = evenW + 'px';
+    cols.style.width = evenW + 'px';
+    cols.style.height = '100%';
+    cols.style.columnCount = String(colsPerSpread);
+    cols.style.columnGap = colGap + 'px';
+    cols.style.columnFill = 'auto';
+
+    bookSpreadStride = evenW + colGap;
+    bookTotalSpreads = Math.max(1, Math.ceil((cols.scrollWidth - 4) / bookSpreadStride));
+    const colStride = bookSinglePage ? bookSpreadStride : (evenW + colGap) / 2;
+    bookTotalPages = Math.max(1, Math.ceil((cols.scrollWidth - 4) / colStride));
+
+    if (jumpAuto && bookSpreadIdx < 0) {
+      const msgs = (lastState && lastState.snapshot && lastState.snapshot.messages) || [];
+      if (msgs.length <= 1) {
+        bookSpreadIdx = 0;
+      } else {
+        const userBlocks = cols.querySelectorAll('.book-user-block');
+        const targetEl = userBlocks.length ? userBlocks[userBlocks.length - 1] : cols.querySelector('.book-char-block:last-of-type');
+        if (targetEl) {
+          const vpRect = vp.getBoundingClientRect();
+          const tRect = targetEl.getBoundingClientRect();
+          const absLeft = (tRect.left - vpRect.left) + vp.scrollLeft;
+          bookSpreadIdx = Math.floor(Math.max(0, absLeft + 4) / bookSpreadStride);
+        } else {
+          bookSpreadIdx = bookTotalSpreads - 1;
+        }
+      }
+    }
+    goToBookSpread(bookSpreadIdx < 0 ? 0 : bookSpreadIdx, false);
+  }
+
+  function flipBook(delta) {
+    const base = bookSpreadIdx < 0 ? 0 : bookSpreadIdx;
+    const next = Math.max(0, Math.min(bookTotalSpreads - 1, base + delta));
+    if (next === base) return;
+    goToBookSpread(next, true);
+  }
+
+  function captureCheckedBotIds() {
+    const ids = [];
+    document.querySelectorAll('#tab-chat .rs-bot-html input[type="checkbox"]:checked, #bookBotOverlay .rs-bot-html input[type="checkbox"]:checked').forEach((el) => {
+      if (el.id) ids.push(el.id);
+    });
+    return ids;
+  }
+
+  function restoreCheckedBotIds(ids) {
+    if (!ids || !ids.length) return;
+    for (const id of ids) {
+      const el = document.getElementById(id);
+      if (el && el.type === 'checkbox') el.checked = true;
+    }
+  }
+
+  function syncBotMenuVisibility() {
+    const overlay = document.getElementById('bookBotOverlay');
+    const fab = document.getElementById('botMenuFab');
+    if (!overlay || !fab) return;
+    const hasFab = Boolean(overlay.querySelector('[data-rs-bot-fab="1"]'));
+    if (!hasFab || currentTab !== 'chat') {
+      fab.style.display = 'none';
+      if (botMenuAutoTimer) { clearTimeout(botMenuAutoTimer); botMenuAutoTimer = null; }
+      return;
+    }
+    fab.style.display = 'inline-flex';
+    overlay.classList.toggle('bot-menu-collapsed', !botMenuExpanded);
+    fab.classList.toggle('expanded', botMenuExpanded);
+    fab.textContent = botMenuExpanded ? '▸ 접기' : '☰ 메뉴';
+  }
+
+  function scheduleBotMenuAutoHide() {
+    if (botMenuAutoTimer) { clearTimeout(botMenuAutoTimer); botMenuAutoTimer = null; }
+    if (!botMenuExpanded) return;
+    botMenuAutoTimer = setTimeout(() => {
+      const overlay = document.getElementById('bookBotOverlay');
+      if (overlay && overlay.querySelector('input[type="checkbox"]:checked')) {
+        scheduleBotMenuAutoHide();
+        return;
+      }
+      botMenuExpanded = false;
+      syncBotMenuVisibility();
+    }, 6000);
+  }
+
+  document.getElementById('botMenuFab').onclick = () => {
+    botMenuExpanded = !botMenuExpanded;
+    syncBotMenuVisibility();
+    if (botMenuExpanded) scheduleBotMenuAutoHide();
+    else if (botMenuAutoTimer) { clearTimeout(botMenuAutoTimer); botMenuAutoTimer = null; }
+  };
+
+  function hoistBotFixedWidgets(rootEl) {
+    const overlay = document.getElementById('bookBotOverlay');
+    if (!overlay || !rootEl) return;
+    overlay.innerHTML = '';
+    rootEl.querySelectorAll('.rs-bot-html').forEach((container) => {
+      let hasFixed = false;
+      container.querySelectorAll('style').forEach((st) => {
+        if (/position\\s*:\\s*fixed/i.test(st.textContent || '')) hasFixed = true;
+      });
+      if (!hasFixed) return;
+      const hostWrap = document.createElement('div');
+      hostWrap.className = 'rs-bot-html';
+      let moved = false;
+      for (const ch of Array.from(container.children)) {
+        const tag = (ch.tagName || '').toLowerCase();
+        if (tag === 'style' && /position\\s*:\\s*fixed/i.test(ch.textContent || '')) {
+          hostWrap.appendChild(ch.cloneNode(true));
+        } else if (
+          (tag === 'input' && (ch.type === 'checkbox' || ch.type === 'radio')) ||
+          (tag === 'div' && /(?:buttons-container|side-panel|overlay|floating)/i.test(ch.className || ''))
+        ) {
+          if (tag === 'div' && /(?:buttons-container|floating)/i.test(ch.className || '')) {
+            ch.setAttribute('data-rs-bot-fab', '1');
+          }
+          hostWrap.appendChild(ch);
+          moved = true;
+        }
+      }
+      if (moved) overlay.appendChild(hostWrap);
+    });
+    syncBotMenuVisibility();
+  }
+
+  function renderChat() {
     const box = document.getElementById('tab-chat');
+    const overlay = document.getElementById('bookBotOverlay');
     const snap = (lastState && lastState.snapshot) || {};
     const msgs = snap.messages || [];
+    const checkedBotIds = captureCheckedBotIds();
 
     if (isBookMode()) {
-      const pages = buildBookPages(msgs);
-      const single = window.innerWidth < 700;
-      const perSpread = single ? 1 : 2;
-      const totalSpreads = Math.max(1, Math.ceil(pages.length / perSpread));
-      if (bookSpreadIdx < 0 || bookSpreadIdx >= totalSpreads) bookSpreadIdx = totalSpreads - 1;
-
-      const leftIdx = bookSpreadIdx * perSpread;
-      const rightIdx = leftIdx + 1;
-      const leftHtml = renderBookPageContent(pages[leftIdx], snap);
-      const rightHtml = !single ? renderBookPageContent(pages[rightIdx], snap) : '';
-
-      const pageLabel = single
-        ? ((leftIdx + 1) + ' / ' + pages.length + '쪽')
-        : ((leftIdx + 1) + '-' + Math.min(rightIdx + 1, pages.length) + '쪽 (' + (bookSpreadIdx + 1) + ' / ' + totalSpreads + ' 펼침)');
-
-      let ruler = '';
-      for (let i = 0; i < totalSpreads; i++) {
-        ruler += '<div class="ruler-tick' + (i === bookSpreadIdx ? ' active' : '') + '" onclick="bookSpreadIdx=' + i + '; renderChat(false);"></div>';
-      }
-
+      if (overlay) overlay.innerHTML = '';
+      const singleInit = window.innerWidth < 700;
       box.innerHTML =
         '<div class="book-shell">' +
-          '<div class="book-frame' + (single ? ' single-page' : '') + '" id="bookFrame">' +
-            '<div class="book-page left">' + leftHtml + '</div>' +
-            (single ? '' : '<div class="book-page right">' + rightHtml + '</div>') +
-            '<div class="epub-flip-leaf' + (animateFlip && flipDirPending ? ' ' + flipDirPending : '') + '" id="flipLeaf"></div>' +
+          '<div class="book-frame' + (singleInit ? ' single-page' : '') + '" id="bookFrame">' +
+            '<div class="book-tap-zone book-tap-left" id="bookTapPrev" aria-label="이전 페이지"></div>' +
+            '<div class="book-tap-zone book-tap-right" id="bookTapNext" aria-label="다음 페이지"></div>' +
+            '<div class="book-viewport" id="bookViewport">' +
+              '<div class="book-columns" id="bookColumns">' + renderBookContent(msgs, snap) + '</div>' +
+            '</div>' +
+            '<div class="epub-flip-leaf" id="flipLeaf"></div>' +
+          '</div>' +
+          '<div class="book-jump-bar" id="bookJumpBar" style="display:none;">' +
+            '<div class="book-jump-head">' +
+              '<span>쪽수 이동</span>' +
+              '<span id="bookJumpPreview">1 / 1 펼침</span>' +
+            '</div>' +
+            '<input type="range" class="book-jump-range" id="bookJumpRange" min="1" max="1" value="1" />' +
+            '<div class="book-jump-row">' +
+              '<button type="button" class="pill" id="bookJumpFirstBtn">처음</button>' +
+              '<input type="number" class="f-inp" id="bookJumpInp" min="1" max="1" placeholder="쪽수" />' +
+              '<button type="button" class="btn" id="bookJumpGoBtn">이동</button>' +
+              '<button type="button" class="pill" id="bookJumpLastBtn">끝</button>' +
+            '</div>' +
           '</div>' +
           '<div class="book-nav">' +
-            '<button class="pill" ' + (bookSpreadIdx <= 0 ? 'disabled' : '') + ' onclick="flipBook(-1)">◀ 이전</button>' +
-            '<span>' + pageLabel + '</span>' +
-            '<button class="pill" ' + (bookSpreadIdx >= totalSpreads - 1 ? 'disabled' : '') + ' onclick="flipBook(1)">다음 ▶</button>' +
+            '<button class="pill" id="bookPrevBtn">◀ 이전</button>' +
+            '<button type="button" class="pill book-page-btn" id="bookPageJumpBtn" title="쪽수 이동">' +
+              '<span id="bookPageLabel">1 / 1쪽</span>' +
+              '<span style="font-size:10px; opacity:0.75;">▾</span>' +
+            '</button>' +
+            '<button class="pill" id="bookNextBtn">다음 ▶</button>' +
           '</div>' +
-          '<div class="turn-ruler">' + ruler + '</div>' +
+          '<div class="turn-ruler" id="bookTurnRuler"></div>' +
         '</div>';
 
-      // Touch swipe support for mobile/tablet book flipping
+      hoistBotFixedWidgets(document.getElementById('bookColumns'));
+      restoreCheckedBotIds(checkedBotIds);
+
+      document.getElementById('bookPrevBtn').onclick = () => flipBook(-1);
+      document.getElementById('bookNextBtn').onclick = () => flipBook(1);
+      document.getElementById('bookTapPrev').onclick = () => flipBook(-1);
+      document.getElementById('bookTapNext').onclick = () => flipBook(1);
+      document.getElementById('bookTurnRuler').onclick = (e) => {
+        const tick = e.target.closest('[data-book-spread]');
+        if (tick) goToBookSpread(Number(tick.getAttribute('data-book-spread')), true);
+      };
+
+      const jumpBar = document.getElementById('bookJumpBar');
+      const jumpBtn = document.getElementById('bookPageJumpBtn');
+      const jumpRange = document.getElementById('bookJumpRange');
+      const jumpInp = document.getElementById('bookJumpInp');
+      const jumpGoBtn = document.getElementById('bookJumpGoBtn');
+      const jumpFirstBtn = document.getElementById('bookJumpFirstBtn');
+      const jumpLastBtn = document.getElementById('bookJumpLastBtn');
+      const setBookJumpOpen = (open) => {
+        if (!jumpBar) return;
+        jumpBar.style.display = open ? 'flex' : 'none';
+        if (open) {
+          updateBookNavUI();
+          if (jumpInp) {
+            const curPage = bookSinglePage ? (bookSpreadIdx + 1) : (bookSpreadIdx * 2 + 1);
+            jumpInp.value = String(curPage);
+            setTimeout(() => { try { jumpInp.focus(); jumpInp.select(); } catch (_) {} }, 20);
+          }
+        }
+      };
+      const submitBookPageJump = () => {
+        const raw = Number(jumpInp && jumpInp.value);
+        if (!Number.isFinite(raw)) return;
+        const p = Math.max(1, Math.min(Math.max(1, bookTotalPages), Math.trunc(raw)));
+        const sp = bookSinglePage ? (p - 1) : Math.floor((p - 1) / 2);
+        goToBookSpread(sp, false);
+        setBookJumpOpen(false);
+      };
+      if (jumpBar) jumpBar.onclick = (e) => e.stopPropagation();
+      if (jumpBtn) jumpBtn.onclick = (e) => {
+        e.stopPropagation();
+        setBookJumpOpen(jumpBar && jumpBar.style.display === 'none');
+      };
+      if (jumpRange) jumpRange.oninput = () => {
+        const sp = Math.max(0, Math.min(bookTotalSpreads - 1, Number(jumpRange.value) - 1));
+        goToBookSpread(sp, false);
+      };
+      if (jumpGoBtn) jumpGoBtn.onclick = submitBookPageJump;
+      if (jumpInp) jumpInp.onkeydown = (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); submitBookPageJump(); }
+      };
+      if (jumpFirstBtn) jumpFirstBtn.onclick = () => { goToBookSpread(0, false); setBookJumpOpen(false); };
+      if (jumpLastBtn) jumpLastBtn.onclick = () => { goToBookSpread(bookTotalSpreads - 1, false); setBookJumpOpen(false); };
+
       const frame = document.getElementById('bookFrame');
+      const vp = document.getElementById('bookViewport');
       let sx = 0, sy = 0;
       frame.ontouchstart = (e) => { sx = e.touches[0].clientX; sy = e.touches[0].clientY; };
       frame.ontouchend = (e) => {
         const dx = e.changedTouches[0].clientX - sx;
         const dy = e.changedTouches[0].clientY - sy;
         if (Math.abs(dx) > 55 && Math.abs(dx) > Math.abs(dy) * 1.3) {
-          if (dx < 0 && bookSpreadIdx < totalSpreads - 1) flipBook(1);
-          else if (dx > 0 && bookSpreadIdx > 0) flipBook(-1);
+          if (dx < 0) flipBook(1);
+          else flipBook(-1);
         }
       };
-      flipDirPending = '';
+      vp.onwheel = (e) => {
+        if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+          e.preventDefault();
+          if (bookWheelLock) return;
+          bookWheelLock = true;
+          flipBook(e.deltaY > 0 ? 1 : -1);
+          setTimeout(() => { bookWheelLock = false; }, 260);
+        }
+      };
+      frame.querySelectorAll('img').forEach((img) => {
+        if (!img.complete) img.addEventListener('load', () => layoutBookSpreads(false), { once: true });
+      });
+
+      requestAnimationFrame(() => layoutBookSpreads(true));
+      setTimeout(() => layoutBookSpreads(false), 80);
       return;
     }
 
     // Standard Scroll Mode (Gemini / Claude / ChatGPT / EPUB 1p / Glass / Sakura / Moss)
+    if (overlay) overlay.innerHTML = '';
     const nearBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 140;
     const autoTr = Boolean(routerCfg && routerCfg.translator && routerCfg.translator.autoTranslateOutput);
 
     let html = '';
     if (!msgs.length) {
-      html = '<div class="empty-hint"><span class="big">💬</span>대화가 비어 있습니다.<br>아래에서 메시지를 보내 시작해 보세요.</div>';
+      html += '<div class="empty-hint"><span class="big">💬</span>대화가 비어 있습니다.<br>아래에서 메시지를 보내 시작해 보세요.</div>';
     } else {
-      for (const m of msgs) {
+      const lastIdx = Number(snap.totalMessages || 0) - 1;
+      for (let mi = 0; mi < msgs.length; mi++) {
+        const m = msgs[mi];
         const key = snap.charIndex + ':' + snap.chatIndex + ':' + m.index;
         const isUser = m.role === 'user';
         const trText = localTranslations.get(key);
         const showTr = shownTranslations.has(key) || (autoTr && !isUser && trText);
+        const useRich = uiPref.richHtml && m.html;
+        const bodyHtml = useRich
+          ? '<div class="rs-bot-html">' + renderBotRichHtml(m.html, snap.assetMap) + '</div>'
+          : renderInlineBody(m.text, m.images);
+        const isLatestChar = m.index >= 0 && !isUser && (m.index === lastIdx || (lastIdx < 0 && mi === msgs.length - 1));
         html += '<div class="msg-wrap ' + (isUser ? 'user' : 'char') + '">';
         html += '<div class="msg-role">' + esc(isUser ? '나' : displayBotName(snap.charName)) + '</div>';
-        html += '<div class="msg-bubble">' + renderInlineBody(m.text, m.images) + '</div>';
+        html += '<div class="msg-bubble">' + bodyHtml + '</div>';
         if (showTr && trText) html += '<div class="tr-box">' + esc(trText) + '</div>';
-        const greetCtrl = m.isFirstMessage ? renderGreetingControlsHtml(snap) : '';
-        html += '<div class="msg-actions"' + (greetCtrl ? ' style="opacity:1; flex-wrap:wrap; align-items:center;"' : '') + '>';
-        if (greetCtrl) html += greetCtrl;
-        if (m.text) html += '<button class="act-btn" data-tr-key="' + esc(key) + '" data-tr-idx="' + m.index + '">🌐 ' + (showTr ? '번역 숨김' : '번역') + '</button>';
-        if (m.index >= 0) {
-          html += '<button class="act-btn" data-edit-msg="' + m.index + '">✏️ 수정</button>';
-          html += '<button class="act-btn" data-del-msg="' + m.index + '">🗑️ 삭제</button>';
-        }
-        html += '</div></div>';
+        html += renderMsgActionBarHtml(m, snap, key, showTr, isLatestChar, false);
+        html += '</div>';
         if (autoTr && !isUser && m.text && !localTranslations.has(key)) autoFetchTranslation(key, m.text);
       }
     }
     box.innerHTML = html;
+    hoistBotFixedWidgets(box);
+    restoreCheckedBotIds(checkedBotIds);
     if (nearBottom) box.scrollTop = box.scrollHeight;
   }
 
+  document.getElementById('bookBotOverlay').addEventListener('change', () => {
+    if (botMenuExpanded) scheduleBotMenuAutoHide();
+  });
+
+  async function handleBotWidgetClick(e) {
+    if (document.getElementById('bookBotOverlay').contains(e.target) && botMenuExpanded) {
+      scheduleBotMenuAutoHide();
+    }
+    const trigEl = e.target.closest('[risu-trigger]');
+    if (trigEl) {
+      e.preventDefault();
+      e.stopPropagation();
+      const snap = lastState && lastState.snapshot;
+      if (!snap || snap.charIndex < 0) return true;
+      const trig = trigEl.getAttribute('risu-trigger');
+      if (!trig) return true;
+      if (/^setFirst\\d+$/i.test(trig)) bookSpreadIdx = 0;
+      await api('/api/command', {
+        method: 'POST',
+        body: JSON.stringify({
+          type: 'run_trigger',
+          payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, trigger: trig, promptAnswers: [] },
+        }),
+      });
+      toast('메뉴 실행 중...');
+      setTimeout(pollState, 350);
+      setTimeout(pollState, 900);
+      setTimeout(pollState, 1600);
+      return true;
+    }
+    const btnEl = e.target.closest('[risu-btn]');
+    if (btnEl) {
+      e.preventDefault();
+      e.stopPropagation();
+      const snap = lastState && lastState.snapshot;
+      const txt = (btnEl.getAttribute('risu-btn') || btnEl.textContent || '').trim();
+      if (!snap || snap.charIndex < 0 || !txt) return true;
+      await api('/api/chat/send', {
+        method: 'POST',
+        body: JSON.stringify({ charIndex: snap.charIndex, chatIndex: snap.chatIndex, text: txt }),
+      });
+      toast('선택 전송됨');
+      setTimeout(pollState, 600);
+      return true;
+    }
+    if (document.body.classList.contains('asset-blur')) {
+      const richImg = e.target.closest('.rs-bot-html img, .rs-bot-html .image-container');
+      if (richImg) { richImg.classList.toggle('revealed'); return true; }
+    }
+    return false;
+  }
+
+  document.getElementById('bookBotOverlay').addEventListener('click', handleBotWidgetClick);
+  document.getElementById('botBgHost').addEventListener('click', handleBotWidgetClick);
+
   document.getElementById('tab-chat').addEventListener('click', async (e) => {
+    if (await handleBotWidgetClick(e)) return;
     const fmBtn = e.target.closest('[data-fm-step]');
     if (fmBtn) {
       const snap = lastState && lastState.snapshot;
@@ -2041,9 +2783,51 @@ function renderWebApp() {
       const curPos = (typeof snap.fmIndex === 'number' && snap.fmIndex >= 0) ? snap.fmIndex + 1 : 0;
       const nextPos = (curPos + step + total) % total;
       const nextFmIndex = nextPos - 1;
+      bookSpreadIdx = 0;
       await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'set_first_message', payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, fmIndex: nextFmIndex } }) });
       toast('퍼스트 메시지 전환 중...');
       setTimeout(pollState, 350);
+      return;
+    }
+    const gVarBtn = e.target.closest('[data-greet-var-step]');
+    if (gVarBtn) {
+      const snap = lastState && lastState.snapshot;
+      if (!snap || snap.charIndex < 0) return;
+      const gKey = gVarBtn.getAttribute('data-greet-var-key');
+      const step = Number(gVarBtn.getAttribute('data-greet-var-step')) || 0;
+      const ctrl = (Array.isArray(snap.greetingControls) ? snap.greetingControls : []).find((c) => c.key === gKey);
+      if (!ctrl || !Array.isArray(ctrl.options) || ctrl.options.length <= 1) return;
+      const curIdx = Math.max(0, ctrl.options.findIndex((o) => String(o) === String(ctrl.value)));
+      const nextVal = ctrl.options[(curIdx + step + ctrl.options.length) % ctrl.options.length];
+      bookSpreadIdx = 0;
+      await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'set_chat_var', payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, key: gKey, value: nextVal } }) });
+      toast('퍼스트 전환: ' + (curIdx + 1) + ' → ' + (ctrl.options.indexOf(nextVal) + 1));
+      setTimeout(pollState, 350);
+      return;
+    }
+    const swBtn = e.target.closest('[data-swipe-msg]');
+    if (swBtn) {
+      const snap = lastState && lastState.snapshot;
+      if (!snap || snap.charIndex < 0) return;
+      const msgIndex = Number(swBtn.getAttribute('data-swipe-msg'));
+      const delta = Number(swBtn.getAttribute('data-swipe-delta')) || 0;
+      await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'swipe_message', payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, msgIndex, delta } }) });
+      toast('응답 전환 중...');
+      setTimeout(pollState, 300);
+      return;
+    }
+    const rerollBtn = e.target.closest('[data-reroll-msg]');
+    if (rerollBtn) {
+      const snap = lastState && lastState.snapshot;
+      if (!snap || snap.charIndex < 0) return;
+      const msgIndex = Number(rerollBtn.getAttribute('data-reroll-msg'));
+      try {
+        await api('/api/chat/reroll', { method: 'POST', body: JSON.stringify({ charIndex: snap.charIndex, chatIndex: snap.chatIndex, msgIndex }) });
+        toast('응답 다시 생성 중...');
+        setTimeout(pollState, 500);
+      } catch (err) {
+        toast('리롤 오류: ' + err.message);
+      }
       return;
     }
     const imgWrap = e.target.closest('[data-img-reveal]');
@@ -2061,6 +2845,7 @@ function renderWebApp() {
     const snap = lastState && lastState.snapshot;
     if (!snap || snap.charIndex < 0) return;
     const key = sel.getAttribute('data-chat-var-key');
+    bookSpreadIdx = 0;
     await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'set_chat_var', payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, key, value: sel.value } }) });
     toast(key + ' = ' + sel.value + ' 반영 중...');
     setTimeout(pollState, 350);
@@ -2471,16 +3256,18 @@ function renderWebApp() {
     renderCustomToggles(false);
     renderChatVariables(force);
     const cat = (lastState && lastState.catalog) || {};
+    const snap = (lastState && lastState.snapshot) || {};
+    const chatModSet = new Set(Array.isArray(snap.chatModules) ? snap.chatModules.map(String) : []);
     const pSel = document.getElementById('personaSel');
     const personas = cat.personas || [];
     const q = (document.getElementById('modSearch').value || '').trim().toLowerCase();
-    const mods = (cat.modules || []).filter((m) => !q || String(m.name).toLowerCase().includes(q));
+    const mods = (cat.modules || []).filter((m) => !q || String(m.name).toLowerCase().includes(q) || String(m.namespace || '').toLowerCase().includes(q));
     if (cat.params && document.activeElement.tagName !== 'INPUT') {
       document.getElementById('pTemp').value = cat.params.temperature;
       document.getElementById('pCtx').value = cat.params.maxContext;
       document.getElementById('pResp').value = cat.params.maxResponse;
     }
-    const modSig = JSON.stringify([q, cat.selectedPersona, personas.map((p) => [p.index, p.name]), mods.map((m) => [m.id, m.name, m.enabled, m.description])]);
+    const modSig = JSON.stringify([q, cat.selectedPersona, snap.charIndex, snap.chatIndex, Array.from(chatModSet).sort(), personas.map((p) => [p.index, p.name]), mods.map((m) => [m.id, m.name, m.enabled, m.description, m.namespace, m.assetCount])]);
     if (!force && modSig === lastModulesRenderSig) return;
     lastModulesRenderSig = modSig;
     if (document.activeElement !== pSel) {
@@ -2490,21 +3277,48 @@ function renderWebApp() {
       await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'select_persona', payload: { personaIndex: Number(pSel.value) } }) });
       toast('페르소나 변경됨');
     };
-    document.getElementById('modCount').textContent = (cat.modules || []).filter((m) => m.enabled).length + ' / ' + (cat.modules || []).length;
-    document.getElementById('modList').innerHTML = mods.map((m) =>
-      '<div class="row"><div style="min-width:0;"><div style="font-size:13.5px; font-weight:600;">' + esc(m.name) + '</div>' +
-      (m.description ? '<div style="font-size:11.5px; color:var(--sub);">' + esc(m.description) + '</div>' : '') + '</div>' +
-      '<input type="checkbox" style="width:20px; height:20px; flex-shrink:0;" ' + (m.enabled ? 'checked' : '') + ' data-mod-id="' + esc(m.id) + '" /></div>'
-    ).join('') || '<div style="color:var(--sub); font-size:12.5px;">모듈 없음</div>';
+    const activeTotal = (cat.modules || []).filter((m) => m.enabled || chatModSet.has(String(m.id))).length;
+    document.getElementById('modCount').textContent = activeTotal + ' / ' + (cat.modules || []).length;
+    document.getElementById('modList').innerHTML = mods.map((m) => {
+      const inChat = chatModSet.has(String(m.id));
+      const metaBadges =
+        (m.namespace ? '<span class="badge">' + esc(m.namespace) + '</span>' : '') +
+        (m.assetCount > 0 ? '<span class="badge">🖼️ ' + m.assetCount + '</span>' : '');
+      return '<div class="row">' +
+        '<div style="min-width:0;">' +
+          '<div style="font-size:13.5px; font-weight:600; display:flex; align-items:center; gap:5px; flex-wrap:wrap;"><span>' + esc(m.name) + '</span>' + metaBadges + '</div>' +
+          (m.description ? '<div style="font-size:11.5px; color:var(--sub);">' + esc(m.description) + '</div>' : '') +
+        '</div>' +
+        '<div style="display:flex; align-items:center; gap:6px; flex-shrink:0;">' +
+          '<button class="pill' + (inChat ? ' active' : '') + '" style="min-height:28px; padding:0 9px; font-size:11.5px;" data-chat-mod-id="' + esc(m.id) + '" data-chat-mod-on="' + (inChat ? '1' : '0') + '" title="이 채팅방 전용 활성화">이 방</button>' +
+          '<input type="checkbox" style="width:20px; height:20px; flex-shrink:0;" ' + (m.enabled ? 'checked' : '') + ' data-mod-id="' + esc(m.id) + '" title="전역 모듈 활성화" />' +
+        '</div>' +
+      '</div>';
+    }).join('') || '<div style="color:var(--sub); font-size:12.5px;">모듈 없음</div>';
   }
+  document.getElementById('modList').addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-chat-mod-id]');
+    if (!btn) return;
+    const snap = lastState && lastState.snapshot;
+    if (!snap || snap.charIndex < 0) return;
+    const moduleId = btn.getAttribute('data-chat-mod-id');
+    const enabled = btn.getAttribute('data-chat-mod-on') !== '1';
+    await api('/api/command', {
+      method: 'POST',
+      body: JSON.stringify({ type: 'toggle_module', payload: { scope: 'chat', charIndex: snap.charIndex, chatIndex: snap.chatIndex, moduleId, enabled } }),
+    });
+    toast('이 방 모듈 ' + (enabled ? '켜짐' : '꺼짐'));
+    setTimeout(pollState, 350);
+  });
   document.getElementById('modList').addEventListener('change', (e) => {
     const chk = e.target.closest('[data-mod-id]');
     if (chk) toggleMod(chk.getAttribute('data-mod-id'), chk.checked);
   });
   document.getElementById('modSearch').oninput = () => renderModules(true);
   window.toggleMod = async (moduleId, enabled) => {
-    await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'toggle_module', payload: { moduleId, enabled } }) });
-    toast('모듈 ' + (enabled ? '켜짐' : '꺼짐'));
+    await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'toggle_module', payload: { scope: 'global', moduleId, enabled } }) });
+    toast('전역 모듈 ' + (enabled ? '켜짐' : '꺼짐'));
+    setTimeout(pollState, 350);
   };
   document.getElementById('saveParamsBtn').onclick = async () => {
     await api('/api/command', {
@@ -2967,6 +3781,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter() } = {}) {
                 state.generating = Boolean(body.generating);
                 if (body.catalog) state.catalog = body.catalog;
                 if (body.snapshot) state.snapshot = body.snapshot;
+                if (body.triggerEvent) state.lastTriggerEvent = body.triggerEvent;
 
                 pruneCommandQueue();
                 if (body.supportsBatchCommands === true) {
@@ -3026,6 +3841,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter() } = {}) {
                 generating: state.generating,
                 directGenerating: state.directGenerating,
                 lastDirectError: state.lastDirectError,
+                lastTriggerEvent: state.lastTriggerEvent,
                 catalog: state.catalog,
                 snapshot: state.snapshot,
             }, req);
@@ -3079,6 +3895,50 @@ function createRelayServer({ token, limiter = createAuthRateLimiter() } = {}) {
                 // Non-PC-active character: execute via Relay Router & persist back to RisuAI DB
                 runDirectRemoteChat(charIndex, chatIndex, text, snapView).catch((err) => {
                     console.error('[DirectChat Error]', err.message);
+                    state.lastDirectError = { message: err && err.message ? err.message : String(err), at: Date.now() };
+                });
+                return sendJson(res, 200, { ok: true, mode: 'direct_router' }, req);
+            } catch (e) {
+                return sendJson(res, 500, { error: e.message }, req);
+            }
+        }
+
+        // 6b) Smart Chat Reroll (Native RisuAI for PC-active bot, Direct Router for other bots)
+        if (pathname === '/api/chat/reroll' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const charIndex = Number(body.charIndex);
+                const chatIndex = Number(body.chatIndex);
+                const msgIndex = Number(body.msgIndex);
+                if (Number.isNaN(charIndex) || Number.isNaN(chatIndex) || Number.isNaN(msgIndex) || msgIndex < 0) {
+                    return sendJson(res, 400, { error: 'Invalid reroll parameters' }, req);
+                }
+
+                if (state.snapshot && state.snapshot.isPcActive && charIndex === state.snapshot.charIndex) {
+                    queueCommand('reroll_message', { charIndex, chatIndex, msgIndex });
+                    return sendJson(res, 200, { ok: true, mode: 'native_risu' }, req);
+                }
+
+                if (state.directGenerating) {
+                    return sendJson(res, 409, { error: '이미 응답을 생성 중입니다.' }, req);
+                }
+                if (!getActiveProfile()) {
+                    return sendJson(res, 400, { error: 'PC에서 현재 열려있지 않은 봇을 리롤하려면 [모델/번역] 탭에서 활성 모델 프로필을 먼저 설정해야 합니다.' }, req);
+                }
+                if (!state.snapshot || state.snapshot.charIndex !== charIndex || state.snapshot.chatIndex !== chatIndex) {
+                    return sendJson(res, 409, { error: '채팅방 동기화가 완료되지 않았습니다. 잠시 후 다시 시도해 주세요.' }, req);
+                }
+
+                state.lastDirectError = null;
+                const snapView = {
+                    charName: state.snapshot.charName,
+                    charContext: state.snapshot.charContext ? { ...state.snapshot.charContext } : null,
+                    messages: Array.isArray(state.snapshot.messages) ? state.snapshot.messages.slice() : [],
+                };
+
+                runDirectRemoteReroll(charIndex, chatIndex, msgIndex, snapView).catch((err) => {
+                    console.error('[DirectReroll Error]', err.message);
                     state.lastDirectError = { message: err && err.message ? err.message : String(err), at: Date.now() };
                 });
                 return sendJson(res, 200, { ok: true, mode: 'direct_router' }, req);
