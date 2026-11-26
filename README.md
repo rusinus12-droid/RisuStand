@@ -70,4 +70,10 @@
 - **절대 이 두 파일을 타인과 공유하거나 GitHub에 업로드하지 마세요.** (동봉된 `.gitignore`에 이미 제외 처리되어 있습니다.)
 
 ## 📄 라이선스
-MIT License
+[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) — 전문은 [LICENSE](LICENSE) 참고.
+
+- ✅ 개인 사용 · 취미 · 연구 · 학습 등 **비상업적 목적**의 사용, 수정, 재배포 허용
+- ❌ **상업적 이용 불가** (유료 판매, 유료 서비스 포함 등)
+- 재배포 시 라이선스 전문(또는 URL)과 `Required Notice:` 문구를 함께 포함해야 합니다.
+
+> Required Notice: Copyright (c) 2026 RisuStand Contributors

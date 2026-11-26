@@ -7,6 +7,9 @@
  *     -> Supports OpenAI-Compatible, Anthropic Claude, Google Gemini + Prompt Override
  *  3) Built-in Translator Engine (Auto/On-demand Output & Korean->English Input)
  *  4) Mobile-first Pocket Web UI (Gemini / Claude / ChatGPT / EPUB Day & Night)
+ *
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+ * Required Notice: Copyright (c) 2026 RisuStand Contributors
  */
 
 const http = require('http');
