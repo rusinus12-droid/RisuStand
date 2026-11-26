@@ -492,6 +492,11 @@ test('pc poll needFullSync signal & risustand.js trash filtering / post-ACK sign
         assert.ok(html.body.includes('bookEndPad'));
         assert.ok(html.body.includes('botWidgetHtml'));
         assert.ok(html.body.includes('extractFixedFromContainer'));
+        assert.ok(html.body.includes('#botBgHost.rs-bg-host'));
+        assert.ok(html.body.includes('contain:layout paint !important'));
+        assert.ok(html.body.includes('body:not(.tab-chat-active)'));
+        assert.ok(html.body.includes('tab-chat-active'));
+        assert.ok(html.body.includes('stripUnsafeRootDecls'));
         const sigMatch = html.body.match(/const sig = JSON\.stringify\(\[snap\.charIndex,[\s\S]*?\]\);/);
         assert.ok(sigMatch && !sigMatch[0].includes('st.generating') && !sigMatch[0].includes('st.directGenerating'), 'lastChatRenderSig should not include generating flags');
         const sendMatch = html.body.match(/async function sendMessage\(\) \{[\s\S]*?document\.getElementById\('sendBtn'\)/);
@@ -511,8 +516,16 @@ test('pc poll needFullSync signal & risustand.js trash filtering / post-ACK sign
         assert.ok(scopedKf.includes('@keyframes spin') && !scopedKf.includes('.rs-bot-html from'));
         const scopedMedia = scopeCtx.scopeBotCss('@media (max-width: 768px) { .btn { width: 40px; } }');
         assert.ok(scopedMedia.includes('@media (max-width: 768px)') && scopedMedia.includes('.rs-bot-html .btn'));
-        const scopedRoot = scopeCtx.scopeBotCss(':root { --x: 1; }');
+        const scopedRoot = scopeCtx.scopeBotCss(':root { --x: 1; position: fixed; }');
         assert.ok(scopedRoot.includes('.rs-bot-html{') || scopedRoot.includes('.rs-bot-html {'));
+        assert.ok(scopedRoot.includes('--x: 1') && !/position\s*:/i.test(scopedRoot));
+        const scopedBodyOverlay = scopeCtx.scopeBotCss('html, body { position: fixed !important; inset: 0; height: 100vh; z-index: 99999; overflow: hidden; display: block; background: linear-gradient(135deg, #faf8f5, #efe7d8); color: #333; }');
+        assert.ok(scopedBodyOverlay.includes('#botBgHost'), 'bare html/body rules should target #botBgHost');
+        assert.ok(scopedBodyOverlay.includes('linear-gradient(135deg, #faf8f5, #efe7d8)'));
+        assert.ok(scopedBodyOverlay.includes('color: #333'));
+        assert.ok(!/(?:position|inset|height|z-index|overflow|display)\s*:/i.test(scopedBodyOverlay), 'viewport-hijacking props must be stripped from html/body');
+        const scopedDescendant = scopeCtx.scopeBotCss('body .card { position: relative; color: red; }');
+        assert.ok(scopedDescendant.includes('.rs-bot-html .card') && scopedDescendant.includes('position: relative'));
         const scopedIs = scopeCtx.scopeBotCss(':is(.a, .b) { color: red; }');
         assert.ok(scopedIs.includes('.rs-bot-html :is(.a, .b)'));
     } finally {
@@ -831,6 +844,273 @@ test('request logs API records proxy non-stream, stream & error calls, redacts s
         const scriptMatch = htmlRes.body.match(/<script>([\s\S]*?)<\/script>/);
         assert.ok(scriptMatch);
         new vm.Script(scriptMatch[1], { filename: 'webapp-reqlogs-inline.js' });
+    } finally {
+        await new Promise((r) => server.close(r));
+        await new Promise((r) => upstream.close(r));
+    }
+});
+
+test('CBS evaluator & Leave r1.1 direct prompt builder honor global and local toggles', () => {
+    const cbsCtx = {
+        charName: 'Alice',
+        personaName: 'Bob',
+        globalVars: {
+            toggle_ooc_mode: '0',
+            toggle_bianca_inject: '1',
+            toggle_flag_a: '0',
+            toggle_flag_b: '1',
+        },
+        chatVars: { nsfw_mode: '1' },
+    };
+    const nested = relay.evalPresetCbs(
+        '{{#if {{equal::{{getglobalvar::toggle_ooc_mode}}::0}}}}' +
+        'Hello {{user}} & {{char}}! ' +
+        '{{#if_pure {{any::{{getglobalvar::toggle_flag_a}}::{{getglobalvar::toggle_flag_b}}}}}}ANY_OK{{:else}}ANY_NO{{/if}} ' +
+        '{{#if {{equal::{{getvar::nsfw_mode}}::1}}}}NSFW_ON{{/if}}' +
+        '{{:else}}OOC_ONLY{{/if}}',
+        cbsCtx
+    );
+    assert.equal(nested, 'Hello Bob & Alice! ANY_OK NSFW_ON');
+
+    const leave = relay.loadBundledLeavePreset();
+    assert.ok(leave && leave.promptTemplate.length === 21);
+
+    const baseSnap = {
+        charName: 'Cheongwon High School',
+        charContext: {
+            name: 'Cheongwon High School',
+            desc: 'Campus simulation.',
+            personaName: 'Puding',
+            personaPrompt: 'Student.',
+            moduleLore: 'Safe lore.\n{{#if {{equal::{{getvar::nsfw_mode}}::1}}}}NSFW_LORE_TAG{{/if}}',
+            note: 'Author focus note.',
+        },
+        chatVariables: { nsfw_mode: '1' },
+        useLocallySetGlobalVariables: false,
+        globalToggleValues: {},
+        localToggleValues: {},
+    };
+    const history = [
+        { index: 0, role: 'user', raw: 'Morning.' },
+        { index: 1, role: 'char', raw: 'Class starts soon.' },
+    ];
+
+    // 1) Default toggles: Bianca omitted, OOC omitted, 09. Commitment Lock sits AFTER latest user input, NSFW lore resolved
+    const defaultMsgs = relay.buildDirectPromptMessages({
+        preset: leave,
+        snap: baseSnap,
+        historyMessages: history,
+        userText: 'Enter the classroom.',
+        remoteToggleValues: {},
+    });
+    const combinedDefault = defaultMsgs.map((m) => m.content).join('\n');
+    assert.ok(!combinedDefault.includes('BIANCA WORKSPACE PERSONA'), 'Bianca should be off by default');
+    assert.ok(!combinedDefault.includes('[LEAVE OOC COMMITMENT LOCK'), 'OOC lock should be off by default');
+    assert.ok(combinedDefault.includes('NSFW_LORE_TAG'), 'chat variable nsfw_mode=1 should resolve inside lorebook');
+    assert.ok(combinedDefault.includes('STEP 3 — CHARACTER-CARD STATUS LINE'), 'Commitment lock should be present');
+    assert.ok(!/\{\{#if|\{\{getglobalvar|\{\{\/if\}\}/.test(combinedDefault), 'No unresolved preset CBS macros should remain');
+    const lastUserIdx = defaultMsgs.map((m) => m.role).lastIndexOf('user');
+    assert.equal(defaultMsgs[lastUserIdx].content, 'Enter the classroom.');
+    assert.ok(lastUserIdx < defaultMsgs.length - 1, 'Commitment lock must appear after latest user turn');
+    assert.ok(defaultMsgs[defaultMsgs.length - 1].content.includes('STEP 3 — CHARACTER-CARD STATUS LINE'));
+
+    // 2) Remote toggles: enable Bianca + English output HUD
+    const biancaMsgs = relay.buildDirectPromptMessages({
+        preset: leave,
+        snap: baseSnap,
+        historyMessages: history,
+        userText: 'Enter the classroom.',
+        remoteToggleValues: { toggle_bianca_inject: '1', toggle_output_lang: '1' },
+    });
+    const combinedBianca = biancaMsgs.map((m) => m.content).join('\n');
+    assert.ok(combinedBianca.includes('BIANCA WORKSPACE PERSONA — this module governs prose voice'));
+    assert.ok(combinedBianca.includes('Leave HUD · [Time] · [Location]'));
+
+    // 3) OOC mode on globally -> OOC lock active; then overridden locally to OFF -> narrative restored
+    const oocMsgs = relay.buildDirectPromptMessages({
+        preset: leave,
+        snap: baseSnap,
+        historyMessages: history,
+        userText: 'Summarize the scene.',
+        remoteToggleValues: { toggle_ooc_mode: '1' },
+    });
+    const combinedOoc = oocMsgs.map((m) => m.content).join('\n');
+    assert.ok(combinedOoc.includes('[LEAVE OOC COMMITMENT LOCK — DIRECT REPLY]'));
+    assert.ok(!combinedOoc.includes('STEP 3 — CHARACTER-CARD STATUS LINE'));
+
+    const localOverrideMsgs = relay.buildDirectPromptMessages({
+        preset: leave,
+        snap: {
+            ...baseSnap,
+            useLocallySetGlobalVariables: true,
+            localToggleValues: { toggle_ooc_mode: '0', toggle_bianca_inject: '1' },
+        },
+        historyMessages: history,
+        userText: 'Back to IC.',
+        remoteToggleValues: { toggle_ooc_mode: '1', toggle_bianca_inject: '0' },
+    });
+    const combinedLocal = localOverrideMsgs.map((m) => m.content).join('\n');
+    assert.ok(combinedLocal.includes('STEP 3 — CHARACTER-CARD STATUS LINE'), 'Local toggle should override remote global OOC toggle');
+    assert.ok(combinedLocal.includes('BIANCA WORKSPACE PERSONA'), 'Local bianca toggle should override global');
+
+    // 4) Preset null -> legacy minimal single-system prompt
+    const legacyMsgs = relay.buildDirectPromptMessages({
+        preset: null,
+        snap: baseSnap,
+        historyMessages: history,
+        userText: 'Hi',
+    });
+    assert.equal(legacyMsgs[0].role, 'system');
+    assert.ok(legacyMsgs[0].content.includes('You are roleplaying as Cheongwon High School'));
+});
+
+test('direct remote chat applies Leave preset + remote toggles & supports custom .risup upload API', async () => {
+    const capturedPayloads = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+            capturedPayloads.push(body);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                id: 'direct-1',
+                model: body.model || 'mock-model',
+                choices: [{ index: 0, message: { role: 'assistant', content: 'Leave remote reply' }, finish_reason: 'stop' }],
+                usage: { prompt_tokens: 100, completion_tokens: 20, total_tokens: 120 },
+            }));
+        });
+    });
+    await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+    const upstreamPort = upstream.address().port;
+
+    const tok = 'direct-preset-test-tok';
+    const server = relay.createRelayServer({
+        token: tok,
+        configOverride: {
+            activeProfileId: 'mock-direct',
+            directPresetId: 'bundled:leave',
+            remoteToggleValues: {},
+            presetToggles: [],
+            profiles: [{
+                id: 'mock-direct',
+                name: 'MockDirect',
+                providerType: 'openai_compat',
+                baseUrl: `http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
+                apiKey: 'mock-key',
+                model: 'deepseek-test',
+                temperature: '',
+                maxTokens: '',
+                overrideMode: 'off',
+                systemOverride: '',
+            }],
+            translator: { useActiveProfile: true, autoTranslateOutput: false, autoTranslateInput: false },
+        },
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+
+    try {
+        const hdrs = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+
+        // 1) Toggle bianca_inject globally via /api/command -> persisted in relay remoteToggleValues
+        const togRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/command',
+            headers: hdrs,
+            body: JSON.stringify({
+                type: 'set_custom_toggle',
+                payload: { charIndex: 1, chatIndex: 0, key: 'bianca_inject', value: '1', scope: 'global' },
+            }),
+        });
+        assert.equal(togRes.status, 200);
+
+        // 2) Sync a non-PC-active character without DOM switch (direct_router fallback)
+        await requestHttp(port, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({
+                bridgeVersion: '2.0.0',
+                generating: false,
+                supportsBatchCommands: true,
+                catalog: { characters: [{ index: 1, name: 'Bot', chats: [{ index: 0, id: 'c0', name: 'Chat 1', msgCount: 1 }] }] },
+                snapshot: {
+                    charIndex: 1,
+                    chatIndex: 0,
+                    charName: 'Bot',
+                    chatName: 'Chat 1',
+                    isPcActive: false,
+                    canPcSwitch: false,
+                    useLocallySetGlobalVariables: false,
+                    globalToggleValues: {},
+                    localToggleValues: {},
+                    chatVariables: { nsfw_mode: '0' },
+                    charContext: {
+                        name: 'Bot',
+                        desc: 'Bot desc',
+                        personaName: 'Tester',
+                        personaPrompt: 'User persona',
+                        moduleLore: 'Safe entry.',
+                    },
+                    messages: [{ index: 0, role: 'char', raw: 'Greeting' }],
+                },
+            }),
+        });
+
+        // 3) Send message -> direct_router -> upstream receives Leave preset + Bianca persona!
+        const sendRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/chat/send',
+            headers: hdrs,
+            body: JSON.stringify({ charIndex: 1, chatIndex: 0, text: 'Hello Leave!' }),
+        });
+        assert.equal(sendRes.status, 200);
+        assert.equal(JSON.parse(sendRes.body).mode, 'direct_router');
+
+        for (let i = 0; i < 40 && capturedPayloads.length === 0; i += 1) {
+            await new Promise((r) => setTimeout(r, 25));
+        }
+        assert.equal(capturedPayloads.length, 1);
+        const sentMsgs = capturedPayloads[0].messages;
+        assert.ok(sentMsgs.length >= 8, `Expected multi-message Leave template, got ${sentMsgs.length}`);
+        const sentAll = sentMsgs.map((m) => m.content).join('\n');
+        assert.ok(sentAll.includes('BIANCA WORKSPACE PERSONA'), 'Remote global toggle must apply to direct remote chat');
+        assert.ok(sentMsgs[sentMsgs.length - 1].content.includes('STEP 3 — CHARACTER-CARD STATUS LINE'));
+
+        // 4) Custom .risup upload, selection, and deletion APIs
+        const risupB64 = fs.readFileSync(path.join(REPO, 'prompt', 'Leave_RisuAI_Preset.risup')).toString('base64');
+        const upRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/presets/custom',
+            headers: hdrs,
+            body: JSON.stringify({ filename: 'MyCustomLeave.risup', dataBase64: risupB64, registerToggle: true }),
+        });
+        assert.equal(upRes.status, 200);
+        const upJson = JSON.parse(upRes.body);
+        assert.ok(upJson.preset && upJson.preset.id.startsWith('custom:'));
+        assert.equal(upJson.config.directPresetId, upJson.preset.id);
+        assert.ok(upJson.config.presetToggles.some((pt) => pt.id === `pt-${upJson.preset.customId}`));
+
+        const delRes = await requestHttp(port, {
+            method: 'DELETE',
+            path: `/api/presets/custom/${encodeURIComponent(upJson.preset.customId)}`,
+            headers: hdrs,
+        });
+        assert.equal(delRes.status, 200);
+        const delJson = JSON.parse(delRes.body);
+        assert.equal(delJson.config.directPresetId, 'bundled:leave');
+        assert.equal(delJson.config.presetToggles.some((pt) => pt.id === `pt-${upJson.preset.customId}`), false);
+
+        // 5) Web UI renders preset selector + upload controls and compiles cleanly
+        const html = await requestHttp(port, { path: '/' });
+        assert.equal(html.status, 200);
+        for (const marker of ['directPresetCard', 'directPresetSel', 'directPresetUploadBtn', 'directPresetDelBtn', '다른 RisuAI 플러그인은 동작하지 않습니다']) {
+            assert.ok(html.body.includes(marker), `Expected UI marker: ${marker}`);
+        }
+        const scriptMatch = html.body.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(scriptMatch);
+        new vm.Script(scriptMatch[1], { filename: 'webapp-direct-preset-inline.js' });
     } finally {
         await new Promise((r) => server.close(r));
         await new Promise((r) => upstream.close(r));

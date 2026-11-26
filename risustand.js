@@ -6,7 +6,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Required Notice: Copyright (c) 2026 rusinus12
 
-(async () => {
+(async function risustandPluginMain() {
     // Kept in sync with //@version by tools/release_version.cjs
     const RISUSTAND_VERSION = '1.0.1';
     const STORAGE_KEY = 'risustand_v1';
@@ -741,6 +741,7 @@
 
     async function unwrapArray(safeArr) {
         if (!safeArr) return [];
+        if (Array.isArray(safeArr)) return safeArr;
         if (typeof risuai.unwarpSafeArray === 'function') {
             return await risuai.unwarpSafeArray(safeArr);
         }
@@ -3710,15 +3711,36 @@
     const PERMS_PROMPTED_KEY = 'risustand_perms_prompted_v3';
     const PERMS_PROMPT_TTL_MS = Math.floor(2.9 * 24 * 60 * 60 * 1000);
 
+    function computePluginBuildSig() {
+        try {
+            const src = String(risustandPluginMain);
+            let h = 2166136261;
+            for (let i = 0; i < src.length; i++) {
+                h ^= src.charCodeAt(i);
+                h = Math.imul(h, 16777619);
+            }
+            return (h >>> 0).toString(16);
+        } catch (_) {
+            return '0';
+        }
+    }
+    const PLUGIN_BUILD_SIG = computePluginBuildSig();
+
     async function requestAllPermissionsOnce(force = false) {
         try {
             if (!force) {
                 const already = await risuai.pluginStorage.getItem(PERMS_PROMPTED_KEY);
                 const raw = String(already || '');
-                const sep = raw.lastIndexOf(':');
-                const ver = sep > 0 ? raw.slice(0, sep) : '';
-                const ts = sep > 0 ? Number(raw.slice(sep + 1)) : NaN;
-                if (ver === RISUSTAND_VERSION && Number.isFinite(ts) && (Date.now() - ts) < PERMS_PROMPT_TTL_MS) {
+                const parts = raw.split(':');
+                const ver = parts[0] || '';
+                const sig = parts.length >= 3 ? parts[1] : '';
+                const ts = parts.length >= 3 ? Number(parts[2]) : NaN;
+                if (
+                    ver === RISUSTAND_VERSION &&
+                    sig === PLUGIN_BUILD_SIG &&
+                    Number.isFinite(ts) &&
+                    (Date.now() - ts) < PERMS_PROMPT_TTL_MS
+                ) {
                     return;
                 }
             }
@@ -3740,7 +3762,7 @@
         }
 
         try {
-            await risuai.pluginStorage.setItem(PERMS_PROMPTED_KEY, `${RISUSTAND_VERSION}:${Date.now()}`);
+            await risuai.pluginStorage.setItem(PERMS_PROMPTED_KEY, `${RISUSTAND_VERSION}:${PLUGIN_BUILD_SIG}:${Date.now()}`);
         } catch (_) {}
     }
 
@@ -7682,8 +7704,9 @@
                         <button class="btn btn-ghost" id="closeBtn">닫기</button>
                     </div>
                     <div class="tip">
-                        <b>릴레이 모델 라우터 연동 팁</b><br>
-                        PC RisuAI 모델 설정(Reverse Proxy / OpenAI 호환)의 URL을 <code>http://127.0.0.1:8787/v1/chat/completions</code>, API 키에 위 <b>보안 접속 토큰</b>, 모델 이름에 <code>risustand-router</code>를 지정하면 휴대폰에서 모델·프롬프트·번역을 실시간 제어할 수 있습니다. (PC 로컬 접속은 기존 키도 동작하지만 원격 프록시 호출에는 토큰이 필요합니다.)
+                        <b>릴레이 모델 라우터 &amp; 원격 라우팅 안내</b><br>
+                        • PC RisuAI 모델 설정(Reverse Proxy / OpenAI 호환)의 URL을 <code>http://127.0.0.1:8787/v1/chat/completions</code>, API 키에 위 <b>보안 접속 토큰</b>, 모델 이름에 <code>risustand-router</code>를 지정하면 휴대폰에서 모델·프롬프트·번역을 실시간 제어할 수 있습니다. (PC 로컬 접속은 기존 키도 동작하지만 원격 프록시 호출에는 토큰이 필요합니다.)<br>
+                        • <b>PC 활성 vs 원격 라우팅</b>: PC RisuAI에 현재 열려 있는 봇(<code>PC 활성</code>)만 <code>risuai.sendChat()</code>을 통해 다른 RisuAI 플러그인들이 정상 작동합니다. PC가 홈 화면이거나 다른 봇을 열어 둔 상태(<code>원격 라우팅</code>)에서는 DB 직접 반영 방식으로 동작하므로 <b>다른 RisuAI 플러그인(메모리·로어북·외부 플러그인 등)은 동작하지 않으며</b>, 대신 모바일 <b>[모델/번역]</b>의 원격 프롬프트 프리셋과 <b>[모듈/설정]</b> 토글이 적용됩니다.
                     </div>
                 </div>
             `;

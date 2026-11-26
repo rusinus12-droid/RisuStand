@@ -9,7 +9,7 @@ const crypto = require('node:crypto');
 const { REPO } = require('./helpers.cjs');
 const CURRENT_VERSION = fs.readFileSync(path.join(REPO, 'VERSION'), 'utf8').trim();
 
-async function bootPluginWithMockRisu({ db, characters, initialStorage, requestPluginPermission, onSendChat, onReadImage, onGetDatabase, onSetDatabaseLite, onReadInlay }) {
+async function bootPluginWithMockRisu({ db, characters, initialStorage, requestPluginPermission, onSendChat, onReadImage, onGetDatabase, onSetDatabaseLite, onReadInlay, rootDoc, getCurrentCharacterIndex, getCurrentChatIndex }) {
     const storage = new Map(initialStorage || [
         ['risustand_perms_prompted_v3', `${CURRENT_VERSION}:${Date.now()}`],
         ['risustand_remote_bridge_v2', JSON.stringify({
@@ -49,7 +49,7 @@ async function bootPluginWithMockRisu({ db, characters, initialStorage, requestP
             getItem: async (k) => storage.get(k) ?? null,
             setItem: async (k, v) => { storage.set(k, v); },
         },
-        getRootDocument: async () => null,
+        getRootDocument: async () => (rootDoc !== undefined ? rootDoc : null),
         changeColorScheme: async () => {},
         changeTextTheme: async () => {},
         setColorScheme: async () => {},
@@ -58,6 +58,7 @@ async function bootPluginWithMockRisu({ db, characters, initialStorage, requestP
         registerSetting: async () => {},
         addRisuChatListener: async () => {},
         removeRisuChatListener: async () => {},
+        createMutationObserver: async () => ({ observe: async () => {}, disconnect: async () => {} }),
         onUnload: async (fn) => { unloadCb = fn; },
         getDatabase: async (keys) => {
             if (typeof onGetDatabase === 'function') await onGetDatabase(keys);
@@ -69,8 +70,8 @@ async function bootPluginWithMockRisu({ db, characters, initialStorage, requestP
             if (typeof onSetDatabaseLite === 'function') await onSetDatabaseLite(patch);
             Object.assign(db, patch);
         },
-        getCurrentCharacterIndex: async () => 0,
-        getCurrentChatIndex: async () => 0,
+        getCurrentCharacterIndex: typeof getCurrentCharacterIndex === 'function' ? getCurrentCharacterIndex : async () => 0,
+        getCurrentChatIndex: typeof getCurrentChatIndex === 'function' ? getCurrentChatIndex : async () => 0,
         getCharacter: async () => characters[0],
         getCharacterFromIndex: async (i) => characters[i] || null,
         setCharacterToIndex: async (i, c) => { characters[i] = c; },
@@ -499,39 +500,63 @@ test('upfront permission onboarding prompts mainDom, db, dbWrite, sendChat, inla
         const firstPermIdx = callOrder.indexOf('perm:mainDom');
         assert.ok(setLiteIdx >= 0 && getDbIdx >= 0 && inlayIdx >= 0 && firstPermIdx > setLiteIdx && firstPermIdx > getDbIdx && firstPermIdx > inlayIdx, `Expected periodic probes before requestPluginPermission, got: ${JSON.stringify(callOrder)}`);
         const savedStamp = String(h1.storage.get('risustand_perms_prompted_v3') || '');
-        assert.ok(savedStamp.startsWith(`${CURRENT_VERSION}:`), `Expected versioned timestamp, got: ${savedStamp}`);
+        const escVer = CURRENT_VERSION.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        assert.match(savedStamp, new RegExp(`^${escVer}:[0-9a-f]+:\\d+$`), `Expected version:sig:ts stamp, got: ${savedStamp}`);
+
+        // Same version + same build sig + within TTL -> must skip re-prompting
+        const requestedSecond = [];
+        const h2 = await bootPluginWithMockRisu({
+            db,
+            characters,
+            initialStorage: [['risustand_perms_prompted_v3', savedStamp]],
+            requestPluginPermission: async (perm) => { requestedSecond.push(perm); return true; },
+        });
+        try {
+            await new Promise((r) => setTimeout(r, 80));
+            assert.deepEqual(requestedSecond, []);
+        } finally {
+            await h2.cleanup();
+        }
     } finally {
         await h1.cleanup();
     }
 
-    const requestedSecond = [];
-    const h2 = await bootPluginWithMockRisu({
-        db,
-        characters,
-        initialStorage: [['risustand_perms_prompted_v3', `${CURRENT_VERSION}:${Date.now()}`]],
-        requestPluginPermission: async (perm) => { requestedSecond.push(perm); return true; },
-    });
-    try {
-        await new Promise((r) => setTimeout(r, 80));
-        assert.deepEqual(requestedSecond, []);
-    } finally {
-        await h2.cleanup();
-    }
-
-    // Legacy v2 or expired (>3 days) stamp must re-prompt upfront
-    const requestedExpired = [];
-    const oldTs = Date.now() - Math.floor(3.1 * 24 * 60 * 60 * 1000);
+    // Legacy 2-part stamp (version:ts) or stale build sig -> must re-prompt all permissions including dbWrite upfront
+    const requestedStale = [];
+    const staleCallOrder = [];
     const h3 = await bootPluginWithMockRisu({
         db,
         characters,
-        initialStorage: [['risustand_perms_prompted_v3', `${CURRENT_VERSION}:${oldTs}`]],
+        initialStorage: [['risustand_perms_prompted_v3', `${CURRENT_VERSION}:deadbeef:${Date.now()}`]],
+        onSetDatabaseLite: async (patch) => { staleCallOrder.push(`setDatabaseLite:${Object.keys(patch || {}).join(',')}`); },
+        requestPluginPermission: async (perm) => {
+            requestedStale.push(perm);
+            staleCallOrder.push(`perm:${perm}`);
+            return true;
+        },
+    });
+    try {
+        await new Promise((r) => setTimeout(r, 80));
+        assert.deepEqual(requestedStale, ['mainDom', 'db', 'dbWrite', 'sendChat', 'inlay']);
+        assert.ok(staleCallOrder.includes('setDatabaseLite:'), 'Expected upfront dbWrite probe on script change/reinstall');
+    } finally {
+        await h3.cleanup();
+    }
+
+    // Expired (>3 days) stamp must re-prompt upfront
+    const requestedExpired = [];
+    const oldTs = Date.now() - Math.floor(3.1 * 24 * 60 * 60 * 1000);
+    const h4 = await bootPluginWithMockRisu({
+        db,
+        characters,
+        initialStorage: [['risustand_perms_prompted_v3', `${CURRENT_VERSION}:0:${oldTs}`]],
         requestPluginPermission: async (perm) => { requestedExpired.push(perm); return true; },
     });
     try {
         await new Promise((r) => setTimeout(r, 80));
         assert.deepEqual(requestedExpired, ['mainDom', 'db', 'dbWrite', 'sendChat', 'inlay']);
     } finally {
-        await h3.cleanup();
+        await h4.cleanup();
     }
 });
 

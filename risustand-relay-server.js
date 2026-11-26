@@ -24,6 +24,8 @@ const RELAY_VERSION = '1.0.1';
 const ROOT_DIR = __dirname;
 const TOKEN_PATH = path.join(ROOT_DIR, '.risustand-token');
 const CONFIG_PATH = path.join(ROOT_DIR, '.risustand-config.json');
+const PRESETS_PATH = path.join(ROOT_DIR, '.risustand-presets.json');
+let configPersistDisabled = false;
 
 function loadSavedPort(rootDir = ROOT_DIR) {
     try {
@@ -69,6 +71,8 @@ let TOKEN = (process.env.RISU_REMOTE_TOKEN || '').trim();
 function defaultConfig() {
     return {
         activeProfileId: '',
+        directPresetId: 'bundled:leave',
+        remoteToggleValues: {},
         presetToggles: [],
         profiles: [
             {
@@ -129,8 +133,16 @@ function loadConfig() {
         if (fs.existsSync(CONFIG_PATH)) {
             const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
             const def = defaultConfig();
+            const remoteToggleValues = {};
+            if (raw.remoteToggleValues && typeof raw.remoteToggleValues === 'object' && !Array.isArray(raw.remoteToggleValues)) {
+                for (const [k, v] of Object.entries(raw.remoteToggleValues)) {
+                    if (k) remoteToggleValues[String(k)] = String(v ?? '');
+                }
+            }
             return {
                 activeProfileId: typeof raw.activeProfileId === 'string' ? raw.activeProfileId : def.activeProfileId,
+                directPresetId: typeof raw.directPresetId === 'string' ? raw.directPresetId : def.directPresetId,
+                remoteToggleValues,
                 profiles: Array.isArray(raw.profiles) ? raw.profiles : def.profiles,
                 presetToggles: Array.isArray(raw.presetToggles) ? raw.presetToggles : [],
                 translator: { ...def.translator, ...(raw.translator || {}) },
@@ -143,6 +155,7 @@ function loadConfig() {
 }
 
 function saveConfig() {
+    if (configPersistDisabled) return;
     const tmp = `${CONFIG_PATH}.rs-tmp-${crypto.randomBytes(6).toString('hex')}`;
     try {
         fs.writeFileSync(tmp, JSON.stringify(config, null, 2), { encoding: 'utf8', mode: 0o600 });
@@ -269,6 +282,10 @@ function loadBundledLeavePreset() {
             name: String((parsed && parsed.name) || 'Leave — Wandering Librarian Engine r1.1'),
             toggleSyntax: String((parsed && parsed.customPromptTemplateToggle) || ''),
             defaultVariables: String((parsed && parsed.templateDefaultVariables) || ''),
+            promptTemplate: Array.isArray(parsed && parsed.promptTemplate) ? parsed.promptTemplate : [],
+            globalNote: String((parsed && parsed.globalNote) || ''),
+            mainPrompt: String((parsed && parsed.mainPrompt) || ''),
+            jailbreak: String((parsed && parsed.jailbreak) || ''),
             hasGuide,
             filename: 'Leave_RisuAI_Preset.risup',
             rawRisup,
@@ -279,6 +296,147 @@ function loadBundledLeavePreset() {
     } catch (_) {
         return null;
     }
+}
+
+let customPresetsCache = null;
+
+function sanitizeUploadedPresetEntry(parsed, { id = '', filename = '' } = {}) {
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('올바른 RisuAI 프리셋 형식이 아닙니다.');
+    }
+    let promptTemplate = Array.isArray(parsed.promptTemplate) ? parsed.promptTemplate : [];
+    const mainPrompt = String(parsed.mainPrompt || '');
+    const globalNote = String(parsed.globalNote || '');
+    const jailbreak = String(parsed.jailbreak || '');
+    if (!promptTemplate.length && (mainPrompt || globalNote || jailbreak)) {
+        promptTemplate = [];
+        if (mainPrompt) promptTemplate.push({ type: 'plain', type2: 'main', role: 'system', text: mainPrompt });
+        promptTemplate.push({ type: 'persona' });
+        promptTemplate.push({ type: 'description' });
+        promptTemplate.push({ type: 'lorebook' });
+        promptTemplate.push({ type: 'authornote' });
+        promptTemplate.push({ type: 'chat', rangeStart: 0, rangeEnd: 'end' });
+        if (globalNote) promptTemplate.push({ type: 'plain', type2: 'globalNote', role: 'system', text: globalNote });
+        if (jailbreak) promptTemplate.push({ type: 'jailbreak', role: 'system', text: jailbreak });
+    }
+    if (!promptTemplate.length) {
+        throw new Error('프리셋에 promptTemplate 또는 mainPrompt가 없습니다.');
+    }
+    const baseName = String(parsed.name || filename.replace(/\.(risup|json)$/i, '') || 'Custom Preset').trim();
+    return {
+        id: id || ('custom-' + crypto.randomBytes(6).toString('hex')),
+        name: baseName.slice(0, 120),
+        filename: String(filename || '').slice(0, 160),
+        createdAt: Date.now(),
+        promptTemplate: promptTemplate.map((it) => ({
+            type: String((it && it.type) || 'plain'),
+            ...(it && it.type2 ? { type2: String(it.type2) } : {}),
+            ...(it && it.role ? { role: String(it.role) } : {}),
+            ...(it && it.name ? { name: String(it.name) } : {}),
+            ...(it && it.text !== undefined ? { text: String(it.text) } : {}),
+            ...(it && it.rangeStart !== undefined ? { rangeStart: it.rangeStart } : {}),
+            ...(it && it.rangeEnd !== undefined ? { rangeEnd: it.rangeEnd } : {}),
+            ...(it && it.innerFormat ? { innerFormat: String(it.innerFormat) } : {}),
+        })),
+        customPromptTemplateToggle: String(parsed.customPromptTemplateToggle || ''),
+        templateDefaultVariables: String(parsed.templateDefaultVariables || ''),
+        globalNote,
+        mainPrompt,
+        jailbreak,
+    };
+}
+
+function parseUploadedPresetPayload({ filename = '', dataBase64 = '', jsonObject = null } = {}) {
+    const cleanName = String(filename || '').trim();
+    if (jsonObject && typeof jsonObject === 'object') {
+        return sanitizeUploadedPresetEntry(jsonObject, { filename: cleanName });
+    }
+    const b64 = String(dataBase64 || '').trim();
+    if (!b64) throw new Error('프리셋 파일 데이터가 비어 있습니다.');
+    const buf = Buffer.from(b64, 'base64');
+    if (!buf.length) throw new Error('프리셋 파일 디코딩에 실패했습니다.');
+    let parsed = null;
+    if (/\.json$/i.test(cleanName)) {
+        parsed = JSON.parse(buf.toString('utf8'));
+    } else if (/\.risup$/i.test(cleanName)) {
+        parsed = decodeRisupPreset(buf);
+    } else {
+        try {
+            parsed = decodeRisupPreset(buf);
+        } catch (_) {
+            parsed = JSON.parse(buf.toString('utf8'));
+        }
+    }
+    return sanitizeUploadedPresetEntry(parsed, { filename: cleanName });
+}
+
+function loadCustomPresets() {
+    if (Array.isArray(customPresetsCache)) return customPresetsCache;
+    try {
+        if (fs.existsSync(PRESETS_PATH)) {
+            const raw = JSON.parse(fs.readFileSync(PRESETS_PATH, 'utf8'));
+            if (Array.isArray(raw)) {
+                customPresetsCache = raw.filter((p) => p && typeof p === 'object' && p.id && Array.isArray(p.promptTemplate));
+                return customPresetsCache;
+            }
+        }
+    } catch (e) {
+        console.warn('[Presets] 커스텀 프리셋 로드 실패:', e.message);
+    }
+    customPresetsCache = [];
+    return customPresetsCache;
+}
+
+function saveCustomPresets(list) {
+    customPresetsCache = Array.isArray(list) ? list : [];
+    if (configPersistDisabled) return;
+    const tmp = `${PRESETS_PATH}.rs-tmp-${crypto.randomBytes(6).toString('hex')}`;
+    try {
+        fs.writeFileSync(tmp, JSON.stringify(customPresetsCache, null, 2), { encoding: 'utf8', mode: 0o600 });
+        fs.renameSync(tmp, PRESETS_PATH);
+    } catch (e) {
+        try { fs.rmSync(tmp, { force: true }); } catch (_) {}
+        console.warn('[Presets] 커스텀 프리셋 저장 실패:', e.message);
+    }
+}
+
+function listDirectPresets() {
+    const out = [
+        { id: 'off', name: '사용 안 함 (기본 간이 프롬프트)', kind: 'off', templateCount: 0, hasToggles: false },
+    ];
+    const leave = loadBundledLeavePreset();
+    if (leave) {
+        out.push({
+            id: 'bundled:leave',
+            name: '🍃 ' + leave.name + ' (내장 .risup)',
+            kind: 'bundled',
+            templateCount: Array.isArray(leave.promptTemplate) ? leave.promptTemplate.length : 0,
+            hasToggles: Boolean(leave.toggleSyntax),
+        });
+    }
+    for (const p of loadCustomPresets()) {
+        out.push({
+            id: 'custom:' + p.id,
+            customId: p.id,
+            name: '📄 ' + p.name,
+            filename: p.filename || '',
+            kind: 'custom',
+            templateCount: Array.isArray(p.promptTemplate) ? p.promptTemplate.length : 0,
+            hasToggles: Boolean(p.customPromptTemplateToggle),
+        });
+    }
+    return out;
+}
+
+function resolveDirectPreset(presetId) {
+    const id = typeof presetId === 'string' ? presetId.trim() : '';
+    if (!id || id === 'off') return null;
+    if (id === 'bundled:leave') return loadBundledLeavePreset();
+    if (id.startsWith('custom:')) {
+        const cid = id.slice(7);
+        return loadCustomPresets().find((p) => p && p.id === cid) || null;
+    }
+    return null;
 }
 
 // Ported from Librarian-System (LIB_UI_Patch) AI Provider & Ollama Cloud catalog
@@ -1586,6 +1744,433 @@ async function translateText(text, direction = 'to_target') {
     return out;
 }
 
+// ================= RisuAI Preset CBS Evaluator & Prompt Builder =================
+function parsePresetDefaultToggles(toggleSyntax = '', defaultVariablesText = '') {
+    const out = {};
+    const assignToggle = (rawKey, val) => {
+        const k = String(rawKey || '').trim();
+        if (!k) return;
+        const fullKey = k.startsWith('toggle_') ? k : `toggle_${k}`;
+        const v = String(val ?? '');
+        out[k] = v;
+        out[fullKey] = v;
+    };
+    for (const rawLine of String(toggleSyntax || '').split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('//') || line.startsWith('#') || line.startsWith('=group') || line.startsWith('=divider')) {
+            continue;
+        }
+        const parts = line.split('=');
+        if (parts.length < 2) continue;
+        const key = (parts[0] || '').trim();
+        if (!key || key.startsWith('=')) continue;
+        const kind = (parts[2] || '').trim().toLowerCase();
+        const defVal = (kind === 'text' || kind === 'textarea') ? '' : '0';
+        assignToggle(key, defVal);
+    }
+    for (const rawLine of String(defaultVariablesText || '').split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#') || line.startsWith('//')) continue;
+        const eq = line.indexOf('=');
+        if (eq <= 0) continue;
+        const key = line.slice(0, eq).trim();
+        const val = line.slice(eq + 1).trim();
+        assignToggle(key, val);
+    }
+    return out;
+}
+
+function isCbsTruthy(val) {
+    const s = String(val ?? '').trim().toLowerCase();
+    return Boolean(s) && s !== '0' && s !== 'false' && s !== 'null' && s !== 'undefined' && s !== 'nan';
+}
+
+function findMatchingCbsClose(str, openIdx) {
+    let depth = 0;
+    for (let i = openIdx; i < str.length - 1; i += 1) {
+        if (str[i] === '{' && str[i + 1] === '{') {
+            depth += 1;
+            i += 1;
+        } else if (str[i] === '}' && str[i + 1] === '}') {
+            depth -= 1;
+            if (depth === 0) return i;
+            i += 1;
+        }
+    }
+    return -1;
+}
+
+function splitCbsTopLevelArgs(inner) {
+    const parts = [];
+    let depth = 0;
+    let start = 0;
+    for (let i = 0; i < inner.length - 1; i += 1) {
+        if (inner[i] === '{' && inner[i + 1] === '{') {
+            depth += 1;
+            i += 1;
+        } else if (inner[i] === '}' && inner[i + 1] === '}') {
+            if (depth > 0) depth -= 1;
+            i += 1;
+        } else if (depth === 0 && inner[i] === ':' && inner[i + 1] === ':') {
+            parts.push(inner.slice(start, i));
+            i += 1;
+            start = i + 1;
+        }
+    }
+    parts.push(inner.slice(start));
+    return parts;
+}
+
+function findMatchingCbsIfEnd(str, startIdx) {
+    let blockDepth = 0;
+    let elseStart = -1;
+    let elseEnd = -1;
+    let i = startIdx;
+    while (i < str.length - 1) {
+        const openIdx = str.indexOf('{{', i);
+        if (openIdx < 0) break;
+        const closeIdx = findMatchingCbsClose(str, openIdx);
+        if (closeIdx < 0) break;
+        const tagInner = str.slice(openIdx + 2, closeIdx).trim();
+        if (/^#(?:if(?:_pure)?|when|each)(?:\s|$)/i.test(tagInner)) {
+            blockDepth += 1;
+        } else if (/^\/(?:if|when|each)?$/i.test(tagInner)) {
+            if (blockDepth === 0) {
+                return { elseStart, elseEnd, endStart: openIdx, endClose: closeIdx };
+            }
+            blockDepth -= 1;
+        } else if (blockDepth === 0 && /^:else$/i.test(tagInner) && elseStart < 0) {
+            elseStart = openIdx;
+            elseEnd = closeIdx + 2;
+        }
+        i = closeIdx + 2;
+    }
+    return null;
+}
+
+function evalPresetCbs(input, ctx = {}, depth = 0) {
+    const str = String(input ?? '');
+    if (!str.includes('{{') || depth > 24) return str;
+    let out = '';
+    let pos = 0;
+    while (pos < str.length) {
+        const openIdx = str.indexOf('{{', pos);
+        if (openIdx < 0) {
+            out += str.slice(pos);
+            break;
+        }
+        out += str.slice(pos, openIdx);
+        const closeIdx = findMatchingCbsClose(str, openIdx);
+        if (closeIdx < 0) {
+            out += str.slice(openIdx);
+            break;
+        }
+        const inner = str.slice(openIdx + 2, closeIdx);
+        const trimmed = inner.trim();
+
+        if (trimmed.startsWith('//')) {
+            pos = closeIdx + 2;
+            continue;
+        }
+
+        const ifMatch = trimmed.match(/^#if(?:_pure)?(?:\s+([\s\S]*))?$/i);
+        if (ifMatch) {
+            const bounds = findMatchingCbsIfEnd(str, closeIdx + 2);
+            if (!bounds) {
+                out += str.slice(openIdx, closeIdx + 2);
+                pos = closeIdx + 2;
+                continue;
+            }
+            const condRaw = ifMatch[1] || '';
+            const condVal = evalPresetCbs(condRaw, ctx, depth + 1);
+            const thenBody = bounds.elseStart >= 0
+                ? str.slice(closeIdx + 2, bounds.elseStart)
+                : str.slice(closeIdx + 2, bounds.endStart);
+            const elseBody = bounds.elseStart >= 0
+                ? str.slice(bounds.elseEnd, bounds.endStart)
+                : '';
+            const branch = isCbsTruthy(condVal) ? thenBody : elseBody;
+            out += evalPresetCbs(branch, ctx, depth + 1);
+            pos = bounds.endClose + 2;
+            continue;
+        }
+
+        const parts = splitCbsTopLevelArgs(inner);
+        const rawCmd = parts[0] || '';
+        const cmd = (rawCmd.includes('{{') ? evalPresetCbs(rawCmd, ctx, depth + 1) : rawCmd).trim().toLowerCase();
+        const args = parts.slice(1).map((a) => evalPresetCbs(a, ctx, depth + 1));
+
+        const gVars = (ctx && ctx.globalVars) || {};
+        const cVars = (ctx && ctx.chatVars) || {};
+
+        let replaced = null;
+        if (cmd === 'getglobalvar') {
+            const k = (args[0] || '').trim();
+            if (Object.prototype.hasOwnProperty.call(gVars, k)) replaced = String(gVars[k] ?? '');
+            else if (k && !k.startsWith('toggle_') && Object.prototype.hasOwnProperty.call(gVars, `toggle_${k}`)) {
+                replaced = String(gVars[`toggle_${k}`] ?? '');
+            } else {
+                replaced = '';
+            }
+        } else if (cmd === 'getvar') {
+            const k = (args[0] || '').trim();
+            if (Object.prototype.hasOwnProperty.call(cVars, k)) replaced = String(cVars[k] ?? '');
+            else if (Object.prototype.hasOwnProperty.call(gVars, k)) replaced = String(gVars[k] ?? '');
+            else replaced = '';
+        } else if (cmd === 'equal') {
+            replaced = String(args[0] ?? '') === String(args[1] ?? '') ? '1' : '0';
+        } else if (cmd === 'notequal') {
+            replaced = String(args[0] ?? '') !== String(args[1] ?? '') ? '1' : '0';
+        } else if (cmd === 'any') {
+            replaced = args.some(isCbsTruthy) ? '1' : '0';
+        } else if (cmd === 'all') {
+            replaced = (args.length > 0 && args.every(isCbsTruthy)) ? '1' : '0';
+        } else if (cmd === 'and') {
+            replaced = (isCbsTruthy(args[0]) && isCbsTruthy(args[1])) ? '1' : '0';
+        } else if (cmd === 'or') {
+            replaced = (isCbsTruthy(args[0]) || isCbsTruthy(args[1])) ? '1' : '0';
+        } else if (cmd === 'not') {
+            replaced = isCbsTruthy(args[0]) ? '0' : '1';
+        } else if (cmd === 'greater') {
+            replaced = Number(args[0]) > Number(args[1]) ? '1' : '0';
+        } else if (cmd === 'less') {
+            replaced = Number(args[0]) < Number(args[1]) ? '1' : '0';
+        } else if (cmd === 'greater_equal') {
+            replaced = Number(args[0]) >= Number(args[1]) ? '1' : '0';
+        } else if (cmd === 'less_equal') {
+            replaced = Number(args[0]) <= Number(args[1]) ? '1' : '0';
+        } else if (cmd === 'char') {
+            replaced = String(ctx.charName || 'Character');
+        } else if (cmd === 'user') {
+            replaced = String(ctx.personaName || 'User');
+        } else if (cmd === 'persona') {
+            replaced = String(ctx.personaPrompt || '');
+        } else if (cmd === 'description') {
+            replaced = String(ctx.desc || '');
+        } else if (cmd === 'personality') {
+            replaced = String(ctx.personality || '');
+        } else if (cmd === 'scenario') {
+            replaced = String(ctx.scenario || '');
+        } else if (cmd === 'authorsnote' || cmd === 'authornote') {
+            replaced = String(ctx.note || '');
+        } else if (cmd === 'globalnote') {
+            replaced = String(ctx.globalNote || '');
+        } else if (cmd === 'mainprompt') {
+            replaced = String(ctx.mainPrompt || '');
+        } else if (cmd === 'jailbreak') {
+            replaced = String(ctx.jailbreak || '');
+        } else if (cmd === 'newline' || cmd === 'br') {
+            replaced = '\n';
+        }
+
+        out += (replaced !== null) ? replaced : str.slice(openIdx, closeIdx + 2);
+        pos = closeIdx + 2;
+    }
+    return out;
+}
+
+function sliceChatRange(list, rangeStart, rangeEnd) {
+    const len = list.length;
+    if (!len) return [];
+    const resolveIdx = (val, def) => {
+        if (val === undefined || val === null || val === '') return def;
+        if (String(val).toLowerCase() === 'end') return len;
+        const n = Number(val);
+        if (!Number.isFinite(n)) return def;
+        return n < 0 ? Math.max(0, len + n) : Math.min(len, n);
+    };
+    const start = resolveIdx(rangeStart, 0);
+    const end = resolveIdx(rangeEnd, len);
+    if (end <= start) return [];
+    return list.slice(start, end);
+}
+
+function cleanPresetPromptText(text) {
+    return String(text || '')
+        .replace(/\r\n/g, '\n')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+function normalizeToggleMapInto(target, src) {
+    if (!src || typeof src !== 'object' || Array.isArray(src)) return;
+    for (const [rawKey, rawVal] of Object.entries(src)) {
+        const k = String(rawKey || '').trim();
+        if (!k) continue;
+        const v = String(rawVal ?? '');
+        target[k] = v;
+        if (k.startsWith('toggle_')) {
+            target[k.slice(7)] = v;
+        } else {
+            target[`toggle_${k}`] = v;
+        }
+    }
+}
+
+function buildDirectPromptMessages({ preset = null, snap = null, historyMessages = [], userText = '', remoteToggleValues = null } = {}) {
+    const s = snap || {};
+    const rawCtx = s.charContext && typeof s.charContext === 'object'
+        ? s.charContext
+        : { name: s.charName || 'Character' };
+
+    const globalVars = parsePresetDefaultToggles(
+        (preset && (preset.toggleSyntax || preset.customPromptTemplateToggle)) || '',
+        (preset && (preset.defaultVariables || preset.templateDefaultVariables)) || ''
+    );
+    normalizeToggleMapInto(globalVars, s.globalToggleValues);
+    normalizeToggleMapInto(globalVars, remoteToggleValues);
+    if (s.useLocallySetGlobalVariables) {
+        normalizeToggleMapInto(globalVars, s.localToggleValues);
+    }
+
+    const chatVars = {};
+    if (s.chatVariables && typeof s.chatVariables === 'object' && !Array.isArray(s.chatVariables)) {
+        for (const [k, v] of Object.entries(s.chatVariables)) {
+            if (k) chatVars[String(k)] = String(v ?? '');
+        }
+    }
+
+    const baseCtx = {
+        globalVars,
+        chatVars,
+        charName: String(rawCtx.name || s.charName || 'Character'),
+        personaName: String(rawCtx.personaName || 'User'),
+        personaPrompt: '',
+        desc: '',
+        personality: '',
+        scenario: '',
+        note: '',
+        globalNote: preset ? String(preset.globalNote || '') : '',
+        mainPrompt: preset ? String(preset.mainPrompt || '') : '',
+        jailbreak: preset ? String(preset.jailbreak || '') : '',
+    };
+    const evalField = (val) => cleanPresetPromptText(evalPresetCbs(String(val || ''), baseCtx));
+    const sysPromptText = evalField(rawCtx.systemPrompt);
+    baseCtx.desc = evalField(rawCtx.desc);
+    baseCtx.personality = evalField(rawCtx.personality);
+    baseCtx.scenario = evalField(rawCtx.scenario);
+    baseCtx.personaPrompt = evalField(rawCtx.personaPrompt);
+    baseCtx.note = evalField(rawCtx.note);
+    const moduleLore = evalField(rawCtx.moduleLore);
+
+    const chatList = (Array.isArray(historyMessages) ? historyMessages : []).map((m) => ({
+        role: m && m.role === 'user' ? 'user' : 'assistant',
+        content: String((m && (m.raw || m.text)) || ''),
+    }));
+    if (userText) {
+        chatList.push({ role: 'user', content: String(userText) });
+    }
+
+    // Fallback: legacy minimal prompt when direct preset is turned off
+    if (!preset || !Array.isArray(preset.promptTemplate) || !preset.promptTemplate.length) {
+        const sysParts = [];
+        sysParts.push(`You are roleplaying as ${baseCtx.charName}. Stay in character and respond naturally.`);
+        if (sysPromptText) sysParts.push(sysPromptText);
+        if (baseCtx.desc) sysParts.push(`[Character Description]\n${baseCtx.desc}`);
+        if (baseCtx.personality) sysParts.push(`[Personality]\n${baseCtx.personality}`);
+        if (baseCtx.scenario) sysParts.push(`[Scenario]\n${baseCtx.scenario}`);
+        if (moduleLore) sysParts.push(`[World / Module Lorebook]\n${moduleLore}`);
+        if (rawCtx.personaName || baseCtx.personaPrompt) {
+            sysParts.push(`[User Persona: ${baseCtx.personaName}]\n${baseCtx.personaPrompt}`);
+        }
+        if (baseCtx.note) sysParts.push(`[Author's Note]\n${baseCtx.note}`);
+        return [{ role: 'system', content: sysParts.join('\n\n') }, ...chatList];
+    }
+
+    const mapRole = (r) => {
+        const v = String(r || '').toLowerCase();
+        if (v === 'user') return 'user';
+        if (v === 'bot' || v === 'char' || v === 'assistant' || v === 'model') return 'assistant';
+        return 'system';
+    };
+    const applyInnerFormat = (item, content) => {
+        if (!content) return '';
+        if (item && item.innerFormat && String(item.innerFormat).includes('{{slot}}')) {
+            return cleanPresetPromptText(evalPresetCbs(String(item.innerFormat).replace(/\{\{slot\}\}/gi, content), baseCtx));
+        }
+        return content;
+    };
+
+    const msgs = [];
+    let sawChatBlock = false;
+
+    for (const item of preset.promptTemplate) {
+        if (!item || typeof item !== 'object') continue;
+        const type = String(item.type || 'plain');
+
+        if (type === 'plain') {
+            let rawText = item.text !== undefined ? String(item.text) : '';
+            if (!rawText && item.type2 === 'main') rawText = baseCtx.mainPrompt;
+            if (!rawText && item.type2 === 'globalNote') rawText = baseCtx.globalNote;
+            const evaluated = cleanPresetPromptText(evalPresetCbs(rawText, baseCtx));
+            if (evaluated) msgs.push({ role: mapRole(item.role), content: evaluated });
+            continue;
+        }
+        if (type === 'jailbreak') {
+            const rawText = item.text !== undefined ? String(item.text) : baseCtx.jailbreak;
+            const evaluated = cleanPresetPromptText(evalPresetCbs(rawText, baseCtx));
+            if (evaluated) msgs.push({ role: mapRole(item.role), content: evaluated });
+            continue;
+        }
+        if (type === 'persona') {
+            if (rawCtx.personaName || baseCtx.personaPrompt) {
+                const body = applyInnerFormat(item, cleanPresetPromptText(`[User Persona: ${baseCtx.personaName}]\n${baseCtx.personaPrompt}`));
+                if (body) msgs.push({ role: 'system', content: body });
+            }
+            continue;
+        }
+        if (type === 'description') {
+            const descParts = [];
+            if (sysPromptText) descParts.push(sysPromptText);
+            if (baseCtx.desc) descParts.push(`[Character Description]\n${baseCtx.desc}`);
+            if (baseCtx.personality) descParts.push(`[Personality]\n${baseCtx.personality}`);
+            if (baseCtx.scenario) descParts.push(`[Scenario]\n${baseCtx.scenario}`);
+            const body = applyInnerFormat(item, cleanPresetPromptText(descParts.join('\n\n')));
+            if (body) msgs.push({ role: 'system', content: body });
+            continue;
+        }
+        if (type === 'lorebook') {
+            if (moduleLore) {
+                const body = applyInnerFormat(item, cleanPresetPromptText(`[World / Module Lorebook]\n${moduleLore}`));
+                if (body) msgs.push({ role: 'system', content: body });
+            }
+            continue;
+        }
+        if (type === 'authornote') {
+            if (baseCtx.note) {
+                const body = applyInnerFormat(item, cleanPresetPromptText(`[Author's Note]\n${baseCtx.note}`));
+                if (body) msgs.push({ role: 'system', content: body });
+            }
+            continue;
+        }
+        if (type === 'chat') {
+            sawChatBlock = true;
+            const sliced = sliceChatRange(chatList, item.rangeStart, item.rangeEnd);
+            for (const cm of sliced) {
+                if (cm.content || cm.role === 'user') msgs.push({ role: cm.role, content: cm.content });
+            }
+            continue;
+        }
+        if (type === 'cache' || type === 'memory' || type === 'postEverything') {
+            if (item.text) {
+                const evaluated = cleanPresetPromptText(evalPresetCbs(String(item.text), baseCtx));
+                if (evaluated) msgs.push({ role: mapRole(item.role), content: evaluated });
+            }
+            continue;
+        }
+        if (item.text) {
+            const evaluated = cleanPresetPromptText(evalPresetCbs(String(item.text), baseCtx));
+            if (evaluated) msgs.push({ role: mapRole(item.role), content: evaluated });
+        }
+    }
+
+    if (!sawChatBlock && chatList.length) {
+        msgs.push(...chatList);
+    }
+    return msgs;
+}
+
 // ================= Direct Remote Chat (for non-PC-active chars) =================
 async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = state.snapshot) {
     const profile = getActiveProfile();
@@ -1593,36 +2178,20 @@ async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = st
         throw new Error('PC에서 현재 열려있지 않은 봇과 대화하려면 [모델/번역] 탭에서 활성 모델 프로필을 먼저 설정해야 합니다.');
     }
     const snap = snapView || state.snapshot;
-    const ctx = snap && snap.charContext ? snap.charContext : { name: (snap && snap.charName) || 'Character' };
-
-    const sysParts = [];
-    sysParts.push(`You are roleplaying as ${ctx.name}. Stay in character and respond naturally.`);
-    if (ctx.systemPrompt) sysParts.push(ctx.systemPrompt);
-    if (ctx.desc) sysParts.push(`[Character Description]\n${ctx.desc}`);
-    if (ctx.personality) sysParts.push(`[Personality]\n${ctx.personality}`);
-    if (ctx.scenario) sysParts.push(`[Scenario]\n${ctx.scenario}`);
-    if (ctx.moduleLore) sysParts.push(`[World / Module Lorebook]\n${ctx.moduleLore}`);
-    if (ctx.personaName || ctx.personaPrompt) {
-        sysParts.push(`[User Persona: ${ctx.personaName || 'User'}]\n${ctx.personaPrompt || ''}`);
-    }
-    if (ctx.note) sysParts.push(`[Author's Note]\n${ctx.note}`);
-
-    const msgs = [{ role: 'system', content: sysParts.join('\n\n') }];
-    const history = Array.isArray(snap.messages) ? snap.messages.slice(-20) : [];
-    for (const m of history) {
-        msgs.push({
-            role: m.role === 'user' ? 'user' : 'assistant',
-            content: m.raw || m.text || '',
-        });
-    }
-    if (userText) {
-        msgs.push({ role: 'user', content: userText });
-    }
+    const preset = resolveDirectPreset(config.directPresetId);
+    const history = Array.isArray(snap && snap.messages) ? snap.messages.slice(-30) : [];
+    const msgs = buildDirectPromptMessages({
+        preset,
+        snap,
+        historyMessages: history,
+        userText,
+        remoteToggleValues: config.remoteToggleValues,
+    });
 
     const finalMsgs = applyPromptOverride(msgs, profile);
     state.directGenerating = true;
     try {
-        console.log(`[DirectChat] char#${charIndex} chat#${chatIndex} via ${profile.name} (${profile.model})`);
+        console.log(`[DirectChat] char#${charIndex} chat#${chatIndex} via ${profile.name} (${profile.model}) preset=${preset ? preset.name : 'off'}`);
         const result = await callLLMNonStream(profile, finalMsgs, { source: 'direct_chat' });
         const appended = [];
         if (userText) appended.push({ role: 'user', data: userText });
@@ -1644,35 +2213,22 @@ async function runDirectRemoteReroll(charIndex, chatIndex, msgIndex, snapView = 
         throw new Error('PC에서 현재 열려있지 않은 봇을 리롤하려면 [모델/번역] 탭에서 활성 모델 프로필을 먼저 설정해야 합니다.');
     }
     const snap = snapView || state.snapshot;
-    const ctx = snap && snap.charContext ? snap.charContext : { name: (snap && snap.charName) || 'Character' };
-
-    const sysParts = [];
-    sysParts.push(`You are roleplaying as ${ctx.name}. Stay in character and respond naturally.`);
-    if (ctx.systemPrompt) sysParts.push(ctx.systemPrompt);
-    if (ctx.desc) sysParts.push(`[Character Description]\n${ctx.desc}`);
-    if (ctx.personality) sysParts.push(`[Personality]\n${ctx.personality}`);
-    if (ctx.scenario) sysParts.push(`[Scenario]\n${ctx.scenario}`);
-    if (ctx.moduleLore) sysParts.push(`[World / Module Lorebook]\n${ctx.moduleLore}`);
-    if (ctx.personaName || ctx.personaPrompt) {
-        sysParts.push(`[User Persona: ${ctx.personaName || 'User'}]\n${ctx.personaPrompt || ''}`);
-    }
-    if (ctx.note) sysParts.push(`[Author's Note]\n${ctx.note}`);
-
-    const msgs = [{ role: 'system', content: sysParts.join('\n\n') }];
-    const prior = (Array.isArray(snap.messages) ? snap.messages : [])
+    const preset = resolveDirectPreset(config.directPresetId);
+    const prior = (Array.isArray(snap && snap.messages) ? snap.messages : [])
         .filter((m) => m.index < msgIndex)
-        .slice(-20);
-    for (const m of prior) {
-        msgs.push({
-            role: m.role === 'user' ? 'user' : 'assistant',
-            content: m.raw || m.text || '',
-        });
-    }
+        .slice(-30);
+    const msgs = buildDirectPromptMessages({
+        preset,
+        snap,
+        historyMessages: prior,
+        userText: '',
+        remoteToggleValues: config.remoteToggleValues,
+    });
 
     const finalMsgs = applyPromptOverride(msgs, profile);
     state.directGenerating = true;
     try {
-        console.log(`[DirectReroll] char#${charIndex} chat#${chatIndex} msg#${msgIndex} via ${profile.name} (${profile.model})`);
+        console.log(`[DirectReroll] char#${charIndex} chat#${chatIndex} msg#${msgIndex} via ${profile.name} (${profile.model}) preset=${preset ? preset.name : 'off'}`);
         const result = await callLLMNonStream(profile, finalMsgs, { source: 'direct_reroll' });
         queueCommand('replace_message_with_swipe', {
             charIndex,
@@ -1875,6 +2431,7 @@ function renderWebApp() {
   /* ===== Panels ===== */
   .panel {
     grid-area: main; overflow-y:auto; display:none; min-height:0;
+    position:relative; z-index:2; isolation:isolate;
     padding: 16px max(14px, calc((100% - var(--content-w)) / 2)) 20px;
     -webkit-overflow-scrolling:touch; overscroll-behavior: contain;
   }
@@ -2037,7 +2594,18 @@ function renderWebApp() {
   .ruler-tick.active { height:16px; width:4px; background:var(--accent); }
 
   /* ===== Bot Regex HTML / Module Widgets & Trigger Modal ===== */
-  .rs-bg-host { display:contents; }
+  .rs-bg-host { display:block; }
+  html body #botBgHost.rs-bg-host {
+    position:fixed !important; inset:0 !important; width:100vw !important; height:100dvh !important;
+    z-index:0 !important; pointer-events:none !important; overflow:hidden !important;
+    isolation:isolate !important; contain:layout paint !important; display:block !important;
+  }
+  html body:not(.tab-chat-active) #botBgHost.rs-bg-host { visibility:hidden !important; }
+  html body .msg-body .rs-bot-html,
+  html body .book-columns .rs-bot-html {
+    position:static !important; inset:auto !important; z-index:auto !important;
+    height:auto !important; max-height:none !important; pointer-events:auto !important;
+  }
   .rs-bot-html { white-space:normal; word-break:keep-all; overflow-wrap:anywhere; width:100%; }
   .rs-bot-html .rs-prose-seg { white-space:pre-wrap; }
   .rs-bot-html img { max-width:100%; height:auto; border-radius:12px; }
@@ -2097,6 +2665,20 @@ function renderWebApp() {
   .leave-thought-body { margin-top:8px; white-space:pre-wrap; line-height:1.6; }
   body.asset-hide .rs-bot-html img, body.asset-hide .rs-bot-html .image-container { display:none !important; }
   body.asset-blur .rs-bot-html img:not(.revealed), body.asset-blur .rs-bot-html .image-container:not(.revealed) { filter:blur(22px) brightness(0.72); cursor:pointer; transition:filter 0.25s ease; }
+  html body #bookBotOverlay {
+    position:fixed !important; inset:0 !important; z-index:25 !important;
+    pointer-events:none !important; isolation:isolate !important; contain:layout paint !important;
+  }
+  html body:not(.tab-chat-active) #bookBotOverlay { display:none !important; }
+  html body #bookBotOverlay [data-rs-bot-fab="1"],
+  html body #bookBotOverlay .side-panel,
+  html body #bookBotOverlay .floating,
+  html body #bookBotOverlay .buttons-container,
+  html body #bookBotOverlay [risu-trigger],
+  html body #bookBotOverlay [risu-btn],
+  html body #bookBotOverlay label,
+  html body #bookBotOverlay button,
+  html body #bookBotOverlay a { pointer-events:auto; }
   #bookBotOverlay:empty { display:none; }
   #bookBotOverlay [data-rs-bot-fab="1"] {
     position:fixed !important; top:106px !important; right:12px !important; z-index:25 !important;
@@ -2108,7 +2690,7 @@ function renderWebApp() {
     opacity:0 !important; pointer-events:none !important; transform:translateX(90px) !important;
   }
   #botMenuFab {
-    position:fixed; right:12px; top:62px; z-index:30;
+    position:fixed; right:12px; top:62px; z-index:35;
     display:inline-flex; align-items:center; justify-content:center; gap:5px;
     box-sizing:border-box; height:34px; min-height:34px; min-width:48px; padding:0 12px; margin:0;
     border-radius:999px; border:1px solid var(--border); background:var(--elev); color:var(--text);
@@ -2255,7 +2837,7 @@ function renderWebApp() {
 
   /* ===== Composer (capsule) ===== */
   .composer {
-    grid-area: composer; display:flex; gap:6px; align-items:flex-end;
+    grid-area: composer; position:relative; z-index:30; display:flex; gap:6px; align-items:flex-end;
     margin: 6px max(10px, calc((100% - var(--content-w)) / 2 + 4px)) 10px;
     padding:6px; border:1px solid var(--border); border-radius:26px;
     background: var(--elev); box-shadow: var(--shadow-sm);
@@ -2279,7 +2861,7 @@ function renderWebApp() {
 
   /* ===== Bottom Nav ===== */
   nav.tabbar {
-    grid-area: nav; display:grid; grid-template-columns:repeat(4, 1fr);
+    grid-area: nav; position:relative; z-index:30; display:grid; grid-template-columns:repeat(4, 1fr);
     border-top:1px solid var(--border); background: var(--header-bg);
     -webkit-backdrop-filter: saturate(160%) blur(14px); backdrop-filter: saturate(160%) blur(14px);
     padding: 4px env(safe-area-inset-right) calc(4px + env(safe-area-inset-bottom)) env(safe-area-inset-left);
@@ -2453,7 +3035,7 @@ function renderWebApp() {
   }
 </style>
 </head>
-<body>
+<body class="tab-chat-active">
 <div id="toast" role="status" aria-live="polite"></div>
 <div id="botBgHost" class="rs-bg-host rs-bot-html"></div>
 <div id="bookBotOverlay" class="bot-menu-collapsed"></div>
@@ -2550,6 +3132,9 @@ function renderWebApp() {
     <div style="display:flex; gap:8px;">
       <input class="search-inp" id="botSearch" placeholder="봇 이름 검색..." />
       <button class="btn sec" id="refreshAllBtn" style="flex-shrink:0;">새로고침</button>
+    </div>
+    <div class="hint" style="margin-top:0;">
+      PC RisuAI에 현재 열려 있는 봇만 <b>PC 활성</b>(<code>risuai.sendChat()</code> · 다른 RisuAI 플러그인 정상 작동)으로 동작합니다. PC가 홈 화면이거나 다른 봇을 열어 둔 상태에서는 <b>원격 라우팅</b>(DB 직접 반영)으로 동작하므로 <b>다른 RisuAI 플러그인은 동작하지 않습니다</b>. 대신 <b>[⚡ 모델/번역]</b>의 원격 프롬프트 프리셋과 <b>[🧩 모듈/설정]</b> 토글이 실시간 적용됩니다.
     </div>
     <div id="botList" style="display:flex; flex-direction:column; gap:8px;"></div>
   </section>
@@ -2698,6 +3283,19 @@ function renderWebApp() {
         <button class="btn" id="saveProfBtn">저장</button>
         <button class="btn sec" onclick="document.getElementById('profileEditor').style.display='none'">취소</button>
         <button class="btn danger" id="delProfBtn" style="margin-left:auto;">삭제</button>
+      </div>
+    </div>
+
+    <div class="card" id="directPresetCard">
+      <h3>📜 원격 직접 요청 프롬프트 프리셋</h3>
+      <select class="f-inp" id="directPresetSel"></select>
+      <div class="hint" id="directPresetHint" style="margin-top:6px;">
+        PC에서 <code>risuai.sendChat()</code>을 쓸 수 없는 상태(<code>원격 라우팅</code>)에서는 DB 직접 반영으로 동작하므로 <b>다른 RisuAI 플러그인은 동작하지 않습니다</b>. 대신 <b>원격 직접 요청(원격채팅 · 원격리롤)</b>에 이 프리셋의 프롬프트 구조와 <b>[🧩 모듈/설정]</b> 탭 토글을 실시간 CBS로 반영합니다. (다른 플러그인까지 쓰려면 PC RisuAI에서 해당 봇을 열어 <b>PC 활성</b> 상태로 사용해 주세요.)
+      </div>
+      <div class="btn-row">
+        <button type="button" class="btn sec" id="directPresetUploadBtn">+ .risup / .json 업로드</button>
+        <input type="file" id="directPresetFile" accept=".risup,.json" style="display:none;" />
+        <button type="button" class="btn danger" id="directPresetDelBtn" style="display:none; margin-left:auto;">삭제</button>
       </div>
     </div>
 
@@ -3039,6 +3637,45 @@ function renderWebApp() {
     return out;
   }
 
+  const UNSAFE_ROOT_CSS_PROPS = new Set([
+    'position', 'inset', 'top', 'right', 'bottom', 'left', 'z-index',
+    'display', 'width', 'height', 'min-width', 'min-height', 'max-width', 'max-height',
+    'overflow', 'overflow-x', 'overflow-y', 'visibility', 'pointer-events',
+    'contain', 'isolation', 'transform'
+  ]);
+
+  function stripUnsafeRootDecls(declBody) {
+    const parts = [];
+    let start = 0;
+    let pDepth = 0;
+    let quote = '';
+    const text = String(declBody || '');
+    for (let i = 0; i <= text.length; i++) {
+      const c = i < text.length ? text[i] : ';';
+      if (i < text.length) {
+        if (quote) {
+          if (c === '\\\\') { i++; continue; }
+          if (c === quote) quote = '';
+          continue;
+        }
+        if (c === '"' || c === "'") { quote = c; continue; }
+        if (c === '(') { pDepth++; continue; }
+        if (c === ')' && pDepth > 0) { pDepth--; continue; }
+        if (c !== ';' || pDepth > 0) continue;
+      }
+      const decl = text.slice(start, i).trim();
+      start = i + 1;
+      if (!decl) continue;
+      const colon = decl.indexOf(':');
+      if (colon <= 0) { parts.push(decl); continue; }
+      const prop = decl.slice(0, colon).trim().toLowerCase();
+      if (prop.startsWith('--') || !UNSAFE_ROOT_CSS_PROPS.has(prop)) {
+        parts.push(decl);
+      }
+    }
+    return parts.join('; ');
+  }
+
   function scopeBotCss(css, scopeSel = '.rs-bot-html') {
     const clean = String(css || '').replace(/\\/\\*[\\s\\S]*?\\*\\//g, '');
     let out = '';
@@ -3085,16 +3722,35 @@ function renderWebApp() {
         } else if (header.startsWith('@')) {
           out += header + '{' + body + '}\\n';
         } else {
-          const scoped = splitCssSelectors(header).map((sel) => {
-            const s = sel.trim();
-            if (!s) return '';
-            if (s.indexOf(scopeSel) === 0 || s.indexOf('#botBgHost') === 0 || s.indexOf('#bookBotOverlay') === 0) return s;
-            if (/^(?:html|body|:root)(?=[\\s.:#[>+~]|$)/i.test(s)) {
-              return s.replace(/^(?:html|body|:root)/i, scopeSel);
+          const bareRootSels = [];
+          const bareDocSels = [];
+          const normalSels = [];
+          for (const rawSel of splitCssSelectors(header)) {
+            const s = rawSel.trim();
+            if (!s) continue;
+            if (s.indexOf(scopeSel) === 0 || s.indexOf('#botBgHost') === 0 || s.indexOf('#bookBotOverlay') === 0) {
+              normalSels.push(s);
+            } else if (/^:root(?=[.#:\\[]|$)/i.test(s)) {
+              bareRootSels.push(s.replace(/^:root/i, scopeSel));
+            } else if (/^(?:html(?:\\s*>?\\s*body)?|body)(?=[.#:\\[]|$)/i.test(s)) {
+              bareDocSels.push(s.replace(/^(?:html(?:\\s*>?\\s*body)?|body)/i, '#botBgHost'));
+            } else if (/^(?:html|body|:root)(?=[\\s.:#[>+~]|$)/i.test(s)) {
+              normalSels.push(s.replace(/^(?:html|body|:root)/i, scopeSel));
+            } else {
+              normalSels.push(scopeSel + ' ' + s);
             }
-            return scopeSel + ' ' + s;
-          }).filter(Boolean).join(', ');
-          if (scoped) out += scoped + '{' + body + '}\\n';
+          }
+          if (bareRootSels.length) {
+            const safeBody = stripUnsafeRootDecls(body);
+            if (safeBody) out += bareRootSels.join(', ') + '{' + safeBody + '}\\n';
+          }
+          if (bareDocSels.length) {
+            const safeBody = stripUnsafeRootDecls(body);
+            if (safeBody) out += bareDocSels.join(', ') + '{' + safeBody + '}\\n';
+          }
+          if (normalSels.length) {
+            out += normalSels.join(', ') + '{' + body + '}\\n';
+          }
         }
       }
     }
@@ -3381,6 +4037,7 @@ function renderWebApp() {
 
   function switchTab(tab) {
     currentTab = tab;
+    document.body.classList.toggle('tab-chat-active', tab === 'chat');
     document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
     document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
     document.getElementById('tab-' + tab).classList.add('active');
@@ -3530,7 +4187,8 @@ function renderWebApp() {
     }
     syncComposerBusy(Boolean(isBusy || localRequestPending));
 
-    syncBotBackground(snap.backgroundHtml || '', snap.assetMap || {});
+    try { syncBotBackground(snap.backgroundHtml || '', snap.assetMap || {}); }
+    catch (err) { console.error('[RisuStand UI] background render failed:', err); }
 
     const msgs = snap.messages || [];
     if (pendingReplyTarget) {
@@ -3555,7 +4213,8 @@ function renderWebApp() {
     const sig = JSON.stringify([snap.charIndex, snap.chatIndex, snap.fmIndex, snap.firstMessageCount, snap.greetingControls || [], snap.backgroundHtml || '', hashStr(snap.botWidgetHtml || ''), Object.keys(snap.assetMap || {}).length, msgs.length, msgDigest, uiPref.theme, uiPref.assetMode, uiPref.richHtml]);
     if (sig !== lastChatRenderSig) {
       lastChatRenderSig = sig;
-      renderChat();
+      try { renderChat(); }
+      catch (err) { console.error('[RisuStand UI] chat render failed:', err); }
     }
     if (currentTab === 'bots') renderBots();
     if (currentTab === 'modules') renderModules();
@@ -4037,6 +4696,28 @@ function renderWebApp() {
         tmpBg.innerHTML = renderBotRichHtml(snap.backgroundHtml, snap.assetMap);
         extractFixedFromContainer(tmpBg);
       }
+    }
+
+    let mayHaveFixedCover = Boolean(rootEl.querySelector('.rs-bot-html [style*="fixed" i]'));
+    if (!mayHaveFixedCover) {
+      rootEl.querySelectorAll('.rs-bot-html style').forEach((st) => {
+        if (/position\\s*:\\s*fixed/i.test(st.textContent || '')) mayHaveFixedCover = true;
+      });
+    }
+    if (mayHaveFixedCover && typeof window.getComputedStyle === 'function') {
+      const vw = window.innerWidth || 0;
+      const vh = window.innerHeight || 0;
+      rootEl.querySelectorAll('.rs-bot-html *').forEach((el) => {
+        const cs = window.getComputedStyle(el);
+        if (cs && cs.position === 'fixed') {
+          const rect = el.getBoundingClientRect();
+          if (vw > 0 && vh > 0 && rect.width >= vw * 0.65 && rect.height >= vh * 0.65) {
+            el.style.setProperty('position', 'absolute', 'important');
+            el.style.setProperty('pointer-events', 'none', 'important');
+            el.style.setProperty('z-index', '-1', 'important');
+          }
+        }
+      });
     }
 
     syncBotMenuVisibility();
@@ -4778,9 +5459,10 @@ function renderWebApp() {
 
     const now = Date.now();
     const useLocal = (now < optimisticUntil && optimisticUseLocal !== null) ? optimisticUseLocal : Boolean(snap.useLocallySetGlobalVariables);
+    const remoteGlobals = (routerCfg && routerCfg.remoteToggleValues && typeof routerCfg.remoteToggleValues === 'object') ? routerCfg.remoteToggleValues : {};
     const baseVals = useLocal
-      ? { ...(snap.globalToggleValues || {}), ...(snap.localToggleValues || {}) }
-      : { ...(snap.globalToggleValues || {}) };
+      ? { ...(snap.globalToggleValues || {}), ...remoteGlobals, ...(snap.localToggleValues || {}) }
+      : { ...(snap.globalToggleValues || {}), ...remoteGlobals };
     const vals = { ...baseVals, ...(now < optimisticUntil ? optimisticVars : {}) };
     const sig = JSON.stringify([snap.charIndex, snap.chatIndex, useLocal, vals, blocks.map((b) => (b.id || '') + ':' + b.source + ':' + b.syntax.length), Array.from(openToggleGroups)]);
     if (!force && sig === lastToggleRenderSig) return;
@@ -4864,6 +5546,10 @@ function renderWebApp() {
     optimisticVars[fullKey] = String(value);
     optimisticUntil = Date.now() + 4500;
     lastToggleRenderSig = '';
+    if (!curUseLocal && routerCfg) {
+      if (!routerCfg.remoteToggleValues || typeof routerCfg.remoteToggleValues !== 'object') routerCfg.remoteToggleValues = {};
+      routerCfg.remoteToggleValues[fullKey] = String(value);
+    }
     await api('/api/command', {
       method: 'POST',
       body: JSON.stringify({
@@ -5095,6 +5781,87 @@ function renderWebApp() {
     } else {
       setModelPickList('trModelPick', 'trModelStatus', [], '');
     }
+    const dpSel = document.getElementById('directPresetSel');
+    const dpDel = document.getElementById('directPresetDelBtn');
+    const dpHint = document.getElementById('directPresetHint');
+    if (dpSel) {
+      const list = Array.isArray(routerCfg.directPresets) ? routerCfg.directPresets : [
+        { id: 'off', name: '사용 안 함 (기본 간이 프롬프트)', templateCount: 0 }
+      ];
+      const activeDp = typeof routerCfg.directPresetId === 'string' ? routerCfg.directPresetId : 'bundled:leave';
+      dpSel.innerHTML = list.map((p) => {
+        const suffix = p.templateCount ? (' · ' + p.templateCount + '블록') : '';
+        return '<option value="' + esc(p.id) + '">' + esc(p.name + suffix) + '</option>';
+      }).join('');
+      dpSel.value = list.some((p) => p.id === activeDp) ? activeDp : (list[1] ? list[1].id : 'off');
+      if (dpDel) dpDel.style.display = dpSel.value.startsWith('custom:') ? '' : 'none';
+      if (dpHint) {
+        dpHint.innerHTML = dpSel.value === 'off'
+          ? '<code>원격 라우팅</code>에서는 <b>다른 RisuAI 플러그인은 동작하지 않습니다</b>. 현재 원격 직접 요청(원격채팅·원격리롤)에 최소 시스템 프롬프트만 전송합니다. RisuAI 프리셋을 입히려면 목록에서 프리셋을 선택하거나 업로드하세요.'
+          : 'PC에서 <code>risuai.sendChat()</code>을 쓸 수 없는 상태(<code>원격 라우팅</code>)에서는 DB 직접 반영으로 동작하므로 <b>다른 RisuAI 플러그인은 동작하지 않습니다</b>. 대신 <b>원격 직접 요청(원격채팅 · 원격리롤)</b>에 이 프리셋과 <b>[🧩 모듈/설정]</b> 탭 토글을 실시간 CBS로 반영합니다. (다른 플러그인까지 쓰려면 PC RisuAI에서 해당 봇을 열어 <b>PC 활성</b> 상태로 사용해 주세요.)';
+      }
+    }
+  }
+  const directPresetSelEl = document.getElementById('directPresetSel');
+  if (directPresetSelEl) {
+    directPresetSelEl.onchange = async () => {
+      try {
+        routerCfg = await api('/api/presets/direct', {
+          method: 'POST',
+          body: JSON.stringify({ directPresetId: directPresetSelEl.value }),
+        });
+        renderRouterUI();
+        toast('원격 직접 요청 프리셋 변경됨');
+      } catch (e) {
+        toast('프리셋 변경 실패: ' + (e && e.message ? e.message : '오류'));
+      }
+    };
+  }
+  const directPresetUploadBtnEl = document.getElementById('directPresetUploadBtn');
+  const directPresetFileEl = document.getElementById('directPresetFile');
+  if (directPresetUploadBtnEl && directPresetFileEl) {
+    directPresetUploadBtnEl.onclick = () => directPresetFileEl.click();
+    directPresetFileEl.onchange = async () => {
+      const f = directPresetFileEl.files && directPresetFileEl.files[0];
+      if (!f) return;
+      try {
+        const buf = new Uint8Array(await f.arrayBuffer());
+        let bin = '';
+        const chunk = 0x8000;
+        for (let i = 0; i < buf.length; i += chunk) {
+          bin += String.fromCharCode.apply(null, buf.subarray(i, i + chunk));
+        }
+        const res = await api('/api/presets/custom', {
+          method: 'POST',
+          body: JSON.stringify({ filename: f.name, dataBase64: btoa(bin), registerToggle: true }),
+        });
+        if (res && res.config) routerCfg = res.config;
+        renderRouterUI();
+        renderCustomToggles(true);
+        toast('프리셋 업로드 및 적용 완료: ' + ((res && res.preset && res.preset.name) || f.name));
+      } catch (e) {
+        toast('프리셋 업로드 실패: ' + (e && e.message ? e.message : '오류'));
+      } finally {
+        directPresetFileEl.value = '';
+      }
+    };
+  }
+  const directPresetDelBtnEl = document.getElementById('directPresetDelBtn');
+  if (directPresetDelBtnEl) {
+    directPresetDelBtnEl.onclick = async () => {
+      const curId = directPresetSelEl ? directPresetSelEl.value : '';
+      if (!curId.startsWith('custom:')) return;
+      if (!confirm('선택한 커스텀 프리셋을 삭제할까요?')) return;
+      try {
+        const res = await api('/api/presets/custom/' + encodeURIComponent(curId.slice(7)), { method: 'DELETE' });
+        if (res && res.config) routerCfg = res.config;
+        renderRouterUI();
+        renderCustomToggles(true);
+        toast('커스텀 프리셋 삭제됨');
+      } catch (e) {
+        toast('삭제 실패: ' + (e && e.message ? e.message : '오류'));
+      }
+    };
   }
   document.getElementById('profileList').addEventListener('click', (e) => {
     const actBtn = e.target.closest('[data-act-prof]');
@@ -5805,8 +6572,14 @@ function renderWebApp() {
 }
 
 function sanitizeConfigForClient() {
+    const remoteToggleValues = (config.remoteToggleValues && typeof config.remoteToggleValues === 'object' && !Array.isArray(config.remoteToggleValues))
+        ? { ...config.remoteToggleValues }
+        : {};
     return {
         activeProfileId: config.activeProfileId,
+        directPresetId: typeof config.directPresetId === 'string' ? config.directPresetId : 'bundled:leave',
+        directPresets: listDirectPresets(),
+        remoteToggleValues,
         presetToggles: Array.isArray(config.presetToggles) ? config.presetToggles : [],
         profiles: config.profiles.map((p) => ({
             id: p.id,
@@ -5980,7 +6753,19 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
     const requireProxyAuth = makeRequireProxyAuth(resolvedToken, limiter);
     const assetCookieVal = crypto.createHmac('sha256', ASSET_HMAC_KEY).update(String(resolvedToken)).digest('hex').slice(0, 32);
     const prevConfig = configOverride ? config : null;
-    if (configOverride) config = configOverride;
+    const prevPersistDisabled = configPersistDisabled;
+    const prevCustomPresetsCache = customPresetsCache;
+    if (configOverride) {
+        config = {
+            ...defaultConfig(),
+            ...configOverride,
+            remoteToggleValues: (configOverride.remoteToggleValues && typeof configOverride.remoteToggleValues === 'object')
+                ? { ...configOverride.remoteToggleValues }
+                : {},
+        };
+        configPersistDisabled = true;
+        customPresetsCache = [];
+    }
 
     const server = http.createServer(async (req, res) => {
         const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -6159,6 +6944,19 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             try {
                 const body = JSON.parse((await readBody(req)) || '{}');
                 if (!body.type) return sendJson(res, 400, { error: 'Missing command type' }, req);
+                if (body.type === 'set_custom_toggle' && body.payload && typeof body.payload === 'object') {
+                    const p = body.payload;
+                    const key = String(p.key || '').trim();
+                    const scope = p.scope || 'global';
+                    if (key && scope !== 'local') {
+                        const fullKey = key.startsWith('toggle_') ? key : `toggle_${key}`;
+                        if (!config.remoteToggleValues || typeof config.remoteToggleValues !== 'object') {
+                            config.remoteToggleValues = {};
+                        }
+                        config.remoteToggleValues[fullKey] = String(p.value ?? '');
+                        saveConfig();
+                    }
+                }
                 queueCommand(body.type, body.payload || {});
                 return sendJson(res, 200, { ok: true }, req);
             } catch (e) {
@@ -6200,6 +6998,10 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     charName: state.snapshot.charName,
                     charContext: state.snapshot.charContext ? { ...state.snapshot.charContext } : null,
                     messages: Array.isArray(state.snapshot.messages) ? state.snapshot.messages.slice() : [],
+                    useLocallySetGlobalVariables: Boolean(state.snapshot.useLocallySetGlobalVariables),
+                    globalToggleValues: state.snapshot.globalToggleValues ? { ...state.snapshot.globalToggleValues } : {},
+                    localToggleValues: state.snapshot.localToggleValues ? { ...state.snapshot.localToggleValues } : {},
+                    chatVariables: state.snapshot.chatVariables ? { ...state.snapshot.chatVariables } : {},
                 };
 
                 // Non-PC-active character: execute via Relay Router & persist back to RisuAI DB
@@ -6247,6 +7049,10 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     charName: state.snapshot.charName,
                     charContext: state.snapshot.charContext ? { ...state.snapshot.charContext } : null,
                     messages: Array.isArray(state.snapshot.messages) ? state.snapshot.messages.slice() : [],
+                    useLocallySetGlobalVariables: Boolean(state.snapshot.useLocallySetGlobalVariables),
+                    globalToggleValues: state.snapshot.globalToggleValues ? { ...state.snapshot.globalToggleValues } : {},
+                    localToggleValues: state.snapshot.localToggleValues ? { ...state.snapshot.localToggleValues } : {},
+                    chatVariables: state.snapshot.chatVariables ? { ...state.snapshot.chatVariables } : {},
                 };
 
                 runDirectRemoteReroll(charIndex, chatIndex, msgIndex, snapView).catch((err) => {
@@ -6302,6 +7108,16 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 }
                 if (typeof body.activeProfileId === 'string') {
                     config.activeProfileId = body.activeProfileId;
+                }
+                if (typeof body.directPresetId === 'string') {
+                    config.directPresetId = body.directPresetId;
+                }
+                if (body.remoteToggleValues && typeof body.remoteToggleValues === 'object' && !Array.isArray(body.remoteToggleValues)) {
+                    const nextRT = {};
+                    for (const [k, v] of Object.entries(body.remoteToggleValues)) {
+                        if (k) nextRT[String(k)] = String(v ?? '');
+                    }
+                    config.remoteToggleValues = nextRT;
                 }
                 if (Array.isArray(body.presetToggles)) {
                     config.presetToggles = body.presetToggles.map((pt) => ({
@@ -6425,10 +7241,97 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             return;
         }
 
+        // 8c-2) Direct Remote Prompt Preset Selection & Custom Upload API
+        if (pathname === '/api/presets/direct' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            return sendJson(res, 200, {
+                ok: true,
+                directPresetId: typeof config.directPresetId === 'string' ? config.directPresetId : 'bundled:leave',
+                presets: listDirectPresets(),
+            }, req);
+        }
+
+        if (pathname === '/api/presets/direct' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const nextId = String(body.directPresetId || 'off').trim();
+                const available = listDirectPresets();
+                if (!available.some((p) => p.id === nextId)) {
+                    return sendJson(res, 404, { error: '선택한 프리셋을 찾을 수 없습니다.' }, req);
+                }
+                config.directPresetId = nextId;
+                saveConfig();
+                return sendJson(res, 200, sanitizeConfigForClient(), req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/presets/custom' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const entry = parseUploadedPresetPayload({
+                    filename: body.filename,
+                    dataBase64: body.dataBase64,
+                    jsonObject: body.jsonObject,
+                });
+                const list = loadCustomPresets().slice();
+                list.push(entry);
+                saveCustomPresets(list);
+                config.directPresetId = `custom:${entry.id}`;
+                if (body.registerToggle !== false && entry.customPromptTemplateToggle) {
+                    if (!Array.isArray(config.presetToggles)) config.presetToggles = [];
+                    const ptId = `pt-${entry.id}`;
+                    const ptEntry = {
+                        id: ptId,
+                        name: `📄 ${entry.name}`,
+                        enabled: true,
+                        syntax: entry.customPromptTemplateToggle,
+                    };
+                    const idx = config.presetToggles.findIndex((x) => x && x.id === ptId);
+                    if (idx >= 0) config.presetToggles[idx] = ptEntry;
+                    else config.presetToggles.unshift(ptEntry);
+                }
+                saveConfig();
+                const summary = listDirectPresets().find((p) => p.id === config.directPresetId) || null;
+                return sendJson(res, 200, { ok: true, preset: summary, config: sanitizeConfigForClient() }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
+            }
+        }
+
+        const customPresetMatch = pathname.match(/^\/api\/presets\/custom\/([^/]+)$/);
+        if (customPresetMatch && req.method === 'DELETE') {
+            if (!requireAuth(req, res)) return;
+            let rawId = customPresetMatch[1];
+            try { rawId = decodeURIComponent(rawId); } catch (_) {}
+            const cid = rawId.startsWith('custom:') ? rawId.slice(7) : rawId;
+            const list = loadCustomPresets();
+            const nextList = list.filter((p) => p && p.id !== cid);
+            if (nextList.length === list.length) {
+                return sendJson(res, 404, { error: '커스텀 프리셋을 찾을 수 없습니다.' }, req);
+            }
+            saveCustomPresets(nextList);
+            if (Array.isArray(config.presetToggles)) {
+                config.presetToggles = config.presetToggles.filter((pt) => !pt || pt.id !== `pt-${cid}`);
+            }
+            if (config.directPresetId === `custom:${cid}`) {
+                config.directPresetId = loadBundledLeavePreset() ? 'bundled:leave' : 'off';
+            }
+            saveConfig();
+            return sendJson(res, 200, { ok: true, config: sanitizeConfigForClient() }, req);
+        }
+
         sendJson(res, 404, { error: 'Not found' }, req);
     });
     if (prevConfig !== null) {
-        server.once('close', () => { config = prevConfig; });
+        server.once('close', () => {
+            config = prevConfig;
+            configPersistDisabled = prevPersistDisabled;
+            customPresetsCache = prevCustomPresetsCache;
+        });
     }
     return server;
 }
@@ -6511,5 +7414,9 @@ module.exports = {
     corsHeaders,
     sanitizeConfigForClient,
     decodeRisupPreset,
+    parsePresetDefaultToggles,
+    evalPresetCbs,
+    buildDirectPromptMessages,
+    loadBundledLeavePreset,
     createRelayServer,
 };
