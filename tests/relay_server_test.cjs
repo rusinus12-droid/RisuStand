@@ -825,7 +825,7 @@ test('request logs API records proxy non-stream, stream & error calls, redacts s
         // 6) Web UI includes Request Log viewer markers & compiles
         const htmlRes = await requestHttp(port, { path: '/' });
         assert.equal(htmlRes.status, 200);
-        for (const marker of ['reqLogQuickBtn', 'reqLogModal', 'reqLogCard', 'reqLogList', 'loadRequestLogs', 'openRequestLogDetail']) {
+        for (const marker of ['reqLogQuickBtn', 'reqLogModal', 'reqLogCard', 'reqLogList', 'loadRequestLogs', 'openRequestLogDetail', '.req-log-body > * { flex-shrink:0; }', 'reqLogMsgSearch', 'data-copy-msg-idx', 'data-log-expand-all']) {
             assert.ok(htmlRes.body.includes(marker), `Expected Request Log UI marker: ${marker}`);
         }
         const scriptMatch = htmlRes.body.match(/<script>([\s\S]*?)<\/script>/);

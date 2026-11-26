@@ -2182,7 +2182,7 @@ function renderWebApp() {
     display:flex; align-items:center; justify-content:center; padding:14px;
   }
   .req-log-dialog {
-    width:100%; max-width:860px; max-height:88vh; background:var(--elev); color:var(--text);
+    width:100%; max-width:min(1040px, 96vw); height:min(88vh, 920px); max-height:90vh; background:var(--elev); color:var(--text);
     border:1px solid var(--border); border-radius:18px; box-shadow:var(--shadow);
     display:flex; flex-direction:column; overflow:hidden;
   }
@@ -2195,23 +2195,51 @@ function renderWebApp() {
     display:flex; gap:6px; flex-wrap:wrap; padding:8px 16px; border-bottom:1px solid var(--border);
     background:var(--elev); flex-shrink:0;
   }
-  .req-log-body { flex:1; min-height:0; overflow:auto; padding:14px 16px; display:flex; flex-direction:column; gap:10px; }
+  .req-log-body {
+    flex:1; min-height:0; overflow-y:auto; overflow-x:hidden; padding:14px 16px;
+    display:flex; flex-direction:column; gap:10px; -webkit-overflow-scrolling:touch;
+  }
+  .req-log-body > * { flex-shrink:0; }
+  .req-log-toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .req-log-toolbar .f-inp { flex:1; min-width:180px; min-height:34px; padding:6px 11px; font-size:13px; }
+  .req-log-msg-list { display:flex; flex-direction:column; gap:10px; }
   .req-log-msg {
-    border:1px solid var(--border); border-radius:12px; background:var(--bg); overflow:hidden;
+    flex-shrink:0; border:1px solid var(--border); border-radius:12px; background:var(--bg);
   }
-  .req-log-msg-head {
+  .req-log-msg.role-system { border-color:color-mix(in srgb, var(--accent) 40%, var(--border)); }
+  .req-log-msg.role-user {
+    border-color:color-mix(in srgb, #38bdf8 45%, var(--border));
+    background:color-mix(in srgb, #38bdf8 4%, var(--bg));
+  }
+  .req-log-msg.role-assistant, .req-log-msg.role-model {
+    border-color:color-mix(in srgb, #34d399 40%, var(--border));
+  }
+  summary.req-log-msg-head {
     display:flex; align-items:center; justify-content:space-between; gap:8px;
-    padding:6px 11px; background:var(--surface); border-bottom:1px solid var(--border); font-size:11.5px; color:var(--sub);
+    padding:8px 12px; background:var(--surface); border-bottom:1px solid var(--border);
+    border-radius:11px 11px 0 0; font-size:12px; color:var(--sub);
+    list-style:none; cursor:pointer; user-select:none;
   }
+  summary.req-log-msg-head::-webkit-details-marker { display:none; }
+  details.req-log-msg:not([open]) summary.req-log-msg-head { border-bottom:none; border-radius:11px; }
+  .req-log-msg-chev { display:inline-block; transition:transform 0.15s ease; font-size:11px; margin-right:6px; }
+  details.req-log-msg:not([open]) .req-log-msg-chev { transform:rotate(-90deg); }
   .req-log-msg-role { font-weight:800; text-transform:uppercase; letter-spacing:0.04em; color:var(--accent); }
+  .req-log-msg.role-user .req-log-msg-role { color:#38bdf8; }
+  .req-log-msg.role-assistant .req-log-msg-role, .req-log-msg.role-model .req-log-msg-role { color:#34d399; }
+  .req-log-mini-btn {
+    padding:3px 9px; border-radius:999px; border:1px solid var(--border); background:var(--bg);
+    color:var(--text); font-size:11px; font-weight:700; cursor:pointer;
+  }
+  .req-log-mini-btn:hover { border-color:var(--accent); color:var(--accent); }
   .req-log-msg-body {
-    margin:0; padding:10px 12px; font-size:12.5px; line-height:1.58;
-    white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere; font-family:inherit;
+    margin:0; padding:12px 14px; font-size:13px; line-height:1.68;
+    white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere; font-family:inherit; user-select:text;
   }
   .req-log-pre {
-    margin:0; padding:12px; border-radius:12px; border:1px solid var(--border); background:var(--surface);
-    font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; line-height:1.55;
-    white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere; max-height:60vh; overflow:auto;
+    margin:0; padding:12px 14px; border-radius:12px; border:1px solid var(--border); background:var(--surface);
+    font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12.5px; line-height:1.62;
+    white-space:pre-wrap; word-break:break-word; overflow-wrap:anywhere; max-height:none; overflow-x:auto; user-select:text;
   }
   .req-log-errbox {
     padding:10px 12px; border-radius:12px; border:1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
@@ -5370,6 +5398,7 @@ function renderWebApp() {
   let reqLogActiveDetail = null;
   let reqLogDetailLoading = false;
   let reqLogDetailTab = 'messages';
+  let reqLogMsgQuery = '';
 
   function formatLogSource(src) {
     if (src === 'proxy') return '프록시';
@@ -5483,13 +5512,12 @@ function renderWebApp() {
     return (d.messages || []).map((m, i) => '[' + (i + 1) + ' ' + String(m.role || 'user').toUpperCase() + ']\\n' + (m.content || '')).join('\\n\\n---\\n\\n');
   }
 
-  async function copyReqLogActiveText() {
-    const txt = getReqLogCopyPayload();
+  async function copyPlainText(txt, okMsg = '복사됨') {
     if (!txt) { toast('복사할 내용이 없습니다'); return; }
     try {
       if (navigator.clipboard && navigator.clipboard.writeText) {
         await navigator.clipboard.writeText(txt);
-        toast('복사됨');
+        toast(okMsg);
         return;
       }
     } catch (_) {}
@@ -5499,8 +5527,43 @@ function renderWebApp() {
     ta.style.opacity = '0';
     document.body.appendChild(ta);
     ta.select();
-    try { document.execCommand('copy'); toast('복사됨'); } catch (_) { toast('복사 실패'); }
+    try { document.execCommand('copy'); toast(okMsg); } catch (_) { toast('복사 실패'); }
     document.body.removeChild(ta);
+  }
+
+  async function copyReqLogActiveText() {
+    await copyPlainText(getReqLogCopyPayload(), '복사됨');
+  }
+
+  function renderReqLogMessagesHtml(msgs, query) {
+    const arr = Array.isArray(msgs) ? msgs : [];
+    if (!arr.length) return '<div style="font-size:13px; color:var(--sub);">저장된 메시지가 없습니다.</div>';
+    const q = String(query || '').trim().toLowerCase();
+    const out = [];
+    for (let i = 0; i < arr.length; i++) {
+      const m = arr[i] || {};
+      const role = String(m.role || 'user');
+      const content = String(m.content || '');
+      if (q && !role.toLowerCase().includes(q) && !content.toLowerCase().includes(q)) continue;
+      const roleCls = role === 'system' ? 'system' : (role === 'user' ? 'user' : (role === 'model' ? 'model' : 'assistant'));
+      out.push(
+        '<details class="req-log-msg role-' + roleCls + '" open>' +
+          '<summary class="req-log-msg-head">' +
+            '<span style="display:flex; align-items:center; gap:6px; min-width:0;">' +
+              '<span class="req-log-msg-chev">▾</span>' +
+              '<span class="req-log-msg-role">#' + (i + 1) + ' ' + esc(role) + '</span>' +
+            '</span>' +
+            '<span style="display:flex; align-items:center; gap:8px; flex-shrink:0;">' +
+              '<span>' + content.length + '자</span>' +
+              '<button type="button" class="req-log-mini-btn" data-copy-msg-idx="' + i + '">📋 복사</button>' +
+            '</span>' +
+          '</summary>' +
+          '<pre class="req-log-msg-body">' + esc(content || '(빈 메시지)') + '</pre>' +
+        '</details>'
+      );
+    }
+    if (!out.length) return '<div style="font-size:13px; color:var(--sub);">검색어와 일치하는 메시지가 없습니다.</div>';
+    return out.join('');
   }
 
   function renderReqLogModal() {
@@ -5556,17 +5619,13 @@ function renderWebApp() {
     const statusText = d.status ? ('HTTP ' + d.status) : (d.ok ? 'OK' : 'ERR');
     let tabBody = '';
     if (reqLogDetailTab === 'messages') {
-      tabBody = msgs.length
-        ? msgs.map((m, idx) =>
-            '<div class="req-log-msg">' +
-              '<div class="req-log-msg-head">' +
-                '<span class="req-log-msg-role">#' + (idx + 1) + ' ' + esc(m.role || 'user') + '</span>' +
-                '<span>' + String((m.content || '').length) + '자</span>' +
-              '</div>' +
-              '<pre class="req-log-msg-body">' + esc(m.content || '') + '</pre>' +
-            '</div>'
-          ).join('')
-        : '<div style="font-size:13px; color:var(--sub);">저장된 메시지가 없습니다.</div>';
+      tabBody =
+        '<div class="req-log-toolbar">' +
+          '<input class="f-inp" id="reqLogMsgSearch" placeholder="메시지 역할/내용 검색..." value="' + esc(reqLogMsgQuery) + '" />' +
+          '<button type="button" class="pill" data-log-expand-all="1">모두 펼치기</button>' +
+          '<button type="button" class="pill" data-log-collapse-all="1">모두 접기</button>' +
+        '</div>' +
+        '<div id="reqLogMsgList" class="req-log-msg-list">' + renderReqLogMessagesHtml(msgs, reqLogMsgQuery) + '</div>';
     } else if (reqLogDetailTab === 'request') {
       tabBody = '<pre class="req-log-pre">' + esc(d.requestJson || '(요청 본문 없음)') + '</pre>';
     } else if (reqLogDetailTab === 'response') {
@@ -5612,6 +5671,14 @@ function renderWebApp() {
         '<div class="req-log-body">' + tabBody + '</div>' +
       '</div>';
     modal.style.display = 'flex';
+    const sInp = document.getElementById('reqLogMsgSearch');
+    if (sInp) {
+      sInp.oninput = () => {
+        reqLogMsgQuery = sInp.value;
+        const listEl = document.getElementById('reqLogMsgList');
+        if (listEl) listEl.innerHTML = renderReqLogMessagesHtml(msgs, reqLogMsgQuery);
+      };
+    }
   }
 
   function closeReqLogModal() {
@@ -5635,6 +5702,7 @@ function renderWebApp() {
     reqLogDetailLoading = true;
     reqLogActiveDetail = null;
     reqLogDetailTab = 'messages';
+    reqLogMsgQuery = '';
     renderReqLogModal();
     try {
       const res = await api('/api/logs/' + encodeURIComponent(id));
@@ -5672,6 +5740,25 @@ function renderWebApp() {
   });
   document.getElementById('reqLogModal').addEventListener('click', (e) => {
     const modal = document.getElementById('reqLogModal');
+    const copyMsgBtn = e.target.closest('[data-copy-msg-idx]');
+    if (copyMsgBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      const idx = Number(copyMsgBtn.getAttribute('data-copy-msg-idx'));
+      const msgs = (reqLogActiveDetail && reqLogActiveDetail.messages) || [];
+      if (Number.isInteger(idx) && msgs[idx]) {
+        copyPlainText(String(msgs[idx].content || ''), '#' + (idx + 1) + ' 메시지 복사됨');
+      }
+      return;
+    }
+    if (e.target.closest('[data-log-expand-all]')) {
+      modal.querySelectorAll('details.req-log-msg').forEach((el) => { el.open = true; });
+      return;
+    }
+    if (e.target.closest('[data-log-collapse-all]')) {
+      modal.querySelectorAll('details.req-log-msg').forEach((el) => { el.open = false; });
+      return;
+    }
     if (e.target === modal || e.target.closest('[data-log-close]')) {
       closeReqLogModal();
       return;
