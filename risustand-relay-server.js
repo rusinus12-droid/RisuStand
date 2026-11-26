@@ -1505,7 +1505,8 @@ function renderWebApp() {
       <h3>🔗 PC RisuAI 프록시 연동 주소</h3>
       <div class="mono">http://127.0.0.1:${PORT}/v1/chat/completions</div>
       <div class="hint">
-        PC RisuAI의 모델(Reverse Proxy / OpenAI 호환) URL을 위 주소로 한 번만 지정하면, 아래에서 고른 모델·프롬프트가 실시간 반영됩니다.
+        PC RisuAI의 모델(Reverse Proxy / OpenAI 호환) URL을 위 주소로, API 키에 <b>Security Token</b>(로컬 PC 외 원격 프록시 호출 시 필수), 모델 이름에 <code>risustand-router</code>를 지정하면 아래에서 고른 모델·프롬프트가 실시간 반영됩니다.<br>
+        프로필의 Temperature · Max Tokens를 입력하면 모든 프로바이더(OpenAI 호환 · Anthropic · Gemini)에서 RisuAI 값보다 우선 적용되며, 비우면 RisuAI 설정을 유지합니다.
       </div>
     </div>
 

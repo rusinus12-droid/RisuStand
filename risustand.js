@@ -4449,7 +4449,7 @@
                     </div>
                     <div class="tip">
                         <b>릴레이 모델 라우터 연동 팁</b><br>
-                        PC RisuAI 모델 설정(Reverse Proxy / OpenAI 호환)의 URL을 <code>http://127.0.0.1:8787/v1/chat/completions</code>로 지정하면 아이폰에서 모델·프롬프트·번역을 실시간 제어할 수 있습니다.
+                        PC RisuAI 모델 설정(Reverse Proxy / OpenAI 호환)의 URL을 <code>http://127.0.0.1:8787/v1/chat/completions</code>, API 키에 위 <b>보안 접속 토큰</b>, 모델 이름에 <code>risustand-router</code>를 지정하면 휴대폰에서 모델·프롬프트·번역을 실시간 제어할 수 있습니다. (PC 로컬 접속은 기존 키도 동작하지만 원격 프록시 호출에는 토큰이 필요합니다.)
                     </div>
                 </div>
             `;
