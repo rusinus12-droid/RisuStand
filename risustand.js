@@ -3775,6 +3775,594 @@
             } catch (_) {}
         }
     
+        function parseDefaultVariables(text, target) {
+            if (!text || typeof text !== 'string') return;
+            for (const rawLine of text.split(/\r?\n/)) {
+                const line = rawLine.trim();
+                if (!line || line.startsWith('#')) continue;
+                const eq = line.indexOf('=');
+                if (eq <= 0) continue;
+                const k = line.slice(0, eq).trim();
+                const v = line.slice(eq + 1).trim();
+                if (k) target[k] = v;
+            }
+        }
+
+        function findMatchingClose(str, openIdx) {
+            let depth = 0;
+            let i = openIdx;
+            while (i < str.length - 1) {
+                if (str[i] === '{' && str[i + 1] === '{') {
+                    depth += 1;
+                    i += 2;
+                    continue;
+                }
+                if (str[i] === '}' && str[i + 1] === '}') {
+                    depth -= 1;
+                    if (depth === 0) return i;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            return -1;
+        }
+
+        function splitTopLevel(str, delim = '::') {
+            const parts = [];
+            let depth = 0;
+            let start = 0;
+            let i = 0;
+            while (i < str.length) {
+                if (str[i] === '{' && str[i + 1] === '{') {
+                    depth += 1;
+                    i += 2;
+                    continue;
+                }
+                if (str[i] === '}' && str[i + 1] === '}') {
+                    depth = Math.max(0, depth - 1);
+                    i += 2;
+                    continue;
+                }
+                if (depth === 0 && str.startsWith(delim, i)) {
+                    parts.push(str.slice(start, i));
+                    i += delim.length;
+                    start = i;
+                    continue;
+                }
+                i += 1;
+            }
+            parts.push(str.slice(start));
+            return parts;
+        }
+
+        function isCbsTruthy(v) {
+            const s = String(v ?? '').trim().toLowerCase();
+            return s !== '' && s !== '0' && s !== 'false' && s !== 'null' && s !== 'undefined';
+        }
+
+        function evalSimpleExpr(expr) {
+            const src = String(expr || '').trim();
+            if (!src) return '0';
+            let pos = 0;
+            const skipWs = () => { while (pos < src.length && /\s/.test(src[pos])) pos++; };
+            const peek = () => { skipWs(); return src.slice(pos); };
+
+            function parsePrimary() {
+                skipWs();
+                if (src[pos] === '(') {
+                    pos++;
+                    const v = parseOr();
+                    skipWs();
+                    if (src[pos] === ')') pos++;
+                    return v;
+                }
+                if (src[pos] === '"' || src[pos] === "'") {
+                    const q = src[pos++];
+                    let out = '';
+                    while (pos < src.length && src[pos] !== q) {
+                        if (src[pos] === '\\' && pos + 1 < src.length) pos++;
+                        out += src[pos++];
+                    }
+                    if (src[pos] === q) pos++;
+                    return out;
+                }
+                const mNum = src.slice(pos).match(/^-?\d+(?:\.\d+)?/);
+                if (mNum) {
+                    pos += mNum[0].length;
+                    return Number(mNum[0]);
+                }
+                const mId = src.slice(pos).match(/^[a-zA-Z_][a-zA-Z0-9_]*/);
+                if (mId) {
+                    pos += mId[0].length;
+                    if (mId[0] === 'true') return 1;
+                    if (mId[0] === 'false') return 0;
+                    if (mId[0] === 'null' || mId[0] === 'undefined') return '';
+                    return mId[0];
+                }
+                return 0;
+            }
+            function parseUnary() {
+                const rest = peek();
+                if (rest.startsWith('!')) { pos++; return isCbsTruthy(parseUnary()) ? 0 : 1; }
+                if (rest.startsWith('-') && !/^-\d/.test(rest)) { pos++; return -Number(parseUnary() || 0); }
+                return parsePrimary();
+            }
+            function parseMul() {
+                let left = parseUnary();
+                while (true) {
+                    const rest = peek();
+                    const op = rest[0];
+                    if (op !== '*' && op !== '/' && op !== '%') break;
+                    pos++;
+                    const right = Number(parseUnary() || 0);
+                    const l = Number(left || 0);
+                    left = op === '*' ? l * right : op === '/' ? (right === 0 ? 0 : l / right) : (right === 0 ? 0 : l % right);
+                }
+                return left;
+            }
+            function parseAdd() {
+                let left = parseMul();
+                while (true) {
+                    const rest = peek();
+                    const op = rest[0];
+                    if (op !== '+' && op !== '-') break;
+                    pos++;
+                    const right = parseMul();
+                    if (op === '+' && (typeof left === 'string' || typeof right === 'string')) left = String(left) + String(right);
+                    else left = op === '+' ? Number(left || 0) + Number(right || 0) : Number(left || 0) - Number(right || 0);
+                }
+                return left;
+            }
+            function parseCmp() {
+                let left = parseAdd();
+                while (true) {
+                    const rest = peek();
+                    const m = rest.match(/^(===|!==|==|!=|>=|<=|>|<)/);
+                    if (!m) break;
+                    pos += m[1].length;
+                    const right = parseAdd();
+                    const op = m[1];
+                    if (op === '==' || op === '===') left = String(left) === String(right) || Number(left) === Number(right) ? 1 : 0;
+                    else if (op === '!=' || op === '!==') left = String(left) !== String(right) && Number(left) !== Number(right) ? 1 : 0;
+                    else if (op === '>') left = Number(left) > Number(right) ? 1 : 0;
+                    else if (op === '<') left = Number(left) < Number(right) ? 1 : 0;
+                    else if (op === '>=') left = Number(left) >= Number(right) ? 1 : 0;
+                    else if (op === '<=') left = Number(left) <= Number(right) ? 1 : 0;
+                }
+                return left;
+            }
+            function parseAnd() {
+                let left = parseCmp();
+                while (peek().startsWith('&&')) {
+                    pos += 2;
+                    const right = parseCmp();
+                    left = isCbsTruthy(left) && isCbsTruthy(right) ? 1 : 0;
+                }
+                return left;
+            }
+            function parseOr() {
+                let left = parseAnd();
+                while (peek().startsWith('||')) {
+                    pos += 2;
+                    const right = parseAnd();
+                    left = isCbsTruthy(left) || isCbsTruthy(right) ? 1 : 0;
+                }
+                return left;
+            }
+            try {
+                const res = parseOr();
+                return typeof res === 'number' && !Number.isFinite(res) ? '0' : String(res);
+            } catch (_) {
+                return '0';
+            }
+        }
+
+        function evalWhenCondition(rawCond, ctx, depth) {
+            const tokens = splitTopLevel(String(rawCond || ''), '::').map((t) => t.trim());
+            while (tokens.length && (tokens[0] === 'keep' || tokens[0] === 'legacy')) {
+                tokens.shift();
+            }
+            if (!tokens.length) return false;
+
+            const evalAtom = (arr) => {
+                if (!arr.length) return false;
+                let neg = false;
+                let idx = 0;
+                while (idx < arr.length && arr[idx] === 'not') {
+                    neg = !neg;
+                    idx += 1;
+                }
+                const rem = arr.slice(idx);
+                let result = false;
+                if (rem.length >= 3 && (rem[1] === 'is' || rem[1] === 'isnot' || rem[1] === '>' || rem[1] === 'greater' || rem[1] === '<' || rem[1] === 'less' || rem[1] === '>=' || rem[1] === 'greater_equal' || rem[1] === '<=' || rem[1] === 'less_equal')) {
+                    const left = evalCBS(rem[0], ctx, depth + 1).trim();
+                    const right = evalCBS(rem[2], ctx, depth + 1).trim();
+                    const op = rem[1];
+                    if (op === 'is') result = left === right;
+                    else if (op === 'isnot') result = left !== right;
+                    else if (op === '>' || op === 'greater') result = Number(left) > Number(right);
+                    else if (op === '<' || op === 'less') result = Number(left) < Number(right);
+                    else if (op === '>=' || op === 'greater_equal') result = Number(left) >= Number(right);
+                    else if (op === '<=' || op === 'less_equal') result = Number(left) <= Number(right);
+                } else if (rem.length >= 2 && rem[0] === 'var') {
+                    const k = evalCBS(rem[1], ctx, depth + 1).trim();
+                    const val = Object.prototype.hasOwnProperty.call(ctx.vars, k) ? ctx.vars[k] : 'null';
+                    if (rem.length >= 4 && (rem[2] === 'is' || rem[2] === 'isnot')) {
+                        const r = evalCBS(rem[3], ctx, depth + 1).trim();
+                        result = rem[2] === 'is' ? String(val) === r : String(val) !== r;
+                    } else {
+                        result = isCbsTruthy(val);
+                    }
+                } else if (rem.length >= 2 && rem[0] === 'toggle') {
+                    const k = evalCBS(rem[1], ctx, depth + 1).trim();
+                    const val = Object.prototype.hasOwnProperty.call(ctx.globalVars, k)
+                        ? ctx.globalVars[k]
+                        : ctx.globalVars['toggle_' + k];
+                    result = isCbsTruthy(val);
+                } else {
+                    const val = evalCBS(rem.join('::'), ctx, depth + 1).trim();
+                    result = isCbsTruthy(val);
+                }
+                return neg ? !result : result;
+            };
+
+            // Split by ::or:: (lowest precedence) then ::and::
+            const orGroups = [];
+            let curOr = [];
+            for (const tok of tokens) {
+                if (tok === 'or') {
+                    orGroups.push(curOr);
+                    curOr = [];
+                } else {
+                    curOr.push(tok);
+                }
+            }
+            orGroups.push(curOr);
+
+            for (const og of orGroups) {
+                const andAtoms = [];
+                let curAnd = [];
+                for (const tok of og) {
+                    if (tok === 'and') {
+                        andAtoms.push(curAnd);
+                        curAnd = [];
+                    } else {
+                        curAnd.push(tok);
+                    }
+                }
+                andAtoms.push(curAnd);
+                if (andAtoms.length && andAtoms.every((a) => evalAtom(a))) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        function findBlockBranches(str, startAfterOpen) {
+            const branches = [];
+            let blockDepth = 1;
+            let segStart = startAfterOpen;
+            let curCond = null; // first segment condition is handled by caller
+            let pos = startAfterOpen;
+            while (pos < str.length) {
+                const openAt = str.indexOf('{{', pos);
+                if (openAt < 0) break;
+                const closeAt = findMatchingClose(str, openAt);
+                if (closeAt < 0) break;
+                const inner = str.slice(openAt + 2, closeAt);
+                const trimmed = inner.trim();
+
+                if (/^#(?:when|if|if_pure|each|func)(?:[\s:]|$)/i.test(trimmed)) {
+                    blockDepth += 1;
+                } else if (/^\/(?:when|if|if_pure|each|func)?\s*$/i.test(trimmed)) {
+                    blockDepth -= 1;
+                    if (blockDepth === 0) {
+                        branches.push({ cond: curCond, body: str.slice(segStart, openAt) });
+                        return { branches, endPos: closeAt + 2 };
+                    }
+                } else if (blockDepth === 1 && /^:(?:else|elif|elseif|else\s+if)(?:[\s:]|$)/i.test(trimmed)) {
+                    branches.push({ cond: curCond, body: str.slice(segStart, openAt) });
+                    if (/^:else\s*$/i.test(trimmed)) {
+                        curCond = '__ELSE__';
+                    } else {
+                        curCond = trimmed.replace(/^:(?:elif|elseif|else\s+if)(?:::|\s+)/i, '');
+                    }
+                    segStart = closeAt + 2;
+                }
+                pos = closeAt + 2;
+            }
+            return null;
+        }
+
+        function evalCBS(input, ctx, depth = 0) {
+            const str = String(input ?? '');
+            if (!str || depth > 24 || !str.includes('{{')) return str;
+
+            let out = '';
+            let pos = 0;
+            while (pos < str.length) {
+                const openAt = str.indexOf('{{', pos);
+                if (openAt < 0) {
+                    out += str.slice(pos);
+                    break;
+                }
+                out += str.slice(pos, openAt);
+                const closeAt = findMatchingClose(str, openAt);
+                if (closeAt < 0) {
+                    out += str.slice(openAt);
+                    break;
+                }
+                const rawInner = str.slice(openAt + 2, closeAt);
+                const trimmed = rawInner.trim();
+
+                // Block conditionals: {{#when...}}, {{#if...}}, {{#if_pure...}}
+                const blockMatch = trimmed.match(/^#(when|if_pure|if)(?:::|\s+)([\s\S]*)$/i);
+                if (blockMatch) {
+                    const parsed = findBlockBranches(str, closeAt + 2);
+                    if (parsed) {
+                        const firstCond = blockMatch[2];
+                        let chosenBody = '';
+                        for (let bi = 0; bi < parsed.branches.length; bi++) {
+                            const br = parsed.branches[bi];
+                            const condStr = bi === 0 ? firstCond : br.cond;
+                            if (condStr === '__ELSE__' || evalWhenCondition(condStr, ctx, depth)) {
+                                chosenBody = br.body;
+                                break;
+                            }
+                        }
+                        if (chosenBody) {
+                            let bodyToRender = chosenBody;
+                            if (bodyToRender.startsWith('\r\n')) bodyToRender = bodyToRender.slice(2);
+                            else if (bodyToRender.startsWith('\n')) bodyToRender = bodyToRender.slice(1);
+                            out += evalCBS(bodyToRender, ctx, depth + 1);
+                        }
+                        pos = parsed.endPos;
+                        continue;
+                    }
+                }
+
+                // Unsupported block tags like {{#each ...}}...{{/each}} -> skip cleanly in remote prose
+                if (/^#(?:each|func)(?:[\s:]|$)/i.test(trimmed)) {
+                    const parsed = findBlockBranches(str, closeAt + 2);
+                    if (parsed) {
+                        pos = parsed.endPos;
+                        continue;
+                    }
+                }
+
+                // Preserve asset/inlay macros for extractInlineImages (resolve nested CBS inside arguments)
+                const assetMacro = rawInner.match(/^\s*(img|raw|asset|image|emotion|inlay|inlayed)::([\s\S]+)$/i);
+                if (assetMacro) {
+                    const resolvedArg = evalCBS(assetMacro[2], ctx, depth + 1).trim();
+                    out += `{{${assetMacro[1].toLowerCase()}::${resolvedArg}}}`;
+                    pos = closeAt + 2;
+                    continue;
+                }
+
+                // Expression {{? ...}}
+                if (trimmed.startsWith('?')) {
+                    const exprStr = evalCBS(trimmed.slice(1), ctx, depth + 1);
+                    out += evalSimpleExpr(exprStr);
+                    pos = closeAt + 2;
+                    continue;
+                }
+
+                const parts = splitTopLevel(rawInner, '::');
+                const cmd = (parts[0] || '').trim().toLowerCase();
+
+                if (cmd === 'user') {
+                    out += ctx.userName || 'User';
+                } else if (cmd === 'char') {
+                    out += ctx.charName || 'Character';
+                } else if (cmd === 'br' || cmd === 'newline') {
+                    out += '\n';
+                } else if (cmd === 'chat_index') {
+                    out += String(ctx.chatIndex ?? 0);
+                } else if (cmd === 'lastmessageid') {
+                    out += String(ctx.lastMessageId ?? 0);
+                } else if (cmd === 'comment' || cmd === 'hidden_key' || cmd === 'button' || cmd.startsWith('//')) {
+                    // hidden / non-prose
+                } else if (cmd === 'getvar' || cmd === 'getchatvar') {
+                    const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
+                    out += Object.prototype.hasOwnProperty.call(ctx.vars, k) ? String(ctx.vars[k]) : 'null';
+                } else if (cmd === 'setvar') {
+                    const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
+                    const v = evalCBS(parts.slice(2).join('::'), ctx, depth + 1);
+                    if (k) ctx.vars[k] = v;
+                } else if (cmd === 'setdefaultvar') {
+                    const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
+                    const v = evalCBS(parts.slice(2).join('::'), ctx, depth + 1);
+                    if (k && (!Object.prototype.hasOwnProperty.call(ctx.vars, k) || ctx.vars[k] === 'null' || ctx.vars[k] === '')) {
+                        ctx.vars[k] = v;
+                    }
+                } else if (cmd === 'addvar') {
+                    const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
+                    const delta = Number(evalCBS(parts[2] || '0', ctx, depth + 1)) || 0;
+                    if (k) ctx.vars[k] = String((Number(ctx.vars[k]) || 0) + delta);
+                } else if (cmd === 'gettempvar') {
+                    const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
+                    out += Object.prototype.hasOwnProperty.call(ctx.tempVars, k) ? String(ctx.tempVars[k]) : '';
+                } else if (cmd === 'settempvar') {
+                    const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
+                    const v = evalCBS(parts.slice(2).join('::'), ctx, depth + 1);
+                    if (k) ctx.tempVars[k] = v;
+                } else if (cmd === 'getglobalvar') {
+                    const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
+                    if (Object.prototype.hasOwnProperty.call(ctx.globalVars, k)) out += String(ctx.globalVars[k]);
+                    else if (Object.prototype.hasOwnProperty.call(ctx.globalVars, 'toggle_' + k)) out += String(ctx.globalVars['toggle_' + k]);
+                    else out += 'null';
+                } else if (cmd === 'equal') {
+                    const a = evalCBS(parts[1] || '', ctx, depth + 1).trim();
+                    const b = evalCBS(parts[2] || '', ctx, depth + 1).trim();
+                    out += a === b ? '1' : '0';
+                } else if (cmd === 'not_equal' || cmd === 'notequal') {
+                    const a = evalCBS(parts[1] || '', ctx, depth + 1).trim();
+                    const b = evalCBS(parts[2] || '', ctx, depth + 1).trim();
+                    out += a !== b ? '1' : '0';
+                } else if (cmd === 'greater') {
+                    const a = Number(evalCBS(parts[1] || '', ctx, depth + 1).trim());
+                    const b = Number(evalCBS(parts[2] || '', ctx, depth + 1).trim());
+                    out += a > b ? '1' : '0';
+                } else if (cmd === 'less') {
+                    const a = Number(evalCBS(parts[1] || '', ctx, depth + 1).trim());
+                    const b = Number(evalCBS(parts[2] || '', ctx, depth + 1).trim());
+                    out += a < b ? '1' : '0';
+                } else if (cmd === 'greater_equal') {
+                    const a = Number(evalCBS(parts[1] || '', ctx, depth + 1).trim());
+                    const b = Number(evalCBS(parts[2] || '', ctx, depth + 1).trim());
+                    out += a >= b ? '1' : '0';
+                } else if (cmd === 'less_equal') {
+                    const a = Number(evalCBS(parts[1] || '', ctx, depth + 1).trim());
+                    const b = Number(evalCBS(parts[2] || '', ctx, depth + 1).trim());
+                    out += a <= b ? '1' : '0';
+                } else if (cmd === 'and' || cmd === 'all') {
+                    const vals = parts.slice(1).map((p) => evalCBS(p, ctx, depth + 1));
+                    out += vals.length && vals.every((v) => isCbsTruthy(v)) ? '1' : '0';
+                } else if (cmd === 'or' || cmd === 'any') {
+                    const vals = parts.slice(1).map((p) => evalCBS(p, ctx, depth + 1));
+                    out += vals.some((v) => isCbsTruthy(v)) ? '1' : '0';
+                } else if (cmd === 'not') {
+                    out += isCbsTruthy(evalCBS(parts[1] || '', ctx, depth + 1)) ? '0' : '1';
+                } else if (cmd === 'calc') {
+                    out += evalSimpleExpr(evalCBS(parts.slice(1).join('::'), ctx, depth + 1));
+                } else if (cmd === 'trim') {
+                    out += evalCBS(parts.slice(1).join('::'), ctx, depth + 1).trim();
+                } else if (cmd === 'lower') {
+                    out += evalCBS(parts.slice(1).join('::'), ctx, depth + 1).toLowerCase();
+                } else if (cmd === 'upper') {
+                    out += evalCBS(parts.slice(1).join('::'), ctx, depth + 1).toUpperCase();
+                } else {
+                    out += str.slice(openAt, closeAt + 2);
+                }
+
+                pos = closeAt + 2;
+            }
+            return out;
+        }
+
+        function discoverGreetingVariables(rawText) {
+            const defaults = {};
+            const options = {};
+            const str = String(rawText || '');
+            let pos = 0;
+            while ((pos = str.indexOf('{{#', pos)) !== -1) {
+                const closeAt = findMatchingClose(str, pos);
+                if (closeAt < 0) break;
+                const inner = str.slice(pos + 2, closeAt);
+                if (/^#(?:when|if|if_pure)(?:[\s:]|$)/i.test(inner)) {
+                    const eqRe = /\{\{equal::\{\{(?:getvar|getchatvar)::([^}]+)\}\}::([^}]*)\}\}/gi;
+                    let m;
+                    while ((m = eqRe.exec(inner)) !== null) {
+                        const k = m[1].trim();
+                        const v = m[2].trim();
+                        if (!k) continue;
+                        if (!Object.prototype.hasOwnProperty.call(defaults, k)) defaults[k] = v;
+                        if (!options[k]) options[k] = [];
+                        if (!options[k].includes(v)) options[k].push(v);
+                    }
+                    const varRe = /::var::([^:]+)::is::([^:}]+)/gi;
+                    while ((m = varRe.exec(inner)) !== null) {
+                        const k = m[1].trim();
+                        const v = m[2].trim();
+                        if (!k) continue;
+                        if (!Object.prototype.hasOwnProperty.call(defaults, k)) defaults[k] = v;
+                        if (!options[k]) options[k] = [];
+                        if (!options[k].includes(v)) options[k].push(v);
+                    }
+                }
+                pos = closeAt + 2;
+            }
+            return { defaults, options };
+        }
+
+        function buildRenderContext(charObj, chatObj, db, personaName, enabledModules, msgIndex, totalMsgs) {
+            const vars = Object.create(null);
+            for (const m of enabledModules || []) {
+                if (m && m.defaultVariables) parseDefaultVariables(m.defaultVariables, vars);
+            }
+            if (charObj && charObj.defaultVariables) parseDefaultVariables(charObj.defaultVariables, vars);
+            if (chatObj && chatObj.scriptstate && typeof chatObj.scriptstate === 'object') {
+                for (const [k, v] of Object.entries(chatObj.scriptstate)) {
+                    const cleanKey = k.startsWith('$') ? k.slice(1) : k;
+                    if (cleanKey && v !== undefined && v !== null && typeof v !== 'object') {
+                        vars[cleanKey] = String(v);
+                    }
+                }
+            }
+
+            const globalVars = Object.create(null);
+            if (db && db.globalChatVariables && typeof db.globalChatVariables === 'object') {
+                Object.assign(globalVars, db.globalChatVariables);
+            }
+            if (chatObj && chatObj.useLocallySetGlobalVariables && chatObj.GLGlobalVariables && typeof chatObj.GLGlobalVariables === 'object') {
+                Object.assign(globalVars, chatObj.GLGlobalVariables);
+            }
+
+            const displayScripts = [];
+            if (db && Array.isArray(db.customscript)) {
+                for (const sc of db.customscript) if (sc && sc.type === 'editdisplay') displayScripts.push(sc);
+            }
+            for (const m of enabledModules || []) {
+                if (m && Array.isArray(m.regex)) {
+                    for (const sc of m.regex) if (sc && sc.type === 'editdisplay') displayScripts.push(sc);
+                }
+            }
+            if (charObj && Array.isArray(charObj.customscript)) {
+                for (const sc of charObj.customscript) if (sc && sc.type === 'editdisplay') displayScripts.push(sc);
+            }
+
+            return {
+                vars,
+                globalVars,
+                tempVars: Object.create(null),
+                displayScripts,
+                charName: (charObj && charObj.name) || 'Character',
+                userName: personaName || 'User',
+                chatIndex: msgIndex,
+                lastMessageId: Math.max(0, Number(totalMsgs || 0) - 1),
+            };
+        }
+
+        function applyDisplayRegexScripts(text, ctx) {
+            let out = String(text || '');
+            for (const sc of ctx.displayScripts || []) {
+                if (!sc || !sc.in) continue;
+                const rawOut = String(sc.out || '');
+                const rawIn = String(sc.in);
+                const rawFlag = sc.ableFlag && sc.flag ? String(sc.flag) : '';
+                const hasCbsFlag = rawFlag.includes('<cbs>');
+                const jsFlags = rawFlag.replace(/<[^>]+>/g, '').replace(/[^gimsu]/g, '') || 'g';
+                const patternStr = hasCbsFlag ? evalCBS(rawIn, ctx) : rawIn;
+                const isWidgetOut = /<(?:style|input|button)\b|risu-(?:trigger|btn)/i.test(rawOut);
+
+                if (isWidgetOut) {
+                    if (/<img/i.test(patternStr)) {
+                        continue; // Let extractInlineImages resolve <img src=...> directly
+                    }
+                    if (!patternStr.includes('(') && patternStr.length <= 12) {
+                        try {
+                            out = out.replace(new RegExp(patternStr, jsFlags), '');
+                        } catch (_) {}
+                    }
+                    continue;
+                }
+
+                const replStr = hasCbsFlag ? evalCBS(rawOut, ctx) : rawOut;
+                try {
+                    out = out.replace(new RegExp(patternStr, jsFlags), replStr);
+                } catch (_) {}
+            }
+            return out;
+        }
+
+        function renderRemoteMessage(raw, ctx) {
+            let s = evalCBS(String(raw || ''), ctx);
+            s = applyDisplayRegexScripts(s, ctx);
+            s = evalCBS(s, ctx);
+            return s;
+        }
+
         function cleanProse(raw) {
             if (!raw) return '';
             return String(raw)
@@ -3785,7 +4373,9 @@
                 .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
                 .replace(/<statusdata\b[^>]*>[\s\S]*?<\/statusdata>/gi, '')
                 .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '')
-                .replace(/<img\s*=\s*["']?[^"'\s>]+["']?\s*\/?>/gi, '')
+                .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '')
+                .replace(/<button\b[^>]*risu-(?:btn|trigger)[^>]*>[\s\S]*?<\/button>/gi, '')
+                .replace(/<img\b[^>]*>/gi, '')
                 .replace(/\{\{(?:img|raw|asset|image|emotion|inlay|inlayed)::[^}]+\}\}/gi, '')
                 .replace(/<[^>]+>/g, '')
                 .trim();
@@ -3827,7 +4417,7 @@
             return null;
         }
     
-        function buildLookup(charObj) {
+        function buildLookup(charObj, enabledModules = []) {
             const list = [];
             if (charObj && Array.isArray(charObj.additionalAssets)) {
                 for (const a of charObj.additionalAssets) {
@@ -3839,8 +4429,15 @@
                     if (Array.isArray(e) && e[0] && e[1]) list.push({ n: String(e[0]).toLowerCase(), p: String(e[1]) });
                 }
             }
+            for (const m of enabledModules || []) {
+                if (m && Array.isArray(m.assets)) {
+                    for (const a of m.assets) {
+                        if (Array.isArray(a) && a[0] && a[1]) list.push({ n: String(a[0]).toLowerCase(), p: String(a[1]) });
+                    }
+                }
+            }
             const norm = (s) => String(s || '').replace(/\.[a-z0-9]{2,5}$/i, '').replace(/[\s_\-]+/g, '').toLowerCase();
-            return (rawName) => {
+            const findSingle = (rawName) => {
                 const k = norm(rawName);
                 if (!k) return null;
                 for (const item of list) {
@@ -3851,20 +4448,28 @@
                 }
                 return null;
             };
+            return (rawName, seasonSuffix = '') => {
+                if (seasonSuffix) {
+                    const withSuffix = findSingle(String(rawName || '') + String(seasonSuffix));
+                    if (withSuffix) return withSuffix;
+                }
+                return findSingle(rawName);
+            };
         }
     
-        async function extractInlineImages(rawMsg, findPath, allowImages) {
+        async function extractInlineImages(rawMsg, findPath, allowImages, seasonSuffix = '') {
             if (!rawMsg) return { text: '', images: [] };
             const imgs = [];
-            const re = /<img\s*=\s*["']?([^"'\s>]+)["']?\s*\/?>|\{\{(?:img|raw|asset|image|emotion)::([^}]+)\}\}|\{\{(?:inlay|inlayed)::([a-f0-9-]+)\}\}/gi;
+            const re = /<img\s*=\s*["']?([^"'\s>]+)["']?\s*\/?>|<img\b[^>]*\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))[^>]*>|\{\{(?:img|raw|asset|image|emotion)::([^}]+)\}\}|\{\{(?:inlay|inlayed)::([a-f0-9-]+)\}\}/gi;
             const rawStr = String(rawMsg);
             const matches = [];
             let m;
             while ((m = re.exec(rawStr)) !== null) {
-                if (m[3]) {
-                    matches.push({ start: m.index, end: re.lastIndex, kind: 'inlay', name: m[3].trim() });
+                if (m[6]) {
+                    matches.push({ start: m.index, end: re.lastIndex, kind: 'inlay', name: m[6].trim() });
                 } else {
-                    matches.push({ start: m.index, end: re.lastIndex, kind: 'asset', name: (m[1] || m[2] || '').trim() });
+                    const name = (m[1] || m[2] || m[3] || m[4] || m[5] || '').trim();
+                    if (name) matches.push({ start: m.index, end: re.lastIndex, kind: 'asset', name });
                 }
             }
             let out = '';
@@ -3876,8 +4481,10 @@
                     let url = null;
                     if (mt.kind === 'inlay') {
                         url = await readInlayDataUrl(mt.name);
+                    } else if (/^(?:data:image\/|https?:\/\/)/i.test(mt.name)) {
+                        url = mt.name;
                     } else {
-                        const p = findPath(mt.name);
+                        const p = findPath(mt.name, seasonSuffix);
                         if (p) url = await readAssetDataUrl(p);
                     }
                     if (url) {
@@ -4025,17 +4632,34 @@
     
             const localVars = (chatObj && chatObj.GLGlobalVariables && typeof chatObj.GLGlobalVariables === 'object') ? chatObj.GLGlobalVariables : {};
             const useLocalToggles = Boolean(chatObj && chatObj.useLocallySetGlobalVariables);
+            const scriptState = (chatObj && chatObj.scriptstate && typeof chatObj.scriptstate === 'object') ? chatObj.scriptstate : {};
+            const fmIdx = typeof chatObj.fmIndex === 'number' ? chatObj.fmIndex : -1;
+            const altGreetings = Array.isArray(charObj.alternateGreetings) ? charObj.alternateGreetings : [];
+            const firstMessageCount = (charObj.firstMessage ? 1 : 0) + altGreetings.length;
+
+            let db = null;
             let toggleBlocks = [];
+            let enabledModules = [];
             try {
-                const tdb = await risuai.getDatabase(['modules', 'enabledModules']);
-                if (tdb && Array.isArray(tdb.modules)) {
-                    const enSet = new Set(Array.isArray(tdb.enabledModules) ? tdb.enabledModules : []);
+                db = await risuai.getDatabase([
+                    'modules',
+                    'enabledModules',
+                    'personas',
+                    'selectedPersona',
+                    'customscript',
+                    'globalChatVariables',
+                ]);
+                if (db && Array.isArray(db.modules)) {
+                    const enSet = new Set(Array.isArray(db.enabledModules) ? db.enabledModules : []);
                     if (Array.isArray(chatObj && chatObj.modules)) {
                         for (const mid of chatObj.modules) enSet.add(mid);
                     }
-                    for (const m of tdb.modules) {
-                        if (enSet.has(m.id) && m.customModuleToggle && String(m.customModuleToggle).trim()) {
-                            toggleBlocks.push({ source: m.name || m.id, syntax: String(m.customModuleToggle) });
+                    for (const m of db.modules) {
+                        if (m && enSet.has(m.id)) {
+                            enabledModules.push(m);
+                            if (m.customModuleToggle && String(m.customModuleToggle).trim()) {
+                                toggleBlocks.push({ source: m.name || m.id, syntax: String(m.customModuleToggle) });
+                            }
                         }
                     }
                 }
@@ -4043,36 +4667,100 @@
             if (charObj && charObj.customModuleToggle && String(charObj.customModuleToggle).trim()) {
                 toggleBlocks.push({ source: charObj.name || 'Character', syntax: String(charObj.customModuleToggle) });
             }
+
             const toggleSig = `${useLocalToggles}:${Object.keys(localVars).length}:${JSON.stringify(localVars)}:${toggleBlocks.length}`;
-            const sig = `${viewCharIndex}:${viewChatIndex}:${isPcActive}:${allMsgs.length}:${recentDigest}:${chatObj.name || ''}:${toggleSig}`;
+            const stateSig = `${fmIdx}:${firstMessageCount}:${JSON.stringify(scriptState)}`;
+            const sig = `${viewCharIndex}:${viewChatIndex}:${isPcActive}:${allMsgs.length}:${recentDigest}:${chatObj.name || ''}:${toggleSig}:${stateSig}`;
             if (!forceFull && sig === lastSnapSig) {
                 return null;
             }
             lastSnapSig = sig;
-    
-            const findPath = buildLookup(charObj);
+
+            let personaName = 'User';
+            let personaPrompt = '';
+            if (db && Array.isArray(db.personas)) {
+                const p = db.personas[db.selectedPersona || 0];
+                if (p) {
+                    personaName = p.name || 'User';
+                    personaPrompt = p.personaPrompt || '';
+                }
+            }
+
+            const findPath = buildLookup(charObj, enabledModules);
+            const renderCtx = buildRenderContext(charObj, chatObj, db, personaName, enabledModules, -1, allMsgs.length);
             const outMsgs = [];
-    
+
+            let greetingControls = [];
+            let inferredDefaults = {};
             if (charObj.firstMessage && startOffset === 0) {
-                const fmIdx = typeof chatObj.fmIndex === 'number' ? chatObj.fmIndex : -1;
-                const altGreetings = Array.isArray(charObj.alternateGreetings) ? charObj.alternateGreetings : [];
                 const firstRaw = fmIdx >= 0 && altGreetings[fmIdx] ? altGreetings[fmIdx] : charObj.firstMessage;
                 if (firstRaw) {
+                    const firstStr = String(firstRaw);
+                    const greetingMeta = discoverGreetingVariables(firstStr);
+                    inferredDefaults = greetingMeta.defaults;
+                    const firstCtx = {
+                        ...renderCtx,
+                        vars: { ...renderCtx.vars },
+                        tempVars: Object.create(null),
+                        chatIndex: -1,
+                    };
+                    let renderedFirst = renderRemoteMessage(firstStr, firstCtx);
+                    let parsedFirst = await extractInlineImages(renderedFirst, findPath, true, firstCtx.vars.current_season_suffix || '');
+                    if (!parsedFirst.text && !parsedFirst.images.length && /\{\{#(?:when|if|if_pure)/i.test(firstStr)) {
+                        let filled = false;
+                        for (const [k, v] of Object.entries(greetingMeta.defaults)) {
+                            if (!Object.prototype.hasOwnProperty.call(firstCtx.vars, k)) {
+                                firstCtx.vars[k] = v;
+                                renderCtx.vars[k] = v;
+                                filled = true;
+                            }
+                        }
+                        if (filled) {
+                            renderedFirst = renderRemoteMessage(firstStr, firstCtx);
+                            parsedFirst = await extractInlineImages(renderedFirst, findPath, true, firstCtx.vars.current_season_suffix || '');
+                        }
+                    }
+                    greetingControls = Object.entries(greetingMeta.options)
+                        .filter(([, opts]) => opts.length > 1)
+                        .map(([key, opts]) => ({
+                            key,
+                            value: Object.prototype.hasOwnProperty.call(firstCtx.vars, key)
+                                ? String(firstCtx.vars[key])
+                                : String(greetingMeta.defaults[key] ?? opts[0] ?? ''),
+                            options: opts,
+                        }));
                     outMsgs.push({
                         index: -1,
                         role: 'char',
-                        text: cleanProse(firstRaw),
-                        raw: String(firstRaw),
-                        images: [],
+                        text: parsedFirst.text,
+                        raw: firstStr,
+                        images: parsedFirst.images,
                         isFirstMessage: true,
                     });
                 }
+            } else if (charObj.firstMessage) {
+                const firstRaw = fmIdx >= 0 && altGreetings[fmIdx] ? altGreetings[fmIdx] : charObj.firstMessage;
+                if (firstRaw) {
+                    const greetingMeta = discoverGreetingVariables(String(firstRaw));
+                    inferredDefaults = greetingMeta.defaults;
+                    greetingControls = Object.entries(greetingMeta.options)
+                        .filter(([, opts]) => opts.length > 1)
+                        .map(([key, opts]) => ({
+                            key,
+                            value: Object.prototype.hasOwnProperty.call(renderCtx.vars, key)
+                                ? String(renderCtx.vars[key])
+                                : String(greetingMeta.defaults[key] ?? opts[0] ?? ''),
+                            options: opts,
+                        }));
+                }
             }
-    
+
             for (let i = 0; i < recent.length; i++) {
                 const msg = recent[i];
                 const isRecent = i >= recent.length - 8;
-                const parsed = await extractInlineImages(msg.data, findPath, isRecent);
+                const msgCtx = { ...renderCtx, tempVars: Object.create(null), chatIndex: startOffset + i };
+                const renderedMsg = renderRemoteMessage(msg.data, msgCtx);
+                const parsed = await extractInlineImages(renderedMsg, findPath, isRecent, msgCtx.vars.current_season_suffix || '');
                 outMsgs.push({
                     index: startOffset + i,
                     role: msg.role,
@@ -4081,20 +4769,18 @@
                     images: parsed.images,
                 });
             }
-    
-            let personaName = 'User';
-            let personaPrompt = '';
-            try {
-                const pdb = await risuai.getDatabase(['personas', 'selectedPersona']);
-                if (pdb && Array.isArray(pdb.personas)) {
-                    const p = pdb.personas[pdb.selectedPersona || 0];
-                    if (p) {
-                        personaName = p.name || 'User';
-                        personaPrompt = p.personaPrompt || '';
-                    }
-                }
-            } catch (_) {}
-    
+
+            const chatVariables = {};
+            for (const [k, v] of Object.entries(inferredDefaults)) {
+                chatVariables[k] = String(v);
+            }
+            for (const [k, v] of Object.entries(renderCtx.vars)) {
+                if (Object.keys(chatVariables).length >= 40) break;
+                const val = String(v ?? '');
+                if (k === 'timetable_html_output' || k.endsWith('_html_output') || val.length > 200) continue;
+                chatVariables[k] = val;
+            }
+
             return {
                 charName: charObj.name || 'Character',
                 charIndex: viewCharIndex,
@@ -4102,6 +4788,10 @@
                 chatName: chatObj.name || `Chat ${viewChatIndex + 1}`,
                 isPcActive,
                 totalMessages: allMsgs.length,
+                fmIndex: fmIdx,
+                firstMessageCount,
+                greetingControls,
+                chatVariables,
                 useLocallySetGlobalVariables: useLocalToggles,
                 localToggleValues: localVars,
                 customToggleBlocks: toggleBlocks,
@@ -4166,6 +4856,7 @@
                     name: newName,
                     localLore: [],
                     fmIndex: -1,
+                    scriptstate: {},
                     id: makeUuid(),
                 });
                 charObj.chatPage = 0;
@@ -4306,6 +4997,44 @@
                 const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
                 if (!chatObj) return;
                 chatObj.useLocallySetGlobalVariables = Boolean(p.enabled);
+                await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                lastSnapSig = '';
+                setTimeout(() => pollOnce(true), 120);
+                return;
+            }
+
+            if (type === 'set_first_message') {
+                const cIdx = Number(p.charIndex);
+                const chIdx = Number(p.chatIndex);
+                if (Number.isNaN(cIdx) || Number.isNaN(chIdx)) return;
+                const charObj = await risuai.getCharacterFromIndex(cIdx);
+                const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
+                if (!charObj || !chatObj) return;
+                const altCount = Array.isArray(charObj.alternateGreetings) ? charObj.alternateGreetings.length : 0;
+                const nextFm = Math.max(-1, Math.min(altCount - 1, Number(p.fmIndex)));
+                if (Number.isNaN(nextFm)) return;
+                chatObj.fmIndex = nextFm;
+                await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                lastSnapSig = '';
+                setTimeout(() => pollOnce(true), 120);
+                return;
+            }
+
+            if (type === 'set_chat_var' && p.key) {
+                const cIdx = Number(p.charIndex);
+                const chIdx = Number(p.chatIndex);
+                if (Number.isNaN(cIdx) || Number.isNaN(chIdx)) return;
+                const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
+                if (!chatObj) return;
+                if (!chatObj.scriptstate || typeof chatObj.scriptstate !== 'object') {
+                    chatObj.scriptstate = {};
+                }
+                const cleanKey = String(p.key).startsWith('$') ? String(p.key).slice(1) : String(p.key);
+                if (p.value === null || p.value === undefined) {
+                    delete chatObj.scriptstate['$' + cleanKey];
+                } else {
+                    chatObj.scriptstate['$' + cleanKey] = String(p.value);
+                }
                 await risuai.setChatToIndex(cIdx, chIdx, chatObj);
                 lastSnapSig = '';
                 setTimeout(() => pollOnce(true), 120);

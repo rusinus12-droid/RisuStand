@@ -1462,6 +1462,10 @@ function renderWebApp() {
         <input type="checkbox" id="localToggleChk" />
       </label>
     </div>
+    <div class="card" id="chatVarsCard" style="display:none;">
+      <h3>💬 채팅 변수 (봇 상태)</h3>
+      <div id="chatVarsBody"></div>
+    </div>
     <div class="card">
       <h3>👤 페르소나 선택</h3>
       <select class="f-inp" id="personaSel"></select>
@@ -1599,6 +1603,7 @@ function renderWebApp() {
   let lastChatRenderSig = '';
   let lastBotsRenderSig = '';
   let lastModulesRenderSig = '';
+  let lastChatVarsRenderSig = '';
   let lastDirectErrAt = 0;
   let pollTimer = null;
   let bookSpreadIdx = -1; // -1 means auto-jump to latest spread
@@ -1855,13 +1860,35 @@ function renderWebApp() {
 
     const msgs = snap.messages || [];
     const msgDigest = hashStr(msgs.map((m) => m.index + ':' + (m.text || '') + ':' + (m.images ? m.images.length : 0)).join('\\x01'));
-    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, msgs.length, msgDigest, st.generating, st.directGenerating, uiPref.theme, uiPref.assetMode]);
+    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, snap.fmIndex, snap.firstMessageCount, snap.greetingControls || [], msgs.length, msgDigest, st.generating, st.directGenerating, uiPref.theme, uiPref.assetMode]);
     if (sig !== lastChatRenderSig) {
       lastChatRenderSig = sig;
       renderChat();
     }
     if (currentTab === 'bots') renderBots();
     if (currentTab === 'modules') renderModules();
+  }
+
+  function renderGreetingControlsHtml(snap) {
+    let out = '';
+    const total = Number(snap.firstMessageCount || 0);
+    const fmIdx = typeof snap.fmIndex === 'number' ? snap.fmIndex : -1;
+    if (total > 1) {
+      const pos = fmIdx < 0 ? 1 : Math.min(total, fmIdx + 2);
+      out += '<button class="act-btn" data-fm-step="-1" title="이전 인사말">◀</button>';
+      out += '<span style="font-size:11.5px; color:var(--sub); font-weight:700; padding:0 4px;">' + pos + ' / ' + total + '</span>';
+      out += '<button class="act-btn" data-fm-step="1" title="다음 인사말">▶</button>';
+    }
+    const ctrls = Array.isArray(snap.greetingControls) ? snap.greetingControls : [];
+    for (const c of ctrls) {
+      out += '<select class="pill" data-chat-var-key="' + esc(c.key) + '" title="' + esc(c.key) + '" style="min-height:26px; height:26px; font-size:11.5px; padding:0 24px 0 8px;">';
+      for (const opt of (c.options || [])) {
+        const sel = String(c.value) === String(opt) ? ' selected' : '';
+        out += '<option value="' + esc(opt) + '"' + sel + '>' + esc(c.key + ': ' + opt) + '</option>';
+      }
+      out += '</select>';
+    }
+    return out;
   }
 
   function buildBookPages(msgs) {
@@ -1895,8 +1922,11 @@ function renderWebApp() {
       out += '<div class="' + (isUser ? 'book-user-block' : 'book-char-block') + '">';
       out += '<div class="book-turn-tag">' + esc(isUser ? '나' : displayBotName(snap.charName)) + '</div>';
       out += '<div>' + (showTr && trText ? esc(trText) : renderInlineBody(m.text, m.images)) + '</div>';
-      if (m.text) {
-        out += '<div class="msg-actions"><button class="act-btn" data-tr-key="' + esc(key) + '" data-tr-idx="' + m.index + '">🌐 ' + (showTr ? '원문' : '번역') + '</button></div>';
+      if (m.text || m.isFirstMessage) {
+        out += '<div class="msg-actions">';
+        if (m.isFirstMessage) out += renderGreetingControlsHtml(snap);
+        if (m.text) out += '<button class="act-btn" data-tr-key="' + esc(key) + '" data-tr-idx="' + m.index + '">🌐 ' + (showTr ? '원문' : '번역') + '</button>';
+        out += '</div>';
       }
       out += '</div>';
     }
@@ -1984,7 +2014,9 @@ function renderWebApp() {
         html += '<div class="msg-role">' + esc(isUser ? '나' : displayBotName(snap.charName)) + '</div>';
         html += '<div class="msg-bubble">' + renderInlineBody(m.text, m.images) + '</div>';
         if (showTr && trText) html += '<div class="tr-box">' + esc(trText) + '</div>';
-        html += '<div class="msg-actions">';
+        const greetCtrl = m.isFirstMessage ? renderGreetingControlsHtml(snap) : '';
+        html += '<div class="msg-actions"' + (greetCtrl ? ' style="opacity:1; flex-wrap:wrap; align-items:center;"' : '') + '>';
+        if (greetCtrl) html += greetCtrl;
         if (m.text) html += '<button class="act-btn" data-tr-key="' + esc(key) + '" data-tr-idx="' + m.index + '">🌐 ' + (showTr ? '번역 숨김' : '번역') + '</button>';
         if (m.index >= 0) {
           html += '<button class="act-btn" data-edit-msg="' + m.index + '">✏️ 수정</button>';
@@ -1998,7 +2030,22 @@ function renderWebApp() {
     if (nearBottom) box.scrollTop = box.scrollHeight;
   }
 
-  document.getElementById('tab-chat').addEventListener('click', (e) => {
+  document.getElementById('tab-chat').addEventListener('click', async (e) => {
+    const fmBtn = e.target.closest('[data-fm-step]');
+    if (fmBtn) {
+      const snap = lastState && lastState.snapshot;
+      if (!snap || snap.charIndex < 0) return;
+      const total = Number(snap.firstMessageCount || 1);
+      if (total <= 1) return;
+      const step = Number(fmBtn.getAttribute('data-fm-step')) || 0;
+      const curPos = (typeof snap.fmIndex === 'number' && snap.fmIndex >= 0) ? snap.fmIndex + 1 : 0;
+      const nextPos = (curPos + step + total) % total;
+      const nextFmIndex = nextPos - 1;
+      await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'set_first_message', payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, fmIndex: nextFmIndex } }) });
+      toast('퍼스트 메시지 전환 중...');
+      setTimeout(pollState, 350);
+      return;
+    }
     const imgWrap = e.target.closest('[data-img-reveal]');
     if (imgWrap) { toggleImgReveal(imgWrap); return; }
     const trBtn = e.target.closest('[data-tr-key]');
@@ -2007,6 +2054,16 @@ function renderWebApp() {
     if (edBtn) { editMsg(Number(edBtn.getAttribute('data-edit-msg'))); return; }
     const delBtn = e.target.closest('[data-del-msg]');
     if (delBtn) { delMsg(Number(delBtn.getAttribute('data-del-msg'))); return; }
+  });
+  document.getElementById('tab-chat').addEventListener('change', async (e) => {
+    const sel = e.target.closest('[data-chat-var-key]');
+    if (!sel) return;
+    const snap = lastState && lastState.snapshot;
+    if (!snap || snap.charIndex < 0) return;
+    const key = sel.getAttribute('data-chat-var-key');
+    await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'set_chat_var', payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, key, value: sel.value } }) });
+    toast(key + ' = ' + sel.value + ' 반영 중...');
+    setTimeout(pollState, 350);
   });
 
   async function autoFetchTranslation(key, text) {
@@ -2371,8 +2428,48 @@ function renderWebApp() {
     toast('토글 반영됨 (로컬 토글)');
   };
 
+  function renderChatVariables(force = false) {
+    const snap = (lastState && lastState.snapshot) || {};
+    const vars = (snap.chatVariables && typeof snap.chatVariables === 'object') ? snap.chatVariables : {};
+    const keys = Object.keys(vars);
+    const card = document.getElementById('chatVarsCard');
+    const body = document.getElementById('chatVarsBody');
+    if (!keys.length) {
+      card.style.display = 'none';
+      lastChatVarsRenderSig = '';
+      return;
+    }
+    card.style.display = '';
+    const activeEl = document.activeElement;
+    if (activeEl && body.contains(activeEl)) return;
+    const ctrls = new Map((Array.isArray(snap.greetingControls) ? snap.greetingControls : []).map((c) => [c.key, c.options || []]));
+    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, vars, snap.greetingControls || []]);
+    if (!force && sig === lastChatVarsRenderSig) return;
+    lastChatVarsRenderSig = sig;
+    body.innerHTML = keys.map((k) => {
+      const val = String(vars[k] ?? '');
+      const opts = ctrls.get(k);
+      if (opts && opts.length > 1) {
+        const optHtml = opts.map((o) => '<option value="' + esc(o) + '"' + (String(o) === val ? ' selected' : '') + '>' + esc(o) + '</option>').join('');
+        return '<div class="tg-row"><span>' + esc(k) + '</span><select class="f-inp" style="width:48%;" data-chat-var-key="' + esc(k) + '">' + optHtml + '</select></div>';
+      }
+      return '<div class="tg-row"><span>' + esc(k) + '</span><input class="f-inp" style="width:48%;" value="' + esc(val) + '" data-chat-var-key="' + esc(k) + '" /></div>';
+    }).join('');
+  }
+  document.getElementById('chatVarsBody').addEventListener('change', async (e) => {
+    const el = e.target.closest('[data-chat-var-key]');
+    if (!el) return;
+    const snap = lastState && lastState.snapshot;
+    if (!snap || snap.charIndex < 0) return;
+    const key = el.getAttribute('data-chat-var-key');
+    await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'set_chat_var', payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, key, value: el.value } }) });
+    toast('변수 ' + key + ' 반영됨');
+    setTimeout(pollState, 350);
+  });
+
   function renderModules(force = false) {
     renderCustomToggles(false);
+    renderChatVariables(force);
     const cat = (lastState && lastState.catalog) || {};
     const pSel = document.getElementById('personaSel');
     const personas = cat.personas || [];
