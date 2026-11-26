@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * RisuStand Remote Relay Server v1.0.0
+ * RisuStand Remote Relay Server v1.0.1
  * Zero-dependency Node.js (v18+) server:
  *  1) PC RisuAI Plugin Bridge Relay (Bots, Chats, Modules, Personas, Params)
  *  2) OpenAI-Compatible Local LLM Proxy Router (/v1/chat/completions)
@@ -19,7 +19,7 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 
 // Kept in sync with VERSION by tools/release_version.cjs
-const RELAY_VERSION = '1.0.0';
+const RELAY_VERSION = '1.0.1';
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const ROOT_DIR = __dirname;
