@@ -1582,6 +1582,69 @@
             .replace(/"/g, '&quot;');
     }
 
+    // Shared chrome for the plugin's own settings panels (Studio, Remote Bridge).
+    // Dark glass base, tinted by the active preset's accent so each theme feels native.
+    function buildPanelChromeCSS() {
+        const preset = PRESETS[config.theme.preset] || PRESETS['ai-gemini'];
+        const acc = /^#[0-9a-f]{6}$/i.test(config.theme.accentColor || '')
+            ? config.theme.accentColor
+            : (preset.defaults && preset.defaults.accentColor) || '#818cf8';
+        return `
+            :root {
+                --acc: ${acc}; --on-acc: ${getContrastText(acc)};
+                --acc-soft: color-mix(in srgb, ${acc} 16%, transparent);
+                --acc-line: color-mix(in srgb, ${acc} 55%, transparent);
+                --bg0: #0c0e14; --bg1: #12151d; --bg2: #181c26; --bg3: #20252f;
+                --line: rgba(255, 255, 255, 0.08); --line2: rgba(255, 255, 255, 0.14);
+                --tx: #eceff6; --tx2: #a3abbe; --tx3: #737c90;
+                --ok: #4ade80; --warn: #fbbf24;
+                color-scheme: dark;
+            }
+            * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Pretendard", "Apple SD Gothic Neo", "Malgun Gothic", "Noto Sans KR", sans-serif; -webkit-tap-highlight-color: transparent; }
+            html { margin: 0; padding: 0; width: 100%; height: 100%; background: transparent !important; }
+            body {
+                margin: 0; padding: 0; width: 100%; height: 100%; color: var(--tx);
+                background: rgba(6, 8, 12, 0.72);
+                -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
+                -webkit-font-smoothing: antialiased;
+            }
+            button { font-family: inherit; }
+            :focus-visible { outline: 2px solid var(--acc); outline-offset: 2px; }
+            * { scrollbar-width: thin; scrollbar-color: var(--bg3) transparent; }
+            ::-webkit-scrollbar { width: 8px; height: 8px; }
+            ::-webkit-scrollbar-thumb { background: var(--bg3); border-radius: 8px; }
+            input[type="checkbox"] {
+                -webkit-appearance: none; appearance: none; flex-shrink: 0; cursor: pointer; margin: 0;
+                width: 42px; height: 24px; border-radius: 999px; position: relative;
+                background: var(--bg3); border: 1px solid var(--line2);
+                transition: background 160ms ease, border-color 160ms ease;
+            }
+            input[type="checkbox"]::after {
+                content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%;
+                background: #cfd5e3; box-shadow: 0 1px 3px rgba(0,0,0,0.4); transition: transform 160ms ease, background 160ms ease;
+            }
+            input[type="checkbox"]:checked { background: var(--acc); border-color: var(--acc); }
+            input[type="checkbox"]:checked::after { transform: translateX(18px); background: var(--on-acc); }
+            input[type="range"] { accent-color: var(--acc); height: 22px; cursor: pointer; }
+            select, textarea, input[type="text"], input[type="password"], input[type="number"] {
+                width: 100%; background: var(--bg0); color: var(--tx); border: 1px solid var(--line2); border-radius: 10px;
+                padding: 9px 11px; font-size: 13.5px; outline: none; transition: border-color 140ms ease, box-shadow 140ms ease;
+            }
+            select:focus, textarea:focus, input[type="text"]:focus, input[type="password"]:focus, input[type="number"]:focus {
+                border-color: var(--acc); box-shadow: 0 0 0 3px var(--acc-soft);
+            }
+            @media (pointer: coarse) {
+                select, textarea, input[type="text"], input[type="password"], input[type="number"] { font-size: 16px; }
+            }
+            .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 0 16px; min-height: 38px; border-radius: 10px; border: 1px solid transparent; font-size: 13px; font-weight: 700; cursor: pointer; white-space: nowrap; transition: filter 140ms ease, background 140ms ease, transform 100ms ease; }
+            .btn:active { transform: scale(0.97); }
+            .btn-primary { background: var(--acc); color: var(--on-acc); }
+            .btn-primary:hover { filter: brightness(1.08); }
+            .btn-ghost { background: var(--bg2); color: var(--tx); border-color: var(--line2); }
+            .btn-ghost:hover { background: var(--bg3); }
+        `;
+    }
+
     function getContrastText(hex) {
         if (!hex || typeof hex !== 'string' || !hex.startsWith('#')) return '#ffffff';
         const clean = hex.replace('#', '');
@@ -2400,7 +2463,7 @@
                     .epub-viewport { margin: 18px auto !important; }
                     .clone-scroll { padding: 16px 12px 24px; }
                     .user-bubble { max-width: 88%; padding: 10px 14px; }
-                    .clone-dock { padding: 8px 10px 10px; }
+                    .clone-dock { padding: 8px 10px calc(10px + env(safe-area-inset-bottom)); }
                     .dock-pill { padding: 7px 11px; }
                 }
                 .nav-btn:hover { background: ${isLight ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.08)'}; }
@@ -2450,33 +2513,47 @@
                     display: flex; flex-direction: column; overflow: hidden;
                 }
                 .clone-header {
-                    min-height: 50px; height: 50px; flex-shrink: 0;
-                    display: flex; align-items: center; justify-content: space-between; gap: 10px;
-                    padding: 0 14px;
+                    min-height: 54px; flex-shrink: 0;
+                    display: flex; align-items: center; gap: 10px;
+                    padding: env(safe-area-inset-top) max(14px, env(safe-area-inset-right)) 0 max(14px, env(safe-area-inset-left));
                     border-bottom: 1px solid ${preset.borderColor};
                     background: ${preset.scheme.bgcolor};
                     overflow: hidden;
+                    font-family: system-ui, -apple-system, "Pretendard", "Malgun Gothic", sans-serif;
                 }
+                .hdr-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; padding-left: 8px; border-left: 1px solid ${preset.borderColor}; }
+                .icon-btn { width: 34px; height: 34px; padding: 0 !important; display: inline-flex; align-items: center; justify-content: center; font-size: 14px; }
+                .exit-btn { height: 34px; display: inline-flex; align-items: center; gap: 2px; }
                 .brand-group { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 14.5px; flex-shrink: 0; white-space: nowrap; }
                 .brand-dot { width: 12px; height: 12px; border-radius: 50%; background: ${preset.badgeBg}; flex-shrink: 0; }
                 .mode-tabs {
-                    display: flex; align-items: center; gap: 6px; flex-wrap: nowrap;
+                    display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; flex: 1;
                     overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch;
-                    min-width: 0; padding: 2px 0;
+                    min-width: 0; padding: 2px 0; justify-content: flex-start;
+                    -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 28px), transparent);
+                    mask-image: linear-gradient(90deg, #000 calc(100% - 28px), transparent);
                 }
+                .mode-tabs > :last-child { margin-right: 24px; }
                 .mode-tabs::-webkit-scrollbar { display: none; }
                 .tab-btn {
                     flex-shrink: 0; white-space: nowrap;
                     border: 1px solid ${preset.borderColor};
                     background: ${isLight ? 'rgba(0,0,0,0.04)' : 'rgba(255,255,255,0.05)'};
                     color: ${preset.scheme.textcolor};
-                    border-radius: 999px; padding: 5px 10px; font-size: 12px; font-weight: 600; cursor: pointer;
+                    border-radius: 999px; padding: 0 12px; height: 32px; font-size: 12px; font-weight: 600; cursor: pointer;
+                    font-family: inherit; transition: background 140ms ease, border-color 140ms ease;
                 }
+                .tab-btn:hover { background: ${isLight ? 'rgba(0,0,0,0.08)' : 'rgba(255,255,255,0.10)'}; }
                 .font-ctrl-group { flex-shrink: 0; }
                 @media (max-width: 820px) {
                     .brand-text { display: none; }
-                    .clone-header { padding: 0 10px; gap: 6px; }
-                    .tab-btn { padding: 4px 9px; font-size: 11.5px; }
+                    .clone-header { padding-left: max(10px, env(safe-area-inset-left)); padding-right: max(10px, env(safe-area-inset-right)); gap: 8px; }
+                    .tab-btn { padding: 0 10px; font-size: 11.5px; }
+                    .exit-lbl { display: none; }
+                    .exit-btn { width: 34px; padding: 0 !important; justify-content: center; }
+                }
+                @media (pointer: coarse) {
+                    .dock-pill textarea { font-size: 16px !important; }
                 }
                 .tab-btn.active {
                     background: ${preset.defaults.accentColor}; color: ${getContrastText(preset.defaults.accentColor)}; border-color: transparent;
@@ -2537,7 +2614,8 @@
                     color: ${preset.textTheme.FontColorQuote2} !important;
                 }
                 .empty-state { text-align: center; opacity: 0.6; padding: 80px 20px; font-size: 14px; }
-                .clone-dock { flex-shrink: 0; padding: 10px 20px 14px; background: ${preset.scheme.bgcolor}; }
+                .clone-dock { flex-shrink: 0; padding: 10px max(20px, env(safe-area-inset-right)) calc(14px + env(safe-area-inset-bottom)) max(20px, env(safe-area-inset-left)); background: ${preset.scheme.bgcolor}; }
+                .dock-pill:focus-within { border-color: ${preset.defaults.accentColor}; box-shadow: 0 0 0 3px ${preset.defaults.accentColor}33, 0 3px 12px rgba(0,0,0,0.12); }
                 .dock-pill {
                     max-width: ${isEpub && twoPage ? '920px' : `${preset.defaults.chatMaxWidth}px`};
                     margin: 0 auto; display: flex; align-items: flex-end; gap: 10px;
@@ -2663,9 +2741,11 @@
                     <button class="tab-btn ${modeKey === 'epub-sepia' ? 'active' : ''}" data-cmode="epub-sepia">📖 2쪽(낮)</button>
                     <button class="tab-btn ${modeKey === 'epub-night' ? 'active' : ''}" data-cmode="epub-night">🌙 2쪽(밤)</button>
                     ${isEpub ? `<button class="tab-btn ${config.layout.epubShowAssets ? 'active' : ''}" id="btn-epub-assets">${config.layout.epubShowAssets ? '🖼️ 에셋 ON' : '🖼️ 에셋 OFF'}</button>` : ''}
-                    <button class="tab-btn" id="btn-refresh-clone" title="화면 새로고침 (인레이·에셋 다시 불러오기)">🔄</button>
-                    <button class="tab-btn" id="btn-open-studio-from-clone" title="테마 & UX 설정">🎨</button>
-                    <button class="tab-btn" id="btn-exit-clone">원래 화면</button>
+                </div>
+                <div class="hdr-actions">
+                    <button class="tab-btn icon-btn" id="btn-refresh-clone" title="화면 새로고침 (인레이·에셋 다시 불러오기)" aria-label="새로고침">🔄</button>
+                    <button class="tab-btn icon-btn" id="btn-open-studio-from-clone" title="테마 & UX 설정" aria-label="설정">🎨</button>
+                    <button class="tab-btn exit-btn" id="btn-exit-clone" title="원래 화면으로" aria-label="원래 화면으로">✕<span class="exit-lbl"> 원래 화면</span></button>
                 </div>
             </div>
             ${mainContentHtml}
@@ -2982,6 +3062,11 @@
         document.querySelectorAll('[data-cmode]').forEach((btn) => {
             btn.onclick = () => renderCloneView(btn.getAttribute('data-cmode'));
         });
+        const activeModeTab = document.querySelector('.mode-tabs [data-cmode].active');
+        const modeStrip = document.querySelector('.mode-tabs');
+        if (activeModeTab && modeStrip && modeStrip.scrollWidth > modeStrip.clientWidth) {
+            modeStrip.scrollLeft = Math.max(0, activeModeTab.offsetLeft - modeStrip.offsetLeft - modeStrip.clientWidth / 2 + activeModeTab.offsetWidth / 2);
+        }
 
         const epubAssetsBtn = document.getElementById('btn-epub-assets');
         if (epubAssetsBtn) {
@@ -3064,19 +3149,30 @@
                 (key === 'epub-night' && config.theme.preset === 'epub-night-scroll')
                     ? 'active'
                     : '';
-            const swatchBg = p.scheme ? p.scheme.bgcolor : '#1e1f26';
-            const swatchAccent = p.defaults.accentColor;
-            const swatchQuote = p.defaults.quoteColor;
-            const tag = p.isChatbot ? '<span class="pill">에셋 자동숨김</span>' : '';
+            const pvBg = p.pageBg || (p.scheme ? p.scheme.bgcolor : '#1e1f26');
+            const pvText = p.scheme ? p.scheme.textcolor : '#d4d4d8';
+            const pvSub = p.scheme ? p.scheme.textcolor2 : '#71717a';
+            const pvAccent = p.defaults.accentColor;
+            const pvUser = p.userBubbleBg || (p.scheme ? p.scheme.selected : '#2a2a30');
+            const pvAvatar = p.badgeBg || pvAccent;
+            const pvInputBg = p.inputBg || pvUser;
+            const pvInputBorder = p.inputBorder || pvSub;
+            const tag = p.isChatbot
+                ? '<span class="pill">에셋 숨김</span>'
+                : (p.isEpub ? '<span class="pill epub">EPUB</span>' : '');
             return `
-                <button class="preset-card ${active}" data-preset="${key}">
-                    <div class="swatch-row">
-                        <span class="swatch" style="background:${swatchBg}"></span>
-                        <span class="swatch" style="background:${swatchAccent}"></span>
-                        <span class="swatch" style="background:${swatchQuote}"></span>
+                <button class="preset-card ${active}" data-preset="${key}" aria-pressed="${active ? 'true' : 'false'}">
+                    <span class="pv-check">✓</span>
+                    <div class="pv" style="background:${pvBg}">
                         ${tag}
+                        <div class="pv-user" style="background:${pvUser}"></div>
+                        <div class="pv-row"><span class="pv-av" style="background:${pvAvatar}"></span><span class="pv-line" style="background:${pvText}; width:62%"></span></div>
+                        <div class="pv-row"><span class="pv-av" style="background:transparent"></span><span class="pv-line" style="background:${pvSub}; width:44%"></span></div>
+                        <div class="pv-input" style="background:${pvInputBg}; border-color:${pvInputBorder}"><i style="background:${pvAccent}"></i></div>
                     </div>
-                    <div class="preset-title">${escapeHtml(p.label)}</div>
+                    <div class="preset-head">
+                        <div class="preset-title">${escapeHtml(p.label)}</div>
+                    </div>
                     <div class="preset-desc">${escapeHtml(p.desc)}</div>
                 </button>
             `;
@@ -3096,55 +3192,90 @@
 
         document.body.innerHTML = `
             <style>
-                * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Pretendard", "Malgun Gothic", "Noto Sans KR", sans-serif; }
-                html { margin: 0; padding: 0; width: 100%; height: 100%; background: transparent !important; }
-                body { margin: 0; padding: 0; width: 100%; height: 100%; background: rgba(10, 12, 18, 0.86); color: #eef2ff; backdrop-filter: blur(8px); }
-                .shell { max-width: 980px; margin: 20px auto; background: #141824; border: 1px solid #283047; border-radius: 18px; overflow: hidden; box-shadow: 0 24px 64px rgba(0,0,0,0.55); display: flex; flex-direction: column; max-height: calc(100vh - 40px); }
-                @media (max-width: 680px) {
-                    .shell { margin: 8px; max-height: calc(100vh - 16px); border-radius: 14px; }
-                    .header { padding: 12px 14px; flex-wrap: wrap; gap: 8px; }
-                    .content { padding: 12px 14px; gap: 12px; }
-                    .section { padding: 14px; }
-                    .preset-grid { grid-template-columns: repeat(auto-fill, minmax(145px, 1fr)); }
-                    .footer { padding: 10px 14px; flex-wrap: wrap; }
+                ${buildPanelChromeCSS()}
+                .shell {
+                    max-width: 1000px; margin: 24px auto; background: var(--bg1); border: 1px solid var(--line);
+                    border-radius: 20px; overflow: hidden; display: flex; flex-direction: column;
+                    max-height: calc(100vh - 48px); max-height: calc(100dvh - 48px);
+                    box-shadow: 0 30px 80px -20px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.02) inset;
                 }
-                .header { display: flex; justify-content: space-between; align-items: center; padding: 16px 24px; background: #101420; border-bottom: 1px solid #232b40; }
-                .header h1 { margin: 0; font-size: 17px; font-weight: 700; display: flex; align-items: center; gap: 10px; }
-                .hdr-actions { display: flex; gap: 8px; }
-                .close-btn { background: #232a3e; color: #dbe4ff; border: 1px solid #35405e; border-radius: 10px; padding: 7px 13px; cursor: pointer; font-weight: 600; font-size: 13px; }
-                .close-btn:hover { background: #2f3854; }
-                .content { padding: 18px 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 18px; }
-                .badge { padding: 10px 14px; border-radius: 10px; font-size: 13px; }
-                .badge.ok { background: rgba(52, 211, 153, 0.12); border: 1px solid rgba(52, 211, 153, 0.35); color: #a7f3d0; }
-                .badge.warn { background: rgba(251, 191, 36, 0.12); border: 1px solid rgba(251, 191, 36, 0.35); color: #fde68a; }
-                .section { background: #191f30; border: 1px solid #26304a; border-radius: 14px; padding: 16px 18px; }
-                .section h2 { margin: 0 0 6px; font-size: 15px; font-weight: 700; }
-                .section .sub { margin: 0 0 12px; font-size: 12.5px; color: #9aa7c7; line-height: 1.5; }
-                .preset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(195px, 1fr)); gap: 10px; }
-                .preset-card { text-align: left; background: #121726; border: 1px solid #293350; border-radius: 12px; padding: 12px; color: #e8eeff; cursor: pointer; transition: transform 120ms ease, border-color 120ms ease; }
-                .preset-card:hover { transform: translateY(-1px); border-color: #6b7cff; }
-                .preset-card.active { border-color: #818cf8; background: #1d2540; box-shadow: 0 0 0 2px rgba(129, 140, 248, 0.25); }
-                .swatch-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
-                .swatch { width: 15px; height: 15px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.22); flex-shrink: 0; }
-                .pill { margin-left: auto; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 999px; background: rgba(16, 185, 129, 0.18); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.35); }
-                .pill.epub { background: rgba(245, 158, 11, 0.18); color: #fcd34d; border-color: rgba(245, 158, 11, 0.35); }
-                .pill.scroll { background: rgba(96, 165, 250, 0.18); color: #93c5fd; border-color: rgba(96, 165, 250, 0.35); }
-                .preset-title { font-size: 13.5px; font-weight: 700; margin-bottom: 4px; }
-                .preset-desc { font-size: 11.5px; color: #9aa7c7; line-height: 1.4; }
-                .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
-                .field { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
-                .field label { display: flex; justify-content: space-between; color: #c7d2f0; font-weight: 600; }
+                .header {
+                    display: flex; justify-content: space-between; align-items: center; gap: 12px;
+                    padding: 14px 20px; border-bottom: 1px solid var(--line);
+                    background: linear-gradient(180deg, var(--acc-soft), transparent 140%);
+                }
+                .header h1 { margin: 0; font-size: 16px; font-weight: 800; letter-spacing: -0.01em; display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+                .header h1 .logo { width: 30px; height: 30px; border-radius: 9px; display: inline-flex; align-items: center; justify-content: center; background: var(--acc-soft); border: 1px solid var(--acc-line); font-size: 16px; }
+                .header h1 .ver { font-size: 11px; font-weight: 700; color: var(--tx3); padding: 2px 7px; border: 1px solid var(--line2); border-radius: 999px; }
+                .hdr-actions { display: flex; gap: 8px; min-width: 0; }
+                .close-btn { display: inline-flex; align-items: center; gap: 6px; background: var(--bg2); color: var(--tx); border: 1px solid var(--line2); border-radius: 10px; padding: 0 13px; min-height: 36px; cursor: pointer; font-weight: 700; font-size: 13px; white-space: nowrap; }
+                .close-btn:hover { background: var(--bg3); }
+                .content { padding: 18px 20px 22px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; overscroll-behavior: contain; }
+                .badge { padding: 10px 14px; border-radius: 12px; font-size: 12.5px; line-height: 1.5; }
+                .badge.ok { background: rgba(74, 222, 128, 0.08); border: 1px solid rgba(74, 222, 128, 0.25); color: #bbf7d0; }
+                .badge.warn { background: rgba(251, 191, 36, 0.08); border: 1px solid rgba(251, 191, 36, 0.3); color: #fde68a; }
+                .section { background: var(--bg2); border: 1px solid var(--line); border-radius: 16px; padding: 18px; }
+                .section h2 { margin: 0 0 4px; font-size: 14.5px; font-weight: 800; letter-spacing: -0.01em; }
+                .section .sub { margin: 0 0 14px; font-size: 12.5px; color: var(--tx2); line-height: 1.55; }
+                .preset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+                .preset-card {
+                    position: relative; text-align: left; background: var(--bg1); border: 1px solid var(--line); border-radius: 14px; padding: 8px 8px 11px;
+                    color: var(--tx); cursor: pointer; display: flex; flex-direction: column;
+                    transition: transform 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
+                }
+                .preset-card:hover { transform: translateY(-2px); border-color: var(--line2); box-shadow: 0 10px 24px -14px rgba(0,0,0,0.8); }
+                .preset-card.active { border-color: var(--acc); box-shadow: 0 0 0 3px var(--acc-soft); }
+                .pv {
+                    position: relative; height: 74px; border-radius: 9px; overflow: hidden; margin-bottom: 10px;
+                    border: 1px solid rgba(127,127,127,0.18); display: flex; flex-direction: column; gap: 5px; padding: 9px 10px;
+                }
+                .pv-row { display: flex; align-items: center; gap: 6px; }
+                .pv-av { width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0; }
+                .pv-line { height: 5px; border-radius: 3px; opacity: 0.55; }
+                .pv-user { align-self: flex-end; height: 13px; width: 46%; border-radius: 7px; }
+                .pv-input { position: absolute; left: 10px; right: 10px; bottom: 7px; height: 11px; border-radius: 999px; border: 1px solid; display: flex; justify-content: flex-end; padding: 2px; }
+                .pv-input i { width: 7px; height: 7px; border-radius: 50%; display: block; }
+                .pv-check { position: absolute; top: 14px; right: 14px; width: 18px; height: 18px; border-radius: 50%; background: var(--acc); color: var(--on-acc); font-size: 11px; font-weight: 900; display: none; align-items: center; justify-content: center; z-index: 1; }
+                .preset-card.active .pv-check { display: flex; }
+                .preset-head { display: flex; align-items: center; gap: 6px; padding: 0 3px; margin-bottom: 3px; min-width: 0; }
+                .pv .pill { position: absolute; top: 6px; left: 7px; z-index: 1; }
+                .pill { margin-left: auto; font-size: 10px; font-weight: 800; padding: 2px 6px; border-radius: 999px; background: rgba(74, 222, 128, 0.12); color: #86efac; border: 1px solid rgba(74, 222, 128, 0.25); white-space: nowrap; flex-shrink: 0; }
+                .pill.epub { background: rgba(245, 158, 11, 0.14); color: #fcd34d; border-color: rgba(245, 158, 11, 0.3); }
+                .pill.scroll { background: rgba(96, 165, 250, 0.14); color: #93c5fd; border-color: rgba(96, 165, 250, 0.3); }
+                .preset-title { font-size: 13px; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+                .preset-desc { font-size: 11.5px; color: var(--tx2); line-height: 1.45; padding: 0 3px; }
+                .launch-row { display: flex; flex-wrap: wrap; gap: 8px; }
+                .launch-row .btn { min-height: 36px; font-weight: 600; font-size: 12.5px; }
+                .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 16px; }
+                .field { display: flex; flex-direction: column; gap: 7px; font-size: 13px; }
+                .field label { display: flex; justify-content: space-between; gap: 8px; color: var(--tx2); font-weight: 600; font-size: 12.5px; }
+                .field label span { color: var(--tx); font-variant-numeric: tabular-nums; }
                 .field input[type="range"], .field select, .field textarea { width: 100%; }
-                .field select, .field textarea { background: #101420; color: #eef2ff; border: 1px solid #2c3754; border-radius: 8px; padding: 8px 10px; font-size: 13px; }
-                .field input[type="color"] { width: 100%; height: 36px; border: 1px solid #2c3754; border-radius: 8px; background: #101420; cursor: pointer; }
-                .toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #232c45; font-size: 13.5px; }
+                .field textarea { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; resize: vertical; }
+                .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 11px 0; border-bottom: 1px solid var(--line); font-size: 13.5px; line-height: 1.45; cursor: pointer; }
                 .toggle-row:last-child { border-bottom: none; }
-                .footer { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 14px 24px; background: #101420; border-top: 1px solid #232b40; }
-                .btn { padding: 9px 16px; border-radius: 10px; border: 1px solid transparent; font-size: 13.5px; font-weight: 700; cursor: pointer; }
-                .btn-primary { background: #6366f1; color: #fff; }
-                .btn-primary:hover { background: #4f46e5; }
-                .btn-ghost { background: #1f263b; color: #cbd5f5; border-color: #313d5e; }
-                .btn-ghost:hover { background: #29324d; }
+                .footer { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 12px 20px; padding-bottom: calc(12px + env(safe-area-inset-bottom)); background: var(--bg1); border-top: 1px solid var(--line); }
+                .footer-sec { display: flex; gap: 8px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+                .footer-sec::-webkit-scrollbar { display: none; }
+                .footer-sec .btn { font-weight: 600; font-size: 12.5px; }
+                @media (max-width: 680px) {
+                    .shell { margin: 0; border-radius: 0; border: none; max-height: 100vh; max-height: 100dvh; height: 100%; }
+                    .header { padding: calc(10px + env(safe-area-inset-top)) 14px 10px; }
+                    .header h1 .ver { display: none; }
+                    .close-btn { padding: 0 11px; font-size: 12.5px; }
+                    .close-btn .lbl-long { display: none; }
+                    .content { padding: 12px 12px 18px; gap: 12px; }
+                    .section { padding: 14px; border-radius: 14px; }
+                    .preset-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+                    .preset-desc { display: none; }
+                    .preset-title { white-space: normal; line-height: 1.35; font-size: 12.5px; }
+                    .pv { height: 62px; }
+                    .footer { padding: 10px 12px; padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
+                    .footer-sec .btn { min-height: 36px; padding: 0 11px; font-size: 12px; }
+                }
+                @media (prefers-reduced-motion: reduce) {
+                    *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+                }
                 body { transition: background 140ms ease; }
                 .shell, .section, .header, .footer, .badge, .field, .toggle-row, .preset-grid {
                     transition: opacity 140ms ease, background 140ms ease, border-color 140ms ease;
@@ -3192,10 +3323,10 @@
             </style>
             <div class="shell">
                 <div class="header">
-                    <h1>📖 RisuStand v1.0.0</h1>
+                    <h1><span class="logo">📖</span>RisuStand <span class="ver">v1.0.0</span></h1>
                     <div class="hdr-actions">
-                        <button class="close-btn" id="btn-open-clone">🖥️ 공홈 · 2쪽 EPUB 뷰 열기</button>
-                        <button class="close-btn" id="btn-close">닫기</button>
+                        <button class="close-btn" id="btn-open-clone">🖥️ <span class="lbl-long">공홈 · EPUB </span>전용 뷰</button>
+                        <button class="close-btn" id="btn-close" aria-label="닫기">✕<span class="lbl-long"> 닫기</span></button>
                     </div>
                 </div>
                 <div class="content">
@@ -3206,9 +3337,9 @@
                         <p class="sub">원래 RisuAI 채팅창과 봇 메뉴를 그대로 유지하면서 배경·카드·배색을 적용합니다.</p>
                         <div class="preset-grid">${mainSkinCards}</div>
 
-                        <h2 style="margin-top:20px;">🖥️ 전체 화면 전용 뷰 바로 열기 (새 화면 렌더링)</h2>
+                        <h2 style="margin-top:22px;">🖥️ 전체 화면 전용 뷰 바로 열기 (새 화면 렌더링)</h2>
                         <p class="sub">메인 채팅창 대신 전용 공홈 화면이나 1쪽·2쪽 전자책 뷰어를 전체 화면으로 바로 띄웁니다.</p>
-                        <div style="display:flex; flex-wrap:wrap; gap:8px;">
+                        <div class="launch-row">
                             <button class="btn btn-ghost" data-launch-clone="ai-gemini">✦ Gemini 공홈 뷰</button>
                             <button class="btn btn-ghost" data-launch-clone="ai-claude">✴ Claude 공홈 뷰</button>
                             <button class="btn btn-ghost" data-launch-clone="ai-chatgpt">● ChatGPT 공홈 뷰</button>
@@ -3252,26 +3383,26 @@
                             </div>
                         </div>
                         <div style="margin-top:12px;">
-                            <div class="toggle-row">
+                            <label class="toggle-row">
                                 <span>문단 양쪽 정렬</span>
                                 <input type="checkbox" id="th-justify" ${config.theme.justifyText ? 'checked' : ''} />
-                            </div>
-                            <div class="toggle-row">
+                            </label>
+                            <label class="toggle-row">
                                 <span>입력창을 중앙 캡슐 도크 형태로 변환</span>
                                 <input type="checkbox" id="ly-capsule" ${config.layout.floatingCapsuleInput ? 'checked' : ''} />
-                            </div>
-                            <div class="toggle-row">
+                            </label>
+                            <label class="toggle-row">
                                 <span>젠(Zen) 집중 모드 — 사이드바 숨기기</span>
                                 <input type="checkbox" id="ly-zen" ${config.layout.zenMode ? 'checked' : ''} />
-                            </div>
-                            <div class="toggle-row">
+                            </label>
+                            <label class="toggle-row">
                                 <span>사이드바 좌↔우 반전 배치</span>
                                 <input type="checkbox" id="ly-right" ${config.layout.sidebarRight ? 'checked' : ''} />
-                            </div>
-                            <div class="toggle-row">
+                            </label>
+                            <label class="toggle-row">
                                 <span>메시지 수정/삭제 버튼을 마우스 올릴 때만 표시</span>
                                 <input type="checkbox" id="ly-hover" ${config.layout.hoverActionsOnly ? 'checked' : ''} />
-                            </div>
+                            </label>
                         </div>
                         <div class="field" style="margin-top:12px;">
                             <label>추가 커스텀 CSS</label>
@@ -3283,26 +3414,26 @@
                         <h2>🛠️ 편의 기능 &amp; UX 설정</h2>
                         <p class="sub">외출용 에셋 가리기, 상단 미니 바 동작, EPUB 기본 보기 및 리로드 깜빡임 완화를 설정합니다.</p>
                         <div>
-                            <div class="toggle-row">
+                            <label class="toggle-row">
                                 <span>🕶️ 외출(에셋 가리기) — 채팅 이미지 숨김 + AI 원형 배지</span>
                                 <input type="checkbox" id="st-enabled" ${config.stealth.mode !== 'off' ? 'checked' : ''} />
-                            </div>
-                            <div class="toggle-row">
+                            </label>
+                            <label class="toggle-row">
                                 <span>상단 드래그·자동 최소화 미니 바 표시</span>
                                 <input type="checkbox" id="ly-topbar" ${config.layout.showFloatingTopBar ? 'checked' : ''} />
-                            </div>
-                            <div class="toggle-row">
+                            </label>
+                            <label class="toggle-row">
                                 <span>EPUB 풀스크린 기본 2쪽 양면 펼침 보기</span>
                                 <input type="checkbox" id="ly-epub2" ${config.layout.epubTwoPage ? 'checked' : ''} />
-                            </div>
-                            <div class="toggle-row">
+                            </label>
+                            <label class="toggle-row">
                                 <span>전체 화면 뷰 자동 새로고침 (페이지 넘길 때 자연스럽게 반영)</span>
                                 <input type="checkbox" id="ly-autorefresh" ${config.layout.autoRefreshClone ? 'checked' : ''} />
-                            </div>
-                            <div class="toggle-row">
+                            </label>
+                            <label class="toggle-row">
                                 <span>리로드 높이 잠금(Anti-Collapse) 활성화 — 깜빡임 완화</span>
                                 <input type="checkbox" id="af-enabled" ${config.antiFlicker.enabled ? 'checked' : ''} />
-                            </div>
+                            </label>
                         </div>
                         <div class="grid-2" style="margin-top:12px;">
                             <div class="field">
@@ -3317,7 +3448,7 @@
                     </div>
                 </div>
                 <div class="footer">
-                    <div style="display:flex; gap:8px;">
+                    <div class="footer-sec">
                         <button class="btn btn-ghost" id="btn-reset">기본값 복원</button>
                         <button class="btn btn-ghost" id="btn-reset-pos">상단 바 위치 초기화</button>
                         ${!domPermissionGranted ? '<button class="btn btn-ghost" id="btn-perm">mainDom 권한 요청</button>' : ''}
@@ -4208,50 +4339,59 @@
         function renderSettingsUI() {
             document.body.innerHTML = `
                 <style>
-                    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Malgun Gothic", sans-serif; }
-                    html, body { margin:0; padding:0; width:100%; height:100%; background:rgba(10,12,18,0.85); color:#eef2ff; }
-                    .wrap { max-width:540px; margin:24px auto; background:#141824; border:1px solid #2b3347; border-radius:16px; padding:22px; box-shadow:0 20px 50px rgba(0,0,0,0.5); }
-                    h2 { margin:0 0 6px; font-size:18px; }
-                    .sub { font-size:12px; color:#9aa4b8; margin-bottom:16px; line-height:1.5; }
-                    .status { padding:10px 12px; border-radius:10px; background:#0d1018; border:1px solid #232a3b; font-size:13px; margin-bottom:14px; display:flex; justify-content:space-between; }
-                    label { display:block; font-size:12px; color:#b8c2d8; margin:12px 0 5px; }
-                    input[type="text"], input[type="password"], input[type="number"] {
-                        width:100%; padding:10px 12px; border-radius:10px; border:1px solid #303952;
-                        background:#0c0f17; color:#fff; font-size:13px; outline:none;
+                    ${buildPanelChromeCSS()}
+                    .wrap { max-width:560px; margin:28px auto; background:var(--bg1); border:1px solid var(--line); border-radius:20px; padding:22px; box-shadow:0 30px 80px -20px rgba(0,0,0,0.7); }
+                    .ttl { display:flex; align-items:center; gap:12px; margin-bottom:16px; }
+                    .ttl .logo { width:38px; height:38px; border-radius:11px; display:flex; align-items:center; justify-content:center; font-size:19px; background:var(--acc-soft); border:1px solid var(--acc-line); flex-shrink:0; }
+                    h2 { margin:0; font-size:17px; font-weight:800; letter-spacing:-0.01em; }
+                    .sub { font-size:12px; color:var(--tx2); margin-top:2px; line-height:1.5; }
+                    .status { padding:11px 13px; border-radius:12px; background:var(--bg0); border:1px solid var(--line); font-size:13px; margin-bottom:6px; display:flex; justify-content:space-between; align-items:center; gap:10px; }
+                    .status .st-dot { width:8px; height:8px; border-radius:50%; background:${cfg.enabled ? 'var(--ok)' : 'var(--tx3)'}; box-shadow:0 0 0 3px ${cfg.enabled ? 'rgba(74,222,128,0.18)' : 'transparent'}; flex-shrink:0; }
+                    .status .st-l { display:flex; align-items:center; gap:9px; min-width:0; }
+                    .status .st-l span:last-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+                    label { display:block; font-size:12px; font-weight:600; color:var(--tx2); margin:14px 0 6px; }
+                    .chk { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:0; padding:12px 0; font-size:13.5px; font-weight:500; color:var(--tx); cursor:pointer; border-bottom:1px solid var(--line); }
+                    .btns { display:flex; gap:8px; margin-top:20px; }
+                    .btns button { flex:1; }
+                    .tip { margin-top:16px; font-size:12px; color:var(--tx2); line-height:1.6; background:var(--bg0); padding:12px 14px; border-radius:12px; border:1px solid var(--line); }
+                    .tip b { color:var(--tx); }
+                    code { background:var(--bg3); padding:1px 6px; border-radius:5px; color:var(--acc); font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:11.5px; word-break:break-all; }
+                    @media (max-width: 600px) {
+                        .wrap { margin:0; border-radius:0; border:none; min-height:100%; padding:calc(18px + env(safe-area-inset-top)) 16px calc(18px + env(safe-area-inset-bottom)); }
+                        .btns { flex-wrap:wrap; }
+                        .btns .btn-primary { flex-basis:100%; }
                     }
-                    .chk { display:flex; align-items:center; gap:8px; margin-top:12px; font-size:13px; cursor:pointer; }
-                    .btns { display:flex; gap:8px; margin-top:18px; }
-                    button { flex:1; padding:11px; border:none; border-radius:10px; font-size:13px; font-weight:600; cursor:pointer; }
-                    .primary { background:#4f7cff; color:#fff; }
-                    .secondary { background:#232b3e; color:#dbe3f5; }
-                    .tip { margin-top:14px; font-size:11.5px; color:#8d97ad; line-height:1.55; background:#0d1018; padding:10px 12px; border-radius:10px; border:1px solid #1f2636; }
-                    code { background:#1c2334; padding:1px 5px; border-radius:4px; color:#a8c7fa; }
                 </style>
                 <div class="wrap">
-                    <h2>📡 RisuStand Remote Bridge v1.0</h2>
-                    <div class="sub">봇/방 전환 · 모듈 · 페르소나 · 파라미터 · 릴레이 모델 라우터 연동</div>
+                    <div class="ttl">
+                        <span class="logo">📡</span>
+                        <div>
+                            <h2>RisuStand Remote Bridge</h2>
+                            <div class="sub">봇/방 전환 · 모듈 · 페르소나 · 파라미터 · 릴레이 모델 라우터 연동</div>
+                        </div>
+                    </div>
                     <div class="status">
-                        <span id="stText">${esc(lastStatus)}</span>
-                        <span style="color:#7c879e;">${esc(lastSyncTime || '-')}</span>
+                        <span class="st-l"><span class="st-dot"></span><span id="stText">${esc(lastStatus)}</span></span>
+                        <span style="color:var(--tx3); font-size:12px; flex-shrink:0;">${esc(lastSyncTime || '-')}</span>
                     </div>
                     <label class="chk">
-                        <input type="checkbox" id="enabled" ${cfg.enabled ? 'checked' : ''} />
                         <span>원격 브릿지 활성화</span>
+                        <input type="checkbox" id="enabled" ${cfg.enabled ? 'checked' : ''} />
                     </label>
                     <label>중계 서버 주소 (PC 로컬)</label>
                     <input type="text" id="relayUrl" value="${esc(cfg.relayUrl)}" placeholder="http://127.0.0.1:8787" />
                     <label>보안 접속 토큰 (PC 터미널에 출력된 값)</label>
                     <input type="password" id="token" value="${esc(cfg.token)}" placeholder="토큰 붙여넣기" />
-                    <label class="chk">
-                        <input type="checkbox" id="includeImages" ${cfg.includeImages ? 'checked' : ''} />
+                    <label class="chk" style="margin-top:6px;">
                         <span>최근 메시지의 캐릭터 에셋 이미지 함께 전송</span>
+                        <input type="checkbox" id="includeImages" ${cfg.includeImages ? 'checked' : ''} />
                     </label>
                     <label>폴링 주기 (ms, 기본 1800)</label>
                     <input type="number" id="pollIntervalMs" value="${esc(cfg.pollIntervalMs)}" min="1200" max="10000" />
                     <div class="btns">
-                        <button class="primary" id="saveBtn">저장 및 연결</button>
-                        <button class="secondary" id="syncBtn">전체 동기화</button>
-                        <button class="secondary" id="closeBtn">닫기</button>
+                        <button class="btn btn-primary" id="saveBtn">저장 및 연결</button>
+                        <button class="btn btn-ghost" id="syncBtn">전체 동기화</button>
+                        <button class="btn btn-ghost" id="closeBtn">닫기</button>
                     </div>
                     <div class="tip">
                         <b>릴레이 모델 라우터 연동 팁</b><br>
