@@ -158,3 +158,190 @@ test('relay proxy & CORS: untrusted Origin blocked on loopback, never emits Acce
         await new Promise((r) => server.close(r));
     }
 });
+
+test('relay /v1/chat/completions forwards non-stream and stream requests without premature Client disconnected', async () => {
+    const upstream = http.createServer((req, res) => {
+        const chunks = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+            const reqBody = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+            if (reqBody.stream) {
+                res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+                res.write(`data: ${JSON.stringify({ id: 's1', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: 'hello stream' }, finish_reason: null }] })}\n\n`);
+                res.write('data: [DONE]\n\n');
+                res.end();
+                return;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                id: 'c1',
+                model: reqBody.model || 'mock-model',
+                choices: [{ index: 0, message: { role: 'assistant', content: 'hello non-stream' }, finish_reason: 'stop' }],
+                usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+            }));
+        });
+    });
+    await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+    const upstreamPort = upstream.address().port;
+
+    const server = relay.createRelayServer({
+        token: 'proxy-test-token',
+        configOverride: {
+            activeProfileId: 'mock-openai',
+            presetToggles: [],
+            profiles: [{
+                id: 'mock-openai',
+                name: 'Mock OpenAI',
+                providerType: 'openai_compat',
+                baseUrl: `http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
+                apiKey: 'mock-key',
+                model: 'deepseek-test',
+                temperature: '',
+                maxTokens: '',
+                overrideMode: 'off',
+                systemOverride: '',
+            }],
+            translator: { enabled: false, useActiveProfile: true },
+        },
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+
+    try {
+        const nonStream = await requestHttp(port, {
+            method: 'POST',
+            path: '/v1/chat/completions',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: 'Bearer proxy-test-token',
+            },
+            body: JSON.stringify({ model: 'risustand-router', stream: false, messages: [{ role: 'user', content: 'hi' }] }),
+        });
+        assert.equal(nonStream.status, 200);
+        const nonStreamJson = JSON.parse(nonStream.body);
+        assert.equal(nonStreamJson.choices[0].message.content, 'hello non-stream');
+
+        const streamed = await requestHttp(port, {
+            method: 'POST',
+            path: '/v1/chat/completions',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: 'Bearer proxy-test-token',
+            },
+            body: JSON.stringify({ model: 'risustand-router', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+        });
+        assert.equal(streamed.status, 200);
+        assert.match(streamed.body, /hello stream/);
+        assert.match(streamed.body, /\[DONE\]/);
+    } finally {
+        await new Promise((r) => server.close(r));
+        await new Promise((r) => upstream.close(r));
+    }
+});
+
+test('bundled Leave preset & AI provider model loader APIs (including 22 Ollama Cloud models)', async () => {
+    const upstream = http.createServer((req, res) => {
+        if (req.url === '/v1/models') {
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ data: [{ id: 'live-model-1' }, { id: 'live-model-2' }] }));
+            return;
+        }
+        res.writeHead(404);
+        res.end();
+    });
+    await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+    const upstreamPort = upstream.address().port;
+
+    const server = relay.createRelayServer({ token: 'preset-loader-token' });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    try {
+        // 1) Auth required on Leave & model loader routes
+        assert.equal((await requestHttp(port, { path: '/api/presets/leave' })).status, 401);
+        assert.equal((await requestHttp(port, { path: '/api/presets/leave/download' })).status, 401);
+        assert.equal((await requestHttp(port, { path: '/api/presets/leave/guide' })).status, 401);
+        assert.equal((await requestHttp(port, { method: 'POST', path: '/api/router/models', body: '{}' })).status, 401);
+
+        const authHdr = { 'X-RisuStand-Token': 'preset-loader-token' };
+
+        // 2) Bundled Leave r1.1 preset metadata, download JSON, and guide HTML
+        const meta = await requestHttp(port, { path: '/api/presets/leave', headers: authHdr });
+        assert.equal(meta.status, 200);
+        const metaJson = JSON.parse(meta.body);
+        assert.equal(metaJson.id, 'preset-leave-r1.1');
+        assert.ok(metaJson.toggleSyntax.includes('ooc_mode='));
+        assert.equal(metaJson.hasGuide, true);
+
+        const dl = await requestHttp(port, { path: '/api/presets/leave/download', headers: authHdr });
+        assert.equal(dl.status, 200);
+        assert.ok(JSON.parse(dl.body).promptTemplate.length >= 20);
+
+        const guide = await requestHttp(port, { path: '/api/presets/leave/guide', headers: authHdr });
+        assert.equal(guide.status, 200);
+        assert.match(guide.body, /Leave/i);
+
+        // 3) Ollama Cloud model loader includes all 22 requested models even without live key
+        const expectedOllamaModels = [
+            'deepseek-v4.1-flash:1017-cloud',
+            'glm-5.3:cloud',
+            'glm-5.3-flash:cloud',
+            'hy4:cloud',
+            'kimi-k3.1-pro:cloud',
+            'inkling-2-small:cloud',
+            'minimax-m3:cloud',
+            'beam:cloud',
+            'glm-5.2:cloud',
+            'minimax-m3.1-flash:cloud',
+            'kimi-k2.7-code:cloud',
+            'kimi-k3:cloud',
+            'nemotron-3-ultra:cloud',
+            'mistral-large-4:cloud',
+            'muse-spark-open:cloud',
+            'mimo-v2.6-flash:cloud',
+            'mimo-v2.6-pro:cloud',
+            'gemma4:31b-cloud',
+            'nemotron-3-super:120b',
+            'deepseek-v4-pro:0813-cloud',
+            'kimi-k2.6:cloud',
+            'gpt-oss:120b-cloud',
+        ];
+        const ollamaRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/router/models',
+            headers: { ...authHdr, 'Content-Type': 'application/json' },
+            body: JSON.stringify({ provider: 'ollama_cloud', baseUrl: 'https://ollama.com/v1/chat/completions' }),
+        });
+        assert.equal(ollamaRes.status, 200);
+        const ollamaIds = JSON.parse(ollamaRes.body).models.map((m) => m.id);
+        for (const id of expectedOllamaModels) {
+            assert.ok(ollamaIds.includes(id), `Expected Ollama Cloud model: ${id}`);
+        }
+
+        // 4) Live OpenAI-compatible /v1/models lookup against local upstream mock
+        const liveRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/router/models',
+            headers: { ...authHdr, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                provider: 'custom',
+                providerType: 'openai_compat',
+                baseUrl: `http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
+            }),
+        });
+        assert.equal(liveRes.status, 200);
+        assert.deepEqual(JSON.parse(liveRes.body).models.map((m) => m.id), ['live-model-1', 'live-model-2']);
+
+        // 5) Rendered HTML includes provider selector, model loader, Leave buttons, and compiles cleanly
+        const html = await requestHttp(port, { path: '/' });
+        assert.equal(html.status, 200);
+        for (const marker of ['edProvider', 'edLoadModelsBtn', 'edModelPick', 'trProvider', 'installBundledLeaveToggle']) {
+            assert.ok(html.body.includes(marker), `Expected UI marker: ${marker}`);
+        }
+        const scriptMatch = html.body.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(scriptMatch);
+        new vm.Script(scriptMatch[1], { filename: 'webapp-presets-inline.js' });
+    } finally {
+        await new Promise((r) => server.close(r));
+        await new Promise((r) => upstream.close(r));
+    }
+});

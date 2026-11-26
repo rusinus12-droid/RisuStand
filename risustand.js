@@ -3707,7 +3707,7 @@
     // =========================================================================
     // 6. Bootstrap & Cleanup
     // =========================================================================
-    const PERMS_PROMPTED_KEY = 'risustand_perms_prompted_v1';
+    const PERMS_PROMPTED_KEY = 'risustand_perms_prompted_v2';
 
     async function requestAllPermissionsOnce(force = false) {
         try {
@@ -3718,7 +3718,7 @@
         } catch (_) {}
 
         if (typeof risuai.requestPluginPermission === 'function') {
-            for (const perm of ['mainDom', 'db', 'dbWrite']) {
+            for (const perm of ['mainDom', 'db', 'dbWrite', 'sendChat', 'inlay']) {
                 try {
                     await risuai.requestPluginPermission(perm);
                 } catch (_) {}
@@ -4584,10 +4584,24 @@
             return out;
         }
 
+        function applyLeavePresetDisplayCompat(str, ctx) {
+            let out = String(str || '');
+            // Leave regex #2: hide text-only <statusdata> blocks (keep HUD cards that contain <details>)
+            out = out.replace(/<statusdata>(?:(?!<details\b|<\/statusdata>)[\s\S])*?<\/statusdata>\s*/gi, '');
+            // Leave regex #3: render <ooc> blocks as styled cards
+            out = out.replace(/<ooc>([\s\S]*?)<\/ooc>\s*/gi, '<div class="leave-ooc-card"><div class="leave-ooc-badge">🍃 OOC</div><div>$1</div></div>');
+            // Leave regex #1: show collapsible thought block when toggle_thought_display === '1'
+            if (ctx && ctx.globalVars && String(ctx.globalVars.toggle_thought_display || '') === '1') {
+                out = out.replace(/<(thinking|thoughts?|think)\b[^>]*>([\s\S]*?)<\/\1>\s*/gi, '<details class="leave-thought-box"><summary>💭 생각의 사슬</summary><div class="leave-thought-body">$2</div></details>');
+            }
+            return out;
+        }
+
         function renderRemoteMessage(raw, ctx) {
             let s = evalCBS(String(raw || ''), ctx);
             s = applyDisplayRegexScripts(s, ctx);
             s = evalCBS(s, ctx);
+            s = applyLeavePresetDisplayCompat(s, ctx);
             return s;
         }
 
@@ -4596,6 +4610,7 @@
             return String(raw)
                 .replace(/<!--\s*HAYAKU[\s\S]*?-->/gi, '')
                 .replace(/<!--[\s\S]*?-->/gi, '')
+                .replace(/<details\b[^>]*class="[^"]*\bleave-thought-box\b[^"]*"[^>]*>[\s\S]*?<\/details>/gi, '')
                 .replace(/<Thoughts>[\s\S]*?<\/Thoughts>/gi, '')
                 .replace(/<think>[\s\S]*?<\/think>/gi, '')
                 .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
@@ -6896,28 +6911,39 @@
                 return;
             }
     
-            if (type === 'send_chat' && p.text) {
+            if (type === 'send_chat') {
+                const msgText = String(p.text ?? '');
                 const targetChar = typeof p.charIndex === 'number' ? p.charIndex : viewCharIndex;
                 const targetChat = typeof p.chatIndex === 'number' ? p.chatIndex : viewChatIndex;
                 const pcCharIdx = await risuai.getCurrentCharacterIndex();
-    
+
                 if (targetChar === pcCharIdx && pcCharIdx >= 0) {
+                    if (isGenerating) return;
                     isGenerating = true;
-                    try {
-                        const charObj = await risuai.getCharacterFromIndex(pcCharIdx);
-                        if (charObj && typeof targetChat === 'number' && targetChat >= 0 && charObj.chatPage !== targetChat) {
-                            charObj.chatPage = targetChat;
-                            await risuai.setCharacterToIndex(pcCharIdx, charObj);
+                    void (async () => {
+                        try {
+                            const charObj = await risuai.getCharacterFromIndex(pcCharIdx);
+                            if (charObj && typeof targetChat === 'number' && targetChat >= 0 && charObj.chatPage !== targetChat) {
+                                charObj.chatPage = targetChat;
+                                await risuai.setCharacterToIndex(pcCharIdx, charObj);
+                            }
+                            await risuai.sendChat(msgText);
+                        } catch (err) {
+                            const errMsg = `전송 오류: ${err && err.message ? err.message : '실패'}`;
+                            lastStatus = `⚠️ ${errMsg}`;
+                            pendingTriggerEvent = {
+                                id: makeUuid(),
+                                at: Date.now(),
+                                kind: 'error',
+                                message: errMsg,
+                            };
+                        } finally {
+                            isGenerating = false;
+                            lastSnapSig = '';
+                            lastCatalogSig = '';
+                            setTimeout(() => pollOnce(true), 250);
                         }
-                        await risuai.sendChat(String(p.text));
-                    } catch (err) {
-                        lastStatus = `⚠️ 전송 오류: ${err && err.message ? err.message : '실패'}`;
-                    } finally {
-                        isGenerating = false;
-                        lastSnapSig = '';
-                        lastCatalogSig = '';
-                        setTimeout(() => pollOnce(true), 350);
-                    }
+                    })();
                 }
                 return;
             }
@@ -7034,6 +7060,7 @@
                 const pcCharIdx = await risuai.getCurrentCharacterIndex();
                 if (Number.isNaN(cIdx) || Number.isNaN(chIdx) || Number.isNaN(mIdx) || mIdx < 0) return;
                 if (cIdx !== pcCharIdx || pcCharIdx < 0) return;
+                if (isGenerating) return;
 
                 const charObj = await risuai.getCharacterFromIndex(cIdx);
                 const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
@@ -7044,42 +7071,44 @@
                 const key = makeSwipeKey(charObj, cIdx, chatObj, chIdx, mIdx);
                 recordSwipeVersion(key, prevMsg.data);
                 isGenerating = true;
-                try {
-                    chatObj.message.splice(mIdx, 1);
-                    await risuai.setChatToIndex(cIdx, chIdx, chatObj);
-                    if (charObj.chatPage !== chIdx) {
-                        charObj.chatPage = chIdx;
-                        await risuai.setCharacterToIndex(cIdx, charObj);
-                    }
-                    await risuai.sendChat('');
-                    const afterChat = await risuai.getChatFromIndex(cIdx, chIdx);
-                    if (afterChat && Array.isArray(afterChat.message) && afterChat.message[mIdx] && afterChat.message[mIdx].role !== 'user' && String(afterChat.message[mIdx].data || '').trim()) {
-                        recordSwipeVersion(key, prevMsg.data, afterChat.message[mIdx].data);
-                    } else if (afterChat && Array.isArray(afterChat.message) && afterChat.message.length <= mIdx) {
-                        afterChat.message.push(prevMsg);
-                        await risuai.setChatToIndex(cIdx, chIdx, afterChat);
-                    }
-                    await saveSwipeHistory();
-                } catch (err) {
+                void (async () => {
                     try {
-                        const fallbackChat = await risuai.getChatFromIndex(cIdx, chIdx);
-                        if (fallbackChat && Array.isArray(fallbackChat.message) && fallbackChat.message.length <= mIdx) {
-                            fallbackChat.message.push(prevMsg);
-                            await risuai.setChatToIndex(cIdx, chIdx, fallbackChat);
+                        chatObj.message.splice(mIdx, 1);
+                        await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                        if (charObj.chatPage !== chIdx) {
+                            charObj.chatPage = chIdx;
+                            await risuai.setCharacterToIndex(cIdx, charObj);
                         }
-                    } catch (_) {}
-                    pendingTriggerEvent = {
-                        id: makeUuid(),
-                        at: Date.now(),
-                        kind: 'error',
-                        message: `리롤 오류: ${err && err.message ? err.message : '실패'}`,
-                    };
-                } finally {
-                    isGenerating = false;
-                    lastSnapSig = '';
-                    lastCatalogSig = '';
-                    setTimeout(() => pollOnce(true), 350);
-                }
+                        await risuai.sendChat('');
+                        const afterChat = await risuai.getChatFromIndex(cIdx, chIdx);
+                        if (afterChat && Array.isArray(afterChat.message) && afterChat.message[mIdx] && afterChat.message[mIdx].role !== 'user' && String(afterChat.message[mIdx].data || '').trim()) {
+                            recordSwipeVersion(key, prevMsg.data, afterChat.message[mIdx].data);
+                        } else if (afterChat && Array.isArray(afterChat.message) && afterChat.message.length <= mIdx) {
+                            afterChat.message.push(prevMsg);
+                            await risuai.setChatToIndex(cIdx, chIdx, afterChat);
+                        }
+                        await saveSwipeHistory();
+                    } catch (err) {
+                        try {
+                            const fallbackChat = await risuai.getChatFromIndex(cIdx, chIdx);
+                            if (fallbackChat && Array.isArray(fallbackChat.message) && fallbackChat.message.length <= mIdx) {
+                                fallbackChat.message.push(prevMsg);
+                                await risuai.setChatToIndex(cIdx, chIdx, fallbackChat);
+                            }
+                        } catch (_) {}
+                        pendingTriggerEvent = {
+                            id: makeUuid(),
+                            at: Date.now(),
+                            kind: 'error',
+                            message: `리롤 오류: ${err && err.message ? err.message : '실패'}`,
+                        };
+                    } finally {
+                        isGenerating = false;
+                        lastSnapSig = '';
+                        lastCatalogSig = '';
+                        setTimeout(() => pollOnce(true), 250);
+                    }
+                })();
                 return;
             }
     

@@ -54,6 +54,8 @@ const PROGRAM_FILES = Object.freeze([
     'LICENSE',
     'VERSION',
     'release-policy.json',
+    'prompt/Leave_RisuAI_Preset.json',
+    'prompt/Leave_RisuAI_Preset.html',
 ]);
 // May be running while we update: staged as "<name>.new" when changed.
 const LAUNCHER_FILES = Object.freeze([
@@ -296,7 +298,7 @@ function verifyReleaseArchive(buf, { expectedVersion, workDir = path.join(requir
     for (const e of entries) {
         if (!e.name.startsWith(prefix)) throw new UpdateError('release_layout_invalid', `ZIP 최상위 폴더가 ${prefix} 가 아닙니다: ${e.name}`);
         const rel = e.name.slice(prefix.length);
-        if (!rel || rel.includes('/')) throw new UpdateError('release_layout_invalid', `예상하지 못한 하위 경로: ${e.name}`);
+        if (!rel) throw new UpdateError('release_layout_invalid', `예상하지 못한 하위 경로: ${e.name}`);
         if (!PAYLOAD_FILES.includes(rel) && !META_FILES.includes(rel)) throw new UpdateError('release_unexpected_file', `예상하지 못한 파일: ${rel}`);
         files.set(rel, e.data);
         modes.set(rel, e.mode);
@@ -381,6 +383,7 @@ function readJournal(root) {
 }
 
 function writeFileAtomic(file, data, mode) {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
     const tmp = `${file}.rs-tmp-${crypto.randomBytes(6).toString('hex')}`;
     fs.writeFileSync(tmp, data, mode ? { mode } : undefined);
     renameWithRetry(tmp, file);
@@ -459,7 +462,11 @@ function installRelease(root, verified, { currentVersion = readInstalledVersion(
 
         try {
             for (const f of files) {
-                if (f.hadOriginal) fs.copyFileSync(path.join(root, f.rel), path.join(backupDir, f.rel));
+                if (f.hadOriginal) {
+                    const backupFile = path.join(backupDir, f.rel);
+                    fs.mkdirSync(path.dirname(backupFile), { recursive: true });
+                    fs.copyFileSync(path.join(root, f.rel), backupFile);
+                }
             }
             log(`백업 완료: ${backupDir}`);
 

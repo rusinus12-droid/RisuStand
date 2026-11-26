@@ -9,7 +9,11 @@ const updater = require('../risustand-updater.cjs');
 /** Copies the shippable files into a fresh temp dir (never touches the repo). */
 function makeInstall(prefix = 'rs-test-') {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-    for (const rel of updater.PAYLOAD_FILES) fs.copyFileSync(path.join(REPO, rel), path.join(dir, rel));
+    for (const rel of updater.PAYLOAD_FILES) {
+        const dest = path.join(dir, rel);
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        fs.copyFileSync(path.join(REPO, rel), dest);
+    }
     return dir;
 }
 

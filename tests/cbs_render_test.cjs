@@ -10,7 +10,7 @@ const { REPO } = require('./helpers.cjs');
 
 async function bootPluginWithMockRisu({ db, characters, initialStorage, requestPluginPermission, onSendChat, onReadImage }) {
     const storage = new Map(initialStorage || [
-        ['risustand_perms_prompted_v1', '1'],
+        ['risustand_perms_prompted_v2', '1'],
         ['risustand_remote_bridge_v2', JSON.stringify({
             enabled: true,
             relayUrl: 'http://127.0.0.1:8787',
@@ -452,7 +452,7 @@ test('run_trigger Lua VM executes direct triggers and multi-step alertSelect / a
     }
 });
 
-test('upfront permission onboarding prompts mainDom, db, dbWrite once on first install only', async () => {
+test('upfront permission onboarding prompts mainDom, db, dbWrite, sendChat, inlay once on first install only', async () => {
     const db = {
         enabledModules: [],
         modules: [],
@@ -479,8 +479,8 @@ test('upfront permission onboarding prompts mainDom, db, dbWrite once on first i
     });
     try {
         await new Promise((r) => setTimeout(r, 80));
-        assert.deepEqual(requestedFirst, ['mainDom', 'db', 'dbWrite']);
-        assert.equal(h1.storage.get('risustand_perms_prompted_v1'), '1');
+        assert.deepEqual(requestedFirst, ['mainDom', 'db', 'dbWrite', 'sendChat', 'inlay']);
+        assert.equal(h1.storage.get('risustand_perms_prompted_v2'), '1');
     } finally {
         await h1.cleanup();
     }
@@ -489,7 +489,7 @@ test('upfront permission onboarding prompts mainDom, db, dbWrite once on first i
     const h2 = await bootPluginWithMockRisu({
         db,
         characters,
-        initialStorage: [['risustand_perms_prompted_v1', '1']],
+        initialStorage: [['risustand_perms_prompted_v2', '1']],
         requestPluginPermission: async (perm) => { requestedSecond.push(perm); return true; },
     });
     try {
@@ -782,10 +782,152 @@ test('Relay server includes book page jump UI and valid client script', async ()
         });
         assert.ok(body.includes('bookPageJumpBtn'), 'Expected bookPageJumpBtn in relay HTML');
         assert.ok(body.includes('bookJumpBar'), 'Expected bookJumpBar in relay HTML');
+        assert.ok(body.includes('RisuAI에 응답을 요청 중...'), 'Expected busy placeholder in relay HTML');
         const scriptMatch = body.match(/<script>([\s\S]*?)<\/script>/);
         assert.ok(scriptMatch, 'Expected inline <script> in rendered HTML');
         new vm.Script(scriptMatch[1], { filename: 'relay-client-inline.js' });
+
+        const reqJson = (method, p, payload) => new Promise((resolve, reject) => {
+            const raw = payload ? JSON.stringify(payload) : '';
+            const req = http.request({
+                hostname: '127.0.0.1', port, path: p, method,
+                headers: {
+                    'X-RisuStand-Token': 'test-jump-token',
+                    ...(raw ? { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(raw) } : {}),
+                },
+            }, (res) => {
+                let buf = '';
+                res.on('data', (c) => { buf += c; });
+                res.on('end', () => resolve({ status: res.statusCode, json: JSON.parse(buf || '{}') }));
+            });
+            req.on('error', reject);
+            if (raw) req.write(raw);
+            req.end();
+        });
+
+        // Establish active PC snapshot
+        await reqJson('POST', '/api/pc/poll', {
+            bridgeVersion: '2.0.0', generating: false, supportsBatchCommands: true,
+            snapshot: { charIndex: 0, chatIndex: 0, isPcActive: true, messages: [{ index: 0, role: 'user', text: 'hello' }] },
+        });
+        // Empty retry send succeeds and sets generating: true until PC poll completes post-dispatch
+        const sendRes = await reqJson('POST', '/api/chat/send', { charIndex: 0, chatIndex: 0, text: '' });
+        assert.equal(sendRes.status, 200);
+        assert.equal(sendRes.json.mode, 'native_risu');
+        const stBefore = await reqJson('GET', '/api/state');
+        assert.equal(stBefore.json.generating, true);
+
+        // PC picks up command
+        const poll1 = await reqJson('POST', '/api/pc/poll', { bridgeVersion: '2.0.0', generating: false, supportsBatchCommands: true });
+        assert.equal(poll1.json.commands[0].type, 'send_chat');
+        assert.equal(poll1.json.commands[0].payload.text, '');
+        const stWhile = await reqJson('GET', '/api/state');
+        assert.equal(stWhile.json.generating, true);
+
+        // PC reports generating finished -> relay clears generating
+        await reqJson('POST', '/api/pc/poll', { bridgeVersion: '2.0.0', generating: false, supportsBatchCommands: true });
+        const stDone = await reqJson('GET', '/api/state');
+        assert.equal(stDone.json.generating, false);
     } finally {
         await new Promise((r) => server.close(r));
+    }
+});
+
+test('empty send_chat command triggers risuai.sendChat("") retry in plugin', async () => {
+    const db = {
+        enabledModules: [],
+        modules: [],
+        personas: [{ name: 'User', personaPrompt: '' }],
+        selectedPersona: 0,
+        customscript: [],
+        globalChatVariables: {},
+        characters: [],
+    };
+    const characters = [{
+        chaId: 'retry-char',
+        name: 'RetryBot',
+        firstMessage: 'hi',
+        alternateGreetings: [],
+        customscript: [],
+        chats: [{
+            id: 'c-retry',
+            name: 'Chat 1',
+            fmIndex: -1,
+            scriptstate: {},
+            message: [{ role: 'user', data: '유나를 상담실에 불렀다.' }],
+        }],
+    }];
+    const sent = [];
+    const harness = await bootPluginWithMockRisu({
+        db,
+        characters,
+        onSendChat: async (txt) => { sent.push(txt); },
+    });
+    try {
+        harness.queuedCommands.push({
+            type: 'send_chat',
+            payload: { charIndex: 0, chatIndex: 0, text: '' },
+        });
+        await harness.triggerNextPoll();
+        await harness.triggerNextPoll();
+        assert.deepEqual(sent, ['']);
+    } finally {
+        await harness.cleanup();
+    }
+});
+
+test('Leave preset display compat renders <ooc>, hides text-only <statusdata>, and respects toggle_thought_display', async () => {
+    const db = {
+        enabledModules: [],
+        modules: [],
+        personas: [{ name: 'User', personaPrompt: '' }],
+        selectedPersona: 0,
+        customscript: [],
+        globalChatVariables: { toggle_thought_display: '0' },
+        characters: [],
+    };
+    const characters = [{
+        chaId: 'leave-compat-char',
+        name: 'LeaveBot',
+        firstMessage: '첫 장면',
+        alternateGreetings: [],
+        customscript: [],
+        chats: [{
+            id: 'c-leave',
+            name: 'Chat 1',
+            fmIndex: -1,
+            scriptstate: {},
+            message: [
+                {
+                    role: 'char',
+                    data: '<thinking>숨길 생각</thinking>\n<statusdata>HP: 100</statusdata>\n<statusdata><details><summary>HUD</summary>상태창</details></statusdata>\n<ooc>사서 리브 응답</ooc>\n본문 서사입니다.',
+                },
+            ],
+        }],
+    }];
+    const harness = await bootPluginWithMockRisu({ db, characters });
+    try {
+        // Case 1: toggle_thought_display = '0' -> thinking hidden, text-only statusdata hidden, HUD & OOC visible
+        let snap = [...harness.polls].reverse().find((p) => p.snapshot)?.snapshot;
+        let msg = snap.messages.find((m) => m.index === 0);
+        assert.ok(msg.html.includes('leave-ooc-card'));
+        assert.ok(msg.html.includes('사서 리브 응답'));
+        assert.ok(!msg.html.includes('HP: 100'));
+        assert.ok(msg.html.includes('<details><summary>HUD</summary>상태창</details>'));
+        assert.ok(!msg.html.includes('숨길 생각'));
+        assert.ok(!msg.html.includes('leave-thought-box'));
+
+        // Case 2: toggle_thought_display = '1' -> <thinking> rendered inside leave-thought-box, cleanProse text still hides it
+        db.globalChatVariables.toggle_thought_display = '1';
+        await harness.triggerNextPoll({ type: 'sync_chat', payload: {} });
+        await harness.triggerNextPoll();
+        snap = [...harness.polls].reverse().find((p) => p.snapshot)?.snapshot;
+        msg = snap.messages.find((m) => m.index === 0);
+        assert.ok(msg.html.includes('<details class="leave-thought-box">'));
+        assert.ok(msg.html.includes('숨길 생각'));
+        assert.ok(!msg.text.includes('숨길 생각'));
+        assert.ok(msg.text.includes('본문 서사입니다.'));
+    } finally {
+        await harness.cleanup();
     }
 });

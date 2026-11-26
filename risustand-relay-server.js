@@ -140,6 +140,262 @@ function saveConfig() {
 
 let config = loadConfig();
 
+const LEAVE_PRESET_ID = 'preset-leave-r1.1';
+function loadBundledLeavePreset() {
+    const jsonPath = path.join(ROOT_DIR, 'prompt', 'Leave_RisuAI_Preset.json');
+    const htmlPath = path.join(ROOT_DIR, 'prompt', 'Leave_RisuAI_Preset.html');
+    if (!fs.existsSync(jsonPath)) return null;
+    try {
+        const rawJson = fs.readFileSync(jsonPath);
+        const parsed = JSON.parse(rawJson.toString('utf8'));
+        const hasGuide = fs.existsSync(htmlPath);
+        return {
+            id: LEAVE_PRESET_ID,
+            name: String(parsed.name || 'Leave — Wandering Librarian Engine r1.1'),
+            toggleSyntax: String(parsed.customPromptTemplateToggle || ''),
+            defaultVariables: String(parsed.templateDefaultVariables || ''),
+            hasGuide,
+            rawJson,
+            htmlPath,
+        };
+    } catch (_) {
+        return null;
+    }
+}
+
+// Ported from Librarian-System (LIB_UI_Patch) AI Provider & Ollama Cloud catalog
+const OLLAMA_CLOUD_MODELS = Object.freeze([
+    'deepseek-v4.1-flash:1017-cloud',
+    'glm-5.3:cloud',
+    'glm-5.3-flash:cloud',
+    'hy4:cloud',
+    'kimi-k3.1-pro:cloud',
+    'inkling-2-small:cloud',
+    'minimax-m3:cloud',
+    'beam:cloud',
+    'glm-5.2:cloud',
+    'minimax-m3.1-flash:cloud',
+    'kimi-k2.7-code:cloud',
+    'kimi-k3:cloud',
+    'nemotron-3-ultra:cloud',
+    'mistral-large-4:cloud',
+    'muse-spark-open:cloud',
+    'mimo-v2.6-flash:cloud',
+    'mimo-v2.6-pro:cloud',
+    'gemma4:31b-cloud',
+    'nemotron-3-super:120b',
+    'deepseek-v4-pro:0813-cloud',
+    'kimi-k2.6:cloud',
+    'gpt-oss:120b-cloud',
+]);
+
+const AI_PROVIDER_PRESETS = Object.freeze({
+    openrouter: Object.freeze({ id: 'openrouter', label: 'OpenRouter', group: 'main', providerType: 'openai_compat', endpoint: 'https://openrouter.ai/api/v1/chat/completions', modelsUrl: 'https://openrouter.ai/api/v1/models', modelsPath: '/v1/models', defaultModel: 'anthropic/claude-3.7-sonnet', allowEmptyKey: false }),
+    ollama_cloud: Object.freeze({ id: 'ollama_cloud', label: 'Ollama Cloud', group: 'main', providerType: 'openai_compat', endpoint: 'https://ollama.com/v1/chat/completions', modelsUrl: 'https://ollama.com/v1/models', modelsPath: '/v1/models', defaultModel: 'deepseek-v4.1-flash:1017-cloud', allowEmptyKey: false, builtinModels: OLLAMA_CLOUD_MODELS }),
+    openai: Object.freeze({ id: 'openai', label: 'OpenAI', group: 'main', providerType: 'openai_compat', endpoint: 'https://api.openai.com/v1/chat/completions', modelsUrl: 'https://api.openai.com/v1/models', modelsPath: '/v1/models', defaultModel: 'gpt-4.1', allowEmptyKey: false }),
+    claude: Object.freeze({ id: 'claude', label: 'Claude / Anthropic', group: 'main', providerType: 'anthropic', endpoint: 'https://api.anthropic.com/v1/messages', modelsUrl: 'https://api.anthropic.com/v1/models', modelsPath: '/v1/models', defaultModel: 'claude-sonnet-4-20250514', allowEmptyKey: false }),
+    gemini: Object.freeze({ id: 'gemini', label: 'Google Gemini API', group: 'main', providerType: 'gemini', endpoint: 'https://generativelanguage.googleapis.com/v1beta', modelsUrl: 'https://generativelanguage.googleapis.com/v1beta/models', modelsPath: '/v1beta/models', defaultModel: 'gemini-2.5-pro', allowEmptyKey: false }),
+    deepseek: Object.freeze({ id: 'deepseek', label: 'DeepSeek', group: 'main', providerType: 'openai_compat', endpoint: 'https://api.deepseek.com/chat/completions', modelsUrl: 'https://api.deepseek.com/models', modelsPath: '/models', defaultModel: 'deepseek-chat', allowEmptyKey: false }),
+    kimi: Object.freeze({ id: 'kimi', label: 'Kimi / Moonshot AI', group: 'main', providerType: 'openai_compat', endpoint: 'https://api.moonshot.ai/v1/chat/completions', modelsUrl: 'https://api.moonshot.ai/v1/models', modelsPath: '/models', defaultModel: 'kimi-k2.5', allowEmptyKey: false }),
+    nanogpt: Object.freeze({ id: 'nanogpt', label: 'NanoGPT', group: 'main', providerType: 'openai_compat', endpoint: 'https://nano-gpt.com/api/v1/chat/completions', modelsUrl: 'https://nano-gpt.com/api/v1/models', modelsPath: '/v1/models', defaultModel: '', allowEmptyKey: false }),
+    ollama: Object.freeze({ id: 'ollama', label: 'Ollama (로컬)', group: 'main', providerType: 'openai_compat', endpoint: 'http://localhost:11434/v1/chat/completions', modelsUrl: 'http://localhost:11434/v1/models', modelsPath: '/v1/models', defaultModel: '', allowEmptyKey: true }),
+    lmstudio: Object.freeze({ id: 'lmstudio', label: 'LM Studio (로컬)', group: 'main', providerType: 'openai_compat', endpoint: 'http://localhost:1234/v1/chat/completions', modelsUrl: 'http://localhost:1234/v1/models', modelsPath: '/v1/models', defaultModel: '', allowEmptyKey: true }),
+    together: Object.freeze({ id: 'together', label: 'Together AI', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.together.xyz/v1/chat/completions', modelsUrl: 'https://api.together.xyz/v1/models', modelsPath: '/models', defaultModel: '', allowEmptyKey: false }),
+    fireworks: Object.freeze({ id: 'fireworks', label: 'Fireworks AI', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.fireworks.ai/inference/v1/chat/completions', modelsUrl: 'https://api.fireworks.ai/inference/v1/models', modelsPath: '/models', defaultModel: '', allowEmptyKey: false }),
+    cerebras: Object.freeze({ id: 'cerebras', label: 'Cerebras', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.cerebras.ai/v1/chat/completions', modelsUrl: 'https://api.cerebras.ai/v1/models', modelsPath: '/models', defaultModel: '', allowEmptyKey: false }),
+    siliconflow: Object.freeze({ id: 'siliconflow', label: 'SiliconFlow', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.siliconflow.com/v1/chat/completions', modelsUrl: 'https://api.siliconflow.com/v1/models?sub_type=chat', modelsPath: '/models?sub_type=chat', defaultModel: '', allowEmptyKey: false }),
+    novita: Object.freeze({ id: 'novita', label: 'Novita AI', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.novita.ai/openai/v1/chat/completions', modelsUrl: 'https://api.novita.ai/openai/v1/models', modelsPath: '/models', defaultModel: '', allowEmptyKey: false }),
+    'novita-coding': Object.freeze({ id: 'novita-coding', label: 'Novita Coding', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.novita.ai/openai/v1/chat/completions', modelsUrl: 'https://api.novita.ai/openai/v1/models', modelsPath: '/models', defaultModel: '', allowEmptyKey: false }),
+    arliai: Object.freeze({ id: 'arliai', label: 'ArliAI', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.arliai.com/v1/chat/completions', modelsUrl: 'https://api.arliai.com/v1/models', modelsPath: '/models', defaultModel: '', allowEmptyKey: false }),
+    featherless: Object.freeze({ id: 'featherless', label: 'Featherless AI', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.featherless.ai/v1/chat/completions', modelsUrl: 'https://api.featherless.ai/v1/models', modelsPath: '/models', defaultModel: '', allowEmptyKey: false }),
+    'venice-ai': Object.freeze({ id: 'venice-ai', label: 'Venice AI', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.venice.ai/api/v1/chat/completions', modelsUrl: 'https://api.venice.ai/api/v1/models?type=text', modelsPath: '/models?type=text', defaultModel: '', allowEmptyKey: false }),
+    'vercel-ai': Object.freeze({ id: 'vercel-ai', label: 'Vercel AI Gateway', group: 'direct', providerType: 'openai_compat', endpoint: 'https://ai-gateway.vercel.sh/v1/chat/completions', modelsUrl: 'https://ai-gateway.vercel.sh/v1/models', modelsPath: '/models', defaultModel: '', allowEmptyKey: false }),
+    'cloudflare-ai-gateway': Object.freeze({ id: 'cloudflare-ai-gateway', label: 'Cloudflare AI Gateway', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.cloudflare.com/client/v4/accounts/ACCOUNT_ID/ai/v1/chat/completions', modelsUrl: '', modelsPath: '', defaultModel: '', allowEmptyKey: false }),
+    crofai: Object.freeze({ id: 'crofai', label: 'CrofAI', group: 'direct', providerType: 'openai_compat', endpoint: 'https://ai.nahcrof.com/v1/chat/completions', modelsUrl: 'https://ai.nahcrof.com/v1/models', modelsPath: '/models', defaultModel: '', allowEmptyKey: false }),
+    digitalocean: Object.freeze({ id: 'digitalocean', label: 'DigitalOcean Gradient AI', group: 'direct', providerType: 'openai_compat', endpoint: 'https://inference.do-ai.run/v1/chat/completions', modelsUrl: 'https://inference.do-ai.run/v1/models', modelsPath: '/models', defaultModel: '', allowEmptyKey: false }),
+    'heroku-us': Object.freeze({ id: 'heroku-us', label: 'Heroku Managed Inference (US)', group: 'direct', providerType: 'openai_compat', endpoint: 'https://us.inference.heroku.com/v1/chat/completions', modelsUrl: '', modelsPath: '', defaultModel: '', allowEmptyKey: false }),
+    'heroku-eu': Object.freeze({ id: 'heroku-eu', label: 'Heroku Managed Inference (EU)', group: 'direct', providerType: 'openai_compat', endpoint: 'https://eu.inference.heroku.com/v1/chat/completions', modelsUrl: '', modelsPath: '', defaultModel: '', allowEmptyKey: false }),
+    'lightning-ai': Object.freeze({ id: 'lightning-ai', label: 'Lightning AI', group: 'direct', providerType: 'openai_compat', endpoint: 'https://lightning.ai/api/v1/chat/completions', modelsUrl: 'https://lightning.ai/api/v1/models', modelsPath: '/models', defaultModel: '', allowEmptyKey: false }),
+    'llm-gateway': Object.freeze({ id: 'llm-gateway', label: 'LLM Gateway', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.llmgateway.io/v1/chat/completions', modelsUrl: 'https://api.llmgateway.io/v1/models?exclude_deprecated=true', modelsPath: '/models?exclude_deprecated=true', defaultModel: '', allowEmptyKey: false }),
+    neuralwatt: Object.freeze({ id: 'neuralwatt', label: 'Neuralwatt', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.neuralwatt.com/v1/chat/completions', modelsUrl: 'https://api.neuralwatt.com/v1/models', modelsPath: '/models', defaultModel: '', allowEmptyKey: false }),
+    'opencode-go': Object.freeze({ id: 'opencode-go', label: 'OpenCode Go', group: 'direct', providerType: 'openai_compat', endpoint: 'https://opencode.ai/zen/go/v1/chat/completions', modelsUrl: 'https://opencode.ai/zen/go/v1/models', modelsPath: '/models', defaultModel: '', allowEmptyKey: false }),
+    synthetic: Object.freeze({ id: 'synthetic', label: 'Synthetic', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.synthetic.new/v1/chat/completions', modelsUrl: 'https://api.synthetic.new/v1/models', modelsPath: '/models', defaultModel: '', allowEmptyKey: false }),
+    'z-ai': Object.freeze({ id: 'z-ai', label: 'Z.ai', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.z.ai/api/paas/v4/chat/completions', modelsUrl: '', modelsPath: '', defaultModel: '', allowEmptyKey: false }),
+    'z-ai-coding': Object.freeze({ id: 'z-ai-coding', label: 'Z.ai Coding Plan', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.z.ai/api/coding/paas/v4/chat/completions', modelsUrl: '', modelsPath: '', defaultModel: '', allowEmptyKey: false }),
+    'xiaomi-mimo': Object.freeze({ id: 'xiaomi-mimo', label: 'Xiaomi MiMo', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.xiaomimimo.com/v1/chat/completions', modelsUrl: '', modelsPath: '', defaultModel: '', allowEmptyKey: false }),
+    'xiaomi-mimo-token-plan-cn': Object.freeze({ id: 'xiaomi-mimo-token-plan-cn', label: 'Xiaomi MiMo Token Plan (China)', group: 'direct', providerType: 'openai_compat', endpoint: 'https://token-plan-cn.xiaomimimo.com/v1/chat/completions', modelsUrl: '', modelsPath: '', defaultModel: '', allowEmptyKey: false }),
+    'xiaomi-mimo-token-plan-sgp': Object.freeze({ id: 'xiaomi-mimo-token-plan-sgp', label: 'Xiaomi MiMo Token Plan (Singapore)', group: 'direct', providerType: 'openai_compat', endpoint: 'https://token-plan-sgp.xiaomimimo.com/v1/chat/completions', modelsUrl: '', modelsPath: '', defaultModel: '', allowEmptyKey: false }),
+    'xiaomi-mimo-token-plan-ams': Object.freeze({ id: 'xiaomi-mimo-token-plan-ams', label: 'Xiaomi MiMo Token Plan (Europe)', group: 'direct', providerType: 'openai_compat', endpoint: 'https://token-plan-ams.xiaomimimo.com/v1/chat/completions', modelsUrl: '', modelsPath: '', defaultModel: '', allowEmptyKey: false }),
+    copilot: Object.freeze({ id: 'copilot', label: 'GitHub Copilot', group: 'direct', providerType: 'openai_compat', endpoint: 'https://api.githubcopilot.com/chat/completions', modelsUrl: '', modelsPath: '', defaultModel: '', allowEmptyKey: false }),
+    custom: Object.freeze({ id: 'custom', label: '커스텀 (직접 입력)', group: 'direct', providerType: 'openai_compat', endpoint: '', modelsUrl: '', modelsPath: '/v1/models', defaultModel: '', allowEmptyKey: true }),
+});
+
+function joinProviderEndpoint(base = '', endpointPath = '') {
+    const rawBase = String(base || '').trim().replace(/\/+$/, '');
+    const rawPath = String(endpointPath || '').trim();
+    if (!rawBase || !rawPath) return rawBase;
+    const [pathPart, queryPart = ''] = rawPath.split('?');
+    const normalizedPath = `/${String(pathPart || '').replace(/^\/+/, '')}`;
+    const currentEndpoint = rawBase.match(/\/(chat\/completions|responses|messages|embeddings|models|api\/tags)(?:\?.*)?$/i);
+    const targetMatch = normalizedPath.match(/\/(chat\/completions|responses|messages|embeddings|models|api\/tags)$/i);
+    const targetEndpoint = targetMatch ? targetMatch[1] : '';
+    if (currentEndpoint) {
+        if (String(currentEndpoint[1]).toLowerCase() === String(targetEndpoint).toLowerCase()) return rawBase;
+        return joinProviderEndpoint(rawBase.slice(0, currentEndpoint.index), rawPath);
+    }
+    const baseLower = rawBase.toLowerCase();
+    const segments = normalizedPath.split('/').filter(Boolean);
+    let overlap = '';
+    for (let count = segments.length; count > 0; count -= 1) {
+        const candidate = `/${segments.slice(0, count).join('/')}`;
+        if (baseLower.endsWith(candidate.toLowerCase())) {
+            overlap = candidate;
+            break;
+        }
+    }
+    const joined = `${rawBase}${overlap ? normalizedPath.slice(overlap.length) : normalizedPath}`;
+    return queryPart ? `${joined}?${queryPart}` : joined;
+}
+
+function detectProviderPresetId(provider = '', providerType = '', baseUrl = '') {
+    const rawId = String(provider || '').trim().toLowerCase();
+    if (rawId && Object.prototype.hasOwnProperty.call(AI_PROVIDER_PRESETS, rawId)) return rawId;
+    const u = String(baseUrl || '').trim().toLowerCase();
+    if (u) {
+        for (const p of Object.values(AI_PROVIDER_PRESETS)) {
+            if (!p.endpoint || p.id === 'custom') continue;
+            try {
+                const pu = new URL(p.endpoint);
+                const bu = new URL(u);
+                if (pu.host === bu.host) {
+                    if (p.id === 'novita-coding') continue;
+                    if (p.id === 'z-ai' && u.includes('/coding/')) return 'z-ai-coding';
+                    return p.id;
+                }
+            } catch (_) {}
+        }
+        if (u.includes('11434')) return 'ollama';
+        if (u.includes('1234')) return 'lmstudio';
+    }
+    if (providerType === 'anthropic') return 'claude';
+    if (providerType === 'gemini') return 'gemini';
+    return 'custom';
+}
+
+function normalizeProviderModelsList(payload, providerId) {
+    const source = Array.isArray(payload)
+        ? payload
+        : Array.isArray(payload && payload.data)
+        ? payload.data
+        : Array.isArray(payload && payload.models)
+        ? payload.models
+        : Array.isArray(payload && payload.items)
+        ? payload.items
+        : [];
+    const seen = new Set();
+    const out = [];
+    for (const item of source) {
+        const rec = typeof item === 'string' ? { id: item } : (item || {});
+        let id = String(rec.id || rec.model || rec.slug || rec.name || '').trim();
+        if (providerId === 'gemini') id = id.replace(/^models\//, '');
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        const label = String(rec.display_name || rec.displayName || rec.label || rec.name || id).trim().replace(/^models\//, '') || id;
+        out.push({ id, label });
+    }
+    return out;
+}
+
+async function fetchProviderModels({ provider = '', providerType = '', baseUrl = '', apiKey = '' } = {}) {
+    const pid = detectProviderPresetId(provider, providerType, baseUrl);
+    const preset = AI_PROVIDER_PRESETS[pid] || AI_PROVIDER_PRESETS.custom;
+    const effType = providerType || preset.providerType || 'openai_compat';
+    const rawUrl = String(baseUrl || '').trim();
+    const builtinList = Array.isArray(preset.builtinModels) ? preset.builtinModels.map((id) => ({ id, label: id })) : [];
+
+    let modelsUrl = '';
+    if (rawUrl && preset.modelsPath) {
+        modelsUrl = joinProviderEndpoint(rawUrl, preset.modelsPath);
+    } else if (preset.modelsUrl) {
+        modelsUrl = preset.modelsUrl;
+    } else if (rawUrl && effType === 'openai_compat' && /\/chat\/completions/i.test(rawUrl)) {
+        modelsUrl = joinProviderEndpoint(rawUrl, '/models');
+    }
+
+    const key = String(apiKey || '').trim().replace(/^Bearer\s+/i, '');
+    let liveModels = [];
+    let liveErr = null;
+
+    if (modelsUrl && (key || preset.allowEmptyKey || pid === 'ollama')) {
+        const headers = { Accept: 'application/json' };
+        if (key && effType === 'gemini') headers['x-goog-api-key'] = key;
+        else if (key && effType === 'anthropic') {
+            headers['x-api-key'] = key;
+            headers['anthropic-version'] = '2023-06-01';
+        } else if (key) {
+            headers.Authorization = `Bearer ${key}`;
+        }
+        const { signal, cleanup } = createTimeoutSignal(15000);
+        try {
+            const resp = await fetch(modelsUrl, { method: 'GET', headers, signal });
+            if (!resp.ok) {
+                const detail = await resp.text().catch(() => '');
+                throw new Error(`HTTP ${resp.status}${detail ? ` - ${detail.slice(0, 160)}` : ''}`);
+            }
+            const json = await resp.json().catch(() => ({}));
+            liveModels = normalizeProviderModelsList(json, pid);
+        } catch (err) {
+            liveErr = err;
+        } finally {
+            cleanup();
+        }
+
+        if ((!liveModels.length || liveErr) && pid === 'ollama') {
+            const tagsUrl = joinProviderEndpoint(rawUrl || 'http://localhost:11434', '/api/tags');
+            const tagCtrl = createTimeoutSignal(8000);
+            try {
+                const tagResp = await fetch(tagsUrl, { method: 'GET', headers: { Accept: 'application/json' }, signal: tagCtrl.signal });
+                if (tagResp.ok) {
+                    const tagJson = await tagResp.json().catch(() => ({}));
+                    liveModels = normalizeProviderModelsList(tagJson, pid);
+                    liveErr = null;
+                }
+            } catch (_) {
+            } finally {
+                tagCtrl.cleanup();
+            }
+        }
+    }
+
+    if (builtinList.length && liveModels.length) {
+        const seen = new Set(builtinList.map((m) => m.id));
+        const merged = [...builtinList];
+        for (const m of liveModels) {
+            if (!seen.has(m.id)) {
+                seen.add(m.id);
+                merged.push(m);
+            }
+        }
+        return { models: merged, source: 'merged', provider: pid };
+    }
+    if (builtinList.length) {
+        return { models: builtinList, source: 'builtin', provider: pid };
+    }
+    if (liveModels.length) {
+        return { models: liveModels, source: 'live', provider: pid };
+    }
+    if (!modelsUrl) {
+        throw new Error(`${preset.label}는 자동 모델 목록을 지원하지 않습니다. 모델 ID를 직접 입력해 주세요.`);
+    }
+    if (!key && !preset.allowEmptyKey) {
+        throw new Error('모델 목록을 불러오려면 API 키를 먼저 입력(또는 저장)해 주세요.');
+    }
+    if (liveErr) {
+        throw new Error(`모델 목록 조회 실패: ${liveErr.message}`);
+    }
+    throw new Error('프로바이더가 빈 모델 목록을 반환했습니다.');
+}
+
 // ================= Runtime State =================
 const CMD_TTL_MS = 5 * 60 * 1000;
 const CMD_MAX_LEN = 50;
@@ -149,6 +405,8 @@ const state = {
     pcLastSeen: 0,
     bridgeVersion: '',
     generating: false,
+    nativeRequestPendingSince: 0,
+    nativeRequestDispatched: false,
     directGenerating: false,
     lastDirectError: null,
     lastTriggerEvent: null,
@@ -593,11 +851,14 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
 
 async function handleOpenAIProxy(req, res) {
     const clientAbort = new AbortController();
-    const onClose = () => {
+    const onReqAborted = () => {
         if (!res.writableEnded) clientAbort.abort(new Error('Client disconnected'));
     };
-    req.on('close', onClose);
-    res.on('close', onClose);
+    const onResClose = () => {
+        if (!res.writableEnded) clientAbort.abort(new Error('Client disconnected'));
+    };
+    req.on('aborted', onReqAborted);
+    res.on('close', onResClose);
     try {
         const raw = await readBody(req);
         const reqBody = JSON.parse(raw || '{}');
@@ -741,8 +1002,8 @@ async function handleOpenAIProxy(req, res) {
         }
         if (!res.writableEnded && !res.destroyed) res.end();
     } finally {
-        req.off('close', onClose);
-        res.off('close', onClose);
+        req.off('aborted', onReqAborted);
+        res.off('close', onResClose);
     }
 }
 
@@ -819,20 +1080,22 @@ async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = st
             content: m.raw || m.text || '',
         });
     }
-    msgs.push({ role: 'user', content: userText });
+    if (userText) {
+        msgs.push({ role: 'user', content: userText });
+    }
 
     const finalMsgs = applyPromptOverride(msgs, profile);
     state.directGenerating = true;
     try {
         console.log(`[DirectChat] char#${charIndex} chat#${chatIndex} via ${profile.name} (${profile.model})`);
         const result = await callLLMNonStream(profile, finalMsgs);
+        const appended = [];
+        if (userText) appended.push({ role: 'user', data: userText });
+        appended.push({ role: 'char', data: result.text });
         queueCommand('append_messages', {
             charIndex,
             chatIndex,
-            messages: [
-                { role: 'user', data: userText },
-                { role: 'char', data: result.text },
-            ],
+            messages: appended,
         });
         return result.text;
     } finally {
@@ -1253,6 +1516,32 @@ function renderWebApp() {
   .rs-bot-html [risu-trigger], .rs-bot-html [risu-btn] { cursor:pointer; }
   .risu-cbs-btn { padding:6px 12px; border-radius:8px; border:1px solid var(--border); background:var(--surface); color:var(--text); font-size:12.5px; font-weight:600; cursor:pointer; margin:4px 4px 4px 0; }
   .risu-cbs-btn:hover { border-color:var(--accent); }
+  .leave-preset-bar {
+    display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;
+    padding:10px 12px; margin-bottom:10px; border-radius:12px;
+    background:color-mix(in srgb, var(--accent) 8%, var(--surface));
+    border:1px solid color-mix(in srgb, var(--accent) 26%, var(--border));
+  }
+  .leave-preset-info { display:flex; flex-direction:column; gap:2px; min-width:0; }
+  .leave-preset-info b { font-size:13px; color:var(--text); }
+  .leave-preset-info span { font-size:11.5px; color:var(--sub); }
+  .leave-preset-btns { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+  .leave-ooc-card {
+    margin:10px 0; padding:13px 15px; border-radius:14px;
+    background:rgba(15,23,42,0.92); border:1px solid rgba(159,212,185,0.35);
+    color:#e2e8f0; line-height:1.72; break-inside:avoid;
+  }
+  .leave-ooc-badge {
+    display:inline-flex; align-items:center; gap:6px; margin-bottom:8px; padding:2px 9px;
+    border-radius:999px; background:rgba(47,104,78,0.35); border:1px solid rgba(159,212,185,0.32);
+    color:#9fd4b9; font-size:11.5px; font-weight:800; letter-spacing:0.04em;
+  }
+  .leave-thought-box {
+    margin:8px 0 12px; padding:8px 12px; border-radius:10px;
+    background:var(--surface); border:1px solid var(--border); font-size:12.5px; color:var(--sub);
+  }
+  .leave-thought-box summary { cursor:pointer; font-weight:700; color:var(--text); }
+  .leave-thought-body { margin-top:8px; white-space:pre-wrap; line-height:1.6; }
   body.asset-hide .rs-bot-html img, body.asset-hide .rs-bot-html .image-container { display:none !important; }
   body.asset-blur .rs-bot-html img:not(.revealed), body.asset-blur .rs-bot-html .image-container:not(.revealed) { filter:blur(22px) brightness(0.72); cursor:pointer; transition:filter 0.25s ease; }
   #bookBotOverlay:empty { display:none; }
@@ -1304,6 +1593,7 @@ function renderWebApp() {
     flex:1; min-height:36px; max-height:140px; resize:none; padding:8px 6px;
     border:none; background:transparent; font-size:15px; line-height:1.4; outline:none;
   }
+  .composer.is-busy textarea::placeholder { color: var(--accent); opacity: 0.92; font-weight: 600; }
   .send-btn {
     height:36px; min-width:36px; padding:0 16px; border-radius:999px; border:none; background:var(--accent);
     color:var(--on-accent); font-weight:700; font-size:13.5px; cursor:pointer; flex-shrink:0;
@@ -1592,6 +1882,17 @@ function renderWebApp() {
           <span id="localToggleBadge" class="badge">로컬 토글</span>
         </span>
       </h3>
+      <div class="leave-preset-bar">
+        <div class="leave-preset-info">
+          <b>🍃 Leave · 방랑 사서의 서가 r1.1</b>
+          <span>내장 AI 프리셋 토글 · RisuAI 임포트 JSON · 가이드</span>
+        </div>
+        <div class="leave-preset-btns">
+          <button type="button" class="pill" onclick="installBundledLeaveToggle()">🍃 Leave r1.1 토글 등록</button>
+          <button type="button" class="pill" onclick="downloadLeavePresetJson()">⬇️ JSON 받기</button>
+          <button type="button" class="pill" onclick="openLeavePresetGuide()">📖 가이드</button>
+        </div>
+      </div>
       <div id="presetToggleAdder" style="display:none; margin-bottom:12px; padding:12px; border-radius:12px; background:var(--bg); border:1px solid var(--border);">
         <div style="font-size:11.5px; color:var(--sub); line-height:1.5; margin-bottom:6px;">
           RisuAI 보안 정책상 프롬프트 프리셋 토글은 플러그인이 직접 읽을 수 없습니다. PC RisuAI 프리셋 설정의 <b>커스텀 토글</b> 텍스트를 아래에 한 번만 붙여넣어 두면, 모든 체크박스·드롭다운이 로컬 토글로 즉시 연동됩니다.
@@ -1662,24 +1963,28 @@ function renderWebApp() {
     </div>
 
     <div class="card">
-      <h3>⚡ 모델 프로필 (릴레이 라우터)</h3>
+      <h3>⚡ AI 프리셋 · 모델 프로필 (릴레이 라우터)</h3>
       <div id="profileList" style="display:flex; flex-direction:column; gap:6px; margin-bottom:10px;"></div>
       <div class="btn-row">
+        <button class="btn sec" onclick="openNewProfile('ollama_cloud')">+ Ollama Cloud</button>
         <button class="btn sec" onclick="openNewProfile('openrouter')">+ OpenRouter</button>
         <button class="btn sec" onclick="openNewProfile('gemini')">+ Gemini</button>
         <button class="btn sec" onclick="openNewProfile('claude')">+ Claude</button>
-        <button class="btn sec" onclick="openNewProfile('openai')">+ OpenAI/커스텀</button>
+        <button class="btn sec" onclick="openNewProfile('deepseek')">+ DeepSeek</button>
+        <button class="btn sec" onclick="openNewProfile('openai')">+ OpenAI/기타</button>
       </div>
     </div>
 
     <div class="card" id="profileEditor" style="display:none;">
       <h3 id="edTitle">프로필 편집</h3>
       <input type="hidden" id="edId" />
+      <label class="f-label">프로바이더 제공사 (선택 시 엔드포인트 자동 입력)</label>
+      <select class="f-inp" id="edProvider"></select>
       <label class="f-label">프로필 이름</label>
       <input class="f-inp" id="edName" />
       <label class="f-label">프로바이더 포맷</label>
       <select class="f-inp" id="edType">
-        <option value="openai_compat">OpenAI 호환 (OpenRouter / OpenAI / DeepSeek / Ollama)</option>
+        <option value="openai_compat">OpenAI 호환 (OpenRouter / Ollama Cloud / DeepSeek / OpenAI)</option>
         <option value="gemini">Google Gemini API</option>
         <option value="anthropic">Anthropic Claude API</option>
       </select>
@@ -1688,7 +1993,12 @@ function renderWebApp() {
       <label class="f-label">API 키 (PC 로컬 파일에만 저장, 비우면 기존 유지)</label>
       <input class="f-inp" id="edKey" type="password" placeholder="새 키 입력 또는 비워두기" />
       <label class="f-label">모델 ID</label>
-      <input class="f-inp" id="edModel" placeholder="예: anthropic/claude-3.7-sonnet, gemini-2.5-pro" />
+      <div style="display:flex; gap:6px; align-items:center;">
+        <input class="f-inp" id="edModel" placeholder="예: deepseek-v4.1-flash:1017-cloud, anthropic/claude-3.7-sonnet" style="flex:1; min-width:0;" />
+        <button type="button" class="btn sec" id="edLoadModelsBtn" style="flex-shrink:0;">🔄 모델 불러오기</button>
+      </div>
+      <select class="f-inp" id="edModelPick" style="display:none; margin-top:6px;"></select>
+      <div class="hint" id="edModelStatus" style="margin-top:4px;"></div>
       <div class="grid-2">
         <div><label class="f-label">Temperature 덮어쓰기</label><input class="f-inp" id="edTemp" placeholder="비우면 유지" /></div>
         <div><label class="f-label">Max Tokens 덮어쓰기</label><input class="f-inp" id="edMaxTok" placeholder="비우면 유지" /></div>
@@ -1714,10 +2024,12 @@ function renderWebApp() {
       <label class="chk-row"><span>AI 응답 자동 한국어 번역 표시</span><input type="checkbox" id="trAutoOut" /></label>
       <label class="chk-row"><span>내 입력 자동 한→영 번역 후 전송</span><input type="checkbox" id="trAutoIn" /></label>
       <div id="trCustomBox">
-        <label class="f-label">전용 번역 프로바이더</label>
+        <label class="f-label">전용 번역 제공사 (선택 시 엔드포인트 자동 입력)</label>
+        <select class="f-inp" id="trProvider"></select>
+        <label class="f-label">전용 번역 프로바이더 포맷</label>
         <select class="f-inp" id="trType">
           <option value="gemini">Google Gemini (추천: gemini-2.5-flash)</option>
-          <option value="openai_compat">OpenAI 호환 (OpenRouter 등)</option>
+          <option value="openai_compat">OpenAI 호환 (OpenRouter / Ollama Cloud 등)</option>
           <option value="anthropic">Anthropic Claude</option>
         </select>
         <label class="f-label">전용 번역 엔드포인트</label>
@@ -1725,7 +2037,12 @@ function renderWebApp() {
         <label class="f-label">전용 번역 API 키 (비우면 기존 유지)</label>
         <input class="f-inp" id="trKey" type="password" placeholder="API 키" />
         <label class="f-label">전용 번역 모델 ID</label>
-        <input class="f-inp" id="trModel" />
+        <div style="display:flex; gap:6px; align-items:center;">
+          <input class="f-inp" id="trModel" style="flex:1; min-width:0;" />
+          <button type="button" class="btn sec" id="trLoadModelsBtn" style="flex-shrink:0;">🔄 모델 불러오기</button>
+        </div>
+        <select class="f-inp" id="trModelPick" style="display:none; margin-top:6px;"></select>
+        <div class="hint" id="trModelStatus" style="margin-top:4px;"></div>
       </div>
       <label class="f-label">응답 번역 프롬프트</label>
       <textarea class="f-inp" id="trPrompt" rows="2"></textarea>
@@ -1742,6 +2059,7 @@ function renderWebApp() {
 </div>
 
 <script>
+  const AI_PROVIDERS = ${JSON.stringify(Object.values(AI_PROVIDER_PRESETS)).replace(/<\//g, '<\\/')};
   let token = localStorage.getItem('rs_token') || '';
   let currentTab = 'chat';
   let lastState = null;
@@ -1756,6 +2074,8 @@ function renderWebApp() {
   let botMenuExpanded = false;
   let botMenuAutoTimer = null;
   let lastDirectErrAt = 0;
+  let localRequestPending = false;
+  let localRequestTimer = null;
   let pollTimer = null;
   let bookSpreadIdx = -1; // -1 means auto-jump to latest spread
   let bookSpreadStride = 1;
@@ -2207,28 +2527,62 @@ function renderWebApp() {
     }
   }
 
+  function syncComposerBusy(isBusy) {
+    const busy = Boolean(isBusy);
+    const btn = document.getElementById('sendBtn');
+    const inp = document.getElementById('msgInput');
+    const bar = document.getElementById('composerBar');
+    if (btn) btn.disabled = busy;
+    if (inp) inp.placeholder = busy ? 'RisuAI에 응답을 요청 중...' : '메시지를 입력하세요...';
+    if (bar) bar.classList.toggle('is-busy', busy);
+  }
+
+  function markLocalRequestPending(active) {
+    if (localRequestTimer) { clearTimeout(localRequestTimer); localRequestTimer = null; }
+    localRequestPending = Boolean(active);
+    if (localRequestPending) {
+      localRequestTimer = setTimeout(() => {
+        localRequestTimer = null;
+        localRequestPending = false;
+        syncComposerBusy(Boolean(lastState && (lastState.generating || lastState.directGenerating)));
+      }, 8000);
+    }
+    syncComposerBusy(Boolean(localRequestPending || (lastState && (lastState.generating || lastState.directGenerating))));
+  }
+
   function applyState(st) {
     lastState = st;
     const snap = st.snapshot || {};
     document.getElementById('pcDot').className = 'dot' + (st.pcConnected ? ' on' : '');
     document.getElementById('hdrChar').textContent = displayBotName(snap.charName || 'PC 연결 대기');
     const modeTag = snap.isPcActive ? 'PC 활성' : '원격 라우팅';
-    const genTag = (st.generating || st.directGenerating) ? ' · ✨ 생성 중...' : '';
+    const isBusy = Boolean(st.generating || st.directGenerating);
+    if (isBusy) {
+      localRequestPending = false;
+      if (localRequestTimer) { clearTimeout(localRequestTimer); localRequestTimer = null; }
+    }
+    const genTag = isBusy ? ' · ✨ 생성 중...' : '';
     document.getElementById('hdrSub').textContent = (uiPref.assetMode === 'hide' ? '대화' : (snap.chatName || '채팅방')) + ' · ' + modeTag + genTag;
-    document.getElementById('sendBtn').disabled = Boolean(st.generating || st.directGenerating);
     document.querySelector('.tab-btn[data-tab="modules"]').classList.toggle('has-update', Boolean(st.updateAvailable));
     if (st.pluginVersion) document.getElementById('updPlugin').textContent = 'v' + st.pluginVersion;
     if (st.lastDirectError && st.lastDirectError.at && st.lastDirectError.at > lastDirectErrAt) {
       lastDirectErrAt = st.lastDirectError.at;
+      localRequestPending = false;
+      if (localRequestTimer) { clearTimeout(localRequestTimer); localRequestTimer = null; }
       toast('응답 오류: ' + (st.lastDirectError.message || '실패'));
     }
     if (st.lastTriggerEvent && st.lastTriggerEvent.id && st.lastTriggerEvent.id !== lastHandledTriggerEventId) {
       lastHandledTriggerEventId = st.lastTriggerEvent.id;
       const tev = st.lastTriggerEvent;
+      if (tev.kind === 'error') {
+        localRequestPending = false;
+        if (localRequestTimer) { clearTimeout(localRequestTimer); localRequestTimer = null; }
+      }
       if (tev.kind === 'prompt_select' || tev.kind === 'prompt_input') showTriggerModal(tev);
       else if (tev.kind === 'error') toast('⚠️ ' + (tev.message || '트리거 오류'));
       else if (tev.kind === 'notice' && tev.message) toast(tev.message);
     }
+    syncComposerBusy(Boolean(isBusy || localRequestPending));
 
     syncBotBackground(snap.backgroundHtml || '', snap.assetMap || {});
 
@@ -2753,12 +3107,19 @@ function renderWebApp() {
       const snap = lastState && lastState.snapshot;
       const txt = (btnEl.getAttribute('risu-btn') || btnEl.textContent || '').trim();
       if (!snap || snap.charIndex < 0 || !txt) return true;
-      await api('/api/chat/send', {
-        method: 'POST',
-        body: JSON.stringify({ charIndex: snap.charIndex, chatIndex: snap.chatIndex, text: txt }),
-      });
-      toast('선택 전송됨');
-      setTimeout(pollState, 600);
+      markLocalRequestPending(true);
+      try {
+        await api('/api/chat/send', {
+          method: 'POST',
+          body: JSON.stringify({ charIndex: snap.charIndex, chatIndex: snap.chatIndex, text: txt }),
+        });
+        toast('선택 전송됨');
+        setTimeout(pollState, 350);
+        setTimeout(pollState, 1200);
+      } catch (err) {
+        markLocalRequestPending(false);
+        toast('전송 오류: ' + err.message);
+      }
       return true;
     }
     if (document.body.classList.contains('asset-blur')) {
@@ -2821,11 +3182,14 @@ function renderWebApp() {
       const snap = lastState && lastState.snapshot;
       if (!snap || snap.charIndex < 0) return;
       const msgIndex = Number(rerollBtn.getAttribute('data-reroll-msg'));
+      markLocalRequestPending(true);
       try {
         await api('/api/chat/reroll', { method: 'POST', body: JSON.stringify({ charIndex: snap.charIndex, chatIndex: snap.chatIndex, msgIndex }) });
         toast('응답 다시 생성 중...');
-        setTimeout(pollState, 500);
+        setTimeout(pollState, 350);
+        setTimeout(pollState, 1200);
       } catch (err) {
+        markLocalRequestPending(false);
         toast('리롤 오류: ' + err.message);
       }
       return;
@@ -2896,25 +3260,27 @@ function renderWebApp() {
   async function sendMessage() {
     const inp = document.getElementById('msgInput');
     let text = inp.value.trim();
-    if (!text) return;
     const snap = lastState && lastState.snapshot;
     if (!snap || snap.charIndex < 0) return toast('먼저 봇을 선택해 주세요.');
+    const hasMsgs = Array.isArray(snap.messages) && snap.messages.length > 0;
+    if (!text && !hasMsgs) return toast('먼저 메시지를 입력해 주세요.');
     inp.value = '';
     autoGrowInput();
-    document.getElementById('sendBtn').disabled = true;
+    markLocalRequestPending(true);
     try {
-      if (routerCfg && routerCfg.translator && routerCfg.translator.autoTranslateInput) {
+      if (text && routerCfg && routerCfg.translator && routerCfg.translator.autoTranslateInput) {
         toast('영어로 번역 후 전송 중...');
         const tr = await api('/api/translate', { method: 'POST', body: JSON.stringify({ text, direction: 'to_en' }) });
         if (tr.translated) text = tr.translated;
       }
       await api('/api/chat/send', { method: 'POST', body: JSON.stringify({ charIndex: snap.charIndex, chatIndex: snap.chatIndex, text }) });
       bookSpreadIdx = -1;
-      toast('전송됨');
-      setTimeout(pollState, 600);
+      toast(text ? '전송됨' : '응답 재요청 중...');
+      setTimeout(pollState, 350);
+      setTimeout(pollState, 1200);
     } catch (e) {
+      markLocalRequestPending(false);
       toast('전송 오류: ' + e.message);
-      document.getElementById('sendBtn').disabled = false;
     }
   }
   document.getElementById('sendBtn').onclick = sendMessage;
@@ -3126,6 +3492,62 @@ function renderWebApp() {
     routerCfg = await api('/api/router/config', { method: 'POST', body: JSON.stringify(routerCfg) });
     renderCustomToggles(true);
     toast('프리셋 토글 삭제됨');
+  };
+
+  window.installBundledLeaveToggle = async () => {
+    try {
+      const data = await api('/api/presets/leave');
+      if (!data || !data.toggleSyntax) return toast('내장 Leave 프리셋을 찾을 수 없습니다.');
+      if (!routerCfg) routerCfg = await api('/api/router/config');
+      if (!Array.isArray(routerCfg.presetToggles)) routerCfg.presetToggles = [];
+      const entry = {
+        id: data.id || 'preset-leave-r1.1',
+        name: '🍃 ' + (data.name || 'Leave · 방랑 사서의 서가 r1.1'),
+        enabled: true,
+        syntax: data.toggleSyntax,
+      };
+      const idx = routerCfg.presetToggles.findIndex((x) => x && x.id === entry.id);
+      if (idx >= 0) routerCfg.presetToggles[idx] = entry;
+      else routerCfg.presetToggles.unshift(entry);
+      routerCfg = await api('/api/router/config', { method: 'POST', body: JSON.stringify(routerCfg) });
+      renderCustomToggles(true);
+      toast('🍃 Leave r1.1 프리셋 토글이 등록되었습니다');
+    } catch (e) {
+      toast('Leave 토글 등록 오류: ' + (e && e.message ? e.message : '실패'));
+    }
+  };
+
+  window.downloadLeavePresetJson = async () => {
+    try {
+      const res = await fetch('/api/presets/leave/download', { headers: { 'X-RisuStand-Token': token } });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'Leave_RisuAI_Preset.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 4000);
+      toast('Leave_RisuAI_Preset.json 다운로드 시작');
+    } catch (e) {
+      toast('다운로드 오류: ' + (e && e.message ? e.message : '실패'));
+    }
+  };
+
+  window.openLeavePresetGuide = async () => {
+    try {
+      const res = await fetch('/api/presets/leave/guide', { headers: { 'X-RisuStand-Token': token } });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const html = await res.text();
+      const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      window.open(url, '_blank', 'noopener');
+      setTimeout(() => URL.revokeObjectURL(url), 15000);
+    } catch (e) {
+      toast('가이드 열기 오류: ' + (e && e.message ? e.message : '실패'));
+    }
   };
 
   function renderCustomToggles(force = false) {
@@ -3340,21 +3762,85 @@ function renderWebApp() {
     syncToggleBadges();
     renderRouterUI();
   }
+  function getProviderMeta(pid) {
+    return AI_PROVIDERS.find((x) => x.id === pid) || AI_PROVIDERS.find((x) => x.id === 'custom') || AI_PROVIDERS[0];
+  }
+  function inferClientProviderId(explicitId, pType, url) {
+    if (explicitId && AI_PROVIDERS.some((x) => x.id === explicitId)) return explicitId;
+    const u = String(url || '').toLowerCase();
+    if (u) {
+      for (const p of AI_PROVIDERS) {
+        if (!p.endpoint || p.id === 'custom') continue;
+        try {
+          const pu = new URL(p.endpoint);
+          const bu = new URL(u);
+          if (pu.host === bu.host) {
+            if (p.id === 'novita-coding') continue;
+            if (p.id === 'z-ai' && u.includes('/coding/')) return 'z-ai-coding';
+            return p.id;
+          }
+        } catch (_) {}
+      }
+      if (u.includes('11434')) return 'ollama';
+      if (u.includes('1234')) return 'lmstudio';
+    }
+    if (pType === 'anthropic') return 'claude';
+    if (pType === 'gemini') return 'gemini';
+    return 'custom';
+  }
+  function populateProviderSelect(selId) {
+    const sel = document.getElementById(selId);
+    if (!sel || sel.options.length) return;
+    const main = AI_PROVIDERS.filter((p) => p.group === 'main');
+    const direct = AI_PROVIDERS.filter((p) => p.group !== 'main');
+    sel.innerHTML =
+      '<optgroup label="주요 제공사">' +
+        main.map((p) => '<option value="' + esc(p.id) + '">' + esc(p.label) + '</option>').join('') +
+      '</optgroup>' +
+      '<optgroup label="Direct 프로바이더 (LIB 호환)">' +
+        direct.map((p) => '<option value="' + esc(p.id) + '">' + esc(p.label) + '</option>').join('') +
+      '</optgroup>';
+  }
+  function setModelPickList(pickId, statusId, models, statusMsg) {
+    const pick = document.getElementById(pickId);
+    const st = document.getElementById(statusId);
+    if (pick) {
+      if (Array.isArray(models) && models.length) {
+        pick.innerHTML = '<option value="">-- 불러온 모델 선택 (' + models.length + '개) --</option>' +
+          models.map((m) => {
+            const id = typeof m === 'string' ? m : m.id;
+            const lbl = typeof m === 'string' ? m : (m.label && m.label !== m.id ? m.label + ' (' + m.id + ')' : m.id);
+            return '<option value="' + esc(id) + '">' + esc(lbl) + '</option>';
+          }).join('');
+        pick.style.display = 'block';
+      } else {
+        pick.innerHTML = '';
+        pick.style.display = 'none';
+      }
+    }
+    if (st) st.textContent = statusMsg || '';
+  }
+  populateProviderSelect('edProvider');
+  populateProviderSelect('trProvider');
+
   function renderRouterUI() {
     if (!routerCfg) return;
     document.getElementById('profileList').innerHTML = (routerCfg.profiles || []).map((p) => {
       const active = p.id === routerCfg.activeProfileId;
+      const pMeta = getProviderMeta(inferClientProviderId(p.provider, p.providerType, p.baseUrl));
       return '<div class="row" style="padding:8px 10px; border:1px solid ' + (active ? 'var(--accent)' : 'var(--border)') + '; border-radius:10px; background:var(--bg);">' +
         '<div style="min-width:0;"><div style="font-size:13.5px; font-weight:700;">' + (active ? '🟢 ' : '') + esc(p.name) + '</div>' +
-        '<div style="font-size:11.5px; color:var(--sub);">' + esc(p.providerType) + ' · ' + esc(p.model) + ' · 키: ' + (p.hasKey ? esc(p.keyPreview) : '미설정') + '</div></div>' +
+        '<div style="font-size:11.5px; color:var(--sub);">' + esc(pMeta.label) + ' · ' + esc(p.model) + ' · 키: ' + (p.hasKey ? esc(p.keyPreview) : '미설정') + '</div></div>' +
         '<div style="display:flex; gap:5px; flex-shrink:0;">' +
         '<button class="btn ' + (active ? '' : 'sec') + '" data-act-prof="' + esc(p.id) + '">' + (active ? '활성' : '선택') + '</button>' +
         '<button class="btn sec" data-edit-prof="' + esc(p.id) + '">편집</button></div></div>';
     }).join('');
     const tr = routerCfg.translator || {};
+    const trPid = inferClientProviderId(tr.provider, tr.providerType, tr.baseUrl);
     document.getElementById('trUseActive').checked = Boolean(tr.useActiveProfile);
     document.getElementById('trAutoOut').checked = Boolean(tr.autoTranslateOutput);
     document.getElementById('trAutoIn').checked = Boolean(tr.autoTranslateInput);
+    document.getElementById('trProvider').value = trPid;
     document.getElementById('trType').value = tr.providerType || 'gemini';
     document.getElementById('trUrl').value = tr.baseUrl || '';
     document.getElementById('trKey').value = '';
@@ -3362,6 +3848,12 @@ function renderWebApp() {
     document.getElementById('trModel').value = tr.model || 'gemini-2.5-flash';
     document.getElementById('trPrompt').value = tr.prompt || '';
     document.getElementById('trCustomBox').style.display = tr.useActiveProfile ? 'none' : 'block';
+    const trMeta = getProviderMeta(trPid);
+    if (trMeta && Array.isArray(trMeta.builtinModels) && trMeta.builtinModels.length) {
+      setModelPickList('trModelPick', 'trModelStatus', trMeta.builtinModels, trMeta.label + ' 내장 모델 ' + trMeta.builtinModels.length + '개');
+    } else {
+      setModelPickList('trModelPick', 'trModelStatus', [], '');
+    }
   }
   document.getElementById('profileList').addEventListener('click', (e) => {
     const actBtn = e.target.closest('[data-act-prof]');
@@ -3376,34 +3868,131 @@ function renderWebApp() {
     renderRouterUI();
     toast('활성 모델 전환됨');
   };
+  function applyEditorProvider(pid, { updateName = true, fillDefaultModel = false } = {}) {
+    const meta = getProviderMeta(pid);
+    if (!meta) return;
+    document.getElementById('edProvider').value = meta.id;
+    document.getElementById('edType').value = meta.providerType || 'openai_compat';
+    if (meta.id !== 'custom') document.getElementById('edUrl').value = meta.endpoint || '';
+    const nameEl = document.getElementById('edName');
+    const curName = nameEl.value.trim();
+    const isDefaultLabel = !curName || AI_PROVIDERS.some((x) => x.label === curName);
+    if (updateName && isDefaultLabel) nameEl.value = meta.label;
+    const modelEl = document.getElementById('edModel');
+    if (fillDefaultModel || !modelEl.value.trim()) {
+      if (meta.defaultModel) modelEl.value = meta.defaultModel;
+    }
+    if (Array.isArray(meta.builtinModels) && meta.builtinModels.length) {
+      setModelPickList('edModelPick', 'edModelStatus', meta.builtinModels, meta.label + ' 기본 제공 모델 ' + meta.builtinModels.length + '개 (API 조회 병합 가능)');
+    } else {
+      setModelPickList('edModelPick', 'edModelStatus', [], meta.modelsUrl ? '🔄 모델 불러오기 버튼으로 사용 가능한 모델을 조회할 수 있습니다.' : '이 제공사는 모델 ID를 직접 입력하세요.');
+    }
+  }
+  document.getElementById('edProvider').onchange = (e) => {
+    applyEditorProvider(e.target.value, { updateName: true, fillDefaultModel: true });
+  };
+  document.getElementById('edModelPick').onchange = (e) => {
+    const val = e.target.value;
+    if (!val) return;
+    document.getElementById('edModel').value = val;
+    toast('모델 선택됨: ' + val);
+  };
+  document.getElementById('edLoadModelsBtn').onclick = async () => {
+    const btn = document.getElementById('edLoadModelsBtn');
+    const st = document.getElementById('edModelStatus');
+    btn.disabled = true;
+    if (st) st.textContent = '모델 목록을 불러오는 중...';
+    try {
+      const r = await api('/api/router/models', {
+        method: 'POST',
+        body: JSON.stringify({
+          provider: document.getElementById('edProvider').value,
+          providerType: document.getElementById('edType').value,
+          baseUrl: document.getElementById('edUrl').value.trim(),
+          apiKey: document.getElementById('edKey').value.trim(),
+          profileId: document.getElementById('edId').value,
+          target: 'profile',
+        }),
+      });
+      const models = r.models || [];
+      setModelPickList('edModelPick', 'edModelStatus', models, models.length + '개 모델을 불러왔습니다. 아래에서 선택하면 자동 입력됩니다.');
+      toast(models.length + '개 모델 불러옴');
+    } catch (e) {
+      if (st) st.textContent = '⚠️ ' + (e && e.message ? e.message : '불러오기 실패');
+      toast('모델 불러오기 실패: ' + (e && e.message ? e.message : '오류'));
+    } finally {
+      btn.disabled = false;
+    }
+  };
+  document.getElementById('trProvider').onchange = (e) => {
+    const meta = getProviderMeta(e.target.value);
+    if (!meta) return;
+    document.getElementById('trType').value = meta.providerType || 'openai_compat';
+    if (meta.id !== 'custom') document.getElementById('trUrl').value = meta.endpoint || '';
+    if (meta.defaultModel && !document.getElementById('trModel').value.trim()) document.getElementById('trModel').value = meta.defaultModel;
+    if (Array.isArray(meta.builtinModels) && meta.builtinModels.length) {
+      setModelPickList('trModelPick', 'trModelStatus', meta.builtinModels, meta.label + ' 기본 제공 모델 ' + meta.builtinModels.length + '개');
+    } else {
+      setModelPickList('trModelPick', 'trModelStatus', [], '');
+    }
+  };
+  document.getElementById('trModelPick').onchange = (e) => {
+    const val = e.target.value;
+    if (!val) return;
+    document.getElementById('trModel').value = val;
+    toast('번역 모델 선택됨: ' + val);
+  };
+  document.getElementById('trLoadModelsBtn').onclick = async () => {
+    const btn = document.getElementById('trLoadModelsBtn');
+    const st = document.getElementById('trModelStatus');
+    btn.disabled = true;
+    if (st) st.textContent = '모델 목록을 불러오는 중...';
+    try {
+      const r = await api('/api/router/models', {
+        method: 'POST',
+        body: JSON.stringify({
+          provider: document.getElementById('trProvider').value,
+          providerType: document.getElementById('trType').value,
+          baseUrl: document.getElementById('trUrl').value.trim(),
+          apiKey: document.getElementById('trKey').value.trim(),
+          target: 'translator',
+        }),
+      });
+      const models = r.models || [];
+      setModelPickList('trModelPick', 'trModelStatus', models, models.length + '개 모델을 불러왔습니다.');
+      toast(models.length + '개 모델 불러옴');
+    } catch (e) {
+      if (st) st.textContent = '⚠️ ' + (e && e.message ? e.message : '불러오기 실패');
+      toast('모델 불러오기 실패: ' + (e && e.message ? e.message : '오류'));
+    } finally {
+      btn.disabled = false;
+    }
+  };
   window.openNewProfile = (preset) => {
-    const presets = {
-      openrouter: { name: 'OpenRouter', providerType: 'openai_compat', baseUrl: 'https://openrouter.ai/api/v1/chat/completions', model: 'anthropic/claude-3.7-sonnet' },
-      gemini: { name: 'Google Gemini', providerType: 'gemini', baseUrl: 'https://generativelanguage.googleapis.com/v1beta', model: 'gemini-2.5-pro' },
-      claude: { name: 'Anthropic Claude', providerType: 'anthropic', baseUrl: 'https://api.anthropic.com/v1/messages', model: 'claude-sonnet-4-20250514' },
-      openai: { name: 'OpenAI / 커스텀', providerType: 'openai_compat', baseUrl: 'https://api.openai.com/v1/chat/completions', model: 'gpt-4.1' },
-    };
-    const p = presets[preset] || presets.openai;
+    const pid = inferClientProviderId(preset, '', '');
+    const meta = getProviderMeta(pid);
     document.getElementById('edTitle').textContent = '새 모델 프로필 추가';
     document.getElementById('edId').value = 'prof-' + Date.now();
-    document.getElementById('edName').value = p.name;
-    document.getElementById('edType').value = p.providerType;
-    document.getElementById('edUrl').value = p.baseUrl;
+    document.getElementById('edName').value = meta.label;
     document.getElementById('edKey').value = '';
-    document.getElementById('edModel').value = p.model;
+    document.getElementById('edModel').value = meta.defaultModel || '';
     document.getElementById('edTemp').value = '';
     document.getElementById('edMaxTok').value = '';
     document.getElementById('edOvMode').value = 'off';
     document.getElementById('edOvText').value = '';
     document.getElementById('delProfBtn').style.display = 'none';
+    applyEditorProvider(meta.id, { updateName: false, fillDefaultModel: true });
     document.getElementById('profileEditor').style.display = 'block';
   };
   window.editProfile = (id) => {
     const p = (routerCfg.profiles || []).find((x) => x.id === id);
     if (!p) return;
+    const pid = inferClientProviderId(p.provider, p.providerType, p.baseUrl);
+    const meta = getProviderMeta(pid);
     document.getElementById('edTitle').textContent = '프로필 편집';
     document.getElementById('edId').value = p.id;
     document.getElementById('edName').value = p.name;
+    document.getElementById('edProvider').value = pid;
     document.getElementById('edType').value = p.providerType;
     document.getElementById('edUrl').value = p.baseUrl;
     document.getElementById('edKey').value = '';
@@ -3414,6 +4003,11 @@ function renderWebApp() {
     document.getElementById('edOvMode').value = p.overrideMode || 'off';
     document.getElementById('edOvText').value = p.systemOverride || '';
     document.getElementById('delProfBtn').style.display = 'inline-block';
+    if (Array.isArray(meta.builtinModels) && meta.builtinModels.length) {
+      setModelPickList('edModelPick', 'edModelStatus', meta.builtinModels, meta.label + ' 기본 제공 모델 ' + meta.builtinModels.length + '개 (API 조회 병합 가능)');
+    } else {
+      setModelPickList('edModelPick', 'edModelStatus', [], meta.modelsUrl ? '🔄 모델 불러오기 버튼으로 사용 가능한 모델을 조회할 수 있습니다.' : '');
+    }
     document.getElementById('profileEditor').style.display = 'block';
   };
   document.getElementById('saveProfBtn').onclick = async () => {
@@ -3421,6 +4015,7 @@ function renderWebApp() {
     const item = {
       id,
       name: document.getElementById('edName').value.trim() || 'Model',
+      provider: document.getElementById('edProvider').value,
       providerType: document.getElementById('edType').value,
       baseUrl: document.getElementById('edUrl').value.trim(),
       apiKey: document.getElementById('edKey').value.trim(),
@@ -3454,6 +4049,7 @@ function renderWebApp() {
       useActiveProfile: document.getElementById('trUseActive').checked,
       autoTranslateOutput: document.getElementById('trAutoOut').checked,
       autoTranslateInput: document.getElementById('trAutoIn').checked,
+      provider: document.getElementById('trProvider').value,
       providerType: document.getElementById('trType').value,
       baseUrl: document.getElementById('trUrl').value.trim(),
       apiKey: document.getElementById('trKey').value.trim(),
@@ -3567,6 +4163,7 @@ function sanitizeConfigForClient() {
         profiles: config.profiles.map((p) => ({
             id: p.id,
             name: p.name,
+            provider: p.provider || detectProviderPresetId('', p.providerType, p.baseUrl),
             providerType: p.providerType,
             baseUrl: p.baseUrl,
             hasKey: Boolean(p.apiKey),
@@ -3729,12 +4326,14 @@ function restartRelay({ guardUpdate }) {
 }
 
 // ================= HTTP Server =================
-function createRelayServer({ token, limiter = createAuthRateLimiter() } = {}) {
+function createRelayServer({ token, limiter = createAuthRateLimiter(), configOverride = null } = {}) {
     const resolvedToken = token !== undefined ? String(token) : (TOKEN || (TOKEN = loadOrCreateToken(ROOT_DIR)));
     const requireAuth = makeRequireAuth(resolvedToken, limiter);
     const requireProxyAuth = makeRequireProxyAuth(resolvedToken, limiter);
+    const prevConfig = configOverride ? config : null;
+    if (configOverride) config = configOverride;
 
-    return http.createServer(async (req, res) => {
+    const server = http.createServer(async (req, res) => {
         const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
         const pathname = urlObj.pathname;
 
@@ -3779,6 +4378,10 @@ function createRelayServer({ token, limiter = createAuthRateLimiter() } = {}) {
                 state.bridgeVersion = body.bridgeVersion || '1.0.0';
                 state.pluginVersion = typeof body.pluginVersion === 'string' ? body.pluginVersion.slice(0, 32) : null;
                 state.generating = Boolean(body.generating);
+                if (state.nativeRequestDispatched && !state.generating) {
+                    state.nativeRequestPendingSince = 0;
+                    state.nativeRequestDispatched = false;
+                }
                 if (body.catalog) state.catalog = body.catalog;
                 if (body.snapshot) state.snapshot = body.snapshot;
                 if (body.triggerEvent) state.lastTriggerEvent = body.triggerEvent;
@@ -3789,11 +4392,19 @@ function createRelayServer({ token, limiter = createAuthRateLimiter() } = {}) {
                     while (state.commandQueue.length && commands.length < 10) {
                         const cmd = state.commandQueue.shift();
                         commands.push(cmd);
-                        if (cmd.type === 'send_chat') break;
+                        if (cmd.type === 'send_chat' || cmd.type === 'reroll_message') {
+                            state.nativeRequestDispatched = true;
+                            if (!state.nativeRequestPendingSince) state.nativeRequestPendingSince = Date.now();
+                            break;
+                        }
                     }
                     return sendJson(res, 200, { ok: true, command: commands[0] || null, commands, relayVersion: RELAY_VERSION }, req);
                 }
                 const nextCmd = state.commandQueue.shift() || null;
+                if (nextCmd && (nextCmd.type === 'send_chat' || nextCmd.type === 'reroll_message')) {
+                    state.nativeRequestDispatched = true;
+                    if (!state.nativeRequestPendingSince) state.nativeRequestPendingSince = Date.now();
+                }
                 return sendJson(res, 200, { ok: true, command: nextCmd, relayVersion: RELAY_VERSION }, req);
             } catch (e) {
                 return sendJson(res, 400, { error: e.message }, req);
@@ -3832,13 +4443,18 @@ function createRelayServer({ token, limiter = createAuthRateLimiter() } = {}) {
             if (!requireAuth(req, res)) return;
             const connected = Date.now() - state.pcLastSeen < 12000;
             state.pcConnected = connected;
+            const nativePending = Boolean(
+                state.nativeRequestPendingSince &&
+                connected &&
+                (Date.now() - state.nativeRequestPendingSince < 180000)
+            );
             return sendJson(res, 200, {
                 pcConnected: connected,
                 bridgeVersion: state.bridgeVersion,
                 relayVersion: RELAY_VERSION,
                 pluginVersion: state.pluginVersion || null,
                 updateAvailable: Boolean(updateState.info && updateState.info.available),
-                generating: state.generating,
+                generating: Boolean(state.generating || nativePending),
                 directGenerating: state.directGenerating,
                 lastDirectError: state.lastDirectError,
                 lastTriggerEvent: state.lastTriggerEvent,
@@ -3865,16 +4481,20 @@ function createRelayServer({ token, limiter = createAuthRateLimiter() } = {}) {
             if (!requireAuth(req, res)) return;
             try {
                 const body = JSON.parse((await readBody(req)) || '{}');
-                const text = String(body.text || '').trim();
-                if (!text) return sendJson(res, 400, { error: 'Empty message' }, req);
+                const text = String(body.text ?? '').trim();
                 const charIndex = Number(body.charIndex);
                 const chatIndex = Number(body.chatIndex);
 
                 if (state.snapshot && state.snapshot.isPcActive && charIndex === state.snapshot.charIndex) {
+                    state.nativeRequestPendingSince = Date.now();
+                    state.nativeRequestDispatched = false;
                     queueCommand('send_chat', { charIndex, chatIndex, text });
                     return sendJson(res, 200, { ok: true, mode: 'native_risu' }, req);
                 }
 
+                if (!text && (!state.snapshot || !Array.isArray(state.snapshot.messages) || !state.snapshot.messages.length)) {
+                    return sendJson(res, 400, { error: '보낼 메시지를 입력해 주세요.' }, req);
+                }
                 if (state.directGenerating) {
                     return sendJson(res, 409, { error: '이미 응답을 생성 중입니다.' }, req);
                 }
@@ -3916,6 +4536,8 @@ function createRelayServer({ token, limiter = createAuthRateLimiter() } = {}) {
                 }
 
                 if (state.snapshot && state.snapshot.isPcActive && charIndex === state.snapshot.charIndex) {
+                    state.nativeRequestPendingSince = Date.now();
+                    state.nativeRequestDispatched = false;
                     queueCommand('reroll_message', { charIndex, chatIndex, msgIndex });
                     return sendJson(res, 200, { ok: true, mode: 'native_risu' }, req);
                 }
@@ -3976,6 +4598,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter() } = {}) {
                         return {
                             id: String(p.id || ('prof-' + Date.now())),
                             name: String(p.name || 'Model'),
+                            provider: String(p.provider || detectProviderPresetId('', p.providerType, p.baseUrl)),
                             providerType: p.providerType || 'openai_compat',
                             baseUrl: String(p.baseUrl || ''),
                             apiKey: p.apiKey ? String(p.apiKey) : (prev ? prev.apiKey : ''),
@@ -4012,8 +4635,83 @@ function createRelayServer({ token, limiter = createAuthRateLimiter() } = {}) {
             }
         }
 
+        // 8b) AI Provider Presets & Model Loader API
+        if (pathname === '/api/router/providers' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            return sendJson(res, 200, { ok: true, providers: Object.values(AI_PROVIDER_PRESETS) }, req);
+        }
+
+        if (pathname === '/api/router/models' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                let apiKey = String(body.apiKey || '').trim();
+                if (!apiKey) {
+                    if (body.target === 'translator') {
+                        apiKey = String((config.translator && config.translator.apiKey) || '');
+                    } else if (body.profileId) {
+                        const existing = (config.profiles || []).find((p) => p && p.id === body.profileId);
+                        if (existing && existing.apiKey) apiKey = String(existing.apiKey);
+                    }
+                }
+                const resModels = await fetchProviderModels({
+                    provider: String(body.provider || ''),
+                    providerType: String(body.providerType || ''),
+                    baseUrl: String(body.baseUrl || ''),
+                    apiKey,
+                });
+                return sendJson(res, 200, { ok: true, ...resModels }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
+            }
+        }
+
+        // 8c) Bundled Leave Preset API
+        if (pathname === '/api/presets/leave' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            const p = loadBundledLeavePreset();
+            if (!p) return sendJson(res, 404, { error: '내장 Leave 프리셋 파일이 없습니다.' }, req);
+            return sendJson(res, 200, {
+                ok: true,
+                id: p.id,
+                name: p.name,
+                toggleSyntax: p.toggleSyntax,
+                defaultVariables: p.defaultVariables,
+                hasGuide: p.hasGuide,
+            }, req);
+        }
+
+        if (pathname === '/api/presets/leave/download' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            const p = loadBundledLeavePreset();
+            if (!p) return sendJson(res, 404, { error: '내장 Leave 프리셋 파일이 없습니다.' }, req);
+            res.writeHead(200, {
+                'Content-Type': 'application/json; charset=utf-8',
+                'Content-Disposition': 'attachment; filename="Leave_RisuAI_Preset.json"',
+                ...corsHeaders(req),
+            });
+            res.end(p.rawJson);
+            return;
+        }
+
+        if (pathname === '/api/presets/leave/guide' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            const p = loadBundledLeavePreset();
+            if (!p || !p.hasGuide) return sendJson(res, 404, { error: '내장 Leave 가이드 HTML이 없습니다.' }, req);
+            res.writeHead(200, {
+                'Content-Type': 'text/html; charset=utf-8',
+                ...corsHeaders(req),
+            });
+            res.end(fs.readFileSync(p.htmlPath));
+            return;
+        }
+
         sendJson(res, 404, { error: 'Not found' }, req);
     });
+    if (prevConfig !== null) {
+        server.once('close', () => { config = prevConfig; });
+    }
+    return server;
 }
 
 function startServer() {
