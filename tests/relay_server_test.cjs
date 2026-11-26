@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const vm = require('node:vm');
 
 const relay = require('../risustand-relay-server.js');
 const { REPO } = require('./helpers.cjs');
@@ -145,10 +146,13 @@ test('relay proxy & CORS: untrusted Origin blocked on loopback, never emits Acce
         assert.equal(okOrigin.headers['access-control-allow-origin'], 'http://localhost:5173');
         assert.notEqual(okOrigin.headers['access-control-allow-origin'], '*');
 
-        // Web UI HTML escapes single quotes in esc() and has no wildcard CORS
+        // Web UI HTML escapes single quotes in esc(), compiles cleanly, and has no wildcard CORS
         const html = await requestHttp(port, { path: '/' });
         assert.equal(html.status, 200);
         assert.match(html.body, /&#39;/);
+        const scriptMatch = html.body.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(scriptMatch, 'rendered HTML must contain inline script');
+        new vm.Script(scriptMatch[1], { filename: 'webapp-inline.js' });
         assert.ok(!fs.readFileSync(path.join(REPO, 'risustand-relay-server.js'), 'utf8').includes("'Access-Control-Allow-Origin': '*'"));
     } finally {
         await new Promise((r) => server.close(r));

@@ -1728,7 +1728,7 @@ function renderWebApp() {
 
   function safeImgSrc(u) {
     const raw = String(u || '').trim();
-    if (/^(data:image\/[a-z0-9.+-]+;base64,|https?:\/\/)/i.test(raw)) return raw;
+    if (/^(data:image\\/[a-z0-9.+-]+;base64,|https?:\\/\\/)/i.test(raw)) return raw;
     return '';
   }
 
@@ -1854,7 +1854,7 @@ function renderWebApp() {
     }
 
     const msgs = snap.messages || [];
-    const msgDigest = hashStr(msgs.map((m) => m.index + ':' + (m.text || '') + ':' + (m.images ? m.images.length : 0)).join('\x01'));
+    const msgDigest = hashStr(msgs.map((m) => m.index + ':' + (m.text || '') + ':' + (m.images ? m.images.length : 0)).join('\\x01'));
     const sig = JSON.stringify([snap.charIndex, snap.chatIndex, msgs.length, msgDigest, st.generating, st.directGenerating, uiPref.theme, uiPref.assetMode]);
     if (sig !== lastChatRenderSig) {
       lastChatRenderSig = sig;
