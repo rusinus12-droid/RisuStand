@@ -1,14 +1,14 @@
 //@name risustand
 //@display-name RisuStand
 //@api 3.0
-//@version 1.0.1
+//@version 1.1.0
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/RisuStand/refs/heads/main/risustand.js
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Required Notice: Copyright (c) 2026 rusinus12
 
 (async function risustandPluginMain() {
     // Kept in sync with //@version by tools/release_version.cjs
-    const RISUSTAND_VERSION = '1.0.1';
+    const RISUSTAND_VERSION = '1.1.0';
     const STORAGE_KEY = 'risustand_v1';
     const LEGACY_STORAGE_KEY = 'risu_ultra_custom_shell_v2';
     const STYLE_ATTR = 'x-risustand-style';
