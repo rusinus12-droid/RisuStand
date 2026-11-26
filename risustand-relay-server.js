@@ -16,7 +16,10 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { spawn } = require('child_process');
 
+// Kept in sync with VERSION by tools/release_version.cjs
+const RELAY_VERSION = '1.0.0';
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const TOKEN = (process.env.RISU_REMOTE_TOKEN || '').trim() || crypto.randomBytes(12).toString('hex');
@@ -580,7 +583,7 @@ function renderWebApp() {
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <meta name="theme-color" id="themeColorMeta" content="#ffffff" />
-<title>RisuStand Remote v1.0.0</title>
+<title>RisuStand Remote v${RELAY_VERSION}</title>
 <style>
   /* ===== Design tokens (light defaults) ===== */
   :root {
@@ -987,6 +990,20 @@ function renderWebApp() {
   .param-grid { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap:10px; align-items:end; }
   .param-grid .f-label { margin-top:0; }
   .grid-2 { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap:10px; }
+  .upd-grid { display:grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap:8px; }
+  .upd-cell { background:var(--bg); border:1px solid var(--border); border-radius:12px; padding:10px 12px; min-width:0; }
+  .upd-cell .k { font-size:11px; font-weight:700; color:var(--sub); margin-bottom:3px; }
+  .upd-cell .v { font-size:15px; font-weight:800; font-variant-numeric: tabular-nums; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .upd-msg { margin-top:12px; padding:10px 12px; border-radius:12px; font-size:13px; line-height:1.55; background:var(--surface); border:1px solid var(--border); display:none; }
+  .upd-msg.show { display:block; }
+  .upd-msg.ok { background: color-mix(in srgb, var(--ok) 12%, transparent); border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
+  .upd-msg.err { background: color-mix(in srgb, var(--danger) 10%, transparent); border-color: color-mix(in srgb, var(--danger) 30%, transparent); color: var(--danger); }
+  .upd-notes { margin-top:10px; max-height:160px; overflow:auto; white-space:pre-wrap; font-size:12px; color:var(--sub); line-height:1.55; }
+  .upd-spin { display:inline-block; width:12px; height:12px; border:2px solid currentColor; border-right-color:transparent; border-radius:50%; animation: rsSpin 0.8s linear infinite; vertical-align:-2px; margin-right:6px; }
+  @keyframes rsSpin { to { transform: rotate(360deg); } }
+  .tab-btn .ic { position:relative; }
+  .tab-btn .ic .nd { position:absolute; top:2px; right:10px; width:8px; height:8px; border-radius:50%; background:var(--danger); box-shadow:0 0 0 2px var(--bg); display:none; }
+  .tab-btn.has-update .ic .nd { display:block; }
 
   /* ===== Login ===== */
   #login { position:fixed; inset:0; background: var(--bg-grad), var(--bg); display:flex; align-items:center; justify-content:center; padding:20px; z-index:99; }
@@ -1198,6 +1215,22 @@ function renderWebApp() {
       <input class="search-inp" id="modSearch" placeholder="모듈 검색..." style="margin-bottom:8px;" />
       <div id="modList"></div>
     </div>
+    <div class="card" id="updateCard">
+      <h3><span>🔄 업데이트</span><span class="badge" id="updBadge">확인 전</span></h3>
+      <div class="upd-grid">
+        <div class="upd-cell"><div class="k">릴레이 서버</div><div class="v" id="updRelay">-</div></div>
+        <div class="upd-cell"><div class="k">PC 플러그인</div><div class="v" id="updPlugin">-</div></div>
+        <div class="upd-cell"><div class="k">최신 릴리즈</div><div class="v" id="updLatest">-</div></div>
+      </div>
+      <div class="upd-msg" id="updMsg"></div>
+      <div class="upd-notes" id="updNotes" style="display:none;"></div>
+      <div class="btn-row">
+        <button class="btn sec" id="updCheckBtn">업데이트 확인</button>
+        <button class="btn" id="updApplyBtn" style="display:none;">서버 업데이트</button>
+        <a class="btn sec" id="updNotesLink" target="_blank" rel="noopener" style="display:none; text-decoration:none;">릴리즈 페이지</a>
+      </div>
+      <div class="hint">서버 업데이트는 GitHub 공식 릴리즈만 받아 SHA-256·매니페스트를 검증한 뒤 백업하고 교체합니다. 새 버전이 시작되지 못하면 자동으로 되돌립니다. 플러그인(risustand.js)은 PC RisuAI의 플러그인 설정에서 업데이트됩니다.</div>
+    </div>
   </section>
 
   <!-- TAB 4: MODEL ROUTER & TRANSLATOR -->
@@ -1286,7 +1319,7 @@ function renderWebApp() {
   <nav class="tabbar">
     <button class="tab-btn active" data-tab="chat" onclick="switchTab('chat')"><span class="ic">📖</span>독서/채팅</button>
     <button class="tab-btn" data-tab="bots" onclick="switchTab('bots')"><span class="ic">📚</span>봇/방</button>
-    <button class="tab-btn" data-tab="modules" onclick="switchTab('modules')"><span class="ic">🧩</span>모듈/설정</button>
+    <button class="tab-btn" data-tab="modules" onclick="switchTab('modules')"><span class="ic">🧩<span class="nd"></span></span>모듈/설정</button>
     <button class="tab-btn" data-tab="router" onclick="switchTab('router')"><span class="ic">⚡</span>모델/번역</button>
   </nav>
 </div>
@@ -1460,7 +1493,7 @@ function renderWebApp() {
     document.getElementById('composerBar').style.display = tab === 'chat' ? 'flex' : 'none';
     if (tab === 'router') loadRouterConfig();
     if (tab === 'bots') renderBots();
-    if (tab === 'modules') renderModules();
+    if (tab === 'modules') { renderModules(); refreshUpdateStatus(); }
   }
 
   async function tryLogin(t) {
@@ -1494,6 +1527,8 @@ function renderWebApp() {
     const genTag = (st.generating || st.directGenerating) ? ' · ✨ 생성 중...' : '';
     document.getElementById('hdrSub').textContent = (uiPref.assetMode === 'hide' ? '대화' : (snap.chatName || '채팅방')) + ' · ' + modeTag + genTag;
     document.getElementById('sendBtn').disabled = Boolean(st.generating || st.directGenerating);
+    document.querySelector('.tab-btn[data-tab="modules"]').classList.toggle('has-update', Boolean(st.updateAvailable));
+    if (st.pluginVersion) document.getElementById('updPlugin').textContent = 'v' + st.pluginVersion;
 
     const msgs = snap.messages || [];
     const sig = JSON.stringify([snap.charIndex, snap.chatIndex, msgs.length, msgs.length ? msgs[msgs.length-1].text.length : 0, st.generating, st.directGenerating, uiPref.theme, uiPref.assetMode]);
@@ -2145,6 +2180,95 @@ function renderWebApp() {
     toast('번역 설정 저장됨');
   };
 
+  // ---------- Remote update ----------
+  let updPolling = null;
+  function cmpVer(a, b) {
+    const pa = String(a || '0').split('.').map(Number), pb = String(b || '0').split('.').map(Number);
+    for (let i = 0; i < 3; i++) { const d = (pa[i] || 0) - (pb[i] || 0); if (d) return d > 0 ? 1 : -1; }
+    return 0;
+  }
+  function renderUpdate(u) {
+    if (!u) return;
+    const busy = ['checking', 'downloading', 'verifying', 'installing', 'restarting'].includes(u.phase);
+    const latest = u.latest;
+    document.getElementById('updRelay').textContent = 'v' + u.relayVersion;
+    document.getElementById('updPlugin').textContent = u.pluginVersion ? 'v' + u.pluginVersion : '연결 대기';
+    document.getElementById('updLatest').textContent = latest && latest.version ? 'v' + latest.version : '-';
+    const badge = document.getElementById('updBadge');
+    const msg = document.getElementById('updMsg');
+    const applyBtn = document.getElementById('updApplyBtn');
+    const checkBtn = document.getElementById('updCheckBtn');
+    const link = document.getElementById('updNotesLink');
+    const notes = document.getElementById('updNotes');
+    let text = '', cls = '';
+    if (!u.available) { badge.textContent = '사용 불가'; badge.className = 'badge'; text = '이 서버에는 업데이터(risustand-updater.cjs)가 없습니다. 릴리즈 ZIP을 한 번 직접 설치해 주세요.'; }
+    else if (busy) { badge.textContent = '진행 중'; badge.className = 'badge'; text = '<span class="upd-spin"></span>' + esc(u.message || u.phase) + (u.target ? ' (v' + esc(u.target) + ')' : ''); }
+    else if (u.phase === 'error') { badge.textContent = '실패'; badge.className = 'badge'; cls = 'err'; text = esc(u.message) + '<br><small>' + esc(u.error || '') + '</small>'; }
+    else if (latest && latest.updateAvailable) { badge.textContent = '새 버전'; badge.className = 'badge pc'; cls = 'ok'; text = 'v' + esc(latest.version) + ' 업데이트를 설치할 수 있습니다.' + (latest.hasAsset ? '' : '<br><small>이 릴리즈에는 검증 가능한 업데이트 ZIP이 없어 자동 설치할 수 없습니다.</small>'); }
+    else if (latest) { badge.textContent = '최신'; badge.className = 'badge pc'; text = '최신 버전을 사용 중입니다.'; }
+    else { badge.textContent = '확인 전'; badge.className = 'badge'; }
+    if (!busy && u.pluginVersion && cmpVer(u.pluginVersion, u.relayVersion) < 0) {
+      text += (text ? '<br>' : '') + '⚠️ PC 플러그인이 서버보다 오래되었습니다. PC RisuAI → 설정 → 플러그인에서 업데이트해 주세요.';
+    }
+    if (!busy && u.lastRollback && u.lastRollback.failedVersion && !(latest && cmpVer(latest.version, u.lastRollback.failedVersion) > 0)) {
+      text += (text ? '<br>' : '') + '⚠️ v' + esc(u.lastRollback.failedVersion) + ' 설치 후 서버가 시작되지 않아 v' + esc(u.lastRollback.restoredVersion) + '(으)로 자동 복구했습니다. PC 콘솔 로그를 확인해 주세요.';
+      if (cls !== 'err') cls = 'err';
+    }
+    if (u.stagedLaunchers && u.stagedLaunchers.length) {
+      text += (text ? '<br>' : '') + '런처 변경됨: ' + u.stagedLaunchers.map((x) => esc(x) + '.new').join(', ') + ' 파일을 확인 후 덮어써 주세요.';
+    }
+    msg.innerHTML = text;
+    msg.className = 'upd-msg' + (text ? ' show' : '') + (cls ? ' ' + cls : '');
+    applyBtn.style.display = latest && latest.updateAvailable && latest.hasAsset && u.available ? '' : 'none';
+    applyBtn.disabled = busy;
+    checkBtn.disabled = busy || !u.available;
+    if (latest && latest.htmlUrl) { link.href = latest.htmlUrl; link.style.display = ''; } else link.style.display = 'none';
+    if (latest && latest.updateAvailable && latest.notes) { notes.textContent = latest.notes; notes.style.display = ''; } else notes.style.display = 'none';
+  }
+  async function refreshUpdateStatus() {
+    try { const u = await api('/api/update/status'); renderUpdate(u); return u; } catch (_) { return null; }
+  }
+  document.getElementById('updCheckBtn').onclick = async () => {
+    const btn = document.getElementById('updCheckBtn');
+    btn.disabled = true;
+    try { renderUpdate(await api('/api/update/check', { method: 'POST', body: '{}' })); }
+    catch (e) { toast('확인 실패: ' + e.message); }
+    finally { btn.disabled = false; }
+  };
+  document.getElementById('updApplyBtn').onclick = async () => {
+    if (!confirm('릴레이 서버를 최신 버전으로 업데이트할까요?\\n잠시 연결이 끊겼다가 자동으로 다시 연결됩니다.')) return;
+    try { renderUpdate(await api('/api/update/apply', { method: 'POST', body: '{}' })); }
+    catch (e) { toast('업데이트 시작 실패: ' + e.message); return; }
+    watchUpdate();
+  };
+  function watchUpdate() {
+    clearInterval(updPolling);
+    const startedVersion = (lastState && lastState.relayVersion) || null;
+    let target = null, sawRestart = false;
+    const deadline = Date.now() + 180000;
+    updPolling = setInterval(async () => {
+      if (Date.now() > deadline) { clearInterval(updPolling); toast('업데이트 상태를 확인하지 못했습니다. PC 콘솔을 확인해 주세요.'); return; }
+      let u = null;
+      try { u = await api('/api/update/status'); } catch (_) { sawRestart = true; }
+      if (u) {
+        if (u.target) target = u.target;
+        if (u.phase === 'restarting') sawRestart = true;
+        if (sawRestart && u.phase === 'idle') {
+          clearInterval(updPolling);
+          if (target && u.relayVersion === target) { toast('v' + target + ' 업데이트 완료 — 화면을 새로 불러옵니다'); setTimeout(() => location.reload(), 900); }
+          else { renderUpdate(u); toast('새 버전이 시작되지 못해 v' + u.relayVersion + '(으)로 되돌렸습니다.'); }
+          return;
+        }
+        if (u.phase === 'error') { clearInterval(updPolling); renderUpdate(u); return; }
+        renderUpdate(u);
+      } else {
+        const msg = document.getElementById('updMsg');
+        msg.className = 'upd-msg show';
+        msg.innerHTML = '<span class="upd-spin"></span>서버 재시작 대기 중...';
+      }
+    }, 1500);
+  }
+
   if (token) tryLogin(token);
 </script>
 </body>
@@ -2175,6 +2299,143 @@ function sanitizeConfigForClient() {
             keyPreview: maskKey(config.translator.apiKey),
         },
     };
+}
+
+// ================= Remote Updater =================
+const ROOT_DIR = __dirname;
+let updater = null;
+try {
+    updater = require('./risustand-updater.cjs');
+} catch (e) {
+    console.warn('[Update] risustand-updater.cjs를 찾지 못해 원격 업데이트가 꺼져 있습니다.');
+}
+const updateLog = (m) => console.log(`[Update] ${m}`);
+const updateState = {
+    phase: 'idle', // idle | checking | downloading | verifying | installing | restarting | error
+    message: '',
+    error: null,
+    target: null,
+    info: null,
+    checkedAt: null,
+    stagedLaunchers: [],
+};
+const UPDATE_PHASE_LABEL = {
+    checking: '새 버전 확인 중...',
+    downloading: '공식 릴리즈 다운로드 중...',
+    verifying: '무결성 검증 중 (SHA-256 · 매니페스트 · 문법)...',
+    installing: '백업 후 파일 교체 중...',
+    restarting: '새 버전으로 재시작 중...',
+};
+
+function updateBusy() {
+    return ['checking', 'downloading', 'verifying', 'installing', 'restarting'].includes(updateState.phase);
+}
+
+function publicUpdateState() {
+    return {
+        available: Boolean(updater),
+        relayVersion: RELAY_VERSION,
+        pluginVersion: state.pluginVersion || null,
+        phase: updateState.phase,
+        message: updateState.message,
+        error: updateState.error,
+        target: updateState.target,
+        checkedAt: updateState.checkedAt,
+        stagedLaunchers: updateState.stagedLaunchers,
+        lastRollback: (() => {
+            const j = updater ? updater.readJournal(ROOT_DIR) : null;
+            return j && j.state === 'rolled_back' ? { failedVersion: j.to, restoredVersion: j.from, at: j.rolledBackAt || null } : null;
+        })(),
+        latest: updateState.info
+            ? {
+                version: updateState.info.latestVersion || null,
+                updateAvailable: Boolean(updateState.info.available),
+                htmlUrl: updateState.info.htmlUrl || null,
+                publishedAt: updateState.info.publishedAt || null,
+                notes: updateState.info.notes || '',
+                hasAsset: Boolean(updateState.info.asset && updateState.info.asset.sha256),
+            }
+            : null,
+    };
+}
+
+async function checkForUpdate() {
+    if (!updater) throw new Error('업데이터가 설치되어 있지 않습니다.');
+    const info = await updater.checkLatest({ currentVersion: RELAY_VERSION });
+    updateState.info = info;
+    updateState.checkedAt = new Date().toISOString();
+    return info;
+}
+
+async function runRemoteUpdate() {
+    updateState.error = null;
+    updateState.stagedLaunchers = [];
+    try {
+        const r = await updater.updateToLatest({
+            root: ROOT_DIR,
+            currentVersion: RELAY_VERSION,
+            log: updateLog,
+            onPhase: (phase, d) => {
+                updateState.phase = phase;
+                updateState.message = UPDATE_PHASE_LABEL[phase] || phase;
+                if (d && d.version) updateState.target = d.version;
+                updateLog(updateState.message);
+            },
+        });
+        updateState.info = r.info;
+        updateState.checkedAt = new Date().toISOString();
+        if (!r.updated) {
+            updateState.phase = 'idle';
+            updateState.message = '이미 최신 버전입니다.';
+            return;
+        }
+        updateState.stagedLaunchers = r.stagedLaunchers || [];
+        for (const rel of updateState.stagedLaunchers) updateLog(`런처 변경: ${rel}.new 를 확인 후 ${rel} 에 덮어써 주세요.`);
+        updateState.phase = 'restarting';
+        updateState.message = UPDATE_PHASE_LABEL.restarting;
+        // Give the phone a moment to read the "restarting" state.
+        setTimeout(() => restartRelay({ guardUpdate: true }), 1200);
+    } catch (e) {
+        updateState.phase = 'error';
+        updateState.error = e && e.message ? e.message : String(e);
+        updateState.message = '업데이트 실패 — 기존 버전이 그대로 유지됩니다.';
+        updateLog(`실패: ${updateState.error}${e && e.code ? ` (${e.code})` : ''}`);
+    }
+}
+
+/**
+ * Hands the port to a fresh process running the files now on disk and stays alive as its
+ * supervisor (same console window, same token). If the freshly installed version exits
+ * within 20s, the backup is restored and the previous version is started instead.
+ */
+function restartRelay({ guardUpdate }) {
+    const childEnv = { ...process.env, RISU_REMOTE_TOKEN: TOKEN, PORT: String(PORT), HOST };
+    let child = null;
+    const launch = (allowRollback) => {
+        const startedAt = Date.now();
+        child = spawn(process.execPath, [path.join(ROOT_DIR, 'risustand-relay-server.js'), ...process.argv.slice(2)], { stdio: 'inherit', env: childEnv });
+        child.on('exit', (code) => {
+            const quickFail = Date.now() - startedAt < 20000 && code !== 0;
+            const journal = updater ? updater.readJournal(ROOT_DIR) : null;
+            if (allowRollback && quickFail && journal && journal.state === 'installed') {
+                console.error('[Update] 새 버전이 정상적으로 시작되지 않아 이전 버전으로 되돌립니다.');
+                try {
+                    updater.rollback(ROOT_DIR, { log: updateLog });
+                } catch (e) {
+                    console.error('[Update] 롤백 실패:', e.message);
+                    process.exit(1);
+                }
+                launch(false);
+                return;
+            }
+            process.exit(code == null ? 1 : code);
+        });
+    };
+    // Ctrl+C reaches both processes in the console; the child decides, we follow its exit.
+    process.on('SIGINT', () => {});
+    process.on('SIGTERM', () => child && child.kill('SIGTERM'));
+    server.close(() => launch(guardUpdate));
+    if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
 }
 
 // ================= HTTP Server =================
@@ -2223,15 +2484,43 @@ const server = http.createServer(async (req, res) => {
             state.pcConnected = true;
             state.pcLastSeen = Date.now();
             state.bridgeVersion = body.bridgeVersion || '1.0.0';
+            state.pluginVersion = typeof body.pluginVersion === 'string' ? body.pluginVersion.slice(0, 32) : null;
             state.generating = Boolean(body.generating);
             if (body.catalog) state.catalog = body.catalog;
             if (body.snapshot) state.snapshot = body.snapshot;
 
             const nextCmd = state.commandQueue.shift() || null;
-            return sendJson(res, 200, { ok: true, command: nextCmd });
+            return sendJson(res, 200, { ok: true, command: nextCmd, relayVersion: RELAY_VERSION });
         } catch (e) {
             return sendJson(res, 400, { error: e.message });
         }
+    }
+
+    // Remote update (token-protected; downloads only from the official GitHub repository)
+    if (pathname === '/api/update/status' && req.method === 'GET') {
+        if (!requireAuth(req, res, urlObj)) return;
+        return sendJson(res, 200, publicUpdateState());
+    }
+    if (pathname === '/api/update/check' && req.method === 'POST') {
+        if (!requireAuth(req, res, urlObj)) return;
+        if (!updater) return sendJson(res, 501, { error: '업데이터가 설치되어 있지 않습니다.' });
+        if (updateBusy()) return sendJson(res, 200, publicUpdateState());
+        try {
+            await checkForUpdate();
+            if (updateState.phase === 'error') updateState.phase = 'idle';
+            return sendJson(res, 200, publicUpdateState());
+        } catch (e) {
+            return sendJson(res, 502, { error: e.message });
+        }
+    }
+    if (pathname === '/api/update/apply' && req.method === 'POST') {
+        if (!requireAuth(req, res, urlObj)) return;
+        if (!updater) return sendJson(res, 501, { error: '업데이터가 설치되어 있지 않습니다.' });
+        if (updateBusy()) return sendJson(res, 409, { error: '업데이트가 이미 진행 중입니다.' });
+        updateState.phase = 'checking';
+        updateState.message = UPDATE_PHASE_LABEL.checking;
+        runRemoteUpdate();
+        return sendJson(res, 202, publicUpdateState());
     }
 
     // 4) Client State
@@ -2242,6 +2531,9 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, {
             pcConnected: connected,
             bridgeVersion: state.bridgeVersion,
+            relayVersion: RELAY_VERSION,
+            pluginVersion: state.pluginVersion || null,
+            updateAvailable: Boolean(updateState.info && updateState.info.available),
             generating: state.generating,
             directGenerating: state.directGenerating,
             catalog: state.catalog,
@@ -2355,10 +2647,35 @@ const server = http.createServer(async (req, res) => {
     sendJson(res, 404, { error: 'Not found' });
 });
 
-server.listen(PORT, HOST, () => {
+let recoveredFromInterruptedUpdate = false;
+if (updater) {
+    try {
+        recoveredFromInterruptedUpdate = updater.recoverIfNeeded(ROOT_DIR, { log: updateLog }).rolledBack;
+    } catch (e) {
+        console.error('[Update] 미완료 업데이트 복구 실패:', e.message);
+    }
+}
+
+if (recoveredFromInterruptedUpdate) {
+    // This process may have loaded half-written files; run the restored version instead.
+    console.log('[Update] 중단된 업데이트를 되돌렸습니다. 복구된 버전으로 다시 시작합니다.');
+    const child = spawn(process.execPath, [__filename, ...process.argv.slice(2)], { stdio: 'inherit', env: { ...process.env, RISU_REMOTE_TOKEN: TOKEN } });
+    process.on('SIGINT', () => {});
+    child.on('exit', (code) => process.exit(code == null ? 1 : code));
+} else server.listen(PORT, HOST, () => {
+    if (updater) {
+        try {
+            if (updater.commitInstalled(ROOT_DIR, RELAY_VERSION)) updateLog(`v${RELAY_VERSION} 업데이트가 확정되었습니다.`);
+        } catch (_) {}
+        checkForUpdate()
+            .then((info) => {
+                if (info.available) updateLog(`새 버전 v${info.latestVersion} 이(가) 있습니다. 모바일 '모듈/설정' 탭 또는 update-risustand 로 업데이트하세요.`);
+            })
+            .catch(() => {});
+    }
     console.log('');
     console.log('======================================================');
-    console.log('  📡 RisuStand Remote Relay Server v1.0.0 실행 중');
+    console.log(`  📡 RisuStand Remote Relay Server v${RELAY_VERSION} 실행 중`);
     console.log('======================================================');
     console.log(`  로컬 접속 주소 : http://127.0.0.1:${PORT}`);
     console.log(`  프록시 라우터  : http://127.0.0.1:${PORT}/v1/chat/completions`);

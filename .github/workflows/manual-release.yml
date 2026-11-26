@@ -1,0 +1,292 @@
+name: Manual Release
+# Forked from Librarian-System's Manual Release and scaled to RisuStand.
+# Run from Actions -> Manual Release -> Run workflow (branch: main).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version x.y.z. Empty: next patch. Equal to VERSION: publish the current commit as-is. Higher: bump to it.'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  manual-release:
+    name: manual-release
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: risustand-manual-release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Resolve release transaction state (Fence #1)
+        id: state
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "${{ github.ref }}" != "refs/heads/main" ]]; then
+            echo "Error: Manual release is only permitted on main (attempted on ${{ github.ref }})."
+            exit 1
+          fi
+          EXPECTED_RELEASE_SHA="${{ github.sha }}"
+          git fetch origin main --tags
+          CURRENT_MAIN_SHA=$(git rev-parse origin/main)
+          if [[ "$CURRENT_MAIN_SHA" != "$EXPECTED_RELEASE_SHA" ]]; then
+            echo "Error: main moved after this run started (validated $EXPECTED_RELEASE_SHA, now $CURRENT_MAIN_SHA)."
+            echo "Re-run Manual Release against the current main commit."
+            exit 1
+          fi
+          git checkout -B main "$EXPECTED_RELEASE_SHA"
+          # The requested version reaches the script only as an environment value, never as script text.
+          CURRENT_MAIN_SHA="$CURRENT_MAIN_SHA" EXPECTED_RELEASE_SHA="$EXPECTED_RELEASE_SHA" REQUESTED_VERSION="$REQUESTED_VERSION" node -e '
+          const fs = require("node:fs");
+          const { execFileSync } = require("node:child_process");
+          const { determineReleaseState, resolveReleaseTarget, verifyReleaseShaFence } = require("./tools/release_transaction.cjs");
+          verifyReleaseShaFence({ expectedSha: process.env.EXPECTED_RELEASE_SHA, currentMainSha: process.env.CURRENT_MAIN_SHA, stage: "fence1" });
+          const currentVersion = fs.readFileSync("VERSION", "utf8").trim();
+          const headSubject = execFileSync("git", ["log", "-1", "--pretty=%s"], { encoding: "utf8" }).trim();
+          const parentVersion = headSubject.startsWith("chore(release):")
+            ? execFileSync("git", ["show", "HEAD^:VERSION"], { encoding: "utf8" }).trim()
+            : null;
+          const state = resolveReleaseTarget({ state: determineReleaseState({ headSubject, currentVersion, parentVersion }),
+            currentVersion, requestedVersion: process.env.REQUESTED_VERSION || "" });
+          const seedRef = state.phase === "resume" ? "HEAD^" : "HEAD";
+          const seedCommit = execFileSync("git", ["rev-parse", seedRef], { encoding: "utf8" }).trim();
+          const generatedAt = execFileSync("git", ["show", "-s", "--format=%cI", seedRef], { encoding: "utf8" }).trim();
+          console.log(JSON.stringify({ ...state, commit: process.env.CURRENT_MAIN_SHA, seedCommit, seedRef }));
+          fs.appendFileSync(process.env.GITHUB_ENV,
+            `EXPECTED_RELEASE_SHA=${process.env.EXPECTED_RELEASE_SHA}\n` +
+            `CURRENT_VERSION=${currentVersion}\nPREVIOUS_VERSION=${state.previousVersion || currentVersion}\nNEXT_VERSION=${state.targetVersion}\n` +
+            `RELEASE_COMMIT_SHA=${process.env.CURRENT_MAIN_SHA}\nRELEASE_PHASE=${state.phase}\n` +
+            `RISUSTAND_RELEASE_BUILD_ID=release-${seedCommit}\n` +
+            `RISUSTAND_RELEASE_GENERATED_AT=${generatedAt}\n`);
+          '
+
+      - name: Guard against duplicate version transaction
+        if: env.RELEASE_PHASE == 'prepare' || env.RELEASE_PHASE == 'current'
+        run: |
+          if git rev-parse -q --verify "refs/tags/v${NEXT_VERSION}" >/dev/null; then
+            # A "current" release that stopped after tagging may resume only on the same commit.
+            if [[ "$RELEASE_PHASE" == "current" && "$(git rev-list -n 1 "v${NEXT_VERSION}")" == "$RELEASE_COMMIT_SHA" ]]; then
+              echo "Tag v${NEXT_VERSION} already marks ${RELEASE_COMMIT_SHA}; resuming the current-version release."
+              exit 0
+            fi
+            echo "Error: Tag v${NEXT_VERSION} already exists. Aborting release without modification."
+            exit 1
+          fi
+          echo "Tag v${NEXT_VERSION} is unique and available."
+
+      - name: Run release builder
+        run: |
+          mkdir -p "$RUNNER_TEMP/risustand-release"
+          if [[ "$RELEASE_PHASE" == "prepare" ]]; then
+            node tools/build_release.cjs --version "$NEXT_VERSION" --output-dir "$RUNNER_TEMP/risustand-release"
+          else
+            node tools/build_release.cjs --check --output-dir "$RUNNER_TEMP/risustand-release"
+          fi
+
+      - name: Verify build report publication contract
+        run: |
+          node -e '
+          const fs = require("node:fs");
+          const crypto = require("node:crypto");
+          const v = process.env.NEXT_VERSION;
+          const dir = process.env.RUNNER_TEMP + "/risustand-release";
+          const report = JSON.parse(fs.readFileSync(`${dir}/RisuStand-${v}.build-report.json`, "utf8"));
+          const zip = fs.readFileSync(`${dir}/RisuStand-${v}.zip`);
+          const required = {
+            schema: "risustand.build-report.v1",
+            packageVersion: v,
+            releaseTag: `v${v}`,
+            assetName: `RisuStand-${v}.zip`,
+            archiveSha256: crypto.createHash("sha256").update(zip).digest("hex"),
+            archiveBytes: zip.length,
+            updaterVerified: true,
+          };
+          let bad = false;
+          for (const [k, want] of Object.entries(required)) {
+            if (report[k] !== want) { console.error(`Build report mismatch: ${k} = ${report[k]} (expected ${want})`); bad = true; }
+          }
+          if (bad) process.exit(1);
+          console.log("Build report publication contract verified.");
+          '
+
+      - name: Verify version transaction changes against contract
+        if: env.RELEASE_PHASE == 'prepare'
+        run: |
+          node -e '
+          const fs = require("node:fs");
+          const { execSync } = require("node:child_process");
+          const { VERSION_TRANSACTION_FILES } = require("./tools/release_version.cjs");
+          const status = execSync("git -c core.quotePath=false status --porcelain=v1 -z --untracked-files=all", { encoding: "utf8" });
+          const entries = status.split("\0").filter(Boolean);
+          if (!entries.length) { console.error("No file modifications found after version bump"); process.exit(1); }
+          const allowed = new Set(VERSION_TRANSACTION_FILES);
+          const files = [];
+          for (let i = 0; i < entries.length; i += 1) {
+            const code = entries[i].slice(0, 2);
+            files.push(entries[i].slice(3));
+            if (/[RC]/.test(code)) files.push(entries[++i]);
+          }
+          for (const file of files) {
+            if (!allowed.has(file)) { console.error(`Disallowed file modified outside VERSION_TRANSACTION_FILES: ${file}`); process.exit(1); }
+          }
+          const v = fs.readFileSync("VERSION", "utf8").trim();
+          if (v !== process.env.NEXT_VERSION) { console.error(`VERSION (${v}) != NEXT_VERSION (${process.env.NEXT_VERSION})`); process.exit(1); }
+          console.log("All modified files match VERSION_TRANSACTION_FILES.");
+          '
+
+      - name: Run release regressions
+        env:
+          RISUSTAND_PREBUILT_RELEASE_DIR: ${{ runner.temp }}/risustand-release
+        run: node --test "tests/*_test.cjs"
+
+      - name: Verify main commit unchanged before commit (Fence #2)
+        if: env.RELEASE_PHASE == 'prepare'
+        run: |
+          git fetch origin main
+          CURRENT_MAIN_SHA=$(git rev-parse origin/main)
+          CURRENT_MAIN_SHA="$CURRENT_MAIN_SHA" node -e '
+          require("./tools/release_transaction.cjs").verifyReleaseShaFence({
+            expectedSha: process.env.EXPECTED_RELEASE_SHA, currentMainSha: process.env.CURRENT_MAIN_SHA, stage: "fence2" });
+          '
+          echo "Fence #2 passed: origin/main still at $EXPECTED_RELEASE_SHA."
+
+      - name: Commit release version
+        if: env.RELEASE_PHASE == 'prepare'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          node -e '
+          const { execFileSync } = require("node:child_process");
+          const { VERSION_TRANSACTION_FILES } = require("./tools/release_version.cjs");
+          execFileSync("git", ["add", "--", ...VERSION_TRANSACTION_FILES], { stdio: "inherit" });
+          '
+          git commit -m "chore(release): v${NEXT_VERSION}"
+          echo "RELEASE_COMMIT_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Push release commit to main
+        if: env.RELEASE_PHASE == 'prepare'
+        run: |
+          git fetch origin main
+          if git merge-base --is-ancestor "$RELEASE_COMMIT_SHA" origin/main; then
+            echo "Release commit ${RELEASE_COMMIT_SHA} is already on origin/main."
+          else
+            git push origin "HEAD:main"
+          fi
+
+      - name: Create or reuse release tag
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$RELEASE_COMMIT_SHA" origin/main; then
+            echo "Release commit ${RELEASE_COMMIT_SHA} is no longer on origin/main."
+            exit 1
+          fi
+          TAG="v${NEXT_VERSION}"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            TAG_SHA=$(git rev-list -n 1 "${TAG}")
+            if [[ "$TAG_SHA" != "$RELEASE_COMMIT_SHA" ]]; then
+              echo "Tag ${TAG} points to ${TAG_SHA}, expected ${RELEASE_COMMIT_SHA}."
+              exit 1
+            fi
+            echo "Reusing existing tag ${TAG}."
+          else
+            git tag "${TAG}" "$RELEASE_COMMIT_SHA"
+            git push origin "${TAG}"
+            echo "Created and pushed tag ${TAG}."
+          fi
+
+      - name: Create GitHub Release
+        id: github-release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OUT="$RUNNER_TEMP/risustand-release"
+          ASSETS=("$OUT/RisuStand-${NEXT_VERSION}.zip" "$OUT/RisuStand-${NEXT_VERSION}.build-report.json")
+          TAG="v${NEXT_VERSION}"
+          if gh release view "$TAG" --json tagName,url,assets >/tmp/risustand-release.json 2>/dev/null; then
+            RELEASE_URL=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("/tmp/risustand-release.json", "utf8")).url)')
+            RELEASE_TAG=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("/tmp/risustand-release.json", "utf8")).tagName)')
+            [[ "$RELEASE_TAG" == "$TAG" ]] || { echo "Existing GitHub Release has unexpected tag ${RELEASE_TAG}."; exit 1; }
+            missing=()
+            for f in "${ASSETS[@]}"; do
+              name=$(basename "$f")
+              exists=$(node -e '
+                const r = JSON.parse(require("fs").readFileSync("/tmp/risustand-release.json", "utf8"));
+                process.stdout.write((r.assets || []).some(a => a.name === process.argv[1]) ? "true" : "false");
+              ' "$name")
+              if [[ "$exists" == "true" ]]; then
+                if ! gh release download "$TAG" --pattern "$name" --dir "$RUNNER_TEMP/risustand-release-existing" --clobber >/dev/null 2>&1; then
+                  echo "Existing asset ${name} is listed but could not be downloaded; refusing to treat that as missing."
+                  exit 1
+                fi
+                expected=$(sha256sum "$f" | cut -d' ' -f1)
+                actual=$(sha256sum "$RUNNER_TEMP/risustand-release-existing/$name" | cut -d' ' -f1)
+                if [[ "$expected" != "$actual" ]]; then
+                  echo "Existing asset ${name} has a different SHA-256 (${actual}, expected ${expected})."
+                  exit 1
+                fi
+              else
+                missing+=("$f")
+              fi
+            done
+            if ((${#missing[@]} > 0)); then
+              gh release upload "$TAG" "${missing[@]}"
+              echo "Uploaded ${#missing[@]} missing asset(s) to ${RELEASE_URL}."
+            else
+              echo "Reusing complete GitHub Release ${RELEASE_URL}."
+            fi
+          else
+            RELEASE_URL=$(gh release create "$TAG" "${ASSETS[@]}" \
+              --title "RisuStand v${NEXT_VERSION}" \
+              --generate-notes \
+              --latest)
+          fi
+          echo "url=${RELEASE_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release build artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: risustand-release-v${{ env.NEXT_VERSION }}
+          path: |
+            ${{ runner.temp }}/risustand-release/*.zip
+            ${{ runner.temp }}/risustand-release/*.build-report.json
+          if-no-files-found: error
+
+      - name: Write job summary
+        if: always()
+        env:
+          RELEASE_STATUS: ${{ job.status }}
+          RELEASE_URL: ${{ steps.github-release.outputs.url }}
+        run: |
+          node -e '
+          const fs = require("node:fs");
+          const v = process.env.NEXT_VERSION;
+          let report = "Build report not available";
+          try { report = fs.readFileSync(`${process.env.RUNNER_TEMP}/risustand-release/RisuStand-${v}.build-report.json`, "utf8"); } catch (_) {}
+          fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, [
+            "# RisuStand Manual Release Summary", "",
+            `- **Status**: ${process.env.RELEASE_STATUS}`,
+            `- **Phase**: ${process.env.RELEASE_PHASE || "unknown"}`,
+            `- **Version**: ${v || "N/A"} (from ${process.env.PREVIOUS_VERSION || "N/A"})`,
+            `- **Release commit**: \`${process.env.RELEASE_COMMIT_SHA || process.env.GITHUB_SHA}\``,
+            `- **Release**: ${process.env.RELEASE_URL || "not created"}`, "",
+            "## Build Report", "```json", report, "```", "",
+            "If this run failed after the release commit was pushed, simply re-run Manual Release:",
+            "it detects the chore(release) commit and resumes without bumping the version again."
+          ].join("\n") + "\n");
+          '

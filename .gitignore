@@ -1,6 +1,28 @@
-# RisuStand local secrets & user settings (NEVER commit!)
+# ── RisuStand local secrets & personal settings (NEVER commit / NEVER ship) ──
+# Relay access token and personal config (API keys, preset toggles)
 .risustand-token
 .risustand-config.json
+# Any other local RisuStand state file, backups or variants of the above
+.risustand-*
+*.risustand-token*
+*.risustand-config*
+# Generic secret files
+.env
+.env.*
+*.pem
+*.key
+
+# ── Updater working state (journal, backups of your previous install) ──
+.update/
+*.new
+*.rs-tmp-*
+
+# ── Release builder output ──
+dist/
+RELEASES/
+
+# ── OS / editor noise ──
 .DS_Store
 Thumbs.db
+desktop.ini
 node_modules/

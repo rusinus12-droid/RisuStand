@@ -7,6 +7,8 @@
 // Required Notice: Copyright (c) 2026 rusinus12
 
 (async () => {
+    // Kept in sync with //@version by tools/release_version.cjs
+    const RISUSTAND_VERSION = '1.0.0';
     const STORAGE_KEY = 'risustand_v1';
     const LEGACY_STORAGE_KEY = 'risu_ultra_custom_shell_v2';
     const STYLE_ATTR = 'x-risustand-style';
@@ -3326,7 +3328,7 @@
             </style>
             <div class="shell">
                 <div class="header">
-                    <h1><span class="logo">📖</span>RisuStand <span class="ver">v1.0.0</span></h1>
+                    <h1><span class="logo">📖</span>RisuStand <span class="ver">v${RISUSTAND_VERSION}</span></h1>
                     <div class="hdr-actions">
                         <button class="close-btn" id="btn-open-clone">🖥️ <span class="lbl-long">공홈 · EPUB </span>전용 뷰</button>
                         <button class="close-btn" id="btn-close" aria-label="닫기">✕<span class="lbl-long"> 닫기</span></button>
@@ -4296,6 +4298,7 @@
                     },
                     body: JSON.stringify({
                         bridgeVersion: '2.0.0',
+                        pluginVersion: RISUSTAND_VERSION,
                         generating: isGenerating,
                         catalog,
                         snapshot,
@@ -4308,7 +4311,7 @@
                 }
     
                 const data = await res.json();
-                lastStatus = '🟢 중계 서버 v2.0 연결됨';
+                lastStatus = data && data.relayVersion ? `🟢 중계 서버 v${data.relayVersion} 연결됨` : '🟢 중계 서버 연결됨';
                 lastSyncTime = new Date().toLocaleTimeString();
     
                 if (data && data.command) {
@@ -4499,5 +4502,5 @@
         await upsertStyleTag('theme-layout-stealth', '');
     });
 
-    console.log('[RisuStand] v1.0.0 initialized');
+    console.log(`[RisuStand] v${RISUSTAND_VERSION} initialized`);
 })();
