@@ -156,3 +156,50 @@ test('updateToLatest against a fake GitHub: digest required and enforced, then i
     const again = await updater.updateToLatest({ root: dir1, fetchImpl: good.fetchImpl });
     assert.equal(again.updated, false);
 });
+
+test('manifest.files hash mismatch and non-HTTPS asset URLs are rejected', async () => {
+    const { version, zip } = buildNext();
+    const entries = updater.readZip(zip);
+    const prefix = `RisuStand-${version}/`;
+    const crypto = require('node:crypto');
+    const files = new Map(entries.map((e) => [e.name.slice(prefix.length), e.data]));
+    const manifest = JSON.parse(files.get('update-manifest.json'));
+    manifest.files['VERSION'] = '0'.repeat(64);
+    const manifestBuf = Buffer.from(JSON.stringify(manifest));
+    files.set('update-manifest.json', manifestBuf);
+    files.set('SHA256SUMS.txt', Buffer.from(
+        [...files].filter(([r]) => r !== 'SHA256SUMS.txt')
+            .map(([r, d]) => `${crypto.createHash('sha256').update(d).digest('hex')}  ${r}`)
+            .join('\n')
+    ));
+    const badManifestZip = writeZip([...files].map(([r, d]) => ({ name: prefix + r, data: d })));
+    assert.throws(
+        () => updater.verifyReleaseArchive(badManifestZip, { expectedVersion: version }),
+        (e) => e.code === 'manifest_files_mismatch'
+    );
+
+    await assert.rejects(
+        updater.downloadAsset({ url: 'http://example.invalid/asset.zip', sha256: 'a'.repeat(64), size: 100 }),
+        (e) => e.code === 'release_asset_url_invalid'
+    );
+});
+
+test('installRelease automatically rolls back if file replacement fails mid-install', () => {
+    const { version, zip } = buildNext();
+    const dir = installWithSecrets();
+    const before = updater.readInstalledVersion(dir);
+    const relayBefore = fs.readFileSync(path.join(dir, 'risustand-relay-server.js'));
+    const verified = updater.verifyReleaseArchive(zip, { expectedVersion: version });
+
+    // Force a failure when renaming/replacing the second-to-last program file (README.md -> directory conflict)
+    const targetConflict = path.join(dir, 'README.md');
+    fs.rmSync(targetConflict, { force: true });
+    fs.mkdirSync(targetConflict);
+
+    assert.throws(() => updater.installRelease(dir, verified));
+    fs.rmdirSync(targetConflict);
+    // Re-run rollback on the clean path or verify files already backed up before README.md were restored
+    assert.equal(updater.readInstalledVersion(dir), before);
+    assert.ok(fs.readFileSync(path.join(dir, 'risustand-relay-server.js')).equals(relayBefore));
+    assert.equal(updater.readJournal(dir).state, 'rolled_back');
+});

@@ -228,12 +228,31 @@ async function checkLatest({ currentVersion, fetchImpl } = {}) {
 
 async function downloadAsset(asset, { fetchImpl } = {}) {
     if (!asset || !asset.url) throw new UpdateError('release_asset_missing', '릴리즈에 공식 업데이트 ZIP이 없습니다.');
+    if (!/^https:\/\//i.test(String(asset.url))) throw new UpdateError('release_asset_url_invalid', 'HTTPS 공식 릴리즈 URL만 허용됩니다.');
     if (!asset.sha256) throw new UpdateError('release_asset_digest_missing', '릴리즈 ZIP의 SHA-256 정보가 없어 업데이트를 거부합니다.');
     if (asset.size > MAX_ZIP_BYTES) throw new UpdateError('release_asset_too_large', '업데이트 파일이 너무 큽니다.');
     const res = await fetchWithTimeout(asset.url, { fetchImpl, timeoutMs: 120000, headers: { Accept: 'application/octet-stream' } });
     if (!res.ok) throw new UpdateError('download_failed', `업데이트 파일 다운로드 실패 (HTTP ${res.status}).`);
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.length > MAX_ZIP_BYTES) throw new UpdateError('release_asset_too_large', '업데이트 파일이 너무 큽니다.');
+    let buf;
+    if (res.body && typeof res.body.getReader === 'function') {
+        const reader = res.body.getReader();
+        const chunks = [];
+        let total = 0;
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            total += value.byteLength || value.length || 0;
+            if (total > MAX_ZIP_BYTES) {
+                await reader.cancel().catch(() => {});
+                throw new UpdateError('release_asset_too_large', '업데이트 파일이 너무 큽니다.');
+            }
+            chunks.push(Buffer.from(value));
+        }
+        buf = Buffer.concat(chunks, total);
+    } else {
+        buf = Buffer.from(await res.arrayBuffer());
+        if (buf.length > MAX_ZIP_BYTES) throw new UpdateError('release_asset_too_large', '업데이트 파일이 너무 큽니다.');
+    }
     if (sha256(buf) !== asset.sha256) throw new UpdateError('release_sha256_mismatch', '다운로드한 파일의 SHA-256이 GitHub 릴리즈와 다릅니다.');
     return buf;
 }
@@ -317,6 +336,20 @@ function verifyReleaseArchive(buf, { expectedVersion, workDir = path.join(requir
     }
     for (const rel of sums.keys()) {
         if (!files.has(rel)) throw new UpdateError('checksum_extra', `SHA256SUMS.txt의 ${rel} 파일이 ZIP에 없습니다.`);
+    }
+
+    if (!manifest.files || typeof manifest.files !== 'object' || Array.isArray(manifest.files)) {
+        throw new UpdateError('manifest_files_mismatch', 'update-manifest.json의 files 항목이 올바르지 않습니다.');
+    }
+    const payloadRels = [...files.keys()].filter((rel) => !META_FILES.includes(rel));
+    const manifestKeys = Object.keys(manifest.files);
+    if (manifestKeys.length !== payloadRels.length) {
+        throw new UpdateError('manifest_files_mismatch', 'update-manifest.json의 파일 목록이 ZIP 내용과 다릅니다.');
+    }
+    for (const rel of payloadRels) {
+        if (!Object.prototype.hasOwnProperty.call(manifest.files, rel) || manifest.files[rel] !== sums.get(rel)) {
+            throw new UpdateError('manifest_files_mismatch', `update-manifest.json 해시 불일치: ${rel}`);
+        }
     }
 
     const version = files.get('VERSION').toString('utf8').trim();
@@ -424,37 +457,41 @@ function installRelease(root, verified, { currentVersion = readInstalledVersion(
         const journal = { schema: 'risustand.update-journal.v1', state: 'installing', from: currentVersion, to: verified.version, backupDir, files, startedAt: new Date().toISOString() };
         writeJournal(root, journal);
 
-        for (const f of files) {
-            if (f.hadOriginal) fs.copyFileSync(path.join(root, f.rel), path.join(backupDir, f.rel));
-        }
-        log(`백업 완료: ${backupDir}`);
-
-        for (const f of files) {
-            writeFileAtomic(path.join(root, f.rel), verified.files.get(f.rel));
-        }
-
-        const stagedLaunchers = [];
-        for (const rel of LAUNCHER_FILES) {
-            if (!verified.files.has(rel)) continue;
-            const data = verified.files.get(rel);
-            const target = path.join(root, rel);
-            const mode = EXECUTABLE_FILES.has(rel) ? 0o755 : undefined;
-            if (!fs.existsSync(target)) {
-                writeFileAtomic(target, data, mode);
-            } else if (!fs.readFileSync(target).equals(data)) {
-                writeFileAtomic(`${target}.new`, data, mode);
-                stagedLaunchers.push(rel);
+        try {
+            for (const f of files) {
+                if (f.hadOriginal) fs.copyFileSync(path.join(root, f.rel), path.join(backupDir, f.rel));
             }
-        }
+            log(`백업 완료: ${backupDir}`);
 
-        writeJournal(root, { ...journal, state: 'installed', stagedLaunchers });
-        log(`v${currentVersion} → v${verified.version} 파일 교체 완료`);
-        return { from: currentVersion, to: verified.version, stagedLaunchers, backupDir };
+            for (const f of files) {
+                writeFileAtomic(path.join(root, f.rel), verified.files.get(f.rel));
+            }
+
+            const stagedLaunchers = [];
+            for (const rel of LAUNCHER_FILES) {
+                if (!verified.files.has(rel)) continue;
+                const data = verified.files.get(rel);
+                const target = path.join(root, rel);
+                const mode = EXECUTABLE_FILES.has(rel) ? 0o755 : undefined;
+                if (!fs.existsSync(target)) {
+                    writeFileAtomic(target, data, mode);
+                } else if (!fs.readFileSync(target).equals(data)) {
+                    writeFileAtomic(`${target}.new`, data, mode);
+                    stagedLaunchers.push(rel);
+                }
+            }
+
+            writeJournal(root, { ...journal, state: 'installed', stagedLaunchers });
+            log(`v${currentVersion} → v${verified.version} 파일 교체 완료`);
+            return { from: currentVersion, to: verified.version, stagedLaunchers, backupDir };
+        } catch (err) {
+            try { rollbackUnlocked(root, { log }); } catch (_) {}
+            throw err;
+        }
     });
 }
 
-/** Restores the backup of the journal's install. Safe to call repeatedly. */
-function rollback(root, { log = () => {} } = {}) {
+function rollbackUnlocked(root, { log = () => {} } = {}) {
     root = path.resolve(root);
     const j = readJournal(root);
     if (!j || !['installing', 'installed'].includes(j.state)) return { rolledBack: false };
@@ -467,6 +504,11 @@ function rollback(root, { log = () => {} } = {}) {
     writeJournal(root, { ...j, state: 'rolled_back', rolledBackAt: new Date().toISOString() });
     log(`업데이트를 되돌렸습니다: v${j.to} → v${j.from}`);
     return { rolledBack: true, from: j.to, to: j.from };
+}
+
+/** Restores the backup of the journal's install. Safe to call repeatedly. */
+function rollback(root, opts = {}) {
+    return withLock(path.resolve(root), () => rollbackUnlocked(root, opts));
 }
 
 /** Called at relay start: an install that never finished is rolled back. */

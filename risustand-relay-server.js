@@ -22,8 +22,33 @@ const { spawn } = require('child_process');
 const RELAY_VERSION = '1.0.0';
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
-const TOKEN = (process.env.RISU_REMOTE_TOKEN || '').trim() || crypto.randomBytes(12).toString('hex');
-const CONFIG_PATH = path.join(__dirname, '.risustand-config.json');
+const ROOT_DIR = __dirname;
+const TOKEN_PATH = path.join(ROOT_DIR, '.risustand-token');
+const CONFIG_PATH = path.join(ROOT_DIR, '.risustand-config.json');
+
+function loadOrCreateToken(rootDir = ROOT_DIR) {
+    const envToken = (process.env.RISU_REMOTE_TOKEN || '').trim();
+    if (envToken) return envToken;
+    const tokenPath = path.join(rootDir, '.risustand-token');
+    try {
+        if (fs.existsSync(tokenPath)) {
+            const fileToken = fs.readFileSync(tokenPath, 'utf8').trim();
+            if (fileToken) return fileToken;
+        }
+    } catch (_) {}
+    const generated = crypto.randomBytes(16).toString('hex');
+    try {
+        fs.writeFileSync(tokenPath, `${generated}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    } catch (_) {
+        try {
+            const existing = fs.readFileSync(tokenPath, 'utf8').trim();
+            if (existing) return existing;
+        } catch (_) {}
+    }
+    return generated;
+}
+
+let TOKEN = (process.env.RISU_REMOTE_TOKEN || '').trim();
 
 // ================= Persistent Config =================
 function defaultConfig() {
@@ -103,9 +128,12 @@ function loadConfig() {
 }
 
 function saveConfig() {
+    const tmp = `${CONFIG_PATH}.rs-tmp-${crypto.randomBytes(6).toString('hex')}`;
     try {
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), 'utf8');
+        fs.writeFileSync(tmp, JSON.stringify(config, null, 2), { encoding: 'utf8', mode: 0o600 });
+        fs.renameSync(tmp, CONFIG_PATH);
     } catch (e) {
+        try { fs.rmSync(tmp, { force: true }); } catch (_) {}
         console.warn('[Config] 설정 저장 실패:', e.message);
     }
 }
@@ -113,12 +141,16 @@ function saveConfig() {
 let config = loadConfig();
 
 // ================= Runtime State =================
+const CMD_TTL_MS = 5 * 60 * 1000;
+const CMD_MAX_LEN = 50;
+
 const state = {
     pcConnected: false,
     pcLastSeen: 0,
     bridgeVersion: '',
     generating: false,
     directGenerating: false,
+    lastDirectError: null,
     catalog: {
         pcActiveCharIndex: -1,
         pcActiveChatIndex: -1,
@@ -155,16 +187,28 @@ function getActiveProfile() {
     return config.profiles.find((p) => p.id === config.activeProfileId) || null;
 }
 
+function pruneCommandQueue(now = Date.now()) {
+    state.commandQueue = state.commandQueue.filter((c) => now - c.createdAt <= CMD_TTL_MS);
+    if (state.commandQueue.length > CMD_MAX_LEN) {
+        state.commandQueue.splice(0, state.commandQueue.length - CMD_MAX_LEN);
+    }
+}
+
 function queueCommand(type, payload) {
+    const now = Date.now();
+    pruneCommandQueue(now);
     state.commandQueue.push({
         id: crypto.randomBytes(6).toString('hex'),
         type,
         payload: payload || {},
-        createdAt: Date.now(),
+        createdAt: now,
     });
+    if (state.commandQueue.length > CMD_MAX_LEN) {
+        state.commandQueue.shift();
+    }
 }
 
-// ================= HTTP Helpers =================
+// ================= HTTP & Security Helpers =================
 function readBody(req, limitBytes = 25 * 1024 * 1024) {
     return new Promise((resolve, reject) => {
         const chunks = [];
@@ -183,33 +227,153 @@ function readBody(req, limitBytes = 25 * 1024 * 1024) {
     });
 }
 
-function sendJson(res, status, data) {
+function isLoopbackAddress(addr) {
+    const raw = String(addr || '').trim();
+    return raw === '127.0.0.1' || raw === '::1' || raw === '::ffff:127.0.0.1';
+}
+
+function isTrustedOrigin(origin, hostHeader) {
+    if (!origin) return true;
+    const raw = String(origin).trim();
+    if (/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i.test(raw)) return true;
+    if (/^(tauri:\/\/localhost|https?:\/\/tauri\.localhost)$/i.test(raw)) return true;
+    if (hostHeader) {
+        try {
+            if (new URL(raw).host === String(hostHeader).trim()) return true;
+        } catch (_) {}
+    }
+    return false;
+}
+
+function corsHeaders(req) {
+    const origin = req && req.headers && req.headers.origin ? String(req.headers.origin).trim() : '';
+    const hostHeader = req && req.headers && req.headers.host ? String(req.headers.host).trim() : '';
+    if (!origin || !isTrustedOrigin(origin, hostHeader)) return {};
+    return {
+        'Access-Control-Allow-Origin': origin,
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-RisuStand-Token',
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+        'Vary': 'Origin',
+    };
+}
+
+function sendJson(res, status, data, req = null, extraHeaders = {}) {
     const body = JSON.stringify(data);
     res.writeHead(status, {
         'Content-Type': 'application/json; charset=utf-8',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-RisuStand-Token',
-        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+        ...corsHeaders(req),
+        ...extraHeaders,
     });
     res.end(body);
 }
 
-function getRequestToken(req, urlObj) {
+function getRequestToken(req) {
     const h = req.headers['x-risustand-token'];
     if (h) return String(h).trim();
     const auth = req.headers['authorization'] || '';
     if (auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim();
-    const q = urlObj.searchParams.get('token');
-    if (q) return q.trim();
     return '';
 }
 
-function requireAuth(req, res, urlObj) {
-    if (getRequestToken(req, urlObj) !== TOKEN) {
-        sendJson(res, 401, { error: 'Unauthorized: Invalid token' });
+function safeTokenEqual(provided, expected) {
+    const a = String(provided || '');
+    const b = String(expected || '');
+    if (!a || !b) return false;
+    const da = crypto.createHash('sha256').update(a, 'utf8').digest();
+    const db = crypto.createHash('sha256').update(b, 'utf8').digest();
+    return crypto.timingSafeEqual(da, db);
+}
+
+const AUTH_WINDOW_MS = 60 * 1000;
+const AUTH_MAX_FAILURES = 15;
+
+function createAuthRateLimiter() {
+    const failures = new Map();
+    const clientKey = (req) => String((req && req.socket && req.socket.remoteAddress) || 'unknown');
+    const isBlocked = (req, now = Date.now()) => {
+        const entry = failures.get(clientKey(req));
+        if (!entry) return false;
+        if (now - entry.windowStart >= AUTH_WINDOW_MS) {
+            failures.delete(clientKey(req));
+            return false;
+        }
+        return entry.count >= AUTH_MAX_FAILURES;
+    };
+    const recordFailure = (req, now = Date.now()) => {
+        const key = clientKey(req);
+        let entry = failures.get(key);
+        if (!entry || now - entry.windowStart >= AUTH_WINDOW_MS) {
+            if (failures.size >= 500) {
+                const oldest = failures.keys().next().value;
+                if (oldest !== undefined) failures.delete(oldest);
+            }
+            entry = { count: 0, windowStart: now };
+        }
+        entry.count += 1;
+        failures.set(key, entry);
+        return entry.count >= AUTH_MAX_FAILURES;
+    };
+    const reset = (req) => failures.delete(clientKey(req));
+    return { isBlocked, recordFailure, reset };
+}
+
+function makeRequireAuth(expectedToken, limiter) {
+    return function requireAuthFn(req, res) {
+        if (limiter.isBlocked(req)) {
+            sendJson(res, 429, { error: 'Too many failed authentication attempts. Try again later.' }, req, { 'Retry-After': '60' });
+            return false;
+        }
+        if (!safeTokenEqual(getRequestToken(req), expectedToken)) {
+            const blocked = limiter.recordFailure(req);
+            if (blocked) {
+                sendJson(res, 429, { error: 'Too many failed authentication attempts. Try again later.' }, req, { 'Retry-After': '60' });
+            } else {
+                sendJson(res, 401, { error: 'Unauthorized: Invalid token' }, req);
+            }
+            return false;
+        }
+        limiter.reset(req);
+        return true;
+    };
+}
+
+function makeRequireProxyAuth(expectedToken, limiter) {
+    return function requireProxyAuthFn(req, res) {
+        if (limiter.isBlocked(req)) {
+            sendJson(res, 429, { error: { message: 'Too many failed authentication attempts', type: 'rate_limit_error' } }, req, { 'Retry-After': '60' });
+            return false;
+        }
+        const provided = getRequestToken(req);
+        if (provided) {
+            if (safeTokenEqual(provided, expectedToken)) {
+                limiter.reset(req);
+                return true;
+            }
+            // Allow local PC RisuAI Custom API users who left a dummy key like 'risustand', unless untrusted Origin
+            if (isLoopbackAddress(req.socket && req.socket.remoteAddress)) {
+                const origin = req.headers && req.headers.origin;
+                if (origin && !isTrustedOrigin(origin, req.headers.host)) {
+                    sendJson(res, 403, { error: { message: 'Forbidden cross-origin request', type: 'auth_error' } }, req);
+                    return false;
+                }
+                return true;
+            }
+            limiter.recordFailure(req);
+            sendJson(res, 401, { error: { message: 'Unauthorized: Invalid token for remote proxy access', type: 'auth_error' } }, req);
+            return false;
+        }
+        if (isLoopbackAddress(req.socket && req.socket.remoteAddress)) {
+            const origin = req.headers && req.headers.origin;
+            if (origin && !isTrustedOrigin(origin, req.headers.host)) {
+                sendJson(res, 403, { error: { message: 'Forbidden cross-origin request', type: 'auth_error' } }, req);
+                return false;
+            }
+            return true;
+        }
+        limiter.recordFailure(req);
+        sendJson(res, 401, { error: { message: 'Unauthorized: Bearer token required for remote proxy access', type: 'auth_error' } }, req);
         return false;
-    }
-    return true;
+    };
 }
 
 // ================= LLM Router Core =================
@@ -237,6 +401,12 @@ function applyPromptOverride(messages, profile) {
     return list;
 }
 
+function parseOptionalNumber(v) {
+    if (v === '' || v === null || v === undefined) return undefined;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : undefined;
+}
+
 function normalizeMessageText(content) {
     if (typeof content === 'string') return content;
     if (Array.isArray(content)) {
@@ -248,114 +418,182 @@ function normalizeMessageText(content) {
     return String(content || '');
 }
 
+function normalizeTurnMessages(messages, { assistantRole = 'assistant', ensureUserFirst = false } = {}) {
+    const sysParts = [];
+    const turns = [];
+    for (const m of Array.isArray(messages) ? messages : []) {
+        const txt = normalizeMessageText(m && m.content);
+        if (m && m.role === 'system') {
+            if (txt) sysParts.push(txt);
+            continue;
+        }
+        const role = m && m.role === 'assistant' ? assistantRole : 'user';
+        const last = turns[turns.length - 1];
+        if (last && last.role === role) {
+            if (txt) last.text = last.text ? `${last.text}\n\n${txt}` : txt;
+        } else {
+            turns.push({ role, text: txt });
+        }
+    }
+    if (ensureUserFirst) {
+        if (!turns.length) turns.push({ role: 'user', text: 'Continue.' });
+        else if (turns[0].role !== 'user') turns.unshift({ role: 'user', text: '[Start]' });
+    } else if (!turns.length) {
+        turns.push({ role: 'user', text: 'Continue.' });
+    }
+    return { sysParts, turns };
+}
+
+function createTimeoutSignal(timeoutMs, externalSignal) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(new Error(`요청 시간 초과 (${Math.round(timeoutMs / 1000)}초)`)), timeoutMs);
+    let onAbort = null;
+    if (externalSignal) {
+        if (externalSignal.aborted) {
+            ctrl.abort(externalSignal.reason);
+        } else {
+            onAbort = () => ctrl.abort(externalSignal.reason);
+            externalSignal.addEventListener('abort', onAbort, { once: true });
+        }
+    }
+    const cleanup = () => {
+        clearTimeout(timer);
+        if (externalSignal && onAbort) externalSignal.removeEventListener('abort', onAbort);
+    };
+    return { signal: ctrl.signal, cleanup };
+}
+
+function mapUsageToOpenAI(usage) {
+    if (!usage || typeof usage !== 'object') {
+        return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+    }
+    if (typeof usage.prompt_tokens === 'number' || typeof usage.completion_tokens === 'number') {
+        const prompt = Number(usage.prompt_tokens || 0);
+        const completion = Number(usage.completion_tokens || 0);
+        return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: Number(usage.total_tokens || (prompt + completion)) };
+    }
+    if (typeof usage.input_tokens === 'number' || typeof usage.output_tokens === 'number') {
+        const prompt = Number(usage.input_tokens || 0);
+        const completion = Number(usage.output_tokens || 0);
+        return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion };
+    }
+    if (typeof usage.promptTokenCount === 'number' || typeof usage.candidatesTokenCount === 'number') {
+        const prompt = Number(usage.promptTokenCount || 0);
+        const completion = Number(usage.candidatesTokenCount || 0);
+        return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: Number(usage.totalTokenCount || (prompt + completion)) };
+    }
+    return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+}
+
 async function callLLMNonStream(profile, messages, extraOpts = {}) {
     if (!profile) throw new Error('활성화된 모델 프로필이 없습니다. [모델/번역] 탭에서 프로필을 선택하세요.');
     if (!profile.apiKey && profile.providerType !== 'openai_compat') {
         throw new Error(`프로필 "${profile.name}"의 API 키가 비어 있습니다.`);
     }
 
-    const tempVal = extraOpts.temperature !== undefined
-        ? extraOpts.temperature
-        : profile.temperature !== '' && profile.temperature !== undefined
-        ? Number(profile.temperature)
-        : undefined;
-    const maxTokVal = extraOpts.maxTokens !== undefined
-        ? extraOpts.maxTokens
-        : profile.maxTokens !== '' && profile.maxTokens !== undefined
-        ? Number(profile.maxTokens)
-        : undefined;
+    const tempVal = extraOpts.forceTemperature !== undefined
+        ? extraOpts.forceTemperature
+        : (parseOptionalNumber(profile.temperature) ?? parseOptionalNumber(extraOpts.temperature));
+    const maxTokVal = extraOpts.forceMaxTokens !== undefined
+        ? extraOpts.forceMaxTokens
+        : (parseOptionalNumber(profile.maxTokens) ?? parseOptionalNumber(extraOpts.maxTokens));
+    const timeoutMs = Number(extraOpts.timeoutMs) || 180000;
+    const { signal, cleanup } = createTimeoutSignal(timeoutMs, extraOpts.signal);
 
-    if (profile.providerType === 'anthropic') {
-        const sysParts = [];
-        const chatMsgs = [];
-        for (const m of messages) {
-            const txt = normalizeMessageText(m.content);
-            if (m.role === 'system') sysParts.push(txt);
-            else chatMsgs.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: txt });
+    try {
+        if (profile.providerType === 'anthropic') {
+            const { sysParts, turns } = normalizeTurnMessages(messages, { assistantRole: 'assistant', ensureUserFirst: true });
+            const body = {
+                model: profile.model,
+                max_tokens: maxTokVal || 4096,
+                messages: turns.map((t) => ({ role: t.role, content: t.text })),
+            };
+            if (sysParts.length) body.system = sysParts.join('\n\n');
+            if (tempVal !== undefined) body.temperature = tempVal;
+
+            const resp = await fetch(profile.baseUrl || 'https://api.anthropic.com/v1/messages', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-api-key': profile.apiKey,
+                    'anthropic-version': '2023-06-01',
+                },
+                body: JSON.stringify(body),
+                signal,
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) throw new Error(data.error?.message || `Anthropic HTTP ${resp.status}`);
+            const out = Array.isArray(data.content) ? data.content.map((b) => b.text || '').join('') : '';
+            return { text: out, model: data.model || profile.model, usage: data.usage || null };
         }
-        if (!chatMsgs.length) chatMsgs.push({ role: 'user', content: 'Continue.' });
+
+        if (profile.providerType === 'gemini') {
+            const base = (profile.baseUrl || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '');
+            const endpoint = `${base}/models/${encodeURIComponent(profile.model)}:generateContent`;
+            const { sysParts, turns } = normalizeTurnMessages(messages, { assistantRole: 'model', ensureUserFirst: false });
+            const contents = turns.map((t) => ({ role: t.role, parts: [{ text: t.text }] }));
+            const body = { contents };
+            if (sysParts.length) body.systemInstruction = { parts: [{ text: sysParts.join('\n\n') }] };
+            const genCfg = {};
+            if (tempVal !== undefined) genCfg.temperature = tempVal;
+            if (maxTokVal !== undefined) genCfg.maxOutputTokens = maxTokVal;
+            if (Object.keys(genCfg).length) body.generationConfig = genCfg;
+
+            const resp = await fetch(endpoint, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-goog-api-key': profile.apiKey,
+                },
+                body: JSON.stringify(body),
+                signal,
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) throw new Error(data.error?.message || `Gemini HTTP ${resp.status}`);
+            const parts = data.candidates?.[0]?.content?.parts || [];
+            const out = parts.map((p) => p.text || '').join('');
+            return { text: out, model: profile.model, usage: data.usageMetadata || null };
+        }
+
+        // Default: OpenAI-Compatible
+        const endpoint = profile.baseUrl || 'https://api.openai.com/v1/chat/completions';
+        const headers = { 'Content-Type': 'application/json' };
+        if (profile.apiKey) headers['Authorization'] = `Bearer ${profile.apiKey}`;
+        if (endpoint.includes('openrouter.ai')) {
+            headers['HTTP-Referer'] = `http://localhost:${PORT}`;
+            headers['X-Title'] = 'RisuStand Remote';
+        }
+
         const body = {
             model: profile.model,
-            max_tokens: maxTokVal || 4096,
-            messages: chatMsgs,
+            messages,
+            stream: false,
         };
-        if (sysParts.length) body.system = sysParts.join('\n\n');
-        if (tempVal !== undefined && !Number.isNaN(tempVal)) body.temperature = tempVal;
-
-        const resp = await fetch(profile.baseUrl || 'https://api.anthropic.com/v1/messages', {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'x-api-key': profile.apiKey,
-                'anthropic-version': '2023-06-01',
-            },
-            body: JSON.stringify(body),
-        });
-        const data = await resp.json().catch(() => ({}));
-        if (!resp.ok) throw new Error(data.error?.message || `Anthropic HTTP ${resp.status}`);
-        const out = Array.isArray(data.content) ? data.content.map((b) => b.text || '').join('') : '';
-        return { text: out, model: data.model || profile.model, usage: data.usage || null };
-    }
-
-    if (profile.providerType === 'gemini') {
-        const base = (profile.baseUrl || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '');
-        const endpoint = `${base}/models/${encodeURIComponent(profile.model)}:generateContent?key=${encodeURIComponent(profile.apiKey)}`;
-        const sysParts = [];
-        const contents = [];
-        for (const m of messages) {
-            const txt = normalizeMessageText(m.content);
-            if (m.role === 'system') sysParts.push(txt);
-            else contents.push({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: txt }] });
-        }
-        if (!contents.length) contents.push({ role: 'user', parts: [{ text: 'Continue.' }] });
-        const body = { contents };
-        if (sysParts.length) body.systemInstruction = { parts: [{ text: sysParts.join('\n\n') }] };
-        const genCfg = {};
-        if (tempVal !== undefined && !Number.isNaN(tempVal)) genCfg.temperature = tempVal;
-        if (maxTokVal !== undefined && !Number.isNaN(maxTokVal)) genCfg.maxOutputTokens = maxTokVal;
-        if (Object.keys(genCfg).length) body.generationConfig = genCfg;
+        if (tempVal !== undefined) body.temperature = tempVal;
+        if (maxTokVal !== undefined) body.max_tokens = maxTokVal;
 
         const resp = await fetch(endpoint, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers,
             body: JSON.stringify(body),
+            signal,
         });
         const data = await resp.json().catch(() => ({}));
-        if (!resp.ok) throw new Error(data.error?.message || `Gemini HTTP ${resp.status}`);
-        const parts = data.candidates?.[0]?.content?.parts || [];
-        const out = parts.map((p) => p.text || '').join('');
-        return { text: out, model: profile.model, usage: data.usageMetadata || null };
+        if (!resp.ok) throw new Error(data.error?.message || `Upstream HTTP ${resp.status}`);
+        const out = data.choices?.[0]?.message?.content || '';
+        return { text: out, model: data.model || profile.model, usage: data.usage || null };
+    } finally {
+        cleanup();
     }
-
-    // Default: OpenAI-Compatible
-    const endpoint = profile.baseUrl || 'https://api.openai.com/v1/chat/completions';
-    const headers = { 'Content-Type': 'application/json' };
-    if (profile.apiKey) headers['Authorization'] = `Bearer ${profile.apiKey}`;
-    if (endpoint.includes('openrouter.ai')) {
-        headers['HTTP-Referer'] = 'http://localhost:8787';
-        headers['X-Title'] = 'RisuStand Remote';
-    }
-
-    const body = {
-        model: profile.model,
-        messages,
-        stream: false,
-    };
-    if (tempVal !== undefined && !Number.isNaN(tempVal)) body.temperature = tempVal;
-    if (maxTokVal !== undefined && !Number.isNaN(maxTokVal)) body.max_tokens = maxTokVal;
-
-    const resp = await fetch(endpoint, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-    });
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(data.error?.message || `Upstream HTTP ${resp.status}`);
-    const out = data.choices?.[0]?.message?.content || '';
-    return { text: out, model: data.model || profile.model, usage: data.usage || null };
 }
 
 async function handleOpenAIProxy(req, res) {
+    const clientAbort = new AbortController();
+    const onClose = () => {
+        if (!res.writableEnded) clientAbort.abort(new Error('Client disconnected'));
+    };
+    req.on('close', onClose);
+    res.on('close', onClose);
     try {
         const raw = await readBody(req);
         const reqBody = JSON.parse(raw || '{}');
@@ -366,7 +604,7 @@ async function handleOpenAIProxy(req, res) {
                     message: 'RisuStand 릴레이 라우터에 활성화된 모델 프로필이 없습니다. 모바일 [모델/번역] 탭에서 프로필을 선택해 주세요.',
                     type: 'configuration_error',
                 },
-            });
+            }, req);
         }
 
         const messages = applyPromptOverride(reqBody.messages || [], profile);
@@ -379,7 +617,7 @@ async function handleOpenAIProxy(req, res) {
             const headers = { 'Content-Type': 'application/json' };
             if (profile.apiKey) headers['Authorization'] = `Bearer ${profile.apiKey}`;
             if (endpoint.includes('openrouter.ai')) {
-                headers['HTTP-Referer'] = 'http://localhost:8787';
+                headers['HTTP-Referer'] = `http://localhost:${PORT}`;
                 headers['X-Title'] = 'RisuStand Remote';
             }
             const upBody = {
@@ -388,54 +626,71 @@ async function handleOpenAIProxy(req, res) {
                 messages,
                 stream: true,
             };
-            if (profile.temperature !== '' && profile.temperature !== undefined) upBody.temperature = Number(profile.temperature);
-            if (profile.maxTokens !== '' && profile.maxTokens !== undefined) upBody.max_tokens = Number(profile.maxTokens);
+            const profTemp = parseOptionalNumber(profile.temperature);
+            const profMaxTok = parseOptionalNumber(profile.maxTokens);
+            if (profTemp !== undefined) upBody.temperature = profTemp;
+            if (profMaxTok !== undefined) upBody.max_tokens = profMaxTok;
 
-            const upRes = await fetch(endpoint, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify(upBody),
-            });
-
-            if (!upRes.ok || !upRes.body) {
-                const errText = await upRes.text().catch(() => '');
-                return sendJson(res, upRes.status || 502, {
-                    error: { message: errText || `Upstream HTTP ${upRes.status}`, type: 'upstream_error' },
+            const { signal, cleanup } = createTimeoutSignal(180000, clientAbort.signal);
+            let reader = null;
+            try {
+                const upRes = await fetch(endpoint, {
+                    method: 'POST',
+                    headers,
+                    body: JSON.stringify(upBody),
+                    signal,
                 });
-            }
 
-            res.writeHead(200, {
-                'Content-Type': 'text/event-stream; charset=utf-8',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-                'Access-Control-Allow-Origin': '*',
-            });
+                if (!upRes.ok || !upRes.body) {
+                    const errText = await upRes.text().catch(() => '');
+                    return sendJson(res, upRes.status || 502, {
+                        error: { message: errText || `Upstream HTTP ${upRes.status}`, type: 'upstream_error' },
+                    }, req);
+                }
 
-            const reader = upRes.body.getReader();
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                res.write(Buffer.from(value));
+                res.writeHead(200, {
+                    'Content-Type': 'text/event-stream; charset=utf-8',
+                    'Cache-Control': 'no-cache',
+                    'Connection': 'keep-alive',
+                    ...corsHeaders(req),
+                });
+
+                reader = upRes.body.getReader();
+                while (true) {
+                    if (res.writableEnded || res.destroyed || clientAbort.signal.aborted) {
+                        await reader.cancel().catch(() => {});
+                        break;
+                    }
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    if (!res.writableEnded && !res.destroyed) {
+                        res.write(Buffer.from(value));
+                    }
+                }
+                if (!res.writableEnded && !res.destroyed) res.end();
+                return;
+            } finally {
+                cleanup();
             }
-            res.end();
-            return;
         }
 
         // Universal call (works for Anthropic, Gemini, and non-stream OpenAI)
         const result = await callLLMNonStream(profile, messages, {
             temperature: reqBody.temperature,
             maxTokens: reqBody.max_tokens,
+            signal: clientAbort.signal,
         });
 
         const id = 'chatcmpl-' + crypto.randomBytes(8).toString('hex');
         const created = Math.floor(Date.now() / 1000);
 
         if (wantStream) {
+            if (res.writableEnded || res.destroyed) return;
             res.writeHead(200, {
                 'Content-Type': 'text/event-stream; charset=utf-8',
                 'Cache-Control': 'no-cache',
                 'Connection': 'keep-alive',
-                'Access-Control-Allow-Origin': '*',
+                ...corsHeaders(req),
             });
             const chunk = {
                 id,
@@ -470,13 +725,20 @@ async function handleOpenAIProxy(req, res) {
                     finish_reason: 'stop',
                 },
             ],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        });
+            usage: mapUsageToOpenAI(result.usage),
+        }, req);
     } catch (e) {
+        if (clientAbort.signal.aborted && (res.writableEnded || res.destroyed)) return;
         console.error('[Router Error]', e.message);
-        return sendJson(res, 502, {
-            error: { message: e.message || 'Proxy router error', type: 'proxy_error' },
-        });
+        if (!res.headersSent) {
+            return sendJson(res, 502, {
+                error: { message: e.message || 'Proxy router error', type: 'proxy_error' },
+            }, req);
+        }
+        if (!res.writableEnded && !res.destroyed) res.end();
+    } finally {
+        req.off('close', onClose);
+        res.off('close', onClose);
     }
 }
 
@@ -514,7 +776,7 @@ async function translateText(text, direction = 'to_target') {
     const res = await callLLMNonStream(profile, [
         { role: 'system', content: sysPrompt },
         { role: 'user', content: clean },
-    ], { temperature: 0.2 });
+    ], { forceTemperature: 0.2, timeoutMs: 60000 });
 
     const out = String(res.text || '').trim();
     if (out) {
@@ -525,13 +787,13 @@ async function translateText(text, direction = 'to_target') {
 }
 
 // ================= Direct Remote Chat (for non-PC-active chars) =================
-async function runDirectRemoteChat(charIndex, chatIndex, userText) {
+async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = state.snapshot) {
     const profile = getActiveProfile();
     if (!profile) {
         throw new Error('PC에서 현재 열려있지 않은 봇과 대화하려면 [모델/번역] 탭에서 활성 모델 프로필을 먼저 설정해야 합니다.');
     }
-    const snap = state.snapshot;
-    const ctx = snap && snap.charContext ? snap.charContext : { name: snap.charName || 'Character' };
+    const snap = snapView || state.snapshot;
+    const ctx = snap && snap.charContext ? snap.charContext : { name: (snap && snap.charName) || 'Character' };
 
     const sysParts = [];
     sysParts.push(`You are roleplaying as ${ctx.name}. Stay in character and respond naturally.`);
@@ -1148,6 +1410,9 @@ function renderWebApp() {
           <button class="pill" id="amHide" onclick="setAssetMode('hide')">🙈 감추기</button>
         </div>
       </div>
+      <div class="rb-sec" style="border-top:1px solid var(--border); padding-top:10px;">
+        <button class="btn sec" id="logoutBtn" style="width:100%;">🔒 로그아웃 / 토큰 변경</button>
+      </div>
     </div>
   </header>
 
@@ -1238,7 +1503,7 @@ function renderWebApp() {
     <div class="panel-title">모델 · 번역</div>
     <div class="card">
       <h3>🔗 PC RisuAI 프록시 연동 주소</h3>
-      <div class="mono">http://127.0.0.1:8787/v1/chat/completions</div>
+      <div class="mono">http://127.0.0.1:${PORT}/v1/chat/completions</div>
       <div class="hint">
         PC RisuAI의 모델(Reverse Proxy / OpenAI 호환) URL을 위 주소로 한 번만 지정하면, 아래에서 고른 모델·프롬프트가 실시간 반영됩니다.
       </div>
@@ -1331,6 +1596,10 @@ function renderWebApp() {
   let routerCfg = null;
   let expandedBotIdx = -1;
   let lastChatRenderSig = '';
+  let lastBotsRenderSig = '';
+  let lastModulesRenderSig = '';
+  let lastDirectErrAt = 0;
+  let pollTimer = null;
   let bookSpreadIdx = -1; // -1 means auto-jump to latest spread
   const localTranslations = new Map();
   const shownTranslations = new Set();
@@ -1438,8 +1707,28 @@ function renderWebApp() {
     window._tt = setTimeout(() => { el.classList.remove('show'); }, 2400);
   }
 
+  function hashStr(s) {
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0).toString(36);
+  }
+
   function esc(s) {
-    return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    return String(s || '')
+      .replace(/&/g,'&amp;')
+      .replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;')
+      .replace(/"/g,'&quot;')
+      .replace(/'/g,'&#39;');
+  }
+
+  function safeImgSrc(u) {
+    const raw = String(u || '').trim();
+    if (/^(data:image\/[a-z0-9.+-]+;base64,|https?:\/\/)/i.test(raw)) return raw;
+    return '';
   }
 
   function stripImgTokens(t) {
@@ -1451,15 +1740,17 @@ function renderWebApp() {
     const used = new Set();
     let html = esc(text || '').replace(/\\[\\[RSIMG:(\\d+)\\]\\]/g, (_, nStr) => {
       const idx = Number(nStr);
-      if (imgs[idx]) {
+      const src = imgs[idx] ? safeImgSrc(imgs[idx]) : '';
+      if (src) {
         used.add(idx);
-        return '<span class="msg-img-wrap" onclick="toggleImgReveal(this)"><img class="msg-img" src="' + imgs[idx] + '" /><span class="img-veil">🌫️ 터치해 보기</span></span>';
+        return '<span class="msg-img-wrap" data-img-reveal="1"><img class="msg-img" src="' + esc(src) + '" /><span class="img-veil">🌫️ 터치해 보기</span></span>';
       }
       return '';
     });
     for (let i = 0; i < imgs.length; i++) {
-      if (!used.has(i) && imgs[i]) {
-        html += '<span class="msg-img-wrap" onclick="toggleImgReveal(this)"><img class="msg-img" src="' + imgs[i] + '" /><span class="img-veil">🌫️ 터치해 보기</span></span>';
+      const src = !used.has(i) && imgs[i] ? safeImgSrc(imgs[i]) : '';
+      if (src) {
+        html += '<span class="msg-img-wrap" data-img-reveal="1"><img class="msg-img" src="' + esc(src) + '" /><span class="img-veil">🌫️ 터치해 보기</span></span>';
       }
     }
     return html;
@@ -1480,9 +1771,27 @@ function renderWebApp() {
       headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token, ...(opts.headers || {}) },
     });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+    if (!res.ok) {
+      const err = new Error(data.error || ('HTTP ' + res.status));
+      err.status = res.status;
+      throw err;
+    }
     return data;
   }
+
+  function logoutToLogin(reason) {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    if (updPolling) { clearInterval(updPolling); updPolling = null; }
+    token = '';
+    localStorage.removeItem('rs_token');
+    setReadBar(false);
+    document.getElementById('app').style.display = 'none';
+    document.getElementById('login').style.display = 'flex';
+    document.getElementById('tokInput').value = '';
+    document.getElementById('loginErr').textContent = reason || '';
+  }
+
+  document.getElementById('logoutBtn').onclick = () => logoutToLogin('로그아웃되었습니다.');
 
   function switchTab(tab) {
     currentTab = tab;
@@ -1505,9 +1814,12 @@ function renderWebApp() {
       document.getElementById('app').style.display = 'grid';
       await loadRouterConfig();
       applyState(st);
-      setInterval(pollState, 2000);
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(pollState, 2000);
     } catch (e) {
-      document.getElementById('loginErr').textContent = '토큰이 올바르지 않습니다.';
+      document.getElementById('loginErr').textContent = e && e.status === 429
+        ? '로그인 시도가 너무 많습니다. 1분 후 다시 시도하세요.'
+        : '토큰이 올바르지 않습니다.';
     }
   }
 
@@ -1515,7 +1827,13 @@ function renderWebApp() {
   document.getElementById('tokInput').onkeydown = (e) => { if (e.key === 'Enter') document.getElementById('loginBtn').click(); };
 
   async function pollState() {
-    try { applyState(await api('/api/state')); } catch (_) {}
+    try {
+      applyState(await api('/api/state'));
+    } catch (e) {
+      if (e && e.status === 401) {
+        logoutToLogin('세션 토큰이 만료되었거나 변경되었습니다. 다시 입력해 주세요.');
+      }
+    }
   }
 
   function applyState(st) {
@@ -1529,9 +1847,14 @@ function renderWebApp() {
     document.getElementById('sendBtn').disabled = Boolean(st.generating || st.directGenerating);
     document.querySelector('.tab-btn[data-tab="modules"]').classList.toggle('has-update', Boolean(st.updateAvailable));
     if (st.pluginVersion) document.getElementById('updPlugin').textContent = 'v' + st.pluginVersion;
+    if (st.lastDirectError && st.lastDirectError.at && st.lastDirectError.at > lastDirectErrAt) {
+      lastDirectErrAt = st.lastDirectError.at;
+      toast('응답 오류: ' + (st.lastDirectError.message || '실패'));
+    }
 
     const msgs = snap.messages || [];
-    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, msgs.length, msgs.length ? msgs[msgs.length-1].text.length : 0, st.generating, st.directGenerating, uiPref.theme, uiPref.assetMode]);
+    const msgDigest = hashStr(msgs.map((m) => m.index + ':' + (m.text || '') + ':' + (m.images ? m.images.length : 0)).join('\x01'));
+    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, msgs.length, msgDigest, st.generating, st.directGenerating, uiPref.theme, uiPref.assetMode]);
     if (sig !== lastChatRenderSig) {
       lastChatRenderSig = sig;
       renderChat();
@@ -1572,7 +1895,7 @@ function renderWebApp() {
       out += '<div class="book-turn-tag">' + esc(isUser ? '나' : displayBotName(snap.charName)) + '</div>';
       out += '<div>' + (showTr && trText ? esc(trText) : renderInlineBody(m.text, m.images)) + '</div>';
       if (m.text) {
-        out += '<div class="msg-actions"><button class="act-btn" onclick="toggleTranslate(\\'' + key + '\\', ' + m.index + ')">🌐 ' + (showTr ? '원문' : '번역') + '</button></div>';
+        out += '<div class="msg-actions"><button class="act-btn" data-tr-key="' + esc(key) + '" data-tr-idx="' + m.index + '">🌐 ' + (showTr ? '원문' : '번역') + '</button></div>';
       }
       out += '</div>';
     }
@@ -1661,10 +1984,10 @@ function renderWebApp() {
         html += '<div class="msg-bubble">' + renderInlineBody(m.text, m.images) + '</div>';
         if (showTr && trText) html += '<div class="tr-box">' + esc(trText) + '</div>';
         html += '<div class="msg-actions">';
-        if (m.text) html += '<button class="act-btn" onclick="toggleTranslate(\\'' + key + '\\', ' + m.index + ')">🌐 ' + (showTr ? '번역 숨김' : '번역') + '</button>';
+        if (m.text) html += '<button class="act-btn" data-tr-key="' + esc(key) + '" data-tr-idx="' + m.index + '">🌐 ' + (showTr ? '번역 숨김' : '번역') + '</button>';
         if (m.index >= 0) {
-          html += '<button class="act-btn" onclick="editMsg(' + m.index + ')">✏️ 수정</button>';
-          html += '<button class="act-btn" onclick="delMsg(' + m.index + ')">🗑️ 삭제</button>';
+          html += '<button class="act-btn" data-edit-msg="' + m.index + '">✏️ 수정</button>';
+          html += '<button class="act-btn" data-del-msg="' + m.index + '">🗑️ 삭제</button>';
         }
         html += '</div></div>';
         if (autoTr && !isUser && m.text && !localTranslations.has(key)) autoFetchTranslation(key, m.text);
@@ -1673,6 +1996,17 @@ function renderWebApp() {
     box.innerHTML = html;
     if (nearBottom) box.scrollTop = box.scrollHeight;
   }
+
+  document.getElementById('tab-chat').addEventListener('click', (e) => {
+    const imgWrap = e.target.closest('[data-img-reveal]');
+    if (imgWrap) { toggleImgReveal(imgWrap); return; }
+    const trBtn = e.target.closest('[data-tr-key]');
+    if (trBtn) { toggleTranslate(trBtn.getAttribute('data-tr-key'), Number(trBtn.getAttribute('data-tr-idx'))); return; }
+    const edBtn = e.target.closest('[data-edit-msg]');
+    if (edBtn) { editMsg(Number(edBtn.getAttribute('data-edit-msg'))); return; }
+    const delBtn = e.target.closest('[data-del-msg]');
+    if (delBtn) { delMsg(Number(delBtn.getAttribute('data-del-msg'))); return; }
+  });
 
   async function autoFetchTranslation(key, text) {
     localTranslations.set(key, '번역 중...');
@@ -1747,7 +2081,7 @@ function renderWebApp() {
     inp.style.height = Math.min(inp.scrollHeight, 140) + 'px';
   }
   document.getElementById('msgInput').addEventListener('input', autoGrowInput);
-  document.getElementById('msgInput').onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } };
+  document.getElementById('msgInput').onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); sendMessage(); } };
 
   document.getElementById('autoTrBtn').onclick = async () => {
     if (!routerCfg) return;
@@ -1766,17 +2100,20 @@ function renderWebApp() {
   };
   function syncToggleBadges() {
     if (!routerCfg || !routerCfg.translator) return;
-    document.getElementById('autoTrBtn').className = 'pill' + (routerCfg.translator.autoTranslateOutput ? ' active' : '');
-    document.getElementById('inTrBtn').className = 'pill' + (routerCfg.translator.autoTranslateInput ? ' active' : '');
+    document.getElementById('autoTrBtn').classList.toggle('active', Boolean(routerCfg.translator.autoTranslateOutput));
+    document.getElementById('inTrBtn').classList.toggle('active', Boolean(routerCfg.translator.autoTranslateInput));
   }
 
-  function renderBots() {
+  function renderBots(force = false) {
     const listEl = document.getElementById('botList');
     const q = (document.getElementById('botSearch').value || '').trim().toLowerCase();
     const chars = (lastState && lastState.catalog && lastState.catalog.characters) || [];
     const curChar = lastState && lastState.snapshot ? lastState.snapshot.charIndex : -1;
     const curChat = lastState && lastState.snapshot ? lastState.snapshot.chatIndex : -1;
     const filtered = chars.filter((c) => !q || String(c.name).toLowerCase().includes(q));
+    const sig = JSON.stringify([q, curChar, curChat, expandedBotIdx, filtered.map((c) => [c.index, c.name, c.isPcActive, (c.chats || []).map((ch) => [ch.index, ch.name, ch.msgCount])])]);
+    if (!force && sig === lastBotsRenderSig) return;
+    lastBotsRenderSig = sig;
     if (!filtered.length) {
       listEl.innerHTML = '<div class="empty-hint"><span class="big">📚</span>표시할 봇이 없습니다.<br>PC RisuStand의 원격 브릿지가 켜져 있는지 확인하세요.</div>';
       return;
@@ -1784,15 +2121,15 @@ function renderWebApp() {
     let html = '';
     for (const c of filtered) {
       const open = expandedBotIdx === c.index || (expandedBotIdx === -1 && c.index === curChar);
-      html += '<div class="bot-item"><div class="bot-head" onclick="toggleBot(' + c.index + ')">';
+      html += '<div class="bot-item"><div class="bot-head" data-toggle-bot="' + c.index + '">';
       html += '<div style="font-weight:700; font-size:14.5px;">' + esc(c.name) + '</div><div style="display:flex; gap:5px; align-items:center;">';
       if (c.isPcActive) html += '<span class="badge pc">PC 활성</span>';
       html += '<span class="badge">방 ' + (c.chats ? c.chats.length : 0) + '</span></div></div>';
       if (open) {
-        html += '<div class="chat-list"><button class="btn sec" style="width:100%; margin-bottom:4px;" onclick="createChat(' + c.index + ')">＋ 새 채팅방 파기</button>';
+        html += '<div class="chat-list"><button class="btn sec" style="width:100%; margin-bottom:4px;" data-create-chat="' + c.index + '">＋ 새 채팅방 파기</button>';
         for (const ch of (c.chats || [])) {
           const isCur = c.index === curChar && ch.index === curChat;
-          html += '<div class="chat-row' + (isCur ? ' cur' : '') + '" onclick="selectTarget(' + c.index + ',' + ch.index + ')"><span>' + esc(ch.name) + '</span><span class="badge">' + ch.msgCount + '턴</span></div>';
+          html += '<div class="chat-row' + (isCur ? ' cur' : '') + '" data-sel-char="' + c.index + '" data-sel-chat="' + ch.index + '"><span>' + esc(ch.name) + '</span><span class="badge">' + ch.msgCount + '턴</span></div>';
         }
         html += '</div>';
       }
@@ -1800,13 +2137,21 @@ function renderWebApp() {
     }
     listEl.innerHTML = html;
   }
-  document.getElementById('botSearch').oninput = renderBots;
+  document.getElementById('botList').addEventListener('click', (e) => {
+    const createBtn = e.target.closest('[data-create-chat]');
+    if (createBtn) { createChat(Number(createBtn.getAttribute('data-create-chat'))); return; }
+    const chatRow = e.target.closest('[data-sel-char]');
+    if (chatRow) { selectTarget(Number(chatRow.getAttribute('data-sel-char')), Number(chatRow.getAttribute('data-sel-chat'))); return; }
+    const botHead = e.target.closest('[data-toggle-bot]');
+    if (botHead) { toggleBot(Number(botHead.getAttribute('data-toggle-bot'))); }
+  });
+  document.getElementById('botSearch').oninput = () => renderBots(true);
   document.getElementById('refreshAllBtn').onclick = async () => {
     await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'sync_all' }) });
     toast('PC 전체 목록 동기화 중...');
     setTimeout(pollState, 900);
   };
-  window.toggleBot = (idx) => { expandedBotIdx = expandedBotIdx === idx ? -2 : idx; renderBots(); };
+  window.toggleBot = (idx) => { expandedBotIdx = expandedBotIdx === idx ? -2 : idx; renderBots(true); };
   window.selectTarget = async (charIndex, chatIndex) => {
     bookSpreadIdx = -1;
     await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'select_target', payload: { charIndex, chatIndex } }) });
@@ -1875,7 +2220,7 @@ function renderWebApp() {
         const gid = 'g-' + blockIdx + '-' + idx + '-' + t.value;
         const isOpen = openToggleGroups.has(gid);
         html += '<div class="tg-acc' + (isOpen ? ' open' : '') + '">';
-        html += '<div class="tg-acc-head" onclick="toggleAccGroup(\\'' + esc(gid) + '\\')"><span>' + esc(t.value) + '</span><span>' + (isOpen ? '▾' : '▸') + '</span></div>';
+        html += '<div class="tg-acc-head" data-acc-gid="' + esc(gid) + '"><span>' + esc(t.value) + '</span><span>' + (isOpen ? '▾' : '▸') + '</span></div>';
         html += '<div class="tg-acc-body">' + renderToggleItemsHtml(t.children || [], vals, blockIdx + '_' + idx) + '</div>';
         html += '</div>';
       } else if (t.type === 'divider') {
@@ -1884,7 +2229,7 @@ function renderWebApp() {
         html += '<div class="tg-cap">' + esc(t.value) + '</div>';
       } else if (t.type === 'select') {
         html += '<div class="tg-row"><span>' + esc(t.value) + '</span>';
-        html += '<select class="f-inp" style="width:48%;" onchange="setCustomToggle(\\'' + esc(t.key) + '\\', this.value)">';
+        html += '<select class="f-inp" style="width:48%;" data-toggle-key="' + esc(t.key) + '">';
         html += '<option value=""' + (curVal === '' ? ' selected' : '') + '>(기본)</option>';
         (t.options || []).forEach((opt, oi) => {
           html += '<option value="' + oi + '"' + (curVal === String(oi) ? ' selected' : '') + '>' + esc(opt) + '</option>';
@@ -1892,14 +2237,14 @@ function renderWebApp() {
         html += '</select></div>';
       } else if (t.type === 'text') {
         html += '<div class="tg-row"><span>' + esc(t.value) + '</span>';
-        html += '<input class="f-inp" style="width:48%;" value="' + esc(curVal) + '" onchange="setCustomToggle(\\'' + esc(t.key) + '\\', this.value)" /></div>';
+        html += '<input class="f-inp" style="width:48%;" value="' + esc(curVal) + '" data-toggle-key="' + esc(t.key) + '" /></div>';
       } else if (t.type === 'textarea') {
         html += '<div style="display:flex; flex-direction:column; gap:4px;"><span style="font-size:12.5px;">' + esc(t.value) + '</span>';
-        html += '<textarea class="f-inp" rows="2" onchange="setCustomToggle(\\'' + esc(t.key) + '\\', this.value)">' + esc(curVal) + '</textarea></div>';
+        html += '<textarea class="f-inp" rows="2" data-toggle-key="' + esc(t.key) + '">' + esc(curVal) + '</textarea></div>';
       } else {
         const checked = curVal === '1';
         html += '<label class="tg-row" style="cursor:pointer;"><span>' + esc(t.value) + '</span>';
-        html += '<input type="checkbox" style="width:19px; height:19px;" ' + (checked ? 'checked' : '') + ' onchange="setCustomToggle(\\'' + esc(t.key) + '\\', this.checked ? \\'1\\' : \\'0\\')" /></label>';
+        html += '<input type="checkbox" style="width:19px; height:19px;" ' + (checked ? 'checked' : '') + ' data-toggle-key="' + esc(t.key) + '" /></label>';
       }
     });
     return html;
@@ -1979,13 +2324,27 @@ function renderWebApp() {
       html += '<div style="margin-bottom:10px;">';
       html += '<div style="display:flex; align-items:center; justify-content:space-between; font-size:12px; font-weight:700; color:var(--accent); margin-bottom:4px;">';
       html += '<span>' + (b.isPreset ? '📘 ' : '🌿 ') + esc(b.source) + '</span>';
-      if (b.isPreset) html += '<button class="act-btn" onclick="deletePresetToggle(\\'' + esc(b.id) + '\\')">삭제</button>';
+      if (b.isPreset) html += '<button class="act-btn" data-del-preset="' + esc(b.id) + '">삭제</button>';
       html += '</div>';
       html += renderToggleItemsHtml(parsed, vals, (b.isPreset ? 'p' : 'm') + bi);
       html += '</div>';
     });
     body.innerHTML = html || '<div style="color:var(--sub); font-size:12.5px;">표시할 토글 항목이 없습니다.</div>';
   }
+
+  document.getElementById('customToggleBody').addEventListener('click', (e) => {
+    const delBtn = e.target.closest('[data-del-preset]');
+    if (delBtn) { deletePresetToggle(delBtn.getAttribute('data-del-preset')); return; }
+    const accHead = e.target.closest('[data-acc-gid]');
+    if (accHead) { toggleAccGroup(accHead.getAttribute('data-acc-gid')); }
+  });
+  document.getElementById('customToggleBody').addEventListener('change', (e) => {
+    const el = e.target.closest('[data-toggle-key]');
+    if (!el) return;
+    const key = el.getAttribute('data-toggle-key');
+    const val = el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value;
+    setCustomToggle(key, val);
+  });
 
   window.toggleAccGroup = (gid) => {
     if (openToggleGroups.has(gid)) openToggleGroups.delete(gid);
@@ -2011,31 +2370,40 @@ function renderWebApp() {
     toast('토글 반영됨 (로컬 토글)');
   };
 
-  function renderModules() {
+  function renderModules(force = false) {
     renderCustomToggles(false);
     const cat = (lastState && lastState.catalog) || {};
     const pSel = document.getElementById('personaSel');
     const personas = cat.personas || [];
-    pSel.innerHTML = personas.map((p) => '<option value="' + p.index + '"' + (p.index === cat.selectedPersona ? ' selected' : '') + '>' + esc(p.name) + '</option>').join('');
-    pSel.onchange = async () => {
-      await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'select_persona', payload: { personaIndex: Number(pSel.value) } }) });
-      toast('페르소나 변경됨');
-    };
+    const q = (document.getElementById('modSearch').value || '').trim().toLowerCase();
+    const mods = (cat.modules || []).filter((m) => !q || String(m.name).toLowerCase().includes(q));
     if (cat.params && document.activeElement.tagName !== 'INPUT') {
       document.getElementById('pTemp').value = cat.params.temperature;
       document.getElementById('pCtx').value = cat.params.maxContext;
       document.getElementById('pResp').value = cat.params.maxResponse;
     }
-    const q = (document.getElementById('modSearch').value || '').trim().toLowerCase();
-    const mods = (cat.modules || []).filter((m) => !q || String(m.name).toLowerCase().includes(q));
+    const modSig = JSON.stringify([q, cat.selectedPersona, personas.map((p) => [p.index, p.name]), mods.map((m) => [m.id, m.name, m.enabled, m.description])]);
+    if (!force && modSig === lastModulesRenderSig) return;
+    lastModulesRenderSig = modSig;
+    if (document.activeElement !== pSel) {
+      pSel.innerHTML = personas.map((p) => '<option value="' + p.index + '"' + (p.index === cat.selectedPersona ? ' selected' : '') + '>' + esc(p.name) + '</option>').join('');
+    }
+    pSel.onchange = async () => {
+      await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'select_persona', payload: { personaIndex: Number(pSel.value) } }) });
+      toast('페르소나 변경됨');
+    };
     document.getElementById('modCount').textContent = (cat.modules || []).filter((m) => m.enabled).length + ' / ' + (cat.modules || []).length;
     document.getElementById('modList').innerHTML = mods.map((m) =>
       '<div class="row"><div style="min-width:0;"><div style="font-size:13.5px; font-weight:600;">' + esc(m.name) + '</div>' +
       (m.description ? '<div style="font-size:11.5px; color:var(--sub);">' + esc(m.description) + '</div>' : '') + '</div>' +
-      '<input type="checkbox" style="width:20px; height:20px; flex-shrink:0;" ' + (m.enabled ? 'checked' : '') + ' onchange="toggleMod(\\'' + esc(m.id) + '\\', this.checked)" /></div>'
+      '<input type="checkbox" style="width:20px; height:20px; flex-shrink:0;" ' + (m.enabled ? 'checked' : '') + ' data-mod-id="' + esc(m.id) + '" /></div>'
     ).join('') || '<div style="color:var(--sub); font-size:12.5px;">모듈 없음</div>';
   }
-  document.getElementById('modSearch').oninput = renderModules;
+  document.getElementById('modList').addEventListener('change', (e) => {
+    const chk = e.target.closest('[data-mod-id]');
+    if (chk) toggleMod(chk.getAttribute('data-mod-id'), chk.checked);
+  });
+  document.getElementById('modSearch').oninput = () => renderModules(true);
   window.toggleMod = async (moduleId, enabled) => {
     await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'toggle_module', payload: { moduleId, enabled } }) });
     toast('모듈 ' + (enabled ? '켜짐' : '꺼짐'));
@@ -2068,8 +2436,8 @@ function renderWebApp() {
         '<div style="min-width:0;"><div style="font-size:13.5px; font-weight:700;">' + (active ? '🟢 ' : '') + esc(p.name) + '</div>' +
         '<div style="font-size:11.5px; color:var(--sub);">' + esc(p.providerType) + ' · ' + esc(p.model) + ' · 키: ' + (p.hasKey ? esc(p.keyPreview) : '미설정') + '</div></div>' +
         '<div style="display:flex; gap:5px; flex-shrink:0;">' +
-        '<button class="btn ' + (active ? '' : 'sec') + '" onclick="activateProfile(\\'' + esc(p.id) + '\\')">' + (active ? '활성' : '선택') + '</button>' +
-        '<button class="btn sec" onclick="editProfile(\\'' + esc(p.id) + '\\')">편집</button></div></div>';
+        '<button class="btn ' + (active ? '' : 'sec') + '" data-act-prof="' + esc(p.id) + '">' + (active ? '활성' : '선택') + '</button>' +
+        '<button class="btn sec" data-edit-prof="' + esc(p.id) + '">편집</button></div></div>';
     }).join('');
     const tr = routerCfg.translator || {};
     document.getElementById('trUseActive').checked = Boolean(tr.useActiveProfile);
@@ -2083,6 +2451,12 @@ function renderWebApp() {
     document.getElementById('trPrompt').value = tr.prompt || '';
     document.getElementById('trCustomBox').style.display = tr.useActiveProfile ? 'none' : 'block';
   }
+  document.getElementById('profileList').addEventListener('click', (e) => {
+    const actBtn = e.target.closest('[data-act-prof]');
+    if (actBtn) { activateProfile(actBtn.getAttribute('data-act-prof')); return; }
+    const edBtn = e.target.closest('[data-edit-prof]');
+    if (edBtn) { editProfile(edBtn.getAttribute('data-edit-prof')); }
+  });
   document.getElementById('trUseActive').onchange = (e) => { document.getElementById('trCustomBox').style.display = e.target.checked ? 'none' : 'block'; };
   window.activateProfile = async (id) => {
     routerCfg.activeProfileId = id;
@@ -2123,8 +2497,8 @@ function renderWebApp() {
     document.getElementById('edKey').value = '';
     document.getElementById('edKey').placeholder = p.hasKey ? ('저장됨: ' + p.keyPreview + ' (비우면 유지)') : 'API 키 입력';
     document.getElementById('edModel').value = p.model;
-    document.getElementById('edTemp').value = p.temperature || '';
-    document.getElementById('edMaxTok').value = p.maxTokens || '';
+    document.getElementById('edTemp').value = p.temperature !== undefined && p.temperature !== null ? p.temperature : '';
+    document.getElementById('edMaxTok').value = p.maxTokens !== undefined && p.maxTokens !== null ? p.maxTokens : '';
     document.getElementById('edOvMode').value = p.overrideMode || 'off';
     document.getElementById('edOvText').value = p.systemOverride || '';
     document.getElementById('delProfBtn').style.display = 'inline-block';
@@ -2232,8 +2606,7 @@ function renderWebApp() {
     const btn = document.getElementById('updCheckBtn');
     btn.disabled = true;
     try { renderUpdate(await api('/api/update/check', { method: 'POST', body: '{}' })); }
-    catch (e) { toast('확인 실패: ' + e.message); }
-    finally { btn.disabled = false; }
+    catch (e) { toast('확인 실패: ' + e.message); btn.disabled = false; }
   };
   document.getElementById('updApplyBtn').onclick = async () => {
     if (!confirm('릴레이 서버를 최신 버전으로 업데이트할까요?\\n잠시 연결이 끊겼다가 자동으로 다시 연결됩니다.')) return;
@@ -2287,8 +2660,8 @@ function sanitizeConfigForClient() {
             hasKey: Boolean(p.apiKey),
             keyPreview: maskKey(p.apiKey),
             model: p.model,
-            temperature: p.temperature || '',
-            maxTokens: p.maxTokens || '',
+            temperature: p.temperature !== undefined && p.temperature !== null ? String(p.temperature) : '',
+            maxTokens: p.maxTokens !== undefined && p.maxTokens !== null ? String(p.maxTokens) : '',
             overrideMode: p.overrideMode || 'off',
             systemOverride: p.systemOverride || '',
         })),
@@ -2302,7 +2675,6 @@ function sanitizeConfigForClient() {
 }
 
 // ================= Remote Updater =================
-const ROOT_DIR = __dirname;
 let updater = null;
 try {
     updater = require('./risustand-updater.cjs');
@@ -2408,6 +2780,8 @@ async function runRemoteUpdate() {
  * supervisor (same console window, same token). If the freshly installed version exits
  * within 20s, the backup is restored and the previous version is started instead.
  */
+let activeServer = null;
+
 function restartRelay({ guardUpdate }) {
     const childEnv = { ...process.env, RISU_REMOTE_TOKEN: TOKEN, PORT: String(PORT), HOST };
     let child = null;
@@ -2434,256 +2808,321 @@ function restartRelay({ guardUpdate }) {
     // Ctrl+C reaches both processes in the console; the child decides, we follow its exit.
     process.on('SIGINT', () => {});
     process.on('SIGTERM', () => child && child.kill('SIGTERM'));
-    server.close(() => launch(guardUpdate));
-    if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+    if (activeServer) {
+        activeServer.close(() => setTimeout(() => launch(guardUpdate), 350));
+        if (typeof activeServer.closeAllConnections === 'function') activeServer.closeAllConnections();
+    } else {
+        launch(guardUpdate);
+    }
 }
 
 // ================= HTTP Server =================
-const server = http.createServer(async (req, res) => {
-    const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-    const pathname = urlObj.pathname;
+function createRelayServer({ token, limiter = createAuthRateLimiter() } = {}) {
+    const resolvedToken = token !== undefined ? String(token) : (TOKEN || (TOKEN = loadOrCreateToken(ROOT_DIR)));
+    const requireAuth = makeRequireAuth(resolvedToken, limiter);
+    const requireProxyAuth = makeRequireProxyAuth(resolvedToken, limiter);
 
-    if (req.method === 'OPTIONS') {
-        res.writeHead(204, {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-RisuStand-Token',
-            'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-        });
-        res.end();
-        return;
-    }
+    return http.createServer(async (req, res) => {
+        const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+        const pathname = urlObj.pathname;
 
-    // 1) Web UI
-    if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(renderWebApp());
-        return;
-    }
-
-    // 2) OpenAI-Compatible Local Proxy Router (for PC RisuAI Reverse Proxy)
-    if (pathname === '/v1/models' && req.method === 'GET') {
-        const active = getActiveProfile();
-        return sendJson(res, 200, {
-            object: 'list',
-            data: [
-                { id: 'risustand-router', object: 'model', owned_by: 'risustand' },
-                ...(active ? [{ id: active.model, object: 'model', owned_by: active.providerType }] : []),
-            ],
-        });
-    }
-
-    if (pathname === '/v1/chat/completions' && req.method === 'POST') {
-        return handleOpenAIProxy(req, res);
-    }
-
-    // 3) PC Bridge Polling
-    if (pathname === '/api/pc/poll' && req.method === 'POST') {
-        if (!requireAuth(req, res, urlObj)) return;
-        try {
-            const body = JSON.parse((await readBody(req)) || '{}');
-            state.pcConnected = true;
-            state.pcLastSeen = Date.now();
-            state.bridgeVersion = body.bridgeVersion || '1.0.0';
-            state.pluginVersion = typeof body.pluginVersion === 'string' ? body.pluginVersion.slice(0, 32) : null;
-            state.generating = Boolean(body.generating);
-            if (body.catalog) state.catalog = body.catalog;
-            if (body.snapshot) state.snapshot = body.snapshot;
-
-            const nextCmd = state.commandQueue.shift() || null;
-            return sendJson(res, 200, { ok: true, command: nextCmd, relayVersion: RELAY_VERSION });
-        } catch (e) {
-            return sendJson(res, 400, { error: e.message });
+        if (req.method === 'OPTIONS') {
+            res.writeHead(204, corsHeaders(req));
+            res.end();
+            return;
         }
-    }
 
-    // Remote update (token-protected; downloads only from the official GitHub repository)
-    if (pathname === '/api/update/status' && req.method === 'GET') {
-        if (!requireAuth(req, res, urlObj)) return;
-        return sendJson(res, 200, publicUpdateState());
-    }
-    if (pathname === '/api/update/check' && req.method === 'POST') {
-        if (!requireAuth(req, res, urlObj)) return;
-        if (!updater) return sendJson(res, 501, { error: '업데이터가 설치되어 있지 않습니다.' });
-        if (updateBusy()) return sendJson(res, 200, publicUpdateState());
-        try {
-            await checkForUpdate();
-            if (updateState.phase === 'error') updateState.phase = 'idle';
-            return sendJson(res, 200, publicUpdateState());
-        } catch (e) {
-            return sendJson(res, 502, { error: e.message });
+        // 1) Web UI
+        if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(renderWebApp());
+            return;
         }
-    }
-    if (pathname === '/api/update/apply' && req.method === 'POST') {
-        if (!requireAuth(req, res, urlObj)) return;
-        if (!updater) return sendJson(res, 501, { error: '업데이터가 설치되어 있지 않습니다.' });
-        if (updateBusy()) return sendJson(res, 409, { error: '업데이트가 이미 진행 중입니다.' });
-        updateState.phase = 'checking';
-        updateState.message = UPDATE_PHASE_LABEL.checking;
-        runRemoteUpdate();
-        return sendJson(res, 202, publicUpdateState());
-    }
 
-    // 4) Client State
-    if (pathname === '/api/state' && req.method === 'GET') {
-        if (!requireAuth(req, res, urlObj)) return;
-        const connected = Date.now() - state.pcLastSeen < 12000;
-        state.pcConnected = connected;
-        return sendJson(res, 200, {
-            pcConnected: connected,
-            bridgeVersion: state.bridgeVersion,
-            relayVersion: RELAY_VERSION,
-            pluginVersion: state.pluginVersion || null,
-            updateAvailable: Boolean(updateState.info && updateState.info.available),
-            generating: state.generating,
-            directGenerating: state.directGenerating,
-            catalog: state.catalog,
-            snapshot: state.snapshot,
-        });
-    }
-
-    // 5) Generic Bridge Command
-    if (pathname === '/api/command' && req.method === 'POST') {
-        if (!requireAuth(req, res, urlObj)) return;
-        try {
-            const body = JSON.parse((await readBody(req)) || '{}');
-            if (!body.type) return sendJson(res, 400, { error: 'Missing command type' });
-            queueCommand(body.type, body.payload || {});
-            return sendJson(res, 200, { ok: true });
-        } catch (e) {
-            return sendJson(res, 400, { error: e.message });
+        // 2) OpenAI-Compatible Local Proxy Router (for PC RisuAI Reverse Proxy)
+        if (pathname === '/v1/models' && req.method === 'GET') {
+            if (!requireProxyAuth(req, res)) return;
+            const active = getActiveProfile();
+            return sendJson(res, 200, {
+                object: 'list',
+                data: [
+                    { id: 'risustand-router', object: 'model', owned_by: 'risustand' },
+                    ...(active ? [{ id: active.model, object: 'model', owned_by: active.providerType }] : []),
+                ],
+            }, req);
         }
-    }
 
-    // 6) Smart Chat Send (Native RisuAI for PC-active bot, Direct Router for other bots)
-    if (pathname === '/api/chat/send' && req.method === 'POST') {
-        if (!requireAuth(req, res, urlObj)) return;
-        try {
-            const body = JSON.parse((await readBody(req)) || '{}');
-            const text = String(body.text || '').trim();
-            if (!text) return sendJson(res, 400, { error: 'Empty message' });
-            const charIndex = Number(body.charIndex);
-            const chatIndex = Number(body.chatIndex);
+        if (pathname === '/v1/chat/completions' && req.method === 'POST') {
+            if (!requireProxyAuth(req, res)) return;
+            return handleOpenAIProxy(req, res);
+        }
 
-            if (state.snapshot && state.snapshot.isPcActive && charIndex === state.snapshot.charIndex) {
-                queueCommand('send_chat', { charIndex, chatIndex, text });
-                return sendJson(res, 200, { ok: true, mode: 'native_risu' });
+        // 3) PC Bridge Polling
+        if (pathname === '/api/pc/poll' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                state.pcConnected = true;
+                state.pcLastSeen = Date.now();
+                state.bridgeVersion = body.bridgeVersion || '1.0.0';
+                state.pluginVersion = typeof body.pluginVersion === 'string' ? body.pluginVersion.slice(0, 32) : null;
+                state.generating = Boolean(body.generating);
+                if (body.catalog) state.catalog = body.catalog;
+                if (body.snapshot) state.snapshot = body.snapshot;
+
+                pruneCommandQueue();
+                if (body.supportsBatchCommands === true) {
+                    const commands = [];
+                    while (state.commandQueue.length && commands.length < 10) {
+                        const cmd = state.commandQueue.shift();
+                        commands.push(cmd);
+                        if (cmd.type === 'send_chat') break;
+                    }
+                    return sendJson(res, 200, { ok: true, command: commands[0] || null, commands, relayVersion: RELAY_VERSION }, req);
+                }
+                const nextCmd = state.commandQueue.shift() || null;
+                return sendJson(res, 200, { ok: true, command: nextCmd, relayVersion: RELAY_VERSION }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e.message }, req);
             }
-
-            // Non-PC-active character: execute via Relay Router & persist back to RisuAI DB
-            runDirectRemoteChat(charIndex, chatIndex, text).catch((err) => {
-                console.error('[DirectChat Error]', err.message);
-            });
-            return sendJson(res, 200, { ok: true, mode: 'direct_router' });
-        } catch (e) {
-            return sendJson(res, 500, { error: e.message });
         }
-    }
 
-    // 7) Built-in Translator
-    if (pathname === '/api/translate' && req.method === 'POST') {
-        if (!requireAuth(req, res, urlObj)) return;
-        try {
-            const body = JSON.parse((await readBody(req)) || '{}');
-            const translated = await translateText(body.text || '', body.direction || 'to_target');
-            return sendJson(res, 200, { ok: true, translated });
-        } catch (e) {
-            return sendJson(res, 500, { error: e.message });
+        // Remote update (token-protected; downloads only from the official GitHub repository)
+        if (pathname === '/api/update/status' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            return sendJson(res, 200, publicUpdateState(), req);
         }
-    }
+        if (pathname === '/api/update/check' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            if (!updater) return sendJson(res, 501, { error: '업데이터가 설치되어 있지 않습니다.' }, req);
+            if (updateBusy()) return sendJson(res, 200, publicUpdateState(), req);
+            try {
+                await checkForUpdate();
+                if (updateState.phase === 'error') updateState.phase = 'idle';
+                return sendJson(res, 200, publicUpdateState(), req);
+            } catch (e) {
+                return sendJson(res, 502, { error: e.message }, req);
+            }
+        }
+        if (pathname === '/api/update/apply' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            if (!updater) return sendJson(res, 501, { error: '업데이터가 설치되어 있지 않습니다.' }, req);
+            if (updateBusy()) return sendJson(res, 409, { error: '업데이트가 이미 진행 중입니다.' }, req);
+            updateState.phase = 'checking';
+            updateState.message = UPDATE_PHASE_LABEL.checking;
+            runRemoteUpdate();
+            return sendJson(res, 202, publicUpdateState(), req);
+        }
 
-    // 8) Router & Translator Config API
-    if (pathname === '/api/router/config' && req.method === 'GET') {
-        if (!requireAuth(req, res, urlObj)) return;
-        return sendJson(res, 200, sanitizeConfigForClient());
-    }
+        // 4) Client State
+        if (pathname === '/api/state' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            const connected = Date.now() - state.pcLastSeen < 12000;
+            state.pcConnected = connected;
+            return sendJson(res, 200, {
+                pcConnected: connected,
+                bridgeVersion: state.bridgeVersion,
+                relayVersion: RELAY_VERSION,
+                pluginVersion: state.pluginVersion || null,
+                updateAvailable: Boolean(updateState.info && updateState.info.available),
+                generating: state.generating,
+                directGenerating: state.directGenerating,
+                lastDirectError: state.lastDirectError,
+                catalog: state.catalog,
+                snapshot: state.snapshot,
+            }, req);
+        }
 
-    if (pathname === '/api/router/config' && req.method === 'POST') {
-        if (!requireAuth(req, res, urlObj)) return;
-        try {
-            const body = JSON.parse((await readBody(req)) || '{}');
-            const oldMap = new Map(config.profiles.map((p) => [p.id, p]));
-            if (Array.isArray(body.profiles)) {
-                config.profiles = body.profiles.map((p) => {
-                    const prev = oldMap.get(p.id);
-                    return {
-                        id: String(p.id || ('prof-' + Date.now())),
-                        name: String(p.name || 'Model'),
-                        providerType: p.providerType || 'openai_compat',
-                        baseUrl: String(p.baseUrl || ''),
-                        apiKey: p.apiKey ? String(p.apiKey) : (prev ? prev.apiKey : ''),
-                        model: String(p.model || ''),
-                        temperature: p.temperature !== undefined ? String(p.temperature) : '',
-                        maxTokens: p.maxTokens !== undefined ? String(p.maxTokens) : '',
-                        overrideMode: p.overrideMode || 'off',
-                        systemOverride: String(p.systemOverride || ''),
-                    };
-                });
+        // 5) Generic Bridge Command
+        if (pathname === '/api/command' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                if (!body.type) return sendJson(res, 400, { error: 'Missing command type' }, req);
+                queueCommand(body.type, body.payload || {});
+                return sendJson(res, 200, { ok: true }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e.message }, req);
             }
-            if (typeof body.activeProfileId === 'string') {
-                config.activeProfileId = body.activeProfileId;
-            }
-            if (Array.isArray(body.presetToggles)) {
-                config.presetToggles = body.presetToggles.map((pt) => ({
-                    id: String(pt.id || ('pt-' + Date.now())),
-                    name: String(pt.name || '프롬프트 프리셋'),
-                    enabled: pt.enabled !== false,
-                    syntax: String(pt.syntax || ''),
-                }));
-            }
-            if (body.translator && typeof body.translator === 'object') {
-                config.translator = {
-                    ...config.translator,
-                    ...body.translator,
-                    apiKey: body.translator.apiKey ? String(body.translator.apiKey) : config.translator.apiKey,
+        }
+
+        // 6) Smart Chat Send (Native RisuAI for PC-active bot, Direct Router for other bots)
+        if (pathname === '/api/chat/send' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const text = String(body.text || '').trim();
+                if (!text) return sendJson(res, 400, { error: 'Empty message' }, req);
+                const charIndex = Number(body.charIndex);
+                const chatIndex = Number(body.chatIndex);
+
+                if (state.snapshot && state.snapshot.isPcActive && charIndex === state.snapshot.charIndex) {
+                    queueCommand('send_chat', { charIndex, chatIndex, text });
+                    return sendJson(res, 200, { ok: true, mode: 'native_risu' }, req);
+                }
+
+                if (state.directGenerating) {
+                    return sendJson(res, 409, { error: '이미 응답을 생성 중입니다.' }, req);
+                }
+                if (!getActiveProfile()) {
+                    return sendJson(res, 400, { error: 'PC에서 현재 열려있지 않은 봇과 대화하려면 [모델/번역] 탭에서 활성 모델 프로필을 먼저 설정해야 합니다.' }, req);
+                }
+                if (!state.snapshot || state.snapshot.charIndex !== charIndex || state.snapshot.chatIndex !== chatIndex) {
+                    return sendJson(res, 409, { error: '채팅방 동기화가 완료되지 않았습니다. 잠시 후 다시 시도해 주세요.' }, req);
+                }
+
+                state.lastDirectError = null;
+                const snapView = {
+                    charName: state.snapshot.charName,
+                    charContext: state.snapshot.charContext ? { ...state.snapshot.charContext } : null,
+                    messages: Array.isArray(state.snapshot.messages) ? state.snapshot.messages.slice() : [],
                 };
+
+                // Non-PC-active character: execute via Relay Router & persist back to RisuAI DB
+                runDirectRemoteChat(charIndex, chatIndex, text, snapView).catch((err) => {
+                    console.error('[DirectChat Error]', err.message);
+                    state.lastDirectError = { message: err && err.message ? err.message : String(err), at: Date.now() };
+                });
+                return sendJson(res, 200, { ok: true, mode: 'direct_router' }, req);
+            } catch (e) {
+                return sendJson(res, 500, { error: e.message }, req);
             }
-            saveConfig();
-            return sendJson(res, 200, sanitizeConfigForClient());
-        } catch (e) {
-            return sendJson(res, 400, { error: e.message });
         }
-    }
 
-    sendJson(res, 404, { error: 'Not found' });
-});
+        // 7) Built-in Translator
+        if (pathname === '/api/translate' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const translated = await translateText(body.text || '', body.direction || 'to_target');
+                return sendJson(res, 200, { ok: true, translated }, req);
+            } catch (e) {
+                return sendJson(res, 500, { error: e.message }, req);
+            }
+        }
 
-let recoveredFromInterruptedUpdate = false;
-if (updater) {
-    try {
-        recoveredFromInterruptedUpdate = updater.recoverIfNeeded(ROOT_DIR, { log: updateLog }).rolledBack;
-    } catch (e) {
-        console.error('[Update] 미완료 업데이트 복구 실패:', e.message);
-    }
+        // 8) Router & Translator Config API
+        if (pathname === '/api/router/config' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            return sendJson(res, 200, sanitizeConfigForClient(), req);
+        }
+
+        if (pathname === '/api/router/config' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const oldMap = new Map(config.profiles.map((p) => [p.id, p]));
+                if (Array.isArray(body.profiles)) {
+                    config.profiles = body.profiles.map((p) => {
+                        const prev = oldMap.get(p.id);
+                        return {
+                            id: String(p.id || ('prof-' + Date.now())),
+                            name: String(p.name || 'Model'),
+                            providerType: p.providerType || 'openai_compat',
+                            baseUrl: String(p.baseUrl || ''),
+                            apiKey: p.apiKey ? String(p.apiKey) : (prev ? prev.apiKey : ''),
+                            model: String(p.model || ''),
+                            temperature: p.temperature !== undefined && p.temperature !== null ? String(p.temperature) : '',
+                            maxTokens: p.maxTokens !== undefined && p.maxTokens !== null ? String(p.maxTokens) : '',
+                            overrideMode: p.overrideMode || 'off',
+                            systemOverride: String(p.systemOverride || ''),
+                        };
+                    });
+                }
+                if (typeof body.activeProfileId === 'string') {
+                    config.activeProfileId = body.activeProfileId;
+                }
+                if (Array.isArray(body.presetToggles)) {
+                    config.presetToggles = body.presetToggles.map((pt) => ({
+                        id: String(pt.id || ('pt-' + Date.now())),
+                        name: String(pt.name || '프롬프트 프리셋'),
+                        enabled: pt.enabled !== false,
+                        syntax: String(pt.syntax || ''),
+                    }));
+                }
+                if (body.translator && typeof body.translator === 'object') {
+                    config.translator = {
+                        ...config.translator,
+                        ...body.translator,
+                        apiKey: body.translator.apiKey ? String(body.translator.apiKey) : config.translator.apiKey,
+                    };
+                }
+                saveConfig();
+                return sendJson(res, 200, sanitizeConfigForClient(), req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e.message }, req);
+            }
+        }
+
+        sendJson(res, 404, { error: 'Not found' }, req);
+    });
 }
 
-if (recoveredFromInterruptedUpdate) {
-    // This process may have loaded half-written files; run the restored version instead.
-    console.log('[Update] 중단된 업데이트를 되돌렸습니다. 복구된 버전으로 다시 시작합니다.');
-    const child = spawn(process.execPath, [__filename, ...process.argv.slice(2)], { stdio: 'inherit', env: { ...process.env, RISU_REMOTE_TOKEN: TOKEN } });
-    process.on('SIGINT', () => {});
-    child.on('exit', (code) => process.exit(code == null ? 1 : code));
-} else server.listen(PORT, HOST, () => {
+function startServer() {
+    TOKEN = loadOrCreateToken(ROOT_DIR);
+    let recoveredFromInterruptedUpdate = false;
     if (updater) {
         try {
-            if (updater.commitInstalled(ROOT_DIR, RELAY_VERSION)) updateLog(`v${RELAY_VERSION} 업데이트가 확정되었습니다.`);
-        } catch (_) {}
-        checkForUpdate()
-            .then((info) => {
-                if (info.available) updateLog(`새 버전 v${info.latestVersion} 이(가) 있습니다. 모바일 '모듈/설정' 탭 또는 update-risustand 로 업데이트하세요.`);
-            })
-            .catch(() => {});
+            recoveredFromInterruptedUpdate = updater.recoverIfNeeded(ROOT_DIR, { log: updateLog }).rolledBack;
+        } catch (e) {
+            console.error('[Update] 미완료 업데이트 복구 실패:', e.message);
+        }
     }
-    console.log('');
-    console.log('======================================================');
-    console.log(`  📡 RisuStand Remote Relay Server v${RELAY_VERSION} 실행 중`);
-    console.log('======================================================');
-    console.log(`  로컬 접속 주소 : http://127.0.0.1:${PORT}`);
-    console.log(`  프록시 라우터  : http://127.0.0.1:${PORT}/v1/chat/completions`);
-    console.log(`  보안 토큰      : ${TOKEN}`);
-    console.log('======================================================');
-    console.log('  * PC RisuAI 브릿지 주소: http://127.0.0.1:' + PORT);
-    console.log('  * 아이폰/아이패드 접속 : http://<PC-Tailscale-IP>:' + PORT);
-    console.log('  * 설정 파일 저장 위치  : ' + CONFIG_PATH);
-    console.log('======================================================');
-    console.log('');
-});
+
+    if (recoveredFromInterruptedUpdate) {
+        // This process may have loaded half-written files; run the restored version instead.
+        console.log('[Update] 중단된 업데이트를 되돌렸습니다. 복구된 버전으로 다시 시작합니다.');
+        const child = spawn(process.execPath, [__filename, ...process.argv.slice(2)], {
+            stdio: 'inherit',
+            env: { ...process.env, RISU_REMOTE_TOKEN: TOKEN, PORT: String(PORT), HOST },
+        });
+        process.on('SIGINT', () => {});
+        process.on('SIGTERM', () => child.kill('SIGTERM'));
+        child.on('exit', (code) => process.exit(code == null ? 1 : code));
+        return;
+    }
+
+    activeServer = createRelayServer({ token: TOKEN });
+    activeServer.listen(PORT, HOST, () => {
+        if (updater) {
+            try {
+                if (updater.commitInstalled(ROOT_DIR, RELAY_VERSION)) updateLog(`v${RELAY_VERSION} 업데이트가 확정되었습니다.`);
+            } catch (_) {}
+            checkForUpdate()
+                .then((info) => {
+                    if (info.available) updateLog(`새 버전 v${info.latestVersion} 이(가) 있습니다. 모바일 '모듈/설정' 탭 또는 update-risustand 로 업데이트하세요.`);
+                })
+                .catch(() => {});
+        }
+        console.log('');
+        console.log('======================================================');
+        console.log(`  📡 RisuStand Remote Relay Server v${RELAY_VERSION} 실행 중`);
+        console.log('======================================================');
+        console.log(`  로컬 접속 주소 : http://127.0.0.1:${PORT}`);
+        console.log(`  프록시 라우터  : http://127.0.0.1:${PORT}/v1/chat/completions`);
+        console.log(`  보안 토큰      : ${TOKEN}`);
+        console.log('======================================================');
+        console.log('  * PC RisuAI 브릿지 주소: http://127.0.0.1:' + PORT);
+        console.log('  * 아이폰/아이패드 접속 : http://<PC-Tailscale-IP>:' + PORT);
+        console.log('  * 설정 파일 저장 위치  : ' + CONFIG_PATH);
+        console.log('======================================================');
+        console.log('');
+    });
+}
+
+if (require.main === module) {
+    startServer();
+}
+
+module.exports = {
+    RELAY_VERSION,
+    parseOptionalNumber,
+    normalizeTurnMessages,
+    applyPromptOverride,
+    safeTokenEqual,
+    isLoopbackAddress,
+    isTrustedOrigin,
+    corsHeaders,
+    sanitizeConfigForClient,
+    createRelayServer,
+};

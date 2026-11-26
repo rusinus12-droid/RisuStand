@@ -733,11 +733,11 @@
         }, 4000);
     }
 
-    // Top bar state (minimizable, auto-minimizing, draggable, eye dropdown)
+    // Top bar state (minimizable, auto-minimizing, draggable)
     let topBarMinimized = true;
-    let eyeDropdownOpen = false;
     let autoMinimizeTimer = null;
     let dragState = null; // { startX, startY, origLeft, origTop, moved, barEl }
+    let studioPointerUpHandler = null;
 
     async function unwrapArray(safeArr) {
         if (!safeArr) return [];
@@ -845,7 +845,6 @@
         autoMinimizeTimer = setTimeout(async () => {
             if (!dragState && !topBarMinimized) {
                 topBarMinimized = true;
-                eyeDropdownOpen = false;
                 await syncTopBar();
             }
         }, sec * 1000);
@@ -973,7 +972,6 @@
                         barEl: bar,
                         onTap: async () => {
                             topBarMinimized = false;
-                            eyeDropdownOpen = false;
                             await syncTopBar();
                             scheduleAutoMinimize();
                         },
@@ -1071,20 +1069,17 @@
             }),
             makePill('🖥️ 공홈·EPUB', false, async () => {
                 topBarMinimized = true;
-                eyeDropdownOpen = false;
                 await syncTopBar();
                 await openCloneView();
             }),
             makePill('🎨 테마', false, async () => {
                 topBarMinimized = true;
-                eyeDropdownOpen = false;
                 await syncTopBar();
                 await openStudio();
             }),
             makePill('—', false, async () => {
                 clearAutoMinimize();
                 topBarMinimized = true;
-                eyeDropdownOpen = false;
                 await syncTopBar();
             }),
         ]);
@@ -1717,14 +1712,51 @@
             doc.querySelectorAll('table, [class*="hud"], [class*="HUD"], [class*="status"], [class*="card"]').forEach((el) => el.remove());
         }
 
-        // Remove scripts for safety
+        // Remove scripts, inline event handlers, and unsafe URL schemes for safety
         doc.querySelectorAll('script').forEach((el) => el.remove());
+        doc.querySelectorAll('*').forEach((el) => {
+            for (const attr of Array.from(el.attributes)) {
+                const name = attr.name.toLowerCase();
+                if (name.startsWith('on')) {
+                    el.removeAttribute(attr.name);
+                } else if (name === 'href' || name === 'src' || name === 'xlink:href') {
+                    const val = String(attr.value || '').replace(/[\u0000-\u0020]+/g, '').toLowerCase();
+                    if (val.startsWith('javascript:') || val.startsWith('vbscript:') || val.startsWith('data:text/html')) {
+                        el.removeAttribute(attr.name);
+                    }
+                }
+            }
+        });
 
         return doc.body.innerHTML.trim();
     }
 
-    const iframeAssetDataCache = new Map(); // assetPath -> data:<mime>;base64,...
-    const iframeInlayDataCache = new Map(); // inlayId -> data:<mime>;base64,...
+    const iframeAssetDataCache = new Map(); // assetPath -> blob:/data:... (capped at 60)
+    const iframeInlayDataCache = new Map(); // inlayId -> data:<mime>;base64,... (capped at 40)
+
+    function cacheSetBounded(map, key, value, maxEntries, onEvict) {
+        if (map.has(key)) map.delete(key);
+        while (map.size >= maxEntries) {
+            const oldestKey = map.keys().next().value;
+            const oldestVal = map.get(oldestKey);
+            map.delete(oldestKey);
+            if (onEvict) onEvict(oldestVal, oldestKey);
+        }
+        map.set(key, value);
+    }
+
+    function revokeBlobIfNeeded(url) {
+        if (typeof url === 'string' && url.startsWith('blob:')) {
+            try { URL.revokeObjectURL(url); } catch (_) {}
+        }
+    }
+
+    function clearIframeCaches() {
+        for (const url of iframeAssetDataCache.values()) revokeBlobIfNeeded(url);
+        iframeAssetDataCache.clear();
+        for (const url of iframeInlayDataCache.values()) revokeBlobIfNeeded(url);
+        iframeInlayDataCache.clear();
+    }
 
     async function getIframeDataUrlForInlay(inlayId) {
         if (!inlayId) return null;
@@ -1735,7 +1767,7 @@
             if (typeof risuai.readInlay !== 'function') return null;
             const res = await risuai.readInlay(inlayId);
             if (res && res.data && String(res.data).startsWith('data:')) {
-                iframeInlayDataCache.set(inlayId, res.data);
+                cacheSetBounded(iframeInlayDataCache, inlayId, res.data, 40, revokeBlobIfNeeded);
                 return res.data;
             }
         } catch (_) {}
@@ -1794,7 +1826,7 @@
             } catch (_) {
                 url = `data:${mime};base64,${uint8ToBase64(bytes)}`;
             }
-            iframeAssetDataCache.set(assetPath, url);
+            cacheSetBounded(iframeAssetDataCache, assetPath, url, 60, revokeBlobIfNeeded);
             return url;
         } catch (err) {
             console.warn('[RisuStand] readImage 실패:', assetPath, err);
@@ -1881,7 +1913,6 @@
         const doc = parser.parseFromString(html, 'text/html');
         const rawNames = extractRawAssetNames(rawMsg);
         let rawCursor = 0;
-        let resolvedCount = 0;
 
         const isBlockedSrc = (s) => {
             if (!s) return true;
@@ -3017,15 +3048,6 @@
             });
         }
 
-        const spreadBtn = document.getElementById('btn-toggle-spread');
-        if (spreadBtn) {
-            spreadBtn.onclick = async () => {
-                config.layout.epubTwoPage = !config.layout.epubTwoPage;
-                await saveConfig();
-                await renderCloneView(modeKey);
-            };
-        }
-
         const getCurrentReadingRatio = () => {
             const vpEl = document.getElementById('epub-viewport');
             if (isEpub && twoPage && vpEl) {
@@ -3143,9 +3165,17 @@
     // =========================================================================
     // 5. Fullscreen Theme & Layout Studio UI
     // =========================================================================
+    function clearStudioListeners() {
+        if (studioPointerUpHandler) {
+            window.removeEventListener('pointerup', studioPointerUpHandler);
+            studioPointerUpHandler = null;
+        }
+    }
+
     function renderStudioUI() {
         currentIframeMode = 'studio';
         stopCloneWatcher();
+        clearStudioListeners();
         document.onkeydown = null;
         const renderPresetCard = ([key, p]) => {
             const active =
@@ -3464,10 +3494,12 @@
         `;
 
         document.getElementById('btn-close').onclick = async () => {
+            clearStudioListeners();
             currentIframeMode = null;
             await risuai.hideContainer();
         };
         document.getElementById('btn-open-clone').onclick = async () => {
+            clearStudioListeners();
             const cur = PRESETS[config.theme.preset];
             if (cur?.isChatbot) {
                 await renderCloneView(config.theme.preset);
@@ -3534,7 +3566,8 @@
             };
         };
 
-        window.addEventListener('pointerup', () => { if (!flashPreviewTimer) exitLivePreview(); }, { passive: true });
+        studioPointerUpHandler = () => { if (!flashPreviewTimer) exitLivePreview(); };
+        window.addEventListener('pointerup', studioPointerUpHandler, { passive: true });
 
         document.getElementById('ly-minsec').oninput = (e) => { document.getElementById('ly-minsec-val').textContent = `${e.target.value}초`; };
         document.getElementById('af-lock-ms').oninput = (e) => { document.getElementById('af-lock-val').textContent = `${e.target.value}ms`; };
@@ -3567,6 +3600,7 @@
 
         document.querySelectorAll('[data-launch-clone]').forEach((btn) => {
             btn.onclick = async () => {
+                clearStudioListeners();
                 const targetMode = btn.getAttribute('data-launch-clone');
                 await renderCloneView(targetMode);
             };
@@ -3757,25 +3791,6 @@
                 .trim();
         }
     
-        function detectMime(bytes, path) {
-            if (bytes && bytes.length >= 12) {
-                if (bytes[0] === 0x89 && bytes[1] === 0x50) return 'image/png';
-                if (bytes[0] === 0xFF && bytes[1] === 0xD8) return 'image/jpeg';
-                if (bytes[0] === 0x47 && bytes[1] === 0x49) return 'image/gif';
-                if (bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return 'image/webp';
-            }
-            return String(path || '').toLowerCase().endsWith('.png') ? 'image/png' : 'image/webp';
-        }
-    
-        function u8ToB64(bytes) {
-            let bin = '';
-            const chunk = 0x8000;
-            for (let i = 0; i < bytes.length; i += chunk) {
-                bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
-            }
-            return btoa(bin);
-        }
-    
         async function readAssetDataUrl(assetPath) {
             if (!assetPath) return null;
             if (assetDataCache.has(assetPath)) return assetDataCache.get(assetPath);
@@ -3790,12 +3805,26 @@
                     ? new Uint8Array(raw)
                     : new Uint8Array(Object.values(raw));
                 if (!bytes.length || bytes.length > 2.5 * 1024 * 1024) return null;
-                const url = `data:${detectMime(bytes, assetPath)};base64,${u8ToB64(bytes)}`;
-                assetDataCache.set(assetPath, url);
+                const url = `data:${detectImageMime(bytes, assetPath)};base64,${uint8ToBase64(bytes)}`;
+                cacheSetBounded(assetDataCache, assetPath, url, 40);
                 return url;
             } catch (_) {
                 return null;
             }
+        }
+
+        async function readInlayDataUrl(inlayId) {
+            if (!inlayId || typeof risuai.readInlay !== 'function') return null;
+            const cacheKey = `inlay:${inlayId}`;
+            if (assetDataCache.has(cacheKey)) return assetDataCache.get(cacheKey);
+            try {
+                const res = await risuai.readInlay(inlayId);
+                if (res && res.data && String(res.data).startsWith('data:') && String(res.data).length <= 3.5 * 1024 * 1024) {
+                    cacheSetBounded(assetDataCache, cacheKey, res.data, 40);
+                    return res.data;
+                }
+            } catch (_) {}
+            return null;
         }
     
         function buildLookup(charObj) {
@@ -3827,12 +3856,16 @@
         async function extractInlineImages(rawMsg, findPath, allowImages) {
             if (!rawMsg) return { text: '', images: [] };
             const imgs = [];
-            const re = /<img\s*=\s*["']?([^"'\s>]+)["']?\s*\/?>|\{\{(?:img|raw|asset|image|emotion)::([^}]+)\}\}/gi;
+            const re = /<img\s*=\s*["']?([^"'\s>]+)["']?\s*\/?>|\{\{(?:img|raw|asset|image|emotion)::([^}]+)\}\}|\{\{(?:inlay|inlayed)::([a-f0-9-]+)\}\}/gi;
             const rawStr = String(rawMsg);
             const matches = [];
             let m;
             while ((m = re.exec(rawStr)) !== null) {
-                matches.push({ start: m.index, end: re.lastIndex, name: (m[1] || m[2] || '').trim() });
+                if (m[3]) {
+                    matches.push({ start: m.index, end: re.lastIndex, kind: 'inlay', name: m[3].trim() });
+                } else {
+                    matches.push({ start: m.index, end: re.lastIndex, kind: 'asset', name: (m[1] || m[2] || '').trim() });
+                }
             }
             let out = '';
             let cursor = 0;
@@ -3840,14 +3873,17 @@
                 out += rawStr.slice(cursor, mt.start);
                 cursor = mt.end;
                 if (allowImages && cfg.includeImages && imgs.length < 6) {
-                    const p = findPath(mt.name);
-                    if (p) {
-                        const url = await readAssetDataUrl(p);
-                        if (url) {
-                            const idx = imgs.length;
-                            imgs.push(url);
-                            out += `\n[[RSIMG:${idx}]]\n`;
-                        }
+                    let url = null;
+                    if (mt.kind === 'inlay') {
+                        url = await readInlayDataUrl(mt.name);
+                    } else {
+                        const p = findPath(mt.name);
+                        if (p) url = await readAssetDataUrl(p);
+                    }
+                    if (url) {
+                        const idx = imgs.length;
+                        imgs.push(url);
+                        out += `\n[[RSIMG:${idx}]]\n`;
                     }
                 }
             }
@@ -3976,7 +4012,15 @@
             const allMsgs = Array.isArray(chatObj.message) ? chatObj.message : [];
             const startOffset = Math.max(0, allMsgs.length - 36);
             const recent = allMsgs.slice(startOffset);
-            const lastLen = recent.length ? String(recent[recent.length - 1].data || '').length : 0;
+            let msgHash = 2166136261;
+            for (const msg of recent) {
+                const s = `${msg.role || ''}:${String(msg.data || '')}`;
+                for (let hi = 0; hi < s.length; hi++) {
+                    msgHash ^= s.charCodeAt(hi);
+                    msgHash = Math.imul(msgHash, 16777619);
+                }
+            }
+            const recentDigest = (msgHash >>> 0).toString(36);
             const isPcActive = viewCharIndex === pcCharIdx;
     
             const localVars = (chatObj && chatObj.GLGlobalVariables && typeof chatObj.GLGlobalVariables === 'object') ? chatObj.GLGlobalVariables : {};
@@ -4000,7 +4044,7 @@
                 toggleBlocks.push({ source: charObj.name || 'Character', syntax: String(charObj.customModuleToggle) });
             }
             const toggleSig = `${useLocalToggles}:${Object.keys(localVars).length}:${JSON.stringify(localVars)}:${toggleBlocks.length}`;
-            const sig = `${viewCharIndex}:${viewChatIndex}:${isPcActive}:${allMsgs.length}:${lastLen}:${chatObj.name || ''}:${toggleSig}`;
+            const sig = `${viewCharIndex}:${viewChatIndex}:${isPcActive}:${allMsgs.length}:${recentDigest}:${chatObj.name || ''}:${toggleSig}`;
             if (!forceFull && sig === lastSnapSig) {
                 return null;
             }
@@ -4300,6 +4344,7 @@
                         bridgeVersion: '2.0.0',
                         pluginVersion: RISUSTAND_VERSION,
                         generating: isGenerating,
+                        supportsBatchCommands: true,
                         catalog,
                         snapshot,
                     }),
@@ -4314,8 +4359,11 @@
                 lastStatus = data && data.relayVersion ? `🟢 중계 서버 v${data.relayVersion} 연결됨` : '🟢 중계 서버 연결됨';
                 lastSyncTime = new Date().toLocaleTimeString();
     
-                if (data && data.command) {
-                    await handleCommand(data.command);
+                const cmds = Array.isArray(data && data.commands)
+                    ? data.commands
+                    : (data && data.command ? [data.command] : []);
+                for (const cmd of cmds) {
+                    await handleCommand(cmd);
                 }
             } catch (err) {
                 lastStatus = `🔴 연결 실패 (${err && err.message ? err.message : '네트워크 오류'})`;
@@ -4338,11 +4386,11 @@
             pollTimer = setInterval(() => pollOnce(false), ms);
         }
     
-        function esc(s) {
-            return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-        }
-    
         function renderSettingsUI() {
+            currentIframeMode = 'remote';
+            stopCloneWatcher();
+            clearStudioListeners();
+            document.onkeydown = null;
             document.body.innerHTML = `
                 <style>
                     ${buildPanelChromeCSS()}
@@ -4377,23 +4425,23 @@
                         </div>
                     </div>
                     <div class="status">
-                        <span class="st-l"><span class="st-dot"></span><span id="stText">${esc(lastStatus)}</span></span>
-                        <span style="color:var(--tx3); font-size:12px; flex-shrink:0;">${esc(lastSyncTime || '-')}</span>
+                        <span class="st-l"><span class="st-dot"></span><span id="stText">${escapeHtml(lastStatus)}</span></span>
+                        <span style="color:var(--tx3); font-size:12px; flex-shrink:0;">${escapeHtml(lastSyncTime || '-')}</span>
                     </div>
                     <label class="chk">
                         <span>원격 브릿지 활성화</span>
                         <input type="checkbox" id="enabled" ${cfg.enabled ? 'checked' : ''} />
                     </label>
                     <label>중계 서버 주소 (PC 로컬)</label>
-                    <input type="text" id="relayUrl" value="${esc(cfg.relayUrl)}" placeholder="http://127.0.0.1:8787" />
+                    <input type="text" id="relayUrl" value="${escapeHtml(cfg.relayUrl)}" placeholder="http://127.0.0.1:8787" />
                     <label>보안 접속 토큰 (PC 터미널에 출력된 값)</label>
-                    <input type="password" id="token" value="${esc(cfg.token)}" placeholder="토큰 붙여넣기" />
+                    <input type="password" id="token" value="${escapeHtml(cfg.token)}" placeholder="토큰 붙여넣기" />
                     <label class="chk" style="margin-top:6px;">
                         <span>최근 메시지의 캐릭터 에셋 이미지 함께 전송</span>
                         <input type="checkbox" id="includeImages" ${cfg.includeImages ? 'checked' : ''} />
                     </label>
                     <label>폴링 주기 (ms, 기본 1800)</label>
-                    <input type="number" id="pollIntervalMs" value="${esc(cfg.pollIntervalMs)}" min="1200" max="10000" />
+                    <input type="number" id="pollIntervalMs" value="${escapeHtml(cfg.pollIntervalMs)}" min="1200" max="10000" />
                     <div class="btns">
                         <button class="btn btn-primary" id="saveBtn">저장 및 연결</button>
                         <button class="btn btn-ghost" id="syncBtn">전체 동기화</button>
@@ -4427,6 +4475,7 @@
             };
     
             document.getElementById('closeBtn').onclick = () => {
+                currentIframeMode = null;
                 risuai.hideContainer();
             };
         }
@@ -4452,23 +4501,25 @@
             await risuai.showContainer('fullscreen');
         }, '📡', 'html');
     
+        const remoteChatOutputListener = async () => {
+            lastSnapSig = '';
+            lastCatalogSig = '';
+            setTimeout(() => pollOnce(true), 250);
+        };
         try {
-            await risuai.addRisuChatListener('output', async () => {
-                lastSnapSig = '';
-                lastCatalogSig = '';
-                setTimeout(() => pollOnce(true), 250);
-            });
+            await risuai.addRisuChatListener('output', remoteChatOutputListener);
         } catch (_) {}
     
         if (cfg.enabled && cfg.token) {
             restartPolling();
         }
     
-        return () => {
+        return async () => {
             if (pollTimer) {
                 clearInterval(pollTimer);
                 pollTimer = null;
             }
+            try { await risuai.removeRisuChatListener('output', remoteChatOutputListener); } catch (_) {}
         };
     }
 
@@ -4480,7 +4531,9 @@
     }
 
     await risuai.onUnload(async () => {
-        if (typeof stopRemoteBridge === 'function') stopRemoteBridge();
+        if (typeof stopRemoteBridge === 'function') await stopRemoteBridge();
+        clearStudioListeners();
+        clearIframeCaches();
         clearAutoMinimize();
         stopCloneWatcher();
         if (lockReleaseTimer) {

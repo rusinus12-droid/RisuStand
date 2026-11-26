@@ -34,12 +34,12 @@ if not exist "risustand-relay-server.js" (
 )
 
 if not exist ".risustand-token" (
-    for /f "usebackq delims=" %%T in (`node -e "console.log(require('crypto').randomBytes(12).toString('hex'))"`) do set "GEN_TOK=%%T"
+    for /f "usebackq delims=" %%T in (`node -e "console.log(require('crypto').randomBytes(16).toString('hex'))"`) do set "GEN_TOK=%%T"
     > ".risustand-token" echo !GEN_TOK!
 )
 
 set /p RISU_REMOTE_TOKEN=<".risustand-token"
-set "PORT=8787"
+if not defined PORT set "PORT=8787"
 
 set "TS_IP="
 where tailscale >nul 2>&1

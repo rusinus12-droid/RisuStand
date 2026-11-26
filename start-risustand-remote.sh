@@ -12,7 +12,8 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 if [ ! -f ".risustand-token" ]; then
-  node -e "console.log(require('crypto').randomBytes(12).toString('hex'))" > .risustand-token
+  node -e "console.log(require('crypto').randomBytes(16).toString('hex'))" > .risustand-token
+  chmod 600 .risustand-token 2>/dev/null || true
 fi
 
 export RISU_REMOTE_TOKEN="$(cat .risustand-token | tr -d '\r\n')"
