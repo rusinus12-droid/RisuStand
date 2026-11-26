@@ -73,6 +73,8 @@ function defaultConfig() {
         activeProfileId: '',
         directPresetId: 'bundled:leave',
         remoteToggleValues: {},
+        disabledLoreEntries: {},
+        pinnedLoreEntries: {},
         presetToggles: [],
         profiles: [
             {
@@ -139,10 +141,21 @@ function loadConfig() {
                     if (k) remoteToggleValues[String(k)] = String(v ?? '');
                 }
             }
+            const normalizeStrArrayMap = (src) => {
+                const out = {};
+                if (src && typeof src === 'object' && !Array.isArray(src)) {
+                    for (const [k, v] of Object.entries(src)) {
+                        if (k && Array.isArray(v)) out[String(k)] = v.map((x) => String(x || '')).filter(Boolean);
+                    }
+                }
+                return out;
+            };
             return {
                 activeProfileId: typeof raw.activeProfileId === 'string' ? raw.activeProfileId : def.activeProfileId,
                 directPresetId: typeof raw.directPresetId === 'string' ? raw.directPresetId : def.directPresetId,
                 remoteToggleValues,
+                disabledLoreEntries: normalizeStrArrayMap(raw.disabledLoreEntries),
+                pinnedLoreEntries: normalizeStrArrayMap(raw.pinnedLoreEntries),
                 profiles: Array.isArray(raw.profiles) ? raw.profiles : def.profiles,
                 presetToggles: Array.isArray(raw.presetToggles) ? raw.presetToggles : [],
                 translator: { ...def.translator, ...(raw.translator || {}) },
@@ -296,6 +309,30 @@ function loadBundledLeavePreset() {
     } catch (_) {
         return null;
     }
+}
+
+function syncBundledLeavePresetToggles(presetToggles) {
+    if (!Array.isArray(presetToggles) || !presetToggles.length) return false;
+    const leave = loadBundledLeavePreset();
+    if (!leave || !leave.toggleSyntax) return false;
+    let changed = false;
+    for (const pt of presetToggles) {
+        if (!pt || pt.id !== LEAVE_PRESET_ID) continue;
+        const nextName = '🍃 ' + leave.name;
+        if (pt.syntax !== leave.toggleSyntax) {
+            pt.syntax = leave.toggleSyntax;
+            changed = true;
+        }
+        if (pt.name !== nextName) {
+            pt.name = nextName;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+if (syncBundledLeavePresetToggles(config.presetToggles)) {
+    saveConfig();
 }
 
 let customPresetsCache = null;
@@ -1848,6 +1885,102 @@ function findMatchingCbsIfEnd(str, startIdx) {
     return null;
 }
 
+function lookupCbsVar(name, ctx) {
+    const k = String(name || '').trim();
+    if (!k) return '';
+    const cVars = (ctx && ctx.chatVars) || {};
+    const gVars = (ctx && ctx.globalVars) || {};
+    if (Object.prototype.hasOwnProperty.call(cVars, k)) return String(cVars[k] ?? '');
+    if (Object.prototype.hasOwnProperty.call(gVars, k)) return String(gVars[k] ?? '');
+    if (!k.startsWith('toggle_') && Object.prototype.hasOwnProperty.call(gVars, `toggle_${k}`)) {
+        return String(gVars[`toggle_${k}`] ?? '');
+    }
+    return '';
+}
+
+function evalCbsWhenCondition(condExpr, ctx, depth) {
+    const raw = String(condExpr || '').trim();
+    if (!raw) return false;
+    if (!raw.includes('::')) {
+        const evaluated = evalPresetCbs(raw, ctx, depth + 1).trim();
+        if (/^(?:0|1|true|false|null|undefined|nan)$/i.test(evaluated) || !evaluated) {
+            return isCbsTruthy(evaluated);
+        }
+        const v = lookupCbsVar(evaluated, ctx);
+        return v !== '' ? isCbsTruthy(v) : isCbsTruthy(evaluated);
+    }
+
+    const tokens = splitCbsTopLevelArgs(raw);
+    const orGroups = [[]];
+    for (const tok of tokens) {
+        if (tok.trim().toLowerCase() === 'or') {
+            orGroups.push([]);
+        } else {
+            orGroups[orGroups.length - 1].push(tok);
+        }
+    }
+
+    const evalAtomic = (slice) => {
+        if (!slice.length) return false;
+        let idx = 0;
+        let negate = false;
+        while (idx < slice.length && slice[idx].trim().toLowerCase() === 'not') {
+            negate = !negate;
+            idx += 1;
+        }
+        const rem = slice.slice(idx);
+        let res = false;
+        if (rem.length === 1) {
+            const evaluated = evalPresetCbs(rem[0], ctx, depth + 1).trim();
+            const v = (!rem[0].includes('{{') && lookupCbsVar(evaluated, ctx)) || evaluated;
+            res = isCbsTruthy(v);
+        } else if (rem.length === 2) {
+            const op = rem[0].trim().toLowerCase();
+            const arg = evalPresetCbs(rem[1], ctx, depth + 1).trim();
+            if (op === 'var' || op === 'toggle' || op === 'vis') {
+                res = isCbsTruthy(lookupCbsVar(arg, ctx) || (op === 'vis' ? arg : ''));
+            } else if (op === 'visnot') {
+                res = !isCbsTruthy(lookupCbsVar(arg, ctx) || arg);
+            } else {
+                res = isCbsTruthy(evalPresetCbs(rem.join('::'), ctx, depth + 1));
+            }
+        } else {
+            // Support either ['var', 'x', 'is', '1'] or ['A', 'is', 'B']
+            let opIdx = 1;
+            let lhs;
+            const headOp = rem[0].trim().toLowerCase();
+            if ((headOp === 'var' || headOp === 'toggle') && rem.length >= 4) {
+                lhs = lookupCbsVar(evalPresetCbs(rem[1], ctx, depth + 1).trim(), ctx);
+                opIdx = 2;
+            } else {
+                const rawLhs = rem[0];
+                const evalLhs = evalPresetCbs(rawLhs, ctx, depth + 1);
+                lhs = (!rawLhs.includes('{{') && lookupCbsVar(evalLhs, ctx) !== '') ? lookupCbsVar(evalLhs, ctx) : evalLhs;
+            }
+            const op = (rem[opIdx] || '').trim().toLowerCase();
+            const rhs = evalPresetCbs(rem.slice(opIdx + 1).join('::'), ctx, depth + 1);
+            if (op === 'is' || op === '==' || op === 'equal') res = String(lhs) === String(rhs);
+            else if (op === 'isnot' || op === '!=' || op === 'notequal') res = String(lhs) !== String(rhs);
+            else if (op === '>') res = Number(lhs) > Number(rhs);
+            else if (op === '<') res = Number(lhs) < Number(rhs);
+            else if (op === '>=') res = Number(lhs) >= Number(rhs);
+            else if (op === '<=') res = Number(lhs) <= Number(rhs);
+            else res = isCbsTruthy(lhs);
+        }
+        return negate ? !res : res;
+    };
+
+    for (const grp of orGroups) {
+        const andParts = [[]];
+        for (const tok of grp) {
+            if (tok.trim().toLowerCase() === 'and') andParts.push([]);
+            else andParts[andParts.length - 1].push(tok);
+        }
+        if (andParts.every(evalAtomic)) return true;
+    }
+    return false;
+}
+
 function evalPresetCbs(input, ctx = {}, depth = 0) {
     const str = String(input ?? '');
     if (!str.includes('{{') || depth > 24) return str;
@@ -1891,6 +2024,26 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
                 : '';
             const branch = isCbsTruthy(condVal) ? thenBody : elseBody;
             out += evalPresetCbs(branch, ctx, depth + 1);
+            pos = bounds.endClose + 2;
+            continue;
+        }
+
+        const whenMatch = trimmed.match(/^#when(?:\s+|::)([\s\S]*)$/i) || (/^#when$/i.test(trimmed) ? ['', ''] : null);
+        if (whenMatch) {
+            const bounds = findMatchingCbsIfEnd(str, closeIdx + 2);
+            if (!bounds) {
+                out += str.slice(openIdx, closeIdx + 2);
+                pos = closeIdx + 2;
+                continue;
+            }
+            const ok = evalCbsWhenCondition(whenMatch[1] || '', ctx, depth);
+            const thenBody = bounds.elseStart >= 0
+                ? str.slice(closeIdx + 2, bounds.elseStart)
+                : str.slice(closeIdx + 2, bounds.endStart);
+            const elseBody = bounds.elseStart >= 0
+                ? str.slice(bounds.elseEnd, bounds.endStart)
+                : '';
+            out += evalPresetCbs(ok ? thenBody : elseBody, ctx, depth + 1);
             pos = bounds.endClose + 2;
             continue;
         }
@@ -2008,7 +2161,310 @@ function normalizeToggleMapInto(target, src) {
     }
 }
 
-function buildDirectPromptMessages({ preset = null, snap = null, historyMessages = [], userText = '', remoteToggleValues = null } = {}) {
+function parseLoreDecorators(rawContent) {
+    const lines = String(rawContent || '').replace(/\r\n/g, '\n').split('\n');
+    const out = {
+        content: '',
+        pos: '',
+        depth: 0,
+        role: 'system',
+        scanDepth: null,
+        priority: null,
+        forceState: 'none',
+        activateOnlyAfter: null,
+        activateOnlyEvery: null,
+        isGreeting: null,
+        additionalKeys: [],
+        excludeKeys: [],
+        excludeKeysAll: [],
+        fullWord: null,
+        recursive: null,
+        noRecursiveSearch: false,
+    };
+
+    let idx = 0;
+    while (idx < lines.length && !lines[idx].trim()) {
+        idx += 1;
+    }
+    while (idx < lines.length) {
+        const line = lines[idx].trim();
+        if (!line.startsWith('@@')) break;
+        const body = line.slice(2).trim();
+        if (body) {
+            const parts = body.split(/\s+/);
+            const name = String(parts[0] || '').toLowerCase();
+            const arg = parts.slice(1);
+            switch (name) {
+                case 'end':
+                    out.pos = 'depth';
+                    out.depth = 0;
+                    break;
+                case 'depth':
+                case 'reverse_depth': {
+                    const n = parseInt(arg[0], 10);
+                    if (!Number.isNaN(n)) {
+                        out.depth = n;
+                        out.pos = name === 'depth' ? 'depth' : 'reverse_depth';
+                    }
+                    break;
+                }
+                case 'role': {
+                    const r = String(arg[0] || '').toLowerCase();
+                    if (r === 'user' || r === 'assistant' || r === 'system') out.role = r;
+                    break;
+                }
+                case 'scan_depth': {
+                    const n = parseInt(arg[0], 10);
+                    if (!Number.isNaN(n) && n > 0) out.scanDepth = n;
+                    break;
+                }
+                case 'priority': {
+                    const n = parseInt(arg[0], 10);
+                    if (!Number.isNaN(n)) out.priority = n;
+                    break;
+                }
+                case 'position': {
+                    const p = String(arg[0] || '');
+                    if (p.startsWith('pt_') || p === 'postEverything' || p === 'after_desc' || p === 'before_desc' || p === 'personality' || p === 'scenario') {
+                        out.pos = p;
+                    }
+                    break;
+                }
+                case 'activate':
+                    out.forceState = 'activate';
+                    break;
+                case 'dont_activate':
+                    out.forceState = 'deactivate';
+                    break;
+                case 'activate_only_after': {
+                    const n = parseInt(arg[0], 10);
+                    if (!Number.isNaN(n)) out.activateOnlyAfter = n;
+                    break;
+                }
+                case 'activate_only_every': {
+                    const n = parseInt(arg[0], 10);
+                    if (!Number.isNaN(n) && n > 0) out.activateOnlyEvery = n;
+                    break;
+                }
+                case 'is_greeting': {
+                    const n = parseInt(arg[0], 10);
+                    if (!Number.isNaN(n)) out.isGreeting = n;
+                    break;
+                }
+                case 'additional_keys':
+                    out.additionalKeys.push(...arg.join(' ').split(',').map((k) => k.trim()).filter(Boolean));
+                    break;
+                case 'exclude_keys':
+                    out.excludeKeys.push(...arg.join(' ').split(',').map((k) => k.trim()).filter(Boolean));
+                    break;
+                case 'exclude_keys_all':
+                    out.excludeKeysAll.push(...arg.join(' ').split(',').map((k) => k.trim()).filter(Boolean));
+                    break;
+                case 'match_full_word':
+                    out.fullWord = true;
+                    break;
+                case 'match_partial_word':
+                    out.fullWord = false;
+                    break;
+                case 'recursive':
+                    out.recursive = true;
+                    break;
+                case 'unrecursive':
+                    out.recursive = false;
+                    break;
+                case 'no_recursive_search':
+                    out.noRecursiveSearch = true;
+                    break;
+                default:
+                    break;
+            }
+        }
+        idx += 1;
+    }
+    out.content = lines.slice(idx).join('\n').trim();
+    return out;
+}
+
+function escapeRegExpStr(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function matchesLoreKeys(corpus, keys, { useRegex = false, fullWord = false, requireAll = false } = {}) {
+    const cleanKeys = (Array.isArray(keys) ? keys : []).map((k) => String(k || '').trim()).filter(Boolean);
+    if (!cleanKeys.length) return false;
+    const text = String(corpus || '');
+    const lowerText = text.toLowerCase();
+
+    const hitOne = (k) => {
+        if (useRegex) {
+            const m = k.match(/^\/([\s\S]+)\/([gimsuy]*)$/);
+            try {
+                const re = m ? new RegExp(m[1], m[2] || 'i') : new RegExp(k, 'i');
+                return re.test(text);
+            } catch (_) {
+                return lowerText.includes(k.toLowerCase());
+            }
+        }
+        if (fullWord && /^[a-zA-Z0-9_]+$/.test(k)) {
+            const re = new RegExp(`(^|[^a-zA-Z0-9_])${escapeRegExpStr(k)}([^a-zA-Z0-9_]|$)`, 'i');
+            return re.test(text);
+        }
+        return lowerText.includes(k.toLowerCase());
+    };
+
+    return requireAll ? cleanKeys.every(hitOne) : cleanKeys.some(hitOne);
+}
+
+function evaluateLorebookEntries({
+    loreEntries = [],
+    chatList = [],
+    cbsCtx = {},
+    loreDepth = 10,
+    loreTokenBudget = 16000,
+    loreRecursive = true,
+    loreFullWord = false,
+    fmIndex = -1,
+    totalChatMessages = 0,
+    disabledLoreUids = [],
+    pinnedLoreUids = [],
+} = {}) {
+    const disabledSet = new Set((Array.isArray(disabledLoreUids) ? disabledLoreUids : []).map(String));
+    const pinnedSet = new Set((Array.isArray(pinnedLoreUids) ? pinnedLoreUids : []).map(String));
+    const parsed = [];
+    for (let i = 0; i < (Array.isArray(loreEntries) ? loreEntries.length : 0); i += 1) {
+        const raw = loreEntries[i];
+        if (!raw || raw.enabled === false || raw.mode === 'folder') continue;
+        if (raw.uid && disabledSet.has(String(raw.uid))) continue;
+        const dec = parseLoreDecorators(raw.content || '');
+        if (!dec.content) continue;
+        const msgCount = Number(totalChatMessages || chatList.length || 0);
+        if (dec.activateOnlyAfter !== null && msgCount < dec.activateOnlyAfter) continue;
+        if (dec.activateOnlyEvery !== null && (msgCount % dec.activateOnlyEvery !== 0)) continue;
+        if (dec.isGreeting !== null && ((Number(fmIndex) + 1) !== dec.isGreeting)) continue;
+        if (dec.forceState === 'deactivate') continue;
+
+        const baseOrder = Number.isFinite(Number(raw.insertorder)) ? Number(raw.insertorder) : 100;
+        parsed.push({
+            idx: i,
+            raw,
+            dec,
+            pinned: Boolean(raw.uid && pinnedSet.has(String(raw.uid))),
+            insertorder: baseOrder,
+            priority: dec.priority !== null ? dec.priority : baseOrder,
+        });
+    }
+
+    const activeMap = new Map();
+    const recursiveTexts = [];
+    const maxPasses = loreRecursive ? 3 : 1;
+
+    for (let pass = 0; pass < maxPasses; pass += 1) {
+        let addedInPass = false;
+        const recursiveChunk = pass > 0 ? recursiveTexts.join('\n') : '';
+
+        for (const item of parsed) {
+            if (activeMap.has(item.idx)) continue;
+            if (pass > 0 && (item.dec.recursive === false || item.dec.noRecursiveSearch)) continue;
+            const { raw, dec } = item;
+            const depth = Math.max(1, Number(dec.scanDepth || loreDepth || 10));
+            const baseCorpus = chatList.slice(-depth).map((m) => String((m && m.content) || '')).join('\n');
+            const corpus = (pass > 0 && recursiveChunk) ? `${baseCorpus}\n${recursiveChunk}` : baseCorpus;
+            const fw = dec.fullWord !== null ? dec.fullWord : Boolean(loreFullWord);
+            const useRegex = Boolean(raw.useRegex);
+
+            let hit = Boolean(raw.alwaysActive) || Boolean(item.pinned) || dec.forceState === 'activate';
+            if (!hit && pass === 0 && !String(raw.key || '').trim() && !dec.additionalKeys.length) {
+                hit = false;
+            } else if (!hit) {
+                const primaryKeys = String(raw.key || '').split(',');
+                hit = matchesLoreKeys(corpus, primaryKeys, { useRegex, fullWord: fw });
+                if (hit && raw.selective && String(raw.secondkey || '').trim()) {
+                    hit = matchesLoreKeys(corpus, String(raw.secondkey).split(','), { useRegex, fullWord: fw });
+                }
+                if (hit && dec.additionalKeys.length) {
+                    hit = matchesLoreKeys(corpus, dec.additionalKeys, { useRegex, fullWord: fw });
+                }
+            }
+            if (hit && dec.excludeKeys.length) {
+                if (matchesLoreKeys(corpus, dec.excludeKeys, { useRegex, fullWord: fw, requireAll: false })) hit = false;
+            }
+            if (hit && dec.excludeKeysAll.length) {
+                if (matchesLoreKeys(corpus, dec.excludeKeysAll, { useRegex, fullWord: fw, requireAll: true })) hit = false;
+            }
+            if (!hit) continue;
+
+            const evaluated = cleanPresetPromptText(evalPresetCbs(dec.content, cbsCtx));
+            if (!evaluated) continue;
+
+            const formatted = raw.comment ? `[${raw.comment}]\n${evaluated}` : evaluated;
+            activeMap.set(item.idx, {
+                idx: item.idx,
+                insertorder: item.insertorder,
+                priority: item.priority,
+                pos: dec.pos,
+                depth: dec.depth,
+                role: dec.role,
+                content: formatted,
+                rawEvaluated: evaluated,
+            });
+            addedInPass = true;
+            if (dec.recursive !== false) {
+                recursiveTexts.push(evaluated);
+            }
+        }
+        if (!addedInPass) break;
+    }
+
+    const byPriority = Array.from(activeMap.values()).sort((a, b) => (b.priority - a.priority) || (a.idx - b.idx));
+    const maxChars = Math.max(12000, Number(loreTokenBudget || 16000) * 3);
+    const accepted = [];
+    let usedChars = 0;
+    for (const item of byPriority) {
+        if (usedChars + item.content.length > maxChars) continue;
+        accepted.push(item);
+        usedChars += item.content.length;
+    }
+
+    accepted.sort((a, b) => (a.insertorder - b.insertorder) || (a.idx - b.idx));
+
+    const buckets = {
+        normal: [],
+        beforeDesc: [],
+        afterDesc: [],
+        personality: [],
+        scenario: [],
+        depthEntries: [],
+        postEverything: [],
+    };
+    const postAssistant = [];
+    for (const item of accepted) {
+        const p = item.pos;
+        if (p === 'before_desc') buckets.beforeDesc.push(item);
+        else if (p === 'after_desc') buckets.afterDesc.push(item);
+        else if (p === 'personality') buckets.personality.push(item);
+        else if (p === 'scenario') buckets.scenario.push(item);
+        else if ((p === 'depth' && item.depth === 0) || p === 'postEverything' || p === 'pt_postEverything') {
+            if (item.role === 'assistant') postAssistant.push(item);
+            else buckets.postEverything.push(item);
+        } else if ((p === 'depth' && item.depth > 0) || p === 'reverse_depth') {
+            buckets.depthEntries.push(item);
+        } else {
+            buckets.normal.push(item);
+        }
+    }
+    if (postAssistant.length) buckets.postEverything.push(...postAssistant);
+    return buckets;
+}
+
+function buildDirectPromptMessages({
+    preset = null,
+    snap = null,
+    historyMessages = [],
+    userText = '',
+    remoteToggleValues = null,
+    disabledLoreUids = [],
+    pinnedLoreUids = [],
+} = {}) {
     const s = snap || {};
     const rawCtx = s.charContext && typeof s.charContext === 'object'
         ? s.charContext
@@ -2052,7 +2508,13 @@ function buildDirectPromptMessages({ preset = null, snap = null, historyMessages
     baseCtx.scenario = evalField(rawCtx.scenario);
     baseCtx.personaPrompt = evalField(rawCtx.personaPrompt);
     baseCtx.note = evalField(rawCtx.note);
-    const moduleLore = evalField(rawCtx.moduleLore);
+    const memoryText = evalField(rawCtx.memory);
+    const replaceGlobalNoteRaw = String(rawCtx.replaceGlobalNote || '');
+    const resolveGlobalNote = (fallbackText) => {
+        const orig = String(fallbackText || baseCtx.globalNote || '');
+        const chosen = replaceGlobalNoteRaw ? replaceGlobalNoteRaw.replace(/\{\{original\}\}/gi, orig) : orig;
+        return evalField(chosen);
+    };
 
     const chatList = (Array.isArray(historyMessages) ? historyMessages : []).map((m) => ({
         role: m && m.role === 'user' ? 'user' : 'assistant',
@@ -2062,20 +2524,92 @@ function buildDirectPromptMessages({ preset = null, snap = null, historyMessages
         chatList.push({ role: 'user', content: String(userText) });
     }
 
+    const loreBuckets = Array.isArray(rawCtx.loreEntries)
+        ? evaluateLorebookEntries({
+            loreEntries: rawCtx.loreEntries,
+            chatList,
+            cbsCtx: baseCtx,
+            loreDepth: rawCtx.loreDepth,
+            loreTokenBudget: rawCtx.loreTokenBudget,
+            loreRecursive: rawCtx.loreRecursive,
+            loreFullWord: rawCtx.loreFullWord,
+            fmIndex: rawCtx.fmIndex ?? s.fmIndex ?? -1,
+            totalChatMessages: rawCtx.totalChatMessages ?? s.totalMessages ?? chatList.length,
+            disabledLoreUids,
+            pinnedLoreUids,
+        })
+        : {
+            normal: rawCtx.moduleLore
+                ? [{ role: 'system', content: parseLoreDecorators(evalField(rawCtx.moduleLore)).content || evalField(rawCtx.moduleLore) }]
+                : [],
+            beforeDesc: [],
+            afterDesc: [],
+            personality: [],
+            scenario: [],
+            depthEntries: [],
+            postEverything: [],
+        };
+
+    if (rawCtx.depthPrompt && typeof rawCtx.depthPrompt === 'object' && rawCtx.depthPrompt.prompt) {
+        const dpText = evalField(rawCtx.depthPrompt.prompt);
+        const dpDepth = Number(rawCtx.depthPrompt.depth || 0);
+        if (dpText) {
+            if (dpDepth === 0) loreBuckets.postEverything.push({ role: 'system', content: dpText });
+            else loreBuckets.depthEntries.push({ role: 'system', content: dpText, pos: 'depth', depth: dpDepth });
+        }
+    }
+
+    const normalLoreText = loreBuckets.normal.map((x) => x.content).filter(Boolean).join('\n\n');
+    const buildDescText = () => {
+        const parts = [];
+        for (const x of loreBuckets.beforeDesc) parts.push(x.content);
+        if (sysPromptText) parts.push(sysPromptText);
+        if (baseCtx.desc) parts.push(`[Character Description]\n${baseCtx.desc}`);
+        for (const x of loreBuckets.afterDesc) parts.push(x.content);
+        const persCombined = [baseCtx.personality, ...loreBuckets.personality.map((x) => x.content)].filter(Boolean).join('\n\n');
+        if (persCombined) parts.push(`[Personality]\n${persCombined}`);
+        const scenCombined = [baseCtx.scenario, ...loreBuckets.scenario.map((x) => x.content)].filter(Boolean).join('\n\n');
+        if (scenCombined) parts.push(`[Scenario]\n${scenCombined}`);
+        return cleanPresetPromptText(parts.join('\n\n'));
+    };
+
+    const chatStream = chatList.slice();
+    if (loreBuckets.depthEntries.length) {
+        for (const d of loreBuckets.depthEntries) {
+            const msgObj = { role: d.role || 'system', content: d.content };
+            if (!chatStream.length) {
+                chatStream.push(msgObj);
+                continue;
+            }
+            let targetIdx;
+            if (d.pos === 'reverse_depth') {
+                targetIdx = Math.min(chatStream.length - 1, Math.max(0, Number(d.depth || 0)));
+            } else {
+                targetIdx = Math.min(chatStream.length - 1, Math.max(0, chatStream.length - Number(d.depth || 1)));
+            }
+            chatStream.splice(targetIdx, 0, msgObj);
+        }
+    }
+
     // Fallback: legacy minimal prompt when direct preset is turned off
     if (!preset || !Array.isArray(preset.promptTemplate) || !preset.promptTemplate.length) {
         const sysParts = [];
         sysParts.push(`You are roleplaying as ${baseCtx.charName}. Stay in character and respond naturally.`);
-        if (sysPromptText) sysParts.push(sysPromptText);
-        if (baseCtx.desc) sysParts.push(`[Character Description]\n${baseCtx.desc}`);
-        if (baseCtx.personality) sysParts.push(`[Personality]\n${baseCtx.personality}`);
-        if (baseCtx.scenario) sysParts.push(`[Scenario]\n${baseCtx.scenario}`);
-        if (moduleLore) sysParts.push(`[World / Module Lorebook]\n${moduleLore}`);
+        const descBlock = buildDescText();
+        if (descBlock) sysParts.push(descBlock);
+        if (normalLoreText) sysParts.push(`[World / Module Lorebook]\n${normalLoreText}`);
         if (rawCtx.personaName || baseCtx.personaPrompt) {
             sysParts.push(`[User Persona: ${baseCtx.personaName}]\n${baseCtx.personaPrompt}`);
         }
+        if (memoryText) sysParts.push(`[Memory]\n${memoryText}`);
         if (baseCtx.note) sysParts.push(`[Author's Note]\n${baseCtx.note}`);
-        return [{ role: 'system', content: sysParts.join('\n\n') }, ...chatList];
+        const gn = resolveGlobalNote('');
+        if (gn) sysParts.push(gn);
+        const out = [{ role: 'system', content: sysParts.join('\n\n') }, ...chatStream];
+        for (const pe of loreBuckets.postEverything) {
+            out.push({ role: pe.role || 'system', content: pe.content });
+        }
+        return out;
     }
 
     const mapRole = (r) => {
@@ -2094,15 +2628,20 @@ function buildDirectPromptMessages({ preset = null, snap = null, historyMessages
 
     const msgs = [];
     let sawChatBlock = false;
+    let emittedPostEverything = false;
 
     for (const item of preset.promptTemplate) {
         if (!item || typeof item !== 'object') continue;
         const type = String(item.type || 'plain');
 
         if (type === 'plain') {
+            if (item.type2 === 'globalNote') {
+                const gn = resolveGlobalNote(item.text);
+                if (gn) msgs.push({ role: mapRole(item.role), content: gn });
+                continue;
+            }
             let rawText = item.text !== undefined ? String(item.text) : '';
             if (!rawText && item.type2 === 'main') rawText = baseCtx.mainPrompt;
-            if (!rawText && item.type2 === 'globalNote') rawText = baseCtx.globalNote;
             const evaluated = cleanPresetPromptText(evalPresetCbs(rawText, baseCtx));
             if (evaluated) msgs.push({ role: mapRole(item.role), content: evaluated });
             continue;
@@ -2115,44 +2654,67 @@ function buildDirectPromptMessages({ preset = null, snap = null, historyMessages
         }
         if (type === 'persona') {
             if (rawCtx.personaName || baseCtx.personaPrompt) {
-                const body = applyInnerFormat(item, cleanPresetPromptText(`[User Persona: ${baseCtx.personaName}]\n${baseCtx.personaPrompt}`));
+                const rawPersona = (item.innerFormat && String(item.innerFormat).includes('{{slot}}'))
+                    ? baseCtx.personaPrompt
+                    : `[User Persona: ${baseCtx.personaName}]\n${baseCtx.personaPrompt}`;
+                const body = applyInnerFormat(item, cleanPresetPromptText(rawPersona));
                 if (body) msgs.push({ role: 'system', content: body });
             }
             continue;
         }
         if (type === 'description') {
-            const descParts = [];
-            if (sysPromptText) descParts.push(sysPromptText);
-            if (baseCtx.desc) descParts.push(`[Character Description]\n${baseCtx.desc}`);
-            if (baseCtx.personality) descParts.push(`[Personality]\n${baseCtx.personality}`);
-            if (baseCtx.scenario) descParts.push(`[Scenario]\n${baseCtx.scenario}`);
-            const body = applyInnerFormat(item, cleanPresetPromptText(descParts.join('\n\n')));
+            const body = applyInnerFormat(item, buildDescText());
             if (body) msgs.push({ role: 'system', content: body });
             continue;
         }
         if (type === 'lorebook') {
-            if (moduleLore) {
-                const body = applyInnerFormat(item, cleanPresetPromptText(`[World / Module Lorebook]\n${moduleLore}`));
+            if (normalLoreText) {
+                const body = applyInnerFormat(item, cleanPresetPromptText(`[World / Module Lorebook]\n${normalLoreText}`));
                 if (body) msgs.push({ role: 'system', content: body });
             }
             continue;
         }
+        if (type === 'memory') {
+            const bodyParts = [];
+            if (item.text) {
+                const t = evalField(item.text);
+                if (t) bodyParts.push(t);
+            }
+            if (memoryText) bodyParts.push(memoryText);
+            const body = applyInnerFormat(item, cleanPresetPromptText(bodyParts.join('\n\n')));
+            if (body) msgs.push({ role: mapRole(item.role), content: body });
+            continue;
+        }
         if (type === 'authornote') {
             if (baseCtx.note) {
-                const body = applyInnerFormat(item, cleanPresetPromptText(`[Author's Note]\n${baseCtx.note}`));
+                const rawNote = (item.innerFormat && String(item.innerFormat).includes('{{slot}}'))
+                    ? baseCtx.note
+                    : `[Author's Note]\n${baseCtx.note}`;
+                const body = applyInnerFormat(item, cleanPresetPromptText(rawNote));
                 if (body) msgs.push({ role: 'system', content: body });
             }
             continue;
         }
         if (type === 'chat') {
             sawChatBlock = true;
-            const sliced = sliceChatRange(chatList, item.rangeStart, item.rangeEnd);
+            const sliced = sliceChatRange(chatStream, item.rangeStart, item.rangeEnd);
             for (const cm of sliced) {
                 if (cm.content || cm.role === 'user') msgs.push({ role: cm.role, content: cm.content });
             }
             continue;
         }
-        if (type === 'cache' || type === 'memory' || type === 'postEverything') {
+        if (type === 'postEverything') {
+            emittedPostEverything = true;
+            if (item.text) {
+                const evaluated = cleanPresetPromptText(evalPresetCbs(String(item.text), baseCtx));
+                if (evaluated) msgs.push({ role: mapRole(item.role), content: evaluated });
+            }
+            for (const pe of loreBuckets.postEverything) {
+                msgs.push({ role: pe.role || 'system', content: pe.content });
+            }
+            continue;
+        }
+        if (type === 'cache') {
             if (item.text) {
                 const evaluated = cleanPresetPromptText(evalPresetCbs(String(item.text), baseCtx));
                 if (evaluated) msgs.push({ role: mapRole(item.role), content: evaluated });
@@ -2165,10 +2727,22 @@ function buildDirectPromptMessages({ preset = null, snap = null, historyMessages
         }
     }
 
-    if (!sawChatBlock && chatList.length) {
-        msgs.push(...chatList);
+    if (!sawChatBlock && chatStream.length) {
+        msgs.push(...chatStream);
+    }
+    if (!emittedPostEverything && loreBuckets.postEverything.length) {
+        for (const pe of loreBuckets.postEverything) {
+            msgs.push({ role: pe.role || 'system', content: pe.content });
+        }
     }
     return msgs;
+}
+
+function getLoreCharKeyFromSnap(snap) {
+    const rawCtx = snap && snap.charContext && typeof snap.charContext === 'object' ? snap.charContext : null;
+    if (rawCtx && rawCtx.charId) return String(rawCtx.charId);
+    if (snap && typeof snap.charIndex === 'number' && snap.charIndex >= 0) return `idx:${snap.charIndex}`;
+    return String((snap && snap.charName) || 'default');
 }
 
 // ================= Direct Remote Chat (for non-PC-active chars) =================
@@ -2180,12 +2754,15 @@ async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = st
     const snap = snapView || state.snapshot;
     const preset = resolveDirectPreset(config.directPresetId);
     const history = Array.isArray(snap && snap.messages) ? snap.messages.slice(-30) : [];
+    const loreKey = getLoreCharKeyFromSnap(snap);
     const msgs = buildDirectPromptMessages({
         preset,
         snap,
         historyMessages: history,
         userText,
         remoteToggleValues: config.remoteToggleValues,
+        disabledLoreUids: (config.disabledLoreEntries && config.disabledLoreEntries[loreKey]) || [],
+        pinnedLoreUids: (config.pinnedLoreEntries && config.pinnedLoreEntries[loreKey]) || [],
     });
 
     const finalMsgs = applyPromptOverride(msgs, profile);
@@ -2217,12 +2794,15 @@ async function runDirectRemoteReroll(charIndex, chatIndex, msgIndex, snapView = 
     const prior = (Array.isArray(snap && snap.messages) ? snap.messages : [])
         .filter((m) => m.index < msgIndex)
         .slice(-30);
+    const loreKey = getLoreCharKeyFromSnap(snap);
     const msgs = buildDirectPromptMessages({
         preset,
         snap,
         historyMessages: prior,
         userText: '',
         remoteToggleValues: config.remoteToggleValues,
+        disabledLoreUids: (config.disabledLoreEntries && config.disabledLoreEntries[loreKey]) || [],
+        pinnedLoreUids: (config.pinnedLoreEntries && config.pinnedLoreEntries[loreKey]) || [],
     });
 
     const finalMsgs = applyPromptOverride(msgs, profile);
@@ -2835,6 +3415,43 @@ function renderWebApp() {
   .req-log-meta-item b { display:block; font-size:11px; color:var(--sub); margin-bottom:2px; }
   .req-log-meta-item span { word-break:break-all; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 
+  /* ===== Dedicated Message Edit Modal ===== */
+  #msgEditModal {
+    position:fixed; inset:0; z-index:165; background:rgba(0,0,0,0.66);
+    -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
+    display:flex; align-items:center; justify-content:center; padding:14px;
+  }
+  .msg-edit-card {
+    width:min(860px, 96vw); height:min(86dvh, 780px); background:var(--elev); color:var(--text);
+    border:1px solid var(--border); border-radius:18px; box-shadow:var(--shadow);
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  .msg-edit-head {
+    display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
+    padding:12px 16px; border-bottom:1px solid var(--border); background:var(--surface); flex-shrink:0;
+  }
+  .msg-edit-title { display:flex; align-items:center; gap:7px; flex-wrap:wrap; font-size:15px; font-weight:800; }
+  .msg-edit-body {
+    flex:1; min-height:0; padding:12px 16px; display:flex; flex-direction:column;
+  }
+  .msg-edit-textarea {
+    flex:1; width:100%; min-height:0; resize:none; padding:14px 16px;
+    border-radius:12px; border:1px solid var(--border); background:var(--bg); color:var(--text);
+    font-family:var(--font); font-size:15px; line-height:1.68; outline:none;
+    overflow-y:auto; white-space:pre-wrap; word-break:keep-all; overflow-wrap:anywhere;
+    transition:border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .msg-edit-textarea:focus { border-color:var(--accent); box-shadow:0 0 0 3px var(--accent-soft); }
+  .msg-edit-foot {
+    display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
+    padding:12px 16px; border-top:1px solid var(--border); background:var(--surface); flex-shrink:0;
+  }
+  @media (max-width: 640px) {
+    #msgEditModal { padding:8px; }
+    .msg-edit-card { width:100%; height:92dvh; border-radius:16px; }
+    .msg-edit-textarea { font-size:16px; padding:12px; }
+  }
+
   /* ===== Composer (capsule) ===== */
   .composer {
     grid-area: composer; position:relative; z-index:30; display:flex; gap:6px; align-items:flex-end;
@@ -3042,6 +3659,7 @@ function renderWebApp() {
 <button id="botMenuFab" type="button" style="display:none;" title="봇 메뉴 펼치기 / 접기">☰ 메뉴</button>
 <div id="triggerModal" style="display:none;" role="dialog" aria-modal="true"></div>
 <div id="reqLogModal" style="display:none;" role="dialog" aria-modal="true" aria-label="리퀘스트 로그"></div>
+<div id="msgEditModal" style="display:none;" role="dialog" aria-modal="true" aria-label="메시지 수정"></div>
 
 <div id="login">
   <div class="login-card">
@@ -3181,6 +3799,52 @@ function renderWebApp() {
     <div class="card" id="chatVarsCard" style="display:none;">
       <h3>💬 채팅 변수 (봇 상태)</h3>
       <div id="chatVarsBody"></div>
+    </div>
+    <div class="card" id="authorNoteCard">
+      <h3>
+        <span>📝 작가의 노트 · 캐릭터 설명</span>
+        <span class="badge" id="authorNoteBadge">0자</span>
+      </h3>
+      <label class="f-label" style="margin-top:4px;">이 채팅방 작가의 노트 (Author's Note)</label>
+      <textarea class="f-inp" id="authorNoteInput" rows="4" placeholder="이 채팅방에 기입된 작가의 노트가 없습니다. 내용을 입력해 저장하면 PC RisuAI 및 원격 직접 요청에 즉시 반영됩니다."></textarea>
+      <div class="btn-row">
+        <button type="button" class="btn" id="saveAuthorNoteBtn">💾 작가의 노트 저장</button>
+        <button type="button" class="btn sec" id="resetAuthorNoteBtn">↺ 되돌리기</button>
+      </div>
+      <details id="charGlobalNoteDetails" style="margin-top:12px; padding-top:10px; border-top:1px solid var(--border);">
+        <summary style="cursor:pointer; font-size:12.5px; font-weight:700; color:var(--text);">🌐 봇 카드 글로벌 노트 (replaceGlobalNote) <span id="charGlobalNoteBadge" class="badge">없음</span></summary>
+        <div style="margin-top:8px;">
+          <textarea class="f-inp" id="charGlobalNoteInput" rows="3" placeholder="봇 카드에 기입된 글로벌 노트가 없습니다. ({{original}} 포함 가능)"></textarea>
+          <div class="btn-row"><button type="button" class="btn sec" id="saveCharGlobalNoteBtn">💾 글로벌 노트 저장</button></div>
+        </div>
+      </details>
+      <details id="charDescPreviewDetails" style="margin-top:10px; padding-top:10px; border-top:1px solid var(--border);">
+        <summary style="cursor:pointer; font-size:12.5px; font-weight:700; color:var(--text);">📋 반영 중인 캐릭터 설명 · 프롬프트 확인 <span id="charDescBadge" class="badge">0자</span></summary>
+        <div id="charDescPreviewBody" style="margin-top:8px; display:flex; flex-direction:column; gap:8px; font-size:12px;"></div>
+      </details>
+    </div>
+    <div class="card" id="lorebookCard">
+      <h3>
+        <span>📚 캐릭터 · 채팅 로어북</span>
+        <span class="badge" id="loreCountBadge">0 / 0 반영</span>
+      </h3>
+      <div class="hint" style="margin-top:0; margin-bottom:8px;">
+        기본적으로 모든 로어북이 <b>체크(반영 대상)</b>되어 있으며, 체크를 해제한 로어북만 요청에서 제외됩니다. 키워드 로어북은 <b>📌 고정</b>으로 키워드와 무관하게 강제 포함할 수도 있습니다.
+      </div>
+      <div style="display:flex; gap:6px; margin-bottom:8px;">
+        <input class="search-inp" id="loreSearch" placeholder="로어북 제목 · 키워드 · 내용 검색..." />
+        <button type="button" class="btn sec" id="loreRefreshBtn" style="flex-shrink:0;">🔄</button>
+      </div>
+      <div id="loreFilters" style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px;">
+        <button type="button" class="pill active" data-lore-src="all">전체</button>
+        <button type="button" class="pill" data-lore-src="char">캐릭터</button>
+        <button type="button" class="pill" data-lore-src="local">이 방</button>
+        <button type="button" class="pill" data-lore-src="module">모듈</button>
+        <span style="flex:1;"></span>
+        <button type="button" class="pill" id="loreEnableAllBtn">전체 반영</button>
+        <button type="button" class="pill" id="loreExcludeShownBtn">표시 제외</button>
+      </div>
+      <div id="loreList" style="display:flex; flex-direction:column; gap:8px; max-height:420px; overflow-y:auto;"></div>
     </div>
     <div class="card">
       <h3>👤 페르소나 선택</h3>
@@ -5124,14 +5788,145 @@ function renderWebApp() {
     } catch (e) { toast('번역 실패: ' + e.message); }
   };
 
-  window.editMsg = async (msgIndex) => {
-    const snap = lastState.snapshot;
+  let msgEditState = null;
+  let msgEditKeyHandler = null;
+
+  function formatMsgEditStats(val) {
+    const text = String(val || '');
+    const lines = text ? text.split('\\n').length : 0;
+    return text.length + '자 · ' + lines + '줄';
+  }
+
+  function closeMsgEditModal(force = false) {
+    const modal = document.getElementById('msgEditModal');
+    const ta = document.getElementById('msgEditTextarea');
+    if (!force && msgEditState && ta && ta.value !== msgEditState.originalText) {
+      if (!confirm('수정한 내용을 저장하지 않고 닫을까요?')) return false;
+    }
+    if (msgEditKeyHandler) {
+      document.removeEventListener('keydown', msgEditKeyHandler);
+      msgEditKeyHandler = null;
+    }
+    msgEditState = null;
+    if (modal) {
+      modal.style.display = 'none';
+      modal.innerHTML = '';
+    }
+    return true;
+  }
+
+  async function saveMsgEditModal() {
+    if (!msgEditState) return;
+    const ta = document.getElementById('msgEditTextarea');
+    const saveBtn = document.getElementById('msgEditSaveBtn');
+    const next = ta ? ta.value : '';
+    const { charIndex, chatIndex, msgIndex } = msgEditState;
+    if (saveBtn) saveBtn.disabled = true;
+    try {
+      await api('/api/command', {
+        method: 'POST',
+        body: JSON.stringify({ type: 'edit_message', payload: { charIndex, chatIndex, msgIndex, text: next } }),
+      });
+      const curSnap = lastState && lastState.snapshot;
+      if (curSnap && curSnap.charIndex === charIndex && curSnap.chatIndex === chatIndex && Array.isArray(curSnap.messages)) {
+        const hit = curSnap.messages.find((x) => x.index === msgIndex);
+        if (hit) hit.raw = next;
+      }
+      closeMsgEditModal(true);
+      toast('메시지가 수정되었습니다');
+      setTimeout(pollState, 300);
+    } catch (e) {
+      toast('수정 실패: ' + (e && e.message ? e.message : '오류'));
+      if (saveBtn) saveBtn.disabled = false;
+    }
+  }
+
+  function openMsgEditModal(msgIndex) {
+    const snap = lastState && lastState.snapshot;
+    if (!snap) return;
     const found = (snap.messages || []).find((x) => x.index === msgIndex);
     if (!found) return;
-    const next = prompt('메시지 수정:', found.raw || found.text);
-    if (next === null) return;
-    await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'edit_message', payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, msgIndex, text: next } }) });
-    toast('수정 요청됨');
+    const modal = document.getElementById('msgEditModal');
+    if (!modal) return;
+    closeMsgEditModal(true);
+
+    const originalText = String(found.raw ?? found.text ?? '');
+    msgEditState = {
+      charIndex: snap.charIndex,
+      chatIndex: snap.chatIndex,
+      msgIndex,
+      role: found.role,
+      originalText,
+    };
+    const roleLabel = found.role === 'user' ? '사용자' : (snap.charName || '캐릭터');
+    modal.innerHTML =
+      '<div class="msg-edit-card">' +
+        '<div class="msg-edit-head">' +
+          '<div class="msg-edit-title">' +
+            '<span>✏️ 메시지 수정</span>' +
+            '<span class="badge">' + esc(roleLabel) + ' · #' + Number(msgIndex) + '</span>' +
+            '<span class="badge" id="msgEditStats">' + esc(formatMsgEditStats(originalText)) + '</span>' +
+          '</div>' +
+          '<button type="button" class="pill" id="msgEditCloseBtn">✕ 닫기</button>' +
+        '</div>' +
+        '<div class="msg-edit-body">' +
+          '<textarea id="msgEditTextarea" class="msg-edit-textarea" spellcheck="false" placeholder="메시지 내용을 입력하세요..."></textarea>' +
+        '</div>' +
+        '<div class="msg-edit-foot">' +
+          '<div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">' +
+            '<button type="button" class="btn sec" id="msgEditCopyBtn">📋 복사</button>' +
+            '<button type="button" class="btn sec" id="msgEditRevertBtn">↺ 원본 복원</button>' +
+            '<span style="font-size:11.5px; color:var(--sub);">Ctrl+Enter 저장</span>' +
+          '</div>' +
+          '<div style="display:flex; gap:6px; align-items:center; margin-left:auto;">' +
+            '<button type="button" class="btn sec" id="msgEditCancelBtn">취소</button>' +
+            '<button type="button" class="btn" id="msgEditSaveBtn">💾 저장</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    modal.style.display = 'flex';
+
+    const ta = document.getElementById('msgEditTextarea');
+    const stats = document.getElementById('msgEditStats');
+    if (ta) {
+      ta.value = originalText;
+      ta.oninput = () => {
+        if (!stats || !msgEditState) return;
+        const dirty = ta.value !== msgEditState.originalText ? ' · 수정됨' : '';
+        stats.textContent = formatMsgEditStats(ta.value) + dirty;
+      };
+      setTimeout(() => {
+        ta.focus();
+        try { ta.setSelectionRange(ta.value.length, ta.value.length); } catch (_) {}
+      }, 20);
+    }
+    document.getElementById('msgEditCloseBtn').onclick = () => closeMsgEditModal(false);
+    document.getElementById('msgEditCancelBtn').onclick = () => closeMsgEditModal(false);
+    document.getElementById('msgEditSaveBtn').onclick = () => saveMsgEditModal();
+    document.getElementById('msgEditCopyBtn').onclick = () => copyPlainText(ta ? ta.value : '', '메시지 내용 복사됨');
+    document.getElementById('msgEditRevertBtn').onclick = () => {
+      if (!ta || !msgEditState) return;
+      ta.value = msgEditState.originalText;
+      if (stats) stats.textContent = formatMsgEditStats(ta.value);
+      toast('원본 내용으로 복원됨');
+    };
+    modal.onclick = (e) => {
+      if (e.target === modal) closeMsgEditModal(false);
+    };
+    msgEditKeyHandler = (ev) => {
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        closeMsgEditModal(false);
+      } else if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') {
+        ev.preventDefault();
+        saveMsgEditModal();
+      }
+    };
+    document.addEventListener('keydown', msgEditKeyHandler);
+  }
+
+  window.editMsg = (msgIndex) => {
+    openMsgEditModal(msgIndex);
   };
 
   window.delMsg = async (msgIndex) => {
@@ -5601,9 +6396,274 @@ function renderWebApp() {
     setTimeout(pollState, 350);
   });
 
+  let lastAuthorNoteChatKey = '';
+  let authorNoteDirty = false;
+  let charGlobalNoteDirty = false;
+  let loreCache = { charKey: '', charIndex: -1, chatIndex: -1, disabledUids: [], pinnedUids: [], entries: [] };
+  let loreSrcFilter = 'all';
+  let lastLoreFetchKey = '';
+  let loreFetchInFlight = false;
+
+  function renderAuthorNoteAndCharContext(force = false) {
+    const snap = (lastState && lastState.snapshot) || {};
+    const ctx = (snap.charContext && typeof snap.charContext === 'object') ? snap.charContext : {};
+    const chatKey = (snap.charIndex ?? -1) + ':' + (snap.chatIndex ?? -1);
+    if (chatKey !== lastAuthorNoteChatKey) {
+      lastAuthorNoteChatKey = chatKey;
+      authorNoteDirty = false;
+      charGlobalNoteDirty = false;
+    }
+    const serverNote = String(ctx.note || '');
+    const serverGlobalNote = String(ctx.replaceGlobalNote || '');
+    const noteEl = document.getElementById('authorNoteInput');
+    const noteBadge = document.getElementById('authorNoteBadge');
+    if (noteEl && (force || (!authorNoteDirty && document.activeElement !== noteEl))) {
+      noteEl.value = serverNote;
+    }
+    if (noteBadge) {
+      const len = (noteEl ? noteEl.value : serverNote).length;
+      noteBadge.textContent = len ? (len + '자') : '비어 있음';
+    }
+    const gnEl = document.getElementById('charGlobalNoteInput');
+    const gnBadge = document.getElementById('charGlobalNoteBadge');
+    if (gnEl && (force || (!charGlobalNoteDirty && document.activeElement !== gnEl))) {
+      gnEl.value = serverGlobalNote;
+    }
+    if (gnBadge) {
+      const len = (gnEl ? gnEl.value : serverGlobalNote).length;
+      gnBadge.textContent = len ? (len + '자') : '없음';
+    }
+    const descBody = document.getElementById('charDescPreviewBody');
+    const descBadge = document.getElementById('charDescBadge');
+    if (descBody) {
+      const fields = [
+        { label: 'System Prompt', text: String(ctx.systemPrompt || '') },
+        { label: '캐릭터 설명 (Description)', text: String(ctx.desc || '') },
+        { label: '성격 (Personality)', text: String(ctx.personality || '') },
+        { label: '시나리오 (Scenario)', text: String(ctx.scenario || '') },
+        { label: 'Depth Prompt (depth ' + Number((ctx.depthPrompt && ctx.depthPrompt.depth) || 0) + ')', text: String((ctx.depthPrompt && ctx.depthPrompt.prompt) || '') },
+        { label: '장기 기억 (Memory)', text: String(ctx.memory || '') },
+      ].filter((f) => f.text.trim());
+      const totalChars = fields.reduce((acc, f) => acc + f.text.length, 0);
+      if (descBadge) descBadge.textContent = totalChars + '자';
+      descBody.innerHTML = fields.length
+        ? fields.map((f) =>
+            '<div style="padding:8px 10px; border-radius:10px; border:1px solid var(--border); background:var(--bg);">' +
+              '<div style="display:flex; justify-content:space-between; font-weight:700; margin-bottom:4px;"><span>' + esc(f.label) + '</span><span style="color:var(--sub);">' + f.text.length + '자</span></div>' +
+              '<div style="white-space:pre-wrap; word-break:break-word; max-height:140px; overflow-y:auto; color:var(--sub); line-height:1.5;">' + esc(f.text) + '</div>' +
+            '</div>'
+          ).join('')
+        : '<div style="color:var(--sub);">현재 봇에 기입된 캐릭터 설명 항목이 없습니다.</div>';
+    }
+  }
+
+  async function saveLoreSelection(charKey, disabledUids, pinnedUids) {
+    const res = await api('/api/lorebook/selection', {
+      method: 'POST',
+      body: JSON.stringify({ charKey, disabledUids, pinnedUids }),
+    });
+    if (res) {
+      loreCache.disabledUids = Array.isArray(res.disabledUids) ? res.disabledUids : [];
+      loreCache.pinnedUids = Array.isArray(res.pinnedUids) ? res.pinnedUids : [];
+    }
+    renderLorebookList();
+  }
+
+  function renderLorebookList() {
+    const listEl = document.getElementById('loreList');
+    const badgeEl = document.getElementById('loreCountBadge');
+    if (!listEl) return;
+    document.querySelectorAll('#loreFilters [data-lore-src]').forEach((btn) => {
+      btn.classList.toggle('active', btn.getAttribute('data-lore-src') === loreSrcFilter);
+    });
+    const entries = Array.isArray(loreCache.entries) ? loreCache.entries : [];
+    const disSet = new Set(Array.isArray(loreCache.disabledUids) ? loreCache.disabledUids : []);
+    const pinSet = new Set(Array.isArray(loreCache.pinnedUids) ? loreCache.pinnedUids : []);
+    const activeCount = entries.filter((e) => !disSet.has(e.uid)).length;
+    if (badgeEl) badgeEl.textContent = activeCount + ' / ' + entries.length + ' 반영';
+
+    const q = (document.getElementById('loreSearch') ? document.getElementById('loreSearch').value : '').trim().toLowerCase();
+    const visible = entries.filter((e) => {
+      if (loreSrcFilter !== 'all' && e.source !== loreSrcFilter) return false;
+      if (!q) return true;
+      return String(e.comment || '').toLowerCase().includes(q) ||
+        String(e.key || '').toLowerCase().includes(q) ||
+        String(e.content || '').toLowerCase().includes(q) ||
+        String(e.sourceName || '').toLowerCase().includes(q);
+    });
+    if (!visible.length) {
+      listEl.innerHTML = '<div style="font-size:12.5px; color:var(--sub); padding:6px 2px;">' +
+        (entries.length ? '검색·필터 조건에 맞는 로어북이 없습니다.' : '표시할 캐릭터 · 채팅 로어북이 없습니다.') +
+        '</div>';
+      return;
+    }
+    const srcLabel = (s) => (s === 'char' ? '캐릭터' : (s === 'local' ? '이 방' : '모듈'));
+    listEl.innerHTML = visible.map((e, idx) => {
+      const checked = !disSet.has(e.uid);
+      const pinned = pinSet.has(e.uid);
+      const title = e.comment || e.key || ('로어북 #' + (idx + 1));
+      const trigText = e.alwaysActive ? '상시' : ('키워드: ' + (e.key || '(없음)'));
+      return '<div style="padding:10px 12px; border-radius:12px; border:1px solid ' + (checked ? 'var(--border)' : 'color-mix(in srgb, var(--border) 60%, transparent)') + '; background:var(--bg); opacity:' + (checked ? '1' : '0.62') + ';">' +
+        '<div style="display:flex; align-items:flex-start; justify-content:space-between; gap:8px;">' +
+          '<div style="min-width:0; flex:1;">' +
+            '<div style="font-size:13px; font-weight:700; word-break:break-word;">' + esc(title) + '</div>' +
+            '<div style="display:flex; gap:4px; flex-wrap:wrap; margin-top:4px; align-items:center;">' +
+              '<span class="badge">' + esc(srcLabel(e.source)) + (e.sourceName && e.source === 'module' ? ' · ' + esc(e.sourceName) : '') + '</span>' +
+              '<span class="badge' + (e.alwaysActive ? ' pc' : '') + '">' + esc(trigText) + '</span>' +
+              (e.decorator ? '<span class="badge">' + esc(e.decorator) + '</span>' : '') +
+              '<span style="font-size:11px; color:var(--sub);">' + Number(e.charLen || 0) + '자</span>' +
+            '</div>' +
+          '</div>' +
+          '<div style="display:flex; align-items:center; gap:6px; flex-shrink:0;">' +
+            (!e.alwaysActive ? '<button type="button" class="pill' + (pinned ? ' active' : '') + '" style="min-height:28px; padding:0 8px; font-size:11.5px;" data-lore-pin="' + esc(e.uid) + '" title="키워드가 없어도 항상 포함">' + (pinned ? '📌 고정' : '고정') + '</button>' : '') +
+            '<input type="checkbox" ' + (checked ? 'checked' : '') + ' data-lore-chk="' + esc(e.uid) + '" title="이 로어북 반영 여부" />' +
+          '</div>' +
+        '</div>' +
+        '<details style="margin-top:6px;">' +
+          '<summary style="cursor:pointer; font-size:11.5px; color:var(--sub);">내용 확인</summary>' +
+          '<div style="margin-top:6px; padding:8px; border-radius:8px; background:var(--surface); font-size:12px; white-space:pre-wrap; word-break:break-word; max-height:180px; overflow-y:auto; line-height:1.5;">' + esc(e.content || '') + '</div>' +
+        '</details>' +
+      '</div>';
+    }).join('');
+  }
+
+  async function loadLorebookList(force = false) {
+    const snap = (lastState && lastState.snapshot) || {};
+    const key = (snap.charIndex ?? -1) + ':' + (snap.chatIndex ?? -1) + ':' + ((lastState && lastState.snapshotVersion) || 0);
+    if (!force && key === lastLoreFetchKey) return;
+    if (loreFetchInFlight) return;
+    loreFetchInFlight = true;
+    try {
+      const res = await api('/api/lorebook');
+      lastLoreFetchKey = key;
+      loreCache = {
+        charKey: res.charKey || '',
+        charIndex: res.charIndex,
+        chatIndex: res.chatIndex,
+        disabledUids: Array.isArray(res.disabledUids) ? res.disabledUids : [],
+        pinnedUids: Array.isArray(res.pinnedUids) ? res.pinnedUids : [],
+        entries: Array.isArray(res.entries) ? res.entries : [],
+      };
+      renderLorebookList();
+    } catch (_) {
+    } finally {
+      loreFetchInFlight = false;
+    }
+  }
+
+  const authorNoteEl = document.getElementById('authorNoteInput');
+  if (authorNoteEl) {
+    authorNoteEl.oninput = () => {
+      authorNoteDirty = true;
+      const b = document.getElementById('authorNoteBadge');
+      if (b) b.textContent = authorNoteEl.value.length ? (authorNoteEl.value.length + '자 (수정 중)') : '비어 있음 (수정 중)';
+    };
+  }
+  const charGlobalNoteEl = document.getElementById('charGlobalNoteInput');
+  if (charGlobalNoteEl) {
+    charGlobalNoteEl.oninput = () => {
+      charGlobalNoteDirty = true;
+      const b = document.getElementById('charGlobalNoteBadge');
+      if (b) b.textContent = charGlobalNoteEl.value.length ? (charGlobalNoteEl.value.length + '자') : '없음';
+    };
+  }
+  const saveAuthorNoteBtn = document.getElementById('saveAuthorNoteBtn');
+  if (saveAuthorNoteBtn) {
+    saveAuthorNoteBtn.onclick = async () => {
+      const snap = lastState && lastState.snapshot;
+      if (!snap || snap.charIndex < 0) return toast('동기화된 봇이 없습니다.');
+      const note = authorNoteEl ? authorNoteEl.value : '';
+      await api('/api/command', {
+        method: 'POST',
+        body: JSON.stringify({ type: 'set_author_note', payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, note } }),
+      });
+      authorNoteDirty = false;
+      if (snap.charContext) snap.charContext.note = note;
+      renderAuthorNoteAndCharContext(true);
+      toast('작가의 노트 저장됨');
+      setTimeout(pollState, 350);
+    };
+  }
+  const resetAuthorNoteBtn = document.getElementById('resetAuthorNoteBtn');
+  if (resetAuthorNoteBtn) {
+    resetAuthorNoteBtn.onclick = () => {
+      authorNoteDirty = false;
+      renderAuthorNoteAndCharContext(true);
+      toast('서버에 저장된 작가의 노트로 되돌렸습니다');
+    };
+  }
+  const saveCharGlobalNoteBtn = document.getElementById('saveCharGlobalNoteBtn');
+  if (saveCharGlobalNoteBtn) {
+    saveCharGlobalNoteBtn.onclick = async () => {
+      const snap = lastState && lastState.snapshot;
+      if (!snap || snap.charIndex < 0) return toast('동기화된 봇이 없습니다.');
+      const replaceGlobalNote = charGlobalNoteEl ? charGlobalNoteEl.value : '';
+      await api('/api/command', {
+        method: 'POST',
+        body: JSON.stringify({ type: 'set_char_global_note', payload: { charIndex: snap.charIndex, replaceGlobalNote } }),
+      });
+      charGlobalNoteDirty = false;
+      if (snap.charContext) snap.charContext.replaceGlobalNote = replaceGlobalNote;
+      renderAuthorNoteAndCharContext(true);
+      toast('봇 카드 글로벌 노트 저장됨');
+      setTimeout(pollState, 350);
+    };
+  }
+  document.getElementById('loreSearch').oninput = () => renderLorebookList();
+  document.getElementById('loreRefreshBtn').onclick = () => loadLorebookList(true);
+  document.getElementById('loreFilters').addEventListener('click', async (e) => {
+    const srcBtn = e.target.closest('[data-lore-src]');
+    if (srcBtn) {
+      loreSrcFilter = srcBtn.getAttribute('data-lore-src') || 'all';
+      renderLorebookList();
+      return;
+    }
+    if (e.target.id === 'loreEnableAllBtn') {
+      if (!loreCache.charKey) return;
+      await saveLoreSelection(loreCache.charKey, [], loreCache.pinnedUids);
+      toast('모든 로어북 반영으로 설정됨');
+      return;
+    }
+    if (e.target.id === 'loreExcludeShownBtn') {
+      if (!loreCache.charKey) return;
+      const q = (document.getElementById('loreSearch').value || '').trim().toLowerCase();
+      const dis = new Set(loreCache.disabledUids || []);
+      for (const item of loreCache.entries || []) {
+        if (loreSrcFilter !== 'all' && item.source !== loreSrcFilter) continue;
+        if (q && !String(item.comment || '').toLowerCase().includes(q) && !String(item.key || '').toLowerCase().includes(q) && !String(item.content || '').toLowerCase().includes(q)) continue;
+        dis.add(item.uid);
+      }
+      await saveLoreSelection(loreCache.charKey, Array.from(dis), loreCache.pinnedUids);
+      toast('표시 중인 로어북 제외됨');
+    }
+  });
+  document.getElementById('loreList').addEventListener('change', async (e) => {
+    const chk = e.target.closest('[data-lore-chk]');
+    if (!chk || !loreCache.charKey) return;
+    const uid = chk.getAttribute('data-lore-chk');
+    const dis = new Set(loreCache.disabledUids || []);
+    if (chk.checked) dis.delete(uid);
+    else dis.add(uid);
+    await saveLoreSelection(loreCache.charKey, Array.from(dis), loreCache.pinnedUids);
+    toast(chk.checked ? '로어북 반영됨' : '로어북 제외됨');
+  });
+  document.getElementById('loreList').addEventListener('click', async (e) => {
+    const pinBtn = e.target.closest('[data-lore-pin]');
+    if (!pinBtn || !loreCache.charKey) return;
+    const uid = pinBtn.getAttribute('data-lore-pin');
+    const pins = new Set(loreCache.pinnedUids || []);
+    const nextPinned = !pins.has(uid);
+    if (nextPinned) pins.add(uid);
+    else pins.delete(uid);
+    await saveLoreSelection(loreCache.charKey, loreCache.disabledUids, Array.from(pins));
+    toast(nextPinned ? '로어북 항상 고정됨' : '고정 해제됨');
+  });
+
   function renderModules(force = false) {
     renderCustomToggles(false);
     renderChatVariables(force);
+    renderAuthorNoteAndCharContext(force);
+    loadLorebookList(false);
     const cat = (lastState && lastState.catalog) || {};
     const snap = (lastState && lastState.snapshot) || {};
     const chatModSet = new Set(Array.isArray(snap.chatModules) ? snap.chatModules.map(String) : []);
@@ -6572,6 +7632,9 @@ function renderWebApp() {
 }
 
 function sanitizeConfigForClient() {
+    if (syncBundledLeavePresetToggles(config.presetToggles)) {
+        saveConfig();
+    }
     const remoteToggleValues = (config.remoteToggleValues && typeof config.remoteToggleValues === 'object' && !Array.isArray(config.remoteToggleValues))
         ? { ...config.remoteToggleValues }
         : {};
@@ -6580,6 +7643,8 @@ function sanitizeConfigForClient() {
         directPresetId: typeof config.directPresetId === 'string' ? config.directPresetId : 'bundled:leave',
         directPresets: listDirectPresets(),
         remoteToggleValues,
+        disabledLoreEntries: (config.disabledLoreEntries && typeof config.disabledLoreEntries === 'object') ? config.disabledLoreEntries : {},
+        pinnedLoreEntries: (config.pinnedLoreEntries && typeof config.pinnedLoreEntries === 'object') ? config.pinnedLoreEntries : {},
         presetToggles: Array.isArray(config.presetToggles) ? config.presetToggles : [],
         profiles: config.profiles.map((p) => ({
             id: p.id,
@@ -6762,6 +7827,12 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             remoteToggleValues: (configOverride.remoteToggleValues && typeof configOverride.remoteToggleValues === 'object')
                 ? { ...configOverride.remoteToggleValues }
                 : {},
+            disabledLoreEntries: (configOverride.disabledLoreEntries && typeof configOverride.disabledLoreEntries === 'object')
+                ? { ...configOverride.disabledLoreEntries }
+                : {},
+            pinnedLoreEntries: (configOverride.pinnedLoreEntries && typeof configOverride.pinnedLoreEntries === 'object')
+                ? { ...configOverride.pinnedLoreEntries }
+                : {},
         };
         configPersistDisabled = true;
         customPresetsCache = [];
@@ -6932,7 +8003,14 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 snapshotVersion: state.snapshotVersion,
             };
             if (reqCv === null || reqCv !== state.catalogVersion) payload.catalog = state.catalog;
-            if (reqSv === null || reqSv !== state.snapshotVersion) payload.snapshot = state.snapshot;
+            if (reqSv === null || reqSv !== state.snapshotVersion) {
+                if (state.snapshot && state.snapshot.charContext && Object.prototype.hasOwnProperty.call(state.snapshot.charContext, 'loreEntries')) {
+                    const { loreEntries: _omitLoreEntries, ...lightCtx } = state.snapshot.charContext;
+                    payload.snapshot = { ...state.snapshot, charContext: lightCtx };
+                } else {
+                    payload.snapshot = state.snapshot;
+                }
+            }
             return sendJson(res, 200, payload, req, {
                 'Set-Cookie': `rs_asset_sid=${assetCookieVal}; Path=/api/asset; HttpOnly; SameSite=Strict`,
             });
@@ -6955,6 +8033,36 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                         }
                         config.remoteToggleValues[fullKey] = String(p.value ?? '');
                         saveConfig();
+                    }
+                }
+                if (body.type === 'set_author_note' && body.payload && typeof body.payload === 'object') {
+                    const p = body.payload;
+                    if (state.snapshot && Number(p.charIndex) === state.snapshot.charIndex && Number(p.chatIndex) === state.snapshot.chatIndex) {
+                        if (!state.snapshot.charContext || typeof state.snapshot.charContext !== 'object') {
+                            state.snapshot.charContext = { name: state.snapshot.charName || 'Character' };
+                        }
+                        state.snapshot.charContext.note = String(p.note ?? '');
+                        state.snapshotVersion += 1;
+                    }
+                }
+                if (body.type === 'set_char_global_note' && body.payload && typeof body.payload === 'object') {
+                    const p = body.payload;
+                    if (state.snapshot && Number(p.charIndex) === state.snapshot.charIndex) {
+                        if (!state.snapshot.charContext || typeof state.snapshot.charContext !== 'object') {
+                            state.snapshot.charContext = { name: state.snapshot.charName || 'Character' };
+                        }
+                        state.snapshot.charContext.replaceGlobalNote = String(p.replaceGlobalNote ?? '');
+                        state.snapshotVersion += 1;
+                    }
+                }
+                if (body.type === 'edit_message' && body.payload && typeof body.payload === 'object') {
+                    const p = body.payload;
+                    if (state.snapshot && Number(p.charIndex) === state.snapshot.charIndex && Number(p.chatIndex) === state.snapshot.chatIndex && Array.isArray(state.snapshot.messages)) {
+                        const hit = state.snapshot.messages.find((m) => m && m.index === Number(p.msgIndex));
+                        if (hit) {
+                            hit.raw = String(p.text ?? '');
+                            state.snapshotVersion += 1;
+                        }
                     }
                 }
                 queueCommand(body.type, body.payload || {});
@@ -7126,6 +8234,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                         enabled: pt.enabled !== false,
                         syntax: String(pt.syntax || ''),
                     }));
+                    syncBundledLeavePresetToggles(config.presetToggles);
                 }
                 if (body.translator && typeof body.translator === 'object') {
                     config.translator = {
@@ -7324,6 +8433,100 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             return sendJson(res, 200, { ok: true, config: sanitizeConfigForClient() }, req);
         }
 
+        // 8c-3) Lorebook Inspector & Per-Bot Selection API
+        if (pathname === '/api/lorebook' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            const snap = state.snapshot || {};
+            const rawCtx = snap.charContext && typeof snap.charContext === 'object' ? snap.charContext : {};
+            const charKey = getLoreCharKeyFromSnap(snap);
+            const rawEntries = Array.isArray(rawCtx.loreEntries) ? rawCtx.loreEntries : [];
+            const entries = rawEntries.map((e, idx) => {
+                const dec = parseLoreDecorators(e && e.content ? e.content : '');
+                const decTags = [];
+                if (dec.pos === 'depth') decTags.push(`@@depth ${dec.depth}`);
+                else if (dec.pos === 'reverse_depth') decTags.push(`@@reverse_depth ${dec.depth}`);
+                else if (dec.pos) decTags.push(`@@position ${dec.pos}`);
+                if (dec.role && dec.role !== 'system') decTags.push(`@@role ${dec.role}`);
+                return {
+                    uid: String((e && e.uid) || `idx:${idx}`),
+                    source: String((e && e.source) || 'char'),
+                    sourceName: String((e && e.sourceName) || ''),
+                    comment: String((e && e.comment) || ''),
+                    key: String((e && e.key) || ''),
+                    secondkey: String((e && e.secondkey) || ''),
+                    alwaysActive: Boolean(e && e.alwaysActive),
+                    insertorder: Number((e && e.insertorder) ?? 100),
+                    decorator: decTags.join(' '),
+                    charLen: dec.content.length,
+                    content: dec.content || String((e && e.content) || ''),
+                };
+            });
+            const disabledUids = (config.disabledLoreEntries && Array.isArray(config.disabledLoreEntries[charKey]))
+                ? config.disabledLoreEntries[charKey]
+                : [];
+            const pinnedUids = (config.pinnedLoreEntries && Array.isArray(config.pinnedLoreEntries[charKey]))
+                ? config.pinnedLoreEntries[charKey]
+                : [];
+            return sendJson(res, 200, {
+                ok: true,
+                charKey,
+                charName: snap.charName || '',
+                charIndex: typeof snap.charIndex === 'number' ? snap.charIndex : -1,
+                chatIndex: typeof snap.chatIndex === 'number' ? snap.chatIndex : -1,
+                disabledUids,
+                pinnedUids,
+                entries,
+            }, req);
+        }
+
+        if (pathname === '/api/lorebook/selection' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const charKey = String(body.charKey || getLoreCharKeyFromSnap(state.snapshot) || '').trim();
+                if (!charKey) return sendJson(res, 400, { error: 'Missing charKey' }, req);
+                if (!config.disabledLoreEntries || typeof config.disabledLoreEntries !== 'object') config.disabledLoreEntries = {};
+                if (!config.pinnedLoreEntries || typeof config.pinnedLoreEntries !== 'object') config.pinnedLoreEntries = {};
+
+                if (Array.isArray(body.disabledUids)) {
+                    const next = Array.from(new Set(body.disabledUids.map((x) => String(x || '')).filter(Boolean)));
+                    if (next.length) config.disabledLoreEntries[charKey] = next;
+                    else delete config.disabledLoreEntries[charKey];
+                }
+                if (Array.isArray(body.pinnedUids)) {
+                    const nextP = Array.from(new Set(body.pinnedUids.map((x) => String(x || '')).filter(Boolean)));
+                    if (nextP.length) config.pinnedLoreEntries[charKey] = nextP;
+                    else delete config.pinnedLoreEntries[charKey];
+                }
+                if (body.uid) {
+                    const uid = String(body.uid);
+                    const disSet = new Set(config.disabledLoreEntries[charKey] || []);
+                    const pinSet = new Set(config.pinnedLoreEntries[charKey] || []);
+                    if (typeof body.enabled === 'boolean') {
+                        if (body.enabled) disSet.delete(uid);
+                        else disSet.add(uid);
+                        if (disSet.size) config.disabledLoreEntries[charKey] = Array.from(disSet);
+                        else delete config.disabledLoreEntries[charKey];
+                    }
+                    if (typeof body.pinned === 'boolean') {
+                        if (body.pinned) pinSet.add(uid);
+                        else pinSet.delete(uid);
+                        if (pinSet.size) config.pinnedLoreEntries[charKey] = Array.from(pinSet);
+                        else delete config.pinnedLoreEntries[charKey];
+                    }
+                }
+                saveConfig();
+                return sendJson(res, 200, {
+                    ok: true,
+                    charKey,
+                    disabledUids: config.disabledLoreEntries[charKey] || [],
+                    pinnedUids: config.pinnedLoreEntries[charKey] || [],
+                }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e.message }, req);
+            }
+        }
+
         sendJson(res, 404, { error: 'Not found' }, req);
     });
     if (prevConfig !== null) {
@@ -7416,7 +8619,10 @@ module.exports = {
     decodeRisupPreset,
     parsePresetDefaultToggles,
     evalPresetCbs,
+    parseLoreDecorators,
+    evaluateLorebookEntries,
     buildDirectPromptMessages,
     loadBundledLeavePreset,
+    syncBundledLeavePresetToggles,
     createRelayServer,
 };

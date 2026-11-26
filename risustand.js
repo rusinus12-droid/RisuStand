@@ -4906,36 +4906,88 @@
             return { text: res.text, images: res.images };
         }
 
-        function collectLorebookSummary(charObj, enabledModules, recentMessages) {
-            const recentText = (Array.isArray(recentMessages) ? recentMessages : [])
-                .slice(-6)
-                .map((m) => String(m && m.data ? m.data : ''))
-                .join('\n')
-                .toLowerCase();
+        function hashLoreUid(str) {
+            let h = 2166136261;
+            const s = String(str || '');
+            for (let i = 0; i < s.length; i++) {
+                h ^= s.charCodeAt(i);
+                h = Math.imul(h, 16777619);
+            }
+            return (h >>> 0).toString(16).padStart(8, '0');
+        }
+
+        function collectStructuredLoreEntries(charObj, chatObj, enabledModules) {
             const out = [];
-            let total = 0;
-            const MAX_LORE_CHARS = 6000;
-            const addEntries = (entries) => {
+            const seenUids = new Map();
+            const pushEntries = (entries, source, sourceName) => {
                 if (!Array.isArray(entries)) return;
                 for (const e of entries) {
-                    if (!e || e.enabled === false || !e.content) continue;
+                    if (!e || e.enabled === false || e.mode === 'folder') continue;
                     const keyRaw = String(e.key || '');
                     if (keyRaw.includes('folder:')) continue;
-                    const content = String(e.content || '').trim();
-                    if (!content) continue;
-                    const keys = keyRaw.split(',').map((k) => k.trim().toLowerCase()).filter(Boolean);
-                    const hit = Boolean(e.alwaysActive) || (recentText && keys.some((k) => recentText.includes(k)));
-                    if (!hit) continue;
-                    const chunk = e.comment ? `[${e.comment}]\n${content}` : content;
-                    if (total + chunk.length > MAX_LORE_CHARS) break;
-                    out.push(chunk);
-                    total += chunk.length;
+                    const content = String(e.content || '');
+                    if (!content.trim()) continue;
+                    const baseUid = `${source}:${hashLoreUid(`${source}|${sourceName}|${e.comment || ''}|${keyRaw}|${content.slice(0, 160)}`)}`;
+                    const cnt = (seenUids.get(baseUid) || 0) + 1;
+                    seenUids.set(baseUid, cnt);
+                    const uid = cnt === 1 ? baseUid : `${baseUid}#${cnt}`;
+                    out.push({
+                        uid,
+                        source,
+                        sourceName: String(sourceName || ''),
+                        key: keyRaw,
+                        secondkey: String(e.secondkey || ''),
+                        comment: String(e.comment || ''),
+                        content,
+                        insertorder: Number.isFinite(Number(e.insertorder)) ? Number(e.insertorder) : 100,
+                        alwaysActive: Boolean(e.alwaysActive),
+                        selective: Boolean(e.selective),
+                        useRegex: Boolean(e.useRegex),
+                        mode: String(e.mode || 'normal'),
+                    });
                 }
             };
             for (const m of enabledModules || []) {
-                if (m && Array.isArray(m.lorebook)) addEntries(m.lorebook);
+                if (m && Array.isArray(m.lorebook)) pushEntries(m.lorebook, 'module', m.name || m.id || '모듈');
             }
-            if (charObj && Array.isArray(charObj.globalLore)) addEntries(charObj.globalLore);
+            if (charObj && Array.isArray(charObj.globalLore)) {
+                pushEntries(charObj.globalLore, 'char', charObj.name || '캐릭터');
+            }
+            if (chatObj && Array.isArray(chatObj.localLore)) {
+                pushEntries(chatObj.localLore, 'local', '이 채팅방');
+            }
+            return out;
+        }
+
+        function collectLorebookSummary(charObj, enabledModules, recentMessages, chatObj = null) {
+            const entries = collectStructuredLoreEntries(charObj, chatObj, enabledModules);
+            const depth = Number((charObj && charObj.loreSettings && charObj.loreSettings.scanDepth) || 10);
+            const recentText = (Array.isArray(recentMessages) ? recentMessages : [])
+                .slice(-Math.max(1, depth))
+                .map((m) => String(m && m.data ? m.data : ''))
+                .join('\n')
+                .toLowerCase();
+            const candidates = [];
+            for (const e of entries) {
+                const body = e.content.replace(/^(?:\s*@@[^\r\n]*\r?\n)+/, '').trim();
+                if (!body) continue;
+                const keys = e.key.split(',').map((k) => k.trim().toLowerCase()).filter(Boolean);
+                const hit = Boolean(e.alwaysActive) || (recentText && keys.some((k) => recentText.includes(k)));
+                if (!hit) continue;
+                candidates.push({
+                    insertorder: e.insertorder,
+                    chunk: e.comment ? `[${e.comment}]\n${body}` : body,
+                });
+            }
+            candidates.sort((a, b) => b.insertorder - a.insertorder);
+            const out = [];
+            let total = 0;
+            const MAX_LORE_CHARS = 30000;
+            for (const c of candidates) {
+                if (total + c.chunk.length > MAX_LORE_CHARS) continue;
+                out.push(c.chunk);
+                total += c.chunk.length;
+            }
             return out.join('\n\n');
         }
     
@@ -5203,7 +5255,8 @@
                 return sw && Array.isArray(sw.swipes) ? `${sw.index}/${sw.swipes.length}` : '0/1';
             }).join(',');
             const toggleSig = `${useLocalToggles}:${Object.keys(localVars).length}:${JSON.stringify(localVars)}:${JSON.stringify(globalToggleValues)}:${toggleBlocks.length}:${enabledModIds}`;
-            const stateSig = `${fmIdx}:${firstMessageCount}:${JSON.stringify(scriptState)}:${swipeDigest}`;
+            const loreSig = `${Array.isArray(charObj.globalLore) ? charObj.globalLore.length : 0}:${Array.isArray(chatObj.localLore) ? chatObj.localLore.length : 0}:${hashLoreUid(charObj.replaceGlobalNote || '')}:${hashLoreUid(chatObj.note || '')}:${hashLoreUid(charObj.desc || '')}`;
+            const stateSig = `${fmIdx}:${firstMessageCount}:${JSON.stringify(scriptState)}:${swipeDigest}:${loreSig}`;
             const sig = `${viewCharIndex}:${viewChatIndex}:${isPcActive}:${allMsgs.length}:${recentDigest}:${chatObj.name || ''}:${toggleSig}:${stateSig}:${Boolean(cfg.includeImages)}`;
             if (!forceFull && sig === lastSnapSig) {
                 return { snapshot: null, sig };
@@ -5358,7 +5411,12 @@
                 chatVariables[k] = val;
             }
 
-            const moduleLore = collectLorebookSummary(charObj, enabledModules, recent);
+            const loreEntries = collectStructuredLoreEntries(charObj, chatObj, enabledModules);
+            const moduleLore = collectLorebookSummary(charObj, enabledModules, recent, chatObj);
+            const loreSettings = (charObj && charObj.loreSettings && typeof charObj.loreSettings === 'object') ? charObj.loreSettings : {};
+            const depthPromptObj = (charObj && charObj.depth_prompt && String(charObj.depth_prompt.prompt || '').trim())
+                ? { depth: Number(charObj.depth_prompt.depth || 0), prompt: String(charObj.depth_prompt.prompt) }
+                : null;
 
             return {
                 sig,
@@ -5383,15 +5441,26 @@
                     assetMap: collector.assetMap,
                     messages: outMsgs,
                     charContext: {
+                        charId: String((charObj && charObj.chaId) || charObj.name || viewCharIndex),
                         name: charObj.name || 'Character',
-                        desc: String(charObj.desc || '').slice(0, 6000),
-                        personality: String(charObj.personality || '').slice(0, 2000),
-                        scenario: String(charObj.scenario || '').slice(0, 2000),
-                        systemPrompt: String(charObj.systemPrompt || '').slice(0, 3000),
+                        desc: String(charObj.desc || '').slice(0, 20000),
+                        personality: String(charObj.personality || '').slice(0, 4000),
+                        scenario: String(charObj.scenario || '').slice(0, 4000),
+                        systemPrompt: String(charObj.systemPrompt || '').slice(0, 6000),
                         moduleLore,
-                        note: String(chatObj.note || '').slice(0, 2000),
+                        loreEntries,
+                        replaceGlobalNote: String(charObj.replaceGlobalNote || ''),
+                        depthPrompt: depthPromptObj,
+                        memory: String((chatObj && chatObj.supaMemoryData) || ''),
+                        loreDepth: Number(loreSettings.scanDepth || 10),
+                        loreTokenBudget: Number(loreSettings.tokenBudget || 16000),
+                        loreRecursive: loreSettings.recursiveScanning !== undefined ? Boolean(loreSettings.recursiveScanning) : true,
+                        loreFullWord: Boolean(loreSettings.fullWordMatching),
+                        fmIndex: fmIdx,
+                        totalChatMessages: allMsgs.length,
+                        note: String(chatObj.note || '').slice(0, 4000),
                         personaName,
-                        personaPrompt: String(personaPrompt || '').slice(0, 2000),
+                        personaPrompt: String(personaPrompt || '').slice(0, 4000),
                     },
                 },
             };
@@ -7264,6 +7333,31 @@
                 setTimeout(() => pollOnce(true), 120);
                 return;
             }
+
+            if (type === 'set_author_note') {
+                const cIdx = Number(p.charIndex);
+                const chIdx = Number(p.chatIndex);
+                if (Number.isNaN(cIdx) || Number.isNaN(chIdx)) return;
+                const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
+                if (!chatObj) return;
+                chatObj.note = String(p.note ?? '');
+                await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                lastSnapSig = '';
+                setTimeout(() => pollOnce(true), 120);
+                return;
+            }
+
+            if (type === 'set_char_global_note') {
+                const cIdx = Number(p.charIndex);
+                if (Number.isNaN(cIdx) || cIdx < 0) return;
+                const charObj = await risuai.getCharacterFromIndex(cIdx);
+                if (!charObj) return;
+                charObj.replaceGlobalNote = String(p.replaceGlobalNote ?? '');
+                await risuai.setCharacterToIndex(cIdx, charObj);
+                lastSnapSig = '';
+                setTimeout(() => pollOnce(true), 120);
+                return;
+            }
     
             if (type === 'delete_message') {
                 const cIdx = Number(p.charIndex);
@@ -7492,6 +7586,31 @@
                 return;
             }
 
+            if (type === 'set_author_note') {
+                const cIdx = Number(p.charIndex);
+                const chIdx = Number(p.chatIndex);
+                if (Number.isNaN(cIdx) || Number.isNaN(chIdx)) return;
+                const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
+                if (!chatObj) return;
+                chatObj.note = String(p.note ?? '');
+                await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                lastSnapSig = '';
+                setTimeout(() => pollOnce(true), 120);
+                return;
+            }
+
+            if (type === 'set_char_global_note') {
+                const cIdx = Number(p.charIndex);
+                if (Number.isNaN(cIdx) || cIdx < 0) return;
+                const charObj = await risuai.getCharacterFromIndex(cIdx);
+                if (!charObj) return;
+                charObj.replaceGlobalNote = String(p.replaceGlobalNote ?? '');
+                await risuai.setCharacterToIndex(cIdx, charObj);
+                lastSnapSig = '';
+                setTimeout(() => pollOnce(true), 120);
+                return;
+            }
+
             if (type === 'set_first_message') {
                 const cIdx = Number(p.charIndex);
                 const chIdx = Number(p.chatIndex);
@@ -7504,6 +7623,31 @@
                 if (Number.isNaN(nextFm)) return;
                 chatObj.fmIndex = nextFm;
                 await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                lastSnapSig = '';
+                setTimeout(() => pollOnce(true), 120);
+                return;
+            }
+
+            if (type === 'set_author_note') {
+                const cIdx = Number(p.charIndex);
+                const chIdx = Number(p.chatIndex);
+                if (Number.isNaN(cIdx) || Number.isNaN(chIdx)) return;
+                const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
+                if (!chatObj) return;
+                chatObj.note = String(p.note ?? '');
+                await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                lastSnapSig = '';
+                setTimeout(() => pollOnce(true), 120);
+                return;
+            }
+
+            if (type === 'set_char_global_note') {
+                const cIdx = Number(p.charIndex);
+                if (Number.isNaN(cIdx) || cIdx < 0) return;
+                const charObj = await risuai.getCharacterFromIndex(cIdx);
+                if (!charObj) return;
+                charObj.replaceGlobalNote = String(p.replaceGlobalNote ?? '');
+                await risuai.setCharacterToIndex(cIdx, charObj);
                 lastSnapSig = '';
                 setTimeout(() => pollOnce(true), 120);
                 return;
@@ -7525,6 +7669,31 @@
                     chatObj.scriptstate['$' + cleanKey] = String(p.value);
                 }
                 await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                lastSnapSig = '';
+                setTimeout(() => pollOnce(true), 120);
+                return;
+            }
+
+            if (type === 'set_author_note') {
+                const cIdx = Number(p.charIndex);
+                const chIdx = Number(p.chatIndex);
+                if (Number.isNaN(cIdx) || Number.isNaN(chIdx)) return;
+                const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
+                if (!chatObj) return;
+                chatObj.note = String(p.note ?? '');
+                await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                lastSnapSig = '';
+                setTimeout(() => pollOnce(true), 120);
+                return;
+            }
+
+            if (type === 'set_char_global_note') {
+                const cIdx = Number(p.charIndex);
+                if (Number.isNaN(cIdx) || cIdx < 0) return;
+                const charObj = await risuai.getCharacterFromIndex(cIdx);
+                if (!charObj) return;
+                charObj.replaceGlobalNote = String(p.replaceGlobalNote ?? '');
+                await risuai.setCharacterToIndex(cIdx, charObj);
                 lastSnapSig = '';
                 setTimeout(() => pollOnce(true), 120);
                 return;

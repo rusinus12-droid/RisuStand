@@ -271,6 +271,8 @@ test('bundled Leave preset & AI provider model loader APIs (including 22 Ollama 
         assert.equal(metaJson.id, 'preset-leave-r1.1');
         assert.equal(metaJson.filename, 'Leave_RisuAI_Preset.risup');
         assert.ok(metaJson.toggleSyntax.includes('ooc_mode='));
+        assert.ok(metaJson.toggleSyntax.includes('bianca_inject=비앙카 투입 (기본: 꺼짐)=select='));
+        assert.ok(metaJson.toggleSyntax.includes('DeepSeek 계열'));
         assert.equal(metaJson.hasGuide, true);
 
         const dl = await new Promise((resolve, reject) => {
@@ -287,6 +289,7 @@ test('bundled Leave preset & AI provider model loader APIs (including 22 Ollama 
         const decodedPreset = relay.decodeRisupPreset(dl.buf);
         assert.equal(decodedPreset.name, 'Leave — Wandering Librarian Engine r1.1');
         assert.equal(decodedPreset.promptTemplate.length, 21);
+        assert.ok(decodedPreset.promptTemplate[8].text.includes('BIANCA WRITING DISCIPLINE — PROSE CRAFT, EDITORIAL CHECKS & MATURE REGISTER ONLY'));
         assert.ok(decodedPreset.promptTemplate[8].text.includes('BIANCA WORKSPACE PERSONA — this module governs prose voice'));
         assert.ok(decodedPreset.promptTemplate[20].text.includes('STEP 3 — CHARACTER-CARD STATUS LINE'));
 
@@ -914,7 +917,7 @@ test('CBS evaluator & Leave r1.1 direct prompt builder honor global and local to
     assert.ok(lastUserIdx < defaultMsgs.length - 1, 'Commitment lock must appear after latest user turn');
     assert.ok(defaultMsgs[defaultMsgs.length - 1].content.includes('STEP 3 — CHARACTER-CARD STATUS LINE'));
 
-    // 2) Remote toggles: enable Bianca + English output HUD
+    // 2) Remote toggles: enable Bianca writing discipline ('1') + English output HUD
     const biancaMsgs = relay.buildDirectPromptMessages({
         preset: leave,
         snap: baseSnap,
@@ -923,8 +926,21 @@ test('CBS evaluator & Leave r1.1 direct prompt builder honor global and local to
         remoteToggleValues: { toggle_bianca_inject: '1', toggle_output_lang: '1' },
     });
     const combinedBianca = biancaMsgs.map((m) => m.content).join('\n');
-    assert.ok(combinedBianca.includes('BIANCA WORKSPACE PERSONA — this module governs prose voice'));
+    assert.ok(combinedBianca.includes('BIANCA WRITING DISCIPLINE — PROSE CRAFT, EDITORIAL CHECKS & MATURE REGISTER ONLY'));
+    assert.ok(!combinedBianca.includes('BIANCA WORKSPACE PERSONA — this module governs prose voice'));
     assert.ok(combinedBianca.includes('Leave HUD · [Time] · [Location]'));
+
+    // 2b) Remote toggles: enable full Bianca persona ('2') + DeepSeek model adapter ('4')
+    const biancaFullMsgs = relay.buildDirectPromptMessages({
+        preset: leave,
+        snap: baseSnap,
+        historyMessages: history,
+        userText: 'Enter the classroom.',
+        remoteToggleValues: { toggle_bianca_inject: '2', toggle_model_adapter: '4' },
+    });
+    const combinedBiancaFull = biancaFullMsgs.map((m) => m.content).join('\n');
+    assert.ok(combinedBiancaFull.includes('BIANCA WORKSPACE PERSONA — this module governs prose voice'));
+    assert.ok(!/\{\{#if|\{\{getglobalvar|\{\{\/if\}\}/.test(combinedBiancaFull), 'No unresolved preset CBS macros should remain with DeepSeek adapter');
 
     // 3) OOC mode on globally -> OOC lock active; then overridden locally to OFF -> narrative restored
     const oocMsgs = relay.buildDirectPromptMessages({
@@ -951,7 +967,7 @@ test('CBS evaluator & Leave r1.1 direct prompt builder honor global and local to
     });
     const combinedLocal = localOverrideMsgs.map((m) => m.content).join('\n');
     assert.ok(combinedLocal.includes('STEP 3 — CHARACTER-CARD STATUS LINE'), 'Local toggle should override remote global OOC toggle');
-    assert.ok(combinedLocal.includes('BIANCA WORKSPACE PERSONA'), 'Local bianca toggle should override global');
+    assert.ok(combinedLocal.includes('BIANCA WRITING DISCIPLINE — PROSE CRAFT, EDITORIAL CHECKS & MATURE REGISTER ONLY'), 'Local bianca toggle should override global');
 
     // 4) Preset null -> legacy minimal single-system prompt
     const legacyMsgs = relay.buildDirectPromptMessages({
@@ -991,7 +1007,7 @@ test('direct remote chat applies Leave preset + remote toggles & supports custom
             activeProfileId: 'mock-direct',
             directPresetId: 'bundled:leave',
             remoteToggleValues: {},
-            presetToggles: [],
+            presetToggles: [{ id: 'preset-leave-r1.1', name: 'Old Leave', enabled: true, syntax: 'ooc_mode=old' }],
             profiles: [{
                 id: 'mock-direct',
                 name: 'MockDirect',
@@ -1012,6 +1028,15 @@ test('direct remote chat applies Leave preset + remote toggles & supports custom
 
     try {
         const hdrs = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+
+        // 0) Stale bundled Leave preset toggle entry is auto-refreshed on GET /api/router/config
+        const cfgRes = await requestHttp(port, { path: '/api/router/config', headers: hdrs });
+        assert.equal(cfgRes.status, 200);
+        const cfgJson = JSON.parse(cfgRes.body);
+        const leaveToggleEntry = (cfgJson.presetToggles || []).find((pt) => pt.id === 'preset-leave-r1.1');
+        assert.ok(leaveToggleEntry);
+        assert.ok(leaveToggleEntry.syntax.includes('bianca_inject=비앙카 투입 (기본: 꺼짐)=select='));
+        assert.ok(leaveToggleEntry.syntax.includes('DeepSeek 계열'));
 
         // 1) Toggle bianca_inject globally via /api/command -> persisted in relay remoteToggleValues
         const togRes = await requestHttp(port, {
@@ -1075,7 +1100,7 @@ test('direct remote chat applies Leave preset + remote toggles & supports custom
         const sentMsgs = capturedPayloads[0].messages;
         assert.ok(sentMsgs.length >= 8, `Expected multi-message Leave template, got ${sentMsgs.length}`);
         const sentAll = sentMsgs.map((m) => m.content).join('\n');
-        assert.ok(sentAll.includes('BIANCA WORKSPACE PERSONA'), 'Remote global toggle must apply to direct remote chat');
+        assert.ok(sentAll.includes('BIANCA WRITING DISCIPLINE — PROSE CRAFT, EDITORIAL CHECKS & MATURE REGISTER ONLY'), 'Remote global toggle must apply to direct remote chat');
         assert.ok(sentMsgs[sentMsgs.length - 1].content.includes('STEP 3 — CHARACTER-CARD STATUS LINE'));
 
         // 4) Custom .risup upload, selection, and deletion APIs
@@ -1111,6 +1136,340 @@ test('direct remote chat applies Leave preset + remote toggles & supports custom
         const scriptMatch = html.body.match(/<script>([\s\S]*?)<\/script>/);
         assert.ok(scriptMatch);
         new vm.Script(scriptMatch[1], { filename: 'webapp-direct-preset-inline.js' });
+    } finally {
+        await new Promise((r) => server.close(r));
+        await new Promise((r) => upstream.close(r));
+    }
+});
+
+test('Cheongwon High School regression: large lorebooks (>6k), character sheet scanDepth, @@depth postEverything, {{#when}}, and replaceGlobalNote', async () => {
+    const capturedPayloads = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+            capturedPayloads.push(body);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                id: 'cw-1',
+                model: body.model || 'mock-model',
+                choices: [{ index: 0, message: { role: 'assistant', content: 'Reply' }, finish_reason: 'stop' }],
+            }));
+        });
+    });
+    await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+    const upstreamPort = upstream.address().port;
+
+    const tok = 'cw-lore-regression-tok';
+    const server = relay.createRelayServer({
+        token: tok,
+        configOverride: {
+            activeProfileId: 'mock-cw',
+            directPresetId: 'bundled:leave',
+            remoteToggleValues: {},
+            presetToggles: [],
+            profiles: [{
+                id: 'mock-cw',
+                name: 'MockCW',
+                providerType: 'openai_compat',
+                baseUrl: `http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
+                apiKey: 'mock-key',
+                model: 'deepseek-test',
+                temperature: '',
+                maxTokens: '',
+                overrideMode: 'off',
+                systemOverride: '',
+            }],
+            translator: { useActiveProfile: true, autoTranslateOutput: false, autoTranslateInput: false },
+        },
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+
+    try {
+        const leave = relay.loadBundledLeavePreset();
+        const loreEntries = [
+            { key: '', comment: 'LBDATA', alwaysActive: true, insertorder: 200, content: 'X'.repeat(2800) },
+            { key: '', comment: '기본 정보', alwaysActive: true, insertorder: 190, content: 'Y'.repeat(2800) },
+            { key: '', comment: 'Asset Prompt', alwaysActive: true, insertorder: 150, content: '@@depth 00\n<img src={name}_{outfit}_{keyword}>' },
+            { key: '', comment: 'Bot Status Bar', alwaysActive: true, insertorder: 50, content: '@@depth 0\nAlways emit status line: [☀️][7°C][YYYY.MM.DD][AM/PM HH:MM][Location][Action]{{#when::nsfw_mode::is::1}}\nNSFW_ACTIVE{{/when}}' },
+            { key: '다인,강다인', comment: '강다인', alwaysActive: false, insertorder: 120, content: 'Character Sheet: 강다인 (음악실 자주 방문).' },
+            { key: '음악실', comment: '음악실', alwaysActive: false, insertorder: 110, content: 'Location Detail: 신관 음악실.' },
+        ];
+
+        const messages = [
+            { index: 0, role: 'user', raw: '방과 후 다인과 음악실로 향했다.' },
+            { index: 1, role: 'char', raw: '음악실 문이 열렸다.' },
+            { index: 2, role: 'user', raw: '그녀의 손을 잡았다.' },
+            { index: 3, role: 'char', raw: '그녀가 고개를 끄덕였다.' },
+        ];
+
+        const snap = {
+            charIndex: 0,
+            chatIndex: 0,
+            charName: 'Cheongwon High School',
+            chatName: 'Chat 1',
+            isPcActive: false,
+            chatVariables: { nsfw_mode: '1' },
+            useLocallySetGlobalVariables: false,
+            globalToggleValues: {},
+            localToggleValues: {},
+            charContext: {
+                name: 'Cheongwon High School',
+                desc: 'High school simulation.',
+                personaName: '푸딩',
+                personaPrompt: 'Student.',
+                loreEntries,
+                loreDepth: 10,
+                loreTokenBudget: 16000,
+                loreRecursive: true,
+                replaceGlobalNote: 'CARD_STATUS_LOCK_REMINDER {{original}}',
+                depthPrompt: { depth: 1, prompt: 'DEPTH1_SCENE_REMINDER' },
+                memory: 'MEMORY_SUMMARY_DAIN',
+            },
+            messages,
+        };
+
+        // Direct unit check on buildDirectPromptMessages with short new userText lacking "다인"
+        const built = relay.buildDirectPromptMessages({
+            preset: leave,
+            snap,
+            historyMessages: messages,
+            userText: '그녀의 입속에...',
+            remoteToggleValues: {},
+        });
+        const fullText = built.map((m) => m.content).join('\n');
+        assert.ok(!/@@depth\b/i.test(fullText), 'Raw @@depth decorator must be stripped before LLM payload');
+        assert.ok(fullText.includes('Always emit status line: [☀️][7°C]'), 'Status bar prompt must not be truncated');
+        assert.ok(fullText.includes('NSFW_ACTIVE'), '{{#when::nsfw_mode::is::1}} must evaluate inside lorebook');
+        assert.ok(fullText.includes('Character Sheet: 강다인'), 'Character lorebook must activate from prior turns');
+        assert.ok(fullText.includes('Location Detail: 신관 음악실'), 'Location lorebook must activate');
+        assert.ok(fullText.includes('CARD_STATUS_LOCK_REMINDER'), 'replaceGlobalNote must populate globalNote slot');
+        assert.ok(!fullText.includes('MEMORY_SUMMARY_DAIN'), 'Leave default toggle_memory_backend=0 suppresses memory via innerFormat');
+
+        const builtWithMem = relay.buildDirectPromptMessages({
+            preset: leave,
+            snap,
+            historyMessages: messages,
+            userText: '그녀의 입속에...',
+            remoteToggleValues: { toggle_memory_backend: '1' },
+        });
+        assert.ok(builtWithMem.some((m) => m.content.includes('[LONG-TERM MEMORY & CONTINUITY]') && m.content.includes('MEMORY_SUMMARY_DAIN')), 'memory slot must populate when toggle_memory_backend=1');
+
+        const userTurnIdx = built.findIndex((m) => m.role === 'user' && m.content === '그녀의 입속에...');
+        const depth1Idx = built.findIndex((m) => m.content.includes('DEPTH1_SCENE_REMINDER'));
+        const assetPostIdx = built.findIndex((m) => m.content.includes('<img src={name}_{outfit}_{keyword}>'));
+        const statusPostIdx = built.findIndex((m) => m.content.includes('Always emit status line: [☀️][7°C]'));
+        const commitIdx = built.findIndex((m) => m.content.includes('STEP 3 — CHARACTER-CARD STATUS LINE'));
+        assert.ok(depth1Idx >= 0 && depth1Idx < userTurnIdx, 'depthPrompt(1) should sit before latest user turn');
+        assert.ok(assetPostIdx > userTurnIdx && assetPostIdx < commitIdx, '@@depth 00 Asset Prompt must land in postEverything after user turn and before Leave 09 anchor');
+        assert.ok(statusPostIdx > userTurnIdx && statusPostIdx < commitIdx, '@@depth 0 status bar must land in postEverything after user turn and before Leave 09 anchor');
+
+        // Integration check: /api/state strips heavy loreEntries, while /api/chat/send forwards full lore + status bar to upstream
+        const hdrs = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+        await requestHttp(port, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({
+                bridgeVersion: '2.0.0',
+                generating: false,
+                supportsBatchCommands: true,
+                catalog: { characters: [{ index: 0, name: 'Cheongwon High School', chats: [{ index: 0, id: 'c0', name: 'Chat 1', msgCount: 4 }] }] },
+                snapshot: snap,
+            }),
+        });
+
+        const stRes = await requestHttp(port, { path: '/api/state', headers: hdrs });
+        assert.equal(stRes.status, 200);
+        const stJson = JSON.parse(stRes.body);
+        assert.equal('loreEntries' in stJson.snapshot.charContext, false, '/api/state should omit heavy loreEntries for mobile');
+
+        const sendRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/chat/send',
+            headers: hdrs,
+            body: JSON.stringify({ charIndex: 0, chatIndex: 0, text: '그녀의 입속에...' }),
+        });
+        assert.equal(sendRes.status, 200);
+        for (let i = 0; i < 40 && capturedPayloads.length === 0; i += 1) {
+            await new Promise((r) => setTimeout(r, 25));
+        }
+        assert.equal(capturedPayloads.length, 1);
+        const sentText = capturedPayloads[0].messages.map((m) => m.content).join('\n');
+        assert.ok(sentText.includes('Always emit status line: [☀️][7°C]'));
+        assert.ok(sentText.includes('Character Sheet: 강다인'));
+        assert.ok(!/@@depth\b/i.test(sentText));
+    } finally {
+        await new Promise((r) => server.close(r));
+        await new Promise((r) => upstream.close(r));
+    }
+});
+
+test('lorebook inspector GET /api/lorebook, per-entry exclude & pin, Author Note editing, and Web UI script compilation', async () => {
+    const capturedPayloads = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+            const body = JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
+            capturedPayloads.push(body);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                id: 'lb-sel-1',
+                model: body.model || 'mock-model',
+                choices: [{ index: 0, message: { role: 'assistant', content: 'Response ok' }, finish_reason: 'stop' }],
+            }));
+        });
+    });
+    await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+    const upstreamPort = upstream.address().port;
+
+    const tok = 'lore-sel-token';
+    const server = relay.createRelayServer({
+        token: tok,
+        configOverride: {
+            activeProfileId: 'mock-lb',
+            directPresetId: 'bundled:leave',
+            remoteToggleValues: {},
+            disabledLoreEntries: {},
+            pinnedLoreEntries: {},
+            presetToggles: [],
+            profiles: [{
+                id: 'mock-lb',
+                name: 'MockLB',
+                providerType: 'openai_compat',
+                baseUrl: `http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
+                apiKey: 'mock-key',
+                model: 'deepseek-test',
+                temperature: '',
+                maxTokens: '',
+                overrideMode: 'off',
+                systemOverride: '',
+            }],
+            translator: { useActiveProfile: true, autoTranslateOutput: false, autoTranslateInput: false },
+        },
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+
+    try {
+        const hdrs = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+        await requestHttp(port, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({
+                bridgeVersion: '2.0.0',
+                generating: false,
+                supportsBatchCommands: true,
+                catalog: { characters: [{ index: 0, name: 'TestChar', chats: [{ index: 0, id: 'c0', name: 'Chat 1', msgCount: 1 }] }] },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: 'TestChar',
+                    chatName: 'Chat 1',
+                    isPcActive: false,
+                    chatVariables: {},
+                    useLocallySetGlobalVariables: false,
+                    globalToggleValues: {},
+                    localToggleValues: {},
+                    charContext: {
+                        charId: 'char-uid-test',
+                        name: 'TestChar',
+                        desc: 'Detailed character description for TestChar.',
+                        personality: 'Calm and witty.',
+                        scenario: 'Rainy library.',
+                        note: 'Initial author note.',
+                        loreEntries: [
+                            { uid: 'char:keep1', source: 'char', sourceName: 'TestChar', comment: 'Keep Always', key: '', alwaysActive: true, insertorder: 100, content: 'ALWAYS_KEPT_ENTRY' },
+                            { uid: 'char:drop1', source: 'char', sourceName: 'TestChar', comment: 'Drop Me', key: '', alwaysActive: true, insertorder: 90, content: 'EXCLUDED_ENTRY_TEXT' },
+                            { uid: 'char:pin1', source: 'char', sourceName: 'TestChar', comment: 'Secret Keyword', key: 'raretrigger', alwaysActive: false, insertorder: 80, content: 'PINNED_KEYWORD_ENTRY' },
+                        ],
+                    },
+                    messages: [{ index: 0, role: 'char', raw: 'Welcome.' }],
+                },
+            }),
+        });
+
+        // 1) GET /api/lorebook returns all entries, all checked (disabledUids empty) by default
+        const lbRes = await requestHttp(port, { path: '/api/lorebook', headers: hdrs });
+        assert.equal(lbRes.status, 200);
+        const lbJson = JSON.parse(lbRes.body);
+        assert.equal(lbJson.charKey, 'char-uid-test');
+        assert.deepEqual(lbJson.disabledUids, []);
+        assert.equal(lbJson.entries.length, 3);
+
+        // 2) Exclude char:drop1 and pin char:pin1
+        const selRes1 = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/lorebook/selection',
+            headers: hdrs,
+            body: JSON.stringify({ charKey: 'char-uid-test', uid: 'char:drop1', enabled: false, pinned: false }),
+        });
+        assert.equal(selRes1.status, 200);
+        const selRes2 = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/lorebook/selection',
+            headers: hdrs,
+            body: JSON.stringify({ charKey: 'char-uid-test', uid: 'char:pin1', enabled: true, pinned: true }),
+        });
+        assert.equal(selRes2.status, 200);
+        const selJson2 = JSON.parse(selRes2.body);
+        assert.deepEqual(selJson2.disabledUids, ['char:drop1']);
+        assert.deepEqual(selJson2.pinnedUids, ['char:pin1']);
+
+        // 3) Edit Author's Note via /api/command -> immediately updates in-memory snapshot for direct request
+        const anRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/command',
+            headers: hdrs,
+            body: JSON.stringify({ type: 'set_author_note', payload: { charIndex: 0, chatIndex: 0, note: 'EDITED_AUTHORS_NOTE_LIVE' } }),
+        });
+        assert.equal(anRes.status, 200);
+
+        // 4) Direct chat send applies description, edited Author's Note, keeps ALWAYS_KEPT_ENTRY + PINNED_KEYWORD_ENTRY, excludes EXCLUDED_ENTRY_TEXT
+        const sendRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/chat/send',
+            headers: hdrs,
+            body: JSON.stringify({ charIndex: 0, chatIndex: 0, text: 'Ordinary message without keyword.' }),
+        });
+        assert.equal(sendRes.status, 200);
+        for (let i = 0; i < 40 && capturedPayloads.length === 0; i += 1) {
+            await new Promise((r) => setTimeout(r, 25));
+        }
+        assert.equal(capturedPayloads.length, 1);
+        const sent = capturedPayloads[0].messages.map((m) => m.content).join('\n');
+        assert.ok(sent.includes('Detailed character description for TestChar.'));
+        assert.ok(sent.includes('EDITED_AUTHORS_NOTE_LIVE'));
+        assert.ok(!sent.includes('Initial author note.'));
+        assert.ok(sent.includes('ALWAYS_KEPT_ENTRY'));
+        assert.ok(sent.includes('PINNED_KEYWORD_ENTRY'), 'Pinned keyword entry must be included even without keyword match');
+        assert.ok(!sent.includes('EXCLUDED_ENTRY_TEXT'), 'Unchecked lorebook entry must be omitted from LLM request');
+
+        // 5) Web UI contains Author Note editor, Lorebook card, dedicated message edit modal & compiles cleanly
+        const html = await requestHttp(port, { path: '/' });
+        assert.equal(html.status, 200);
+        for (const marker of ['authorNoteCard', 'authorNoteInput', 'saveAuthorNoteBtn', 'charDescPreviewDetails', 'lorebookCard', 'loreList', 'loreSearch', 'loreEnableAllBtn', 'msgEditModal', 'msg-edit-card', 'msgEditTextarea', 'openMsgEditModal', 'saveMsgEditModal']) {
+            assert.ok(html.body.includes(marker), `Expected Web UI marker: ${marker}`);
+        }
+        assert.ok(!html.body.includes("prompt('메시지 수정:'"), 'Legacy small prompt() message editor should be removed');
+        const scriptMatch = html.body.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(scriptMatch);
+        new vm.Script(scriptMatch[1], { filename: 'webapp-lorebook-ui-inline.js' });
+
+        // 6) edit_message command immediately updates in-memory snapshot message text
+        const edRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/command',
+            headers: hdrs,
+            body: JSON.stringify({ type: 'edit_message', payload: { charIndex: 0, chatIndex: 0, msgIndex: 0, text: 'EDITED_GREETING_TEXT' } }),
+        });
+        assert.equal(edRes.status, 200);
+        const stAfterEdit = JSON.parse((await requestHttp(port, { path: '/api/state', headers: hdrs })).body);
+        assert.equal(stAfterEdit.snapshot.messages[0].raw, 'EDITED_GREETING_TEXT');
     } finally {
         await new Promise((r) => server.close(r));
         await new Promise((r) => upstream.close(r));

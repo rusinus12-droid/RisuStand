@@ -1036,3 +1036,83 @@ test('buildSnapshot emits botWidgetHtml when chat exceeds 36 messages and firstM
         await harness.cleanup();
     }
 });
+
+test('buildSnapshot emits full loreEntries (beyond 6000 chars), localLore, replaceGlobalNote, depthPrompt, and memory', async () => {
+    const bigBlockA = 'A'.repeat(3200);
+    const bigBlockB = 'B'.repeat(3200);
+    const db = {
+        enabledModules: ['mod-hud'],
+        modules: [{
+            id: 'mod-hud',
+            name: 'StatusHudMod',
+            lorebook: [
+                { key: '', comment: 'Folder Header', mode: 'folder', content: 'ignored' },
+                { key: '', comment: 'Module StatusRule', alwaysActive: true, insertorder: 50, content: '@@depth 0\nEmit status bar [DATE]' },
+            ],
+        }],
+        personas: [{ name: 'Puding', personaPrompt: 'Student' }],
+        selectedPersona: 0,
+        customscript: [],
+        globalChatVariables: {},
+        characters: [],
+    };
+    const characters = [{
+        chaId: 'cheongwon-test',
+        name: 'Cheongwon High School',
+        firstMessage: 'Start',
+        alternateGreetings: [],
+        customscript: [],
+        replaceGlobalNote: 'CARD_GLOBAL_NOTE {{original}}',
+        depth_prompt: { depth: 1, prompt: 'Card depth prompt reminder.' },
+        loreSettings: { scanDepth: 12, tokenBudget: 24000, recursiveScanning: true },
+        globalLore: [
+            { key: '', comment: 'L1 Big', alwaysActive: true, insertorder: 100, content: bigBlockA },
+            { key: '', comment: 'L2 Big', alwaysActive: true, insertorder: 90, content: bigBlockB },
+            { key: '다인,강다인', comment: 'Kang Dain', alwaysActive: false, insertorder: 80, content: 'Kang Dain profile sheet.' },
+        ],
+        chats: [{
+            id: 'c-cw',
+            name: 'Chat 1',
+            fmIndex: -1,
+            supaMemoryData: 'Past memory summary of Music Room.',
+            scriptstate: {},
+            localLore: [
+                { key: '음악실', comment: 'Music Room Note', alwaysActive: false, insertorder: 70, content: 'Local music room detail.' },
+            ],
+            message: [
+                { role: 'char', data: '다인이 음악실 피아노 옆에 서 있다.' },
+                { role: 'user', data: '짧은 행동 입력.' },
+            ],
+        }],
+    }];
+    const harness = await bootPluginWithMockRisu({ db, characters });
+    try {
+        const snap = [...harness.polls].reverse().find((p) => p.snapshot)?.snapshot;
+        assert.ok(snap && snap.charContext);
+        assert.equal(snap.charContext.replaceGlobalNote, 'CARD_GLOBAL_NOTE {{original}}');
+        assert.deepEqual(snap.charContext.depthPrompt, { depth: 1, prompt: 'Card depth prompt reminder.' });
+        assert.equal(snap.charContext.memory, 'Past memory summary of Music Room.');
+        assert.equal(snap.charContext.loreDepth, 12);
+        assert.equal(snap.charContext.loreTokenBudget, 24000);
+        // Folder skipped -> 5 valid entries remain (module + 3 global + 1 local)
+        assert.equal(snap.charContext.loreEntries.length, 5);
+        assert.equal(snap.charContext.charId, 'cheongwon-test');
+        assert.ok(snap.charContext.loreEntries.every((e) => typeof e.uid === 'string' && e.uid.includes(':') && e.source && e.sourceName));
+        assert.ok(snap.charContext.moduleLore.includes('Kang Dain profile sheet.'), 'fallback summary must not drop entries after 6000 chars');
+        assert.ok(snap.charContext.moduleLore.includes('Local music room detail.'));
+
+        // set_author_note and set_char_global_note commands persist to RisuAI DB and refresh snapshot
+        await harness.triggerNextPoll({ type: 'set_author_note', payload: { charIndex: 0, chatIndex: 0, note: 'Focus on emotional pacing.' } });
+        await harness.triggerNextPoll({ type: 'set_char_global_note', payload: { charIndex: 0, replaceGlobalNote: 'UPDATED_GN {{original}}' } });
+        await new Promise((r) => setTimeout(r, 80));
+        await harness.triggerNextPoll();
+        const snapAfter = [...harness.polls].reverse().find((p) => p.snapshot)?.snapshot;
+        assert.ok(snapAfter);
+        assert.equal(snapAfter.charContext.note, 'Focus on emotional pacing.');
+        assert.equal(snapAfter.charContext.replaceGlobalNote, 'UPDATED_GN {{original}}');
+        assert.equal(characters[0].chats[0].note, 'Focus on emotional pacing.');
+        assert.equal(characters[0].replaceGlobalNote, 'UPDATED_GN {{original}}');
+    } finally {
+        await harness.cleanup();
+    }
+});
