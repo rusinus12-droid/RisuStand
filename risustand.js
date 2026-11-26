@@ -2,6 +2,7 @@
 //@display-name RisuStand
 //@api 3.0
 //@version 1.0.0
+//@update-url https://raw.githubusercontent.com/rusinus12-droid/RisuStand/refs/heads/main/risustand.js
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // Required Notice: Copyright (c) 2026 rusinus12
 
