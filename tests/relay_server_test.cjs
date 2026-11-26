@@ -264,17 +264,31 @@ test('bundled Leave preset & AI provider model loader APIs (including 22 Ollama 
 
         const authHdr = { 'X-RisuStand-Token': 'preset-loader-token' };
 
-        // 2) Bundled Leave r1.1 preset metadata, download JSON, and guide HTML
+        // 2) Bundled Leave r1.1 preset metadata, download .risup binary, and guide HTML
         const meta = await requestHttp(port, { path: '/api/presets/leave', headers: authHdr });
         assert.equal(meta.status, 200);
         const metaJson = JSON.parse(meta.body);
         assert.equal(metaJson.id, 'preset-leave-r1.1');
+        assert.equal(metaJson.filename, 'Leave_RisuAI_Preset.risup');
         assert.ok(metaJson.toggleSyntax.includes('ooc_mode='));
         assert.equal(metaJson.hasGuide, true);
 
-        const dl = await requestHttp(port, { path: '/api/presets/leave/download', headers: authHdr });
+        const dl = await new Promise((resolve, reject) => {
+            http.get({ host: '127.0.0.1', port, path: '/api/presets/leave/download', headers: authHdr }, (res) => {
+                const chunks = [];
+                res.on('data', (c) => chunks.push(c));
+                res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, buf: Buffer.concat(chunks) }));
+            }).on('error', reject);
+        });
         assert.equal(dl.status, 200);
-        assert.ok(JSON.parse(dl.body).promptTemplate.length >= 20);
+        assert.equal(dl.headers['content-type'], 'application/octet-stream');
+        assert.match(dl.headers['content-disposition'] || '', /Leave_RisuAI_Preset\.risup/);
+        assert.notEqual(dl.buf[0], 0x7b, 'Downloaded preset must be binary .risup, not raw JSON');
+        const decodedPreset = relay.decodeRisupPreset(dl.buf);
+        assert.equal(decodedPreset.name, 'Leave — Wandering Librarian Engine r1.1');
+        assert.equal(decodedPreset.promptTemplate.length, 21);
+        assert.ok(decodedPreset.promptTemplate[8].text.includes('BIANCA WORKSPACE PERSONA — this module governs prose voice'));
+        assert.ok(decodedPreset.promptTemplate[20].text.includes('STEP 3 — CHARACTER-CARD STATUS LINE'));
 
         const guide = await requestHttp(port, { path: '/api/presets/leave/guide', headers: authHdr });
         assert.equal(guide.status, 200);
@@ -334,7 +348,7 @@ test('bundled Leave preset & AI provider model loader APIs (including 22 Ollama 
         // 5) Rendered HTML includes provider selector, model loader, Leave buttons, and compiles cleanly
         const html = await requestHttp(port, { path: '/' });
         assert.equal(html.status, 200);
-        for (const marker of ['edProvider', 'edLoadModelsBtn', 'edModelPick', 'trProvider', 'installBundledLeaveToggle']) {
+        for (const marker of ['edProvider', 'edLoadModelsBtn', 'edModelPick', 'trProvider', 'installBundledLeaveToggle', 'downloadLeavePreset', 'RISUP 받기']) {
             assert.ok(html.body.includes(marker), `Expected UI marker: ${marker}`);
         }
         const scriptMatch = html.body.match(/<script>([\s\S]*?)<\/script>/);
@@ -472,6 +486,12 @@ test('pc poll needFullSync signal & risustand.js trash filtering / post-ACK sign
         assert.ok(html.body.includes('openBookImgPreview'));
         assert.ok(html.body.includes('closeBookImgPreview'));
         assert.ok(html.body.includes('bookImgPreview'));
+        assert.ok(html.body.includes('bookColOffsets'));
+        assert.ok(html.body.includes('getBookSpreadScrollLeft'));
+        assert.ok(html.body.includes('setBookViewportScrollLeft'));
+        assert.ok(html.body.includes('bookEndPad'));
+        assert.ok(html.body.includes('botWidgetHtml'));
+        assert.ok(html.body.includes('extractFixedFromContainer'));
         const sigMatch = html.body.match(/const sig = JSON\.stringify\(\[snap\.charIndex,[\s\S]*?\]\);/);
         assert.ok(sigMatch && !sigMatch[0].includes('st.generating') && !sigMatch[0].includes('st.directGenerating'), 'lastChatRenderSig should not include generating flags');
         const sendMatch = html.body.match(/async function sendMessage\(\) \{[\s\S]*?document\.getElementById\('sendBtn'\)/);

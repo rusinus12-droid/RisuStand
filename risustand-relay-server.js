@@ -16,6 +16,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const zlib = require('zlib');
 const { spawn } = require('child_process');
 
 // Kept in sync with VERSION by tools/release_version.cjs
@@ -154,24 +155,127 @@ function saveConfig() {
 
 let config = loadConfig();
 
-const LEAVE_PRESET_ID = 'preset-leave-r1.1';
-function loadBundledLeavePreset() {
-    const jsonPath = path.join(ROOT_DIR, 'prompt', 'Leave_RisuAI_Preset.json');
-    const htmlPath = path.join(ROOT_DIR, 'prompt', 'Leave_RisuAI_Preset.html');
-    if (!fs.existsSync(jsonPath)) return null;
+// Byte substitution table matching RisuAI's .risup / rpack container format
+const RISUP_RPACK_MAP_BASE64 = 'xA0eC70rP1X8RW71ZlNPGuC7MJSGumu/QVBvm+/etxBhFyDfMomonW2ryZAADF2v0sFW5RZkkYJldJfKI9ZS0f+0oOgvilg4WmAZlknb18g7PkNLpWNHqmopkvQVz2I0eNMdPOIFjipXDhvNTC3yQCwleUgPsnq1p2w35px7VH7+h9yaAuQzouuxLgPdmaaw59WIGIN89r7hXJ/DIUYfCE7QdhJf7v2PROqjXosoCTWeacwKx4UHrUrzd+ln1NqEgJO2TXP6JyZ/BMb78XI5UcI2qWis+O3FucvOdaQ9gdlCcByVEbzYjJj5WaET9xR9s+xxwOON8AGuWzEGJCI6uCz3hIvJZfu2n66zAy0BaXQf5KPs7lw0IZNKD2riYgKeIpz9PPxxx8atWWcFcG2KRBL6JIZfr9F6R87+UGPdUQZvGOBSqAmdVnNMuFNsw6AOGc8+DX4HMmhG6kj5mS6rpEkgXlU1OAy807FYFnkoChrh8s3EOduiumBydn2V73/IwN43lL+1FIGSJUWs5/Vmpys2WsET40s66I2DG3wnsJpC64eq3FSOeCbSVynUt/gvj4l18EF3wh7/2BUR5QSXF/Mx0JsA18q0Tyo72bJr2l2hPzBhvZE9Tubfvk2CjB0jEJhk9IUze5BDu6mI8dalHPbMbrlbC5bt1enFywimgEA=';
+const RISUP_MAP_BYTES = Uint8Array.from(Buffer.from(RISUP_RPACK_MAP_BASE64, 'base64'));
+const RISUP_DECODE_MAP = RISUP_MAP_BYTES.subarray(256, 512);
+
+function msgpackDecode(u8) {
+    const buf = Buffer.isBuffer(u8) ? u8 : Buffer.from(u8);
+    let pos = 0;
+    const readStr = (len) => {
+        const s = buf.toString('utf8', pos, pos + len);
+        pos += len;
+        return s;
+    };
+    const readBin = (len) => {
+        const b = buf.subarray(pos, pos + len);
+        pos += len;
+        return b;
+    };
+    const readArr = (len) => {
+        const arr = new Array(len);
+        for (let i = 0; i < len; i += 1) arr[i] = read();
+        return arr;
+    };
+    const readMap = (len) => {
+        const obj = {};
+        for (let i = 0; i < len; i += 1) {
+            const k = read();
+            obj[String(k)] = read();
+        }
+        return obj;
+    };
+    function read() {
+        if (pos >= buf.length) throw new Error('Unexpected end of MessagePack data');
+        const b = buf[pos++];
+        if (b <= 0x7f) return b;
+        if (b >= 0xe0) return b - 256;
+        if (b >= 0x80 && b <= 0x8f) return readMap(b & 0x0f);
+        if (b >= 0x90 && b <= 0x9f) return readArr(b & 0x0f);
+        if (b >= 0xa0 && b <= 0xbf) return readStr(b & 0x1f);
+        switch (b) {
+            case 0xc0: return null;
+            case 0xc2: return false;
+            case 0xc3: return true;
+            case 0xc4: return readBin(buf[pos++]);
+            case 0xc5: { const l = buf.readUInt16BE(pos); pos += 2; return readBin(l); }
+            case 0xc6: { const l = buf.readUInt32BE(pos); pos += 4; return readBin(l); }
+            case 0xca: { const v = buf.readFloatBE(pos); pos += 4; return v; }
+            case 0xcb: { const v = buf.readDoubleBE(pos); pos += 8; return v; }
+            case 0xcc: return buf[pos++];
+            case 0xcd: { const v = buf.readUInt16BE(pos); pos += 2; return v; }
+            case 0xce: { const v = buf.readUInt32BE(pos); pos += 4; return v; }
+            case 0xcf: { const v = Number(buf.readBigUInt64BE(pos)); pos += 8; return v; }
+            case 0xd0: { const v = buf.readInt8(pos); pos += 1; return v; }
+            case 0xd1: { const v = buf.readInt16BE(pos); pos += 2; return v; }
+            case 0xd2: { const v = buf.readInt32BE(pos); pos += 4; return v; }
+            case 0xd3: { const v = Number(buf.readBigInt64BE(pos)); pos += 8; return v; }
+            case 0xd9: return readStr(buf[pos++]);
+            case 0xda: { const l = buf.readUInt16BE(pos); pos += 2; return readStr(l); }
+            case 0xdb: { const l = buf.readUInt32BE(pos); pos += 4; return readStr(l); }
+            case 0xdc: { const l = buf.readUInt16BE(pos); pos += 2; return readArr(l); }
+            case 0xdd: { const l = buf.readUInt32BE(pos); pos += 4; return readArr(l); }
+            case 0xde: { const l = buf.readUInt16BE(pos); pos += 2; return readMap(l); }
+            case 0xdf: { const l = buf.readUInt32BE(pos); pos += 4; return readMap(l); }
+            default: throw new Error(`Unsupported MessagePack prefix 0x${b.toString(16)}`);
+        }
+    }
+    return read();
+}
+
+function decodeRisupPreset(buf) {
+    if (!buf || !buf.length) throw new Error('Empty .risup buffer');
+    const decoded = Buffer.allocUnsafe(buf.length);
+    for (let i = 0; i < buf.length; i += 1) {
+        decoded[i] = RISUP_DECODE_MAP[buf[i]];
+    }
+    let unzipped;
     try {
-        const rawJson = fs.readFileSync(jsonPath);
-        const parsed = JSON.parse(rawJson.toString('utf8'));
+        unzipped = zlib.unzipSync(decoded);
+    } catch (_) {
+        unzipped = zlib.inflateRawSync(decoded);
+    }
+    const outer = msgpackDecode(unzipped);
+    const enc = outer && (outer.preset || outer.pres);
+    if (!enc || enc.length <= 16) throw new Error('Invalid .risup payload');
+    const encBuf = Buffer.isBuffer(enc) ? enc : Buffer.from(enc);
+    const aesKey = crypto.createHash('sha256').update('risupreset').digest();
+    const decipher = crypto.createDecipheriv('aes-256-gcm', aesKey, Buffer.alloc(12));
+    decipher.setAuthTag(encBuf.subarray(encBuf.length - 16));
+    const decrypted = Buffer.concat([
+        decipher.update(encBuf.subarray(0, encBuf.length - 16)),
+        decipher.final(),
+    ]);
+    return msgpackDecode(decrypted);
+}
+
+const LEAVE_PRESET_ID = 'preset-leave-r1.1';
+let cachedLeavePreset = null;
+function loadBundledLeavePreset() {
+    const risupPath = path.join(ROOT_DIR, 'prompt', 'Leave_RisuAI_Preset.risup');
+    const htmlPath = path.join(ROOT_DIR, 'prompt', 'Leave_RisuAI_Preset.html');
+    if (!fs.existsSync(risupPath)) return null;
+    try {
+        const stat = fs.statSync(risupPath);
         const hasGuide = fs.existsSync(htmlPath);
-        return {
+        if (cachedLeavePreset && cachedLeavePreset.mtimeMs === stat.mtimeMs && cachedLeavePreset.size === stat.size && cachedLeavePreset.hasGuide === hasGuide) {
+            return cachedLeavePreset.value;
+        }
+        const rawRisup = fs.readFileSync(risupPath);
+        const parsed = decodeRisupPreset(rawRisup);
+        const value = {
             id: LEAVE_PRESET_ID,
-            name: String(parsed.name || 'Leave — Wandering Librarian Engine r1.1'),
-            toggleSyntax: String(parsed.customPromptTemplateToggle || ''),
-            defaultVariables: String(parsed.templateDefaultVariables || ''),
+            name: String((parsed && parsed.name) || 'Leave — Wandering Librarian Engine r1.1'),
+            toggleSyntax: String((parsed && parsed.customPromptTemplateToggle) || ''),
+            defaultVariables: String((parsed && parsed.templateDefaultVariables) || ''),
             hasGuide,
-            rawJson,
+            filename: 'Leave_RisuAI_Preset.risup',
+            rawRisup,
             htmlPath,
         };
+        cachedLeavePreset = { mtimeMs: stat.mtimeMs, size: stat.size, hasGuide, value };
+        return value;
     } catch (_) {
         return null;
     }
@@ -1950,7 +2054,18 @@ function renderWebApp() {
     box-shadow: 0 20px 48px rgba(0, 0, 0, 0.52);
     transition: top 0.45s cubic-bezier(0.22, 1, 0.36, 1), height 0.45s cubic-bezier(0.22, 1, 0.36, 1), background-position 0.45s ease, opacity 0.2s ease;
   }
-  .book-columns .rs-bot-html > div { max-width:100%; }
+  .book-columns .rs-bot-html > div { max-width:100% !important; min-width:0 !important; box-sizing:border-box; }
+  .book-columns .rs-bot-html div,
+  .book-columns .rs-bot-html section,
+  .book-columns .rs-bot-html article,
+  .book-columns .rs-bot-html details,
+  .book-columns .rs-bot-html table,
+  .book-columns .rs-bot-html pre,
+  .book-columns .rs-bot-html img,
+  .book-columns .rs-bot-html svg { max-width:100% !important; box-sizing:border-box; }
+  .book-columns .rs-bot-html table { display:block; overflow-x:auto; }
+  .book-columns .rs-bot-html pre,
+  .book-columns .rs-bot-html code { white-space:pre-wrap; overflow-wrap:anywhere; }
   .rs-bot-html [risu-trigger], .rs-bot-html [risu-btn] { cursor:pointer; }
   .risu-cbs-btn { padding:6px 12px; border-radius:8px; border:1px solid var(--border); background:var(--surface); color:var(--text); font-size:12.5px; font-weight:600; cursor:pointer; margin:4px 4px 4px 0; }
   .risu-cbs-btn:hover { border-color:var(--accent); }
@@ -2425,11 +2540,11 @@ function renderWebApp() {
       <div class="leave-preset-bar">
         <div class="leave-preset-info">
           <b>🍃 Leave · 방랑 사서의 서가 r1.1</b>
-          <span>내장 AI 프리셋 토글 · RisuAI 임포트 JSON · 가이드</span>
+          <span>내장 AI 프리셋 토글 · RisuAI 임포트 RISUP · 가이드</span>
         </div>
         <div class="leave-preset-btns">
           <button type="button" class="pill" onclick="installBundledLeaveToggle()">🍃 Leave r1.1 토글 등록</button>
-          <button type="button" class="pill" onclick="downloadLeavePresetJson()">⬇️ JSON 받기</button>
+          <button type="button" class="pill" onclick="downloadLeavePreset()">⬇️ RISUP 받기</button>
           <button type="button" class="pill" onclick="openLeavePresetGuide()">📖 가이드</button>
         </div>
       </div>
@@ -2647,6 +2762,9 @@ function renderWebApp() {
   let pendingReplyTarget = null;
   let pendingScrollToLastUser = false;
   let bookSpreadStride = 1;
+  let bookColStep = 1;
+  let bookColOffsets = [];
+  let bookScrollGuardLock = false;
   let bookTotalSpreads = 1;
   let bookTotalPages = 1;
   let bookSinglePage = false;
@@ -3406,7 +3524,7 @@ function renderWebApp() {
       }
     }
     const msgDigest = hashStr(msgs.map((m) => m.index + ':' + (m.text || '') + ':' + (m.html || '') + ':' + (m.swipeCount || 1) + ':' + (m.swipeIndex || 0) + ':' + (m.images ? m.images.length : 0)).join('\\x01'));
-    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, snap.fmIndex, snap.firstMessageCount, snap.greetingControls || [], snap.backgroundHtml || '', Object.keys(snap.assetMap || {}).length, msgs.length, msgDigest, uiPref.theme, uiPref.assetMode, uiPref.richHtml]);
+    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, snap.fmIndex, snap.firstMessageCount, snap.greetingControls || [], snap.backgroundHtml || '', hashStr(snap.botWidgetHtml || ''), Object.keys(snap.assetMap || {}).length, msgs.length, msgDigest, uiPref.theme, uiPref.assetMode, uiPref.richHtml]);
     if (sig !== lastChatRenderSig) {
       lastChatRenderSig = sig;
       renderChat();
@@ -3628,6 +3746,22 @@ function renderWebApp() {
     preview.style.pointerEvents = 'auto';
   }
 
+  function getBookSpreadScrollLeft(spreadIdx) {
+    const idx = Math.max(0, Number(spreadIdx) || 0);
+    const firstCol = idx * (bookSinglePage ? 1 : 2);
+    if (typeof bookColOffsets[firstCol] === 'number' && Number.isFinite(bookColOffsets[firstCol])) {
+      return Math.max(0, bookColOffsets[firstCol]);
+    }
+    return Math.max(0, Math.round(firstCol * (bookColStep || bookSpreadStride)));
+  }
+
+  function setBookViewportScrollLeft(vp, leftPx) {
+    if (!vp) return;
+    bookScrollGuardLock = true;
+    vp.scrollLeft = Math.max(0, Math.round(leftPx));
+    requestAnimationFrame(() => { bookScrollGuardLock = false; });
+  }
+
   function goToBookSpread(nextIdx, animate = false, fromLayout = false) {
     closeBookImgPreview(true);
     const vp = document.getElementById('bookViewport');
@@ -3651,7 +3785,7 @@ function renderWebApp() {
       flipLeaf.classList.add(dirClass);
       bookFlipMidTimer = setTimeout(() => {
         bookFlipMidTimer = null;
-        vp.scrollLeft = bookSpreadIdx * bookSpreadStride;
+        setBookViewportScrollLeft(vp, getBookSpreadScrollLeft(bookSpreadIdx));
         updateBookNavUI();
       }, 300);
       bookFlipEndTimer = setTimeout(() => {
@@ -3660,7 +3794,7 @@ function renderWebApp() {
       }, 650);
     } else {
       if (flipLeaf) flipLeaf.classList.remove('flip-next', 'flip-prev');
-      vp.scrollLeft = bookSpreadIdx * bookSpreadStride;
+      setBookViewportScrollLeft(vp, getBookSpreadScrollLeft(bookSpreadIdx));
       updateBookNavUI();
     }
   }
@@ -3673,24 +3807,62 @@ function renderWebApp() {
     const frameW = frame.clientWidth;
     if (!frameW || frameW < 100) return;
 
+    const oldPad = document.getElementById('bookEndPad');
+    if (oldPad) oldPad.remove();
+
     bookSinglePage = frameW < 700;
     frame.classList.toggle('single-page', bookSinglePage);
     const colsPerSpread = bookSinglePage ? 1 : 2;
     const colGap = bookSinglePage ? 32 : 84;
     const sideMargin = bookSinglePage ? 36 : 84;
-    const evenW = Math.floor(Math.max(220, frameW - sideMargin) / 2) * 2;
+    const colW = Math.floor(Math.max(180, (frameW - sideMargin - colGap * (colsPerSpread - 1)) / colsPerSpread) / 4) * 4;
+    const evenW = colW * colsPerSpread + colGap * (colsPerSpread - 1);
 
     vp.style.width = evenW + 'px';
     cols.style.width = evenW + 'px';
     cols.style.height = '100%';
+    cols.style.columnWidth = colW + 'px';
     cols.style.columnCount = String(colsPerSpread);
     cols.style.columnGap = colGap + 'px';
     cols.style.columnFill = 'auto';
 
-    bookSpreadStride = evenW + colGap;
-    bookTotalSpreads = Math.max(1, Math.ceil((cols.scrollWidth - 4) / bookSpreadStride));
-    const colStride = bookSinglePage ? bookSpreadStride : (evenW + colGap) / 2;
-    bookTotalPages = Math.max(1, Math.ceil((cols.scrollWidth - 4) / colStride));
+    const theoColStep = colW + colGap;
+    const vpRect = vp.getBoundingClientRect();
+    const measured = [];
+    let maxMeasuredCol = 0;
+    cols.querySelectorAll('.book-char-block, .book-user-block').forEach((el) => {
+      const rects = el.getClientRects ? el.getClientRects() : [el.getBoundingClientRect()];
+      for (let i = 0; i < rects.length; i++) {
+        const r = rects[i];
+        if (!r || r.width < colW * 0.45 || r.height < 2) continue;
+        const absLeft = (r.left - vpRect.left) + vp.scrollLeft;
+        if (absLeft < -8) continue;
+        const cIdx = Math.round(absLeft / theoColStep);
+        if (cIdx < 0) continue;
+        if (Math.abs(absLeft - cIdx * theoColStep) > theoColStep * 0.35) continue;
+        const floored = Math.max(0, Math.floor(absLeft));
+        if (measured[cIdx] === undefined || floored < measured[cIdx]) measured[cIdx] = floored;
+        if (cIdx > maxMeasuredCol) maxMeasuredCol = cIdx;
+      }
+    });
+    bookColOffsets = measured;
+    let actualColStep = theoColStep;
+    if (maxMeasuredCol > 0 && typeof measured[maxMeasuredCol] === 'number' && measured[maxMeasuredCol] > 0) {
+      const est = measured[maxMeasuredCol] / maxMeasuredCol;
+      if (Math.abs(est - theoColStep) <= theoColStep * 0.04) actualColStep = est;
+    }
+    bookColStep = actualColStep;
+    bookSpreadStride = actualColStep * colsPerSpread;
+    const estPagesFromWidth = Math.max(1, Math.round((cols.scrollWidth + colGap) / actualColStep));
+    bookTotalPages = Math.max(1, maxMeasuredCol + 1, estPagesFromWidth);
+    bookTotalSpreads = Math.max(1, Math.ceil(bookTotalPages / colsPerSpread));
+
+    if (!bookSinglePage && (bookTotalPages % 2 === 1)) {
+      const pad = document.createElement('div');
+      pad.id = 'bookEndPad';
+      pad.style.cssText = 'break-before:column; -webkit-column-break-before:always; height:1px; width:100%; pointer-events:none;';
+      cols.appendChild(pad);
+    }
 
     if (bookAnchorMode === 'last-user') {
       const msgs = (lastState && lastState.snapshot && lastState.snapshot.messages) || [];
@@ -3699,10 +3871,10 @@ function renderWebApp() {
         const userBlocks = cols.querySelectorAll('.book-user-block');
         const targetEl = userBlocks.length ? userBlocks[userBlocks.length - 1] : cols.querySelector('.book-char-block:last-of-type');
         if (targetEl) {
-          const vpRect = vp.getBoundingClientRect();
           const tRect = (targetEl.getClientRects && targetEl.getClientRects()[0]) || targetEl.getBoundingClientRect();
           const absLeft = (tRect.left - vpRect.left) + vp.scrollLeft;
-          targetSpread = Math.floor(Math.max(0, absLeft + 4) / bookSpreadStride);
+          const targetCol = Math.max(0, Math.round(absLeft / actualColStep));
+          targetSpread = Math.floor(targetCol / colsPerSpread);
         } else {
           targetSpread = bookTotalSpreads - 1;
         }
@@ -3776,11 +3948,25 @@ function renderWebApp() {
     const overlay = document.getElementById('bookBotOverlay');
     if (!overlay || !rootEl) return;
     overlay.innerHTML = '';
-    rootEl.querySelectorAll('.rs-bot-html').forEach((container) => {
+
+    const extractFixedFromContainer = (container) => {
+      if (!container) return;
       let hasFixed = false;
       container.querySelectorAll('style').forEach((st) => {
         if (/position\\s*:\\s*fixed/i.test(st.textContent || '')) hasFixed = true;
       });
+      if (!hasFixed) {
+        for (const ch of Array.from(container.children)) {
+          const tag = (ch.tagName || '').toLowerCase();
+          if (tag === 'div' && /(?:buttons-container|side-panel|overlay|floating)/i.test(ch.className || '')) {
+            const stAttr = ch.getAttribute('style') || '';
+            if (/position\\s*:\\s*fixed/i.test(stAttr) || /(?:buttons-container|floating)/i.test(ch.className || '')) {
+              hasFixed = true;
+              break;
+            }
+          }
+        }
+      }
       if (!hasFixed) return;
       const hostWrap = document.createElement('div');
       hostWrap.className = 'rs-bot-html';
@@ -3801,7 +3987,30 @@ function renderWebApp() {
         }
       }
       if (moved) overlay.appendChild(hostWrap);
-    });
+    };
+
+    rootEl.querySelectorAll('.rs-bot-html').forEach(extractFixedFromContainer);
+
+    const snap = (lastState && lastState.snapshot) || null;
+    if (uiPref.richHtml && snap && !overlay.querySelector('[data-rs-bot-fab="1"]')) {
+      if (snap.botWidgetHtml) {
+        const tmp = document.createElement('div');
+        tmp.className = 'rs-bot-html';
+        tmp.innerHTML = renderBotRichHtml(snap.botWidgetHtml, snap.assetMap);
+        extractFixedFromContainer(tmp);
+      }
+      if (!overlay.querySelector('[data-rs-bot-fab="1"]') && snap.backgroundHtml && /(?:buttons-container|side-panel|floating)/i.test(snap.backgroundHtml)) {
+        const bgHost = document.getElementById('botBgHost');
+        if (bgHost) {
+          bgHost.querySelectorAll('input[type="checkbox"], input[type="radio"], .buttons-container, .side-panel, .overlay, .floating').forEach((n) => n.remove());
+        }
+        const tmpBg = document.createElement('div');
+        tmpBg.className = 'rs-bot-html';
+        tmpBg.innerHTML = renderBotRichHtml(snap.backgroundHtml, snap.assetMap);
+        extractFixedFromContainer(tmpBg);
+      }
+    }
+
     syncBotMenuVisibility();
   }
 
@@ -3957,6 +4166,19 @@ function renderWebApp() {
           flipBook(e.deltaY > 0 ? 1 : -1);
           setTimeout(() => { bookWheelLock = false; }, 260);
         }
+      };
+      let bookScrollSnapTimer = null;
+      vp.onscroll = () => {
+        if (bookScrollGuardLock || bookSpreadIdx < 0) return;
+        const expected = getBookSpreadScrollLeft(bookSpreadIdx);
+        if (Math.abs(vp.scrollLeft - expected) <= 1) return;
+        if (bookScrollSnapTimer) clearTimeout(bookScrollSnapTimer);
+        bookScrollSnapTimer = setTimeout(() => {
+          bookScrollSnapTimer = null;
+          if (bookScrollGuardLock || bookSpreadIdx < 0) return;
+          const exp2 = getBookSpreadScrollLeft(bookSpreadIdx);
+          if (Math.abs(vp.scrollLeft - exp2) > 1) setBookViewportScrollLeft(vp, exp2);
+        }, 40);
       };
       frame.querySelectorAll('img').forEach((img) => {
         if (!img.complete) {
@@ -4479,7 +4701,7 @@ function renderWebApp() {
     }
   };
 
-  window.downloadLeavePresetJson = async () => {
+  window.downloadLeavePreset = async () => {
     try {
       const res = await fetch('/api/presets/leave/download', { headers: { 'X-RisuStand-Token': token } });
       if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -4487,12 +4709,12 @@ function renderWebApp() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = 'Leave_RisuAI_Preset.json';
+      a.download = 'Leave_RisuAI_Preset.risup';
       document.body.appendChild(a);
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 4000);
-      toast('Leave_RisuAI_Preset.json 다운로드 시작');
+      toast('Leave_RisuAI_Preset.risup 다운로드 시작');
     } catch (e) {
       toast('다운로드 오류: ' + (e && e.message ? e.message : '실패'));
     }
@@ -6084,6 +6306,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 ok: true,
                 id: p.id,
                 name: p.name,
+                filename: p.filename,
                 toggleSyntax: p.toggleSyntax,
                 defaultVariables: p.defaultVariables,
                 hasGuide: p.hasGuide,
@@ -6095,11 +6318,11 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             const p = loadBundledLeavePreset();
             if (!p) return sendJson(res, 404, { error: '내장 Leave 프리셋 파일이 없습니다.' }, req);
             res.writeHead(200, {
-                'Content-Type': 'application/json; charset=utf-8',
-                'Content-Disposition': 'attachment; filename="Leave_RisuAI_Preset.json"',
+                'Content-Type': 'application/octet-stream',
+                'Content-Disposition': 'attachment; filename="Leave_RisuAI_Preset.risup"',
                 ...corsHeaders(req),
             });
-            res.end(p.rawJson);
+            res.end(p.rawRisup);
             return;
         }
 
@@ -6200,5 +6423,6 @@ module.exports = {
     isTrustedOrigin,
     corsHeaders,
     sanitizeConfigForClient,
+    decodeRisupPreset,
     createRelayServer,
 };

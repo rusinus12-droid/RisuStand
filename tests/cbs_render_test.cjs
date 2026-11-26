@@ -966,3 +966,48 @@ test('Leave preset display compat renders <ooc>, hides text-only <statusdata>, a
         await harness.cleanup();
     }
 });
+
+test('buildSnapshot emits botWidgetHtml when chat exceeds 36 messages and firstMessage holds fixed bot menu', async () => {
+    const db = {
+        enabledModules: [],
+        modules: [],
+        personas: [{ name: 'User', personaPrompt: '' }],
+        selectedPersona: 0,
+        customscript: [],
+        globalChatVariables: {},
+        characters: [],
+    };
+    const menuHtml = '<style>.buttons-container{position:fixed;right:12px;top:90px;display:flex;}</style>' +
+        '<div class="buttons-container"><label for="m_tog">메뉴</label></div>' +
+        '<input type="checkbox" id="m_tog">' +
+        '<div class="side-panel">상태창 패널</div>';
+    const manyMsgs = [];
+    for (let i = 0; i < 40; i++) {
+        manyMsgs.push({ role: i % 2 === 0 ? 'user' : 'char', data: `turn ${i}` });
+    }
+    const characters = [{
+        chaId: 'long-chat-menu-char',
+        name: 'MenuBot',
+        firstMessage: `${menuHtml}\n첫 장면 본문`,
+        alternateGreetings: [],
+        customscript: [],
+        chats: [{
+            id: 'c-long-40',
+            name: 'Chat Long',
+            fmIndex: -1,
+            scriptstate: {},
+            message: manyMsgs,
+        }],
+    }];
+    const harness = await bootPluginWithMockRisu({ db, characters });
+    try {
+        const snap = [...harness.polls].reverse().find((p) => p.snapshot)?.snapshot;
+        assert.ok(snap);
+        assert.equal(snap.messages.length, 36);
+        assert.ok(snap.messages.every((m) => !m.isFirstMessage));
+        assert.ok(snap.botWidgetHtml.includes('buttons-container'));
+        assert.ok(snap.botWidgetHtml.includes('side-panel'));
+    } finally {
+        await harness.cleanup();
+    }
+});

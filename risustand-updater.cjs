@@ -55,7 +55,7 @@ const PROGRAM_FILES = Object.freeze([
     'LICENSE',
     'VERSION',
     'release-policy.json',
-    'prompt/Leave_RisuAI_Preset.json',
+    'prompt/Leave_RisuAI_Preset.risup',
     'prompt/Leave_RisuAI_Preset.html',
 ]);
 // May be running while we update: staged as "<name>.new" when changed.

@@ -45,7 +45,7 @@ RisuAI 원본 소스는 한 줄도 고치지 않습니다. 공식 **Plugin API v
 | `rotate-risustand-token.bat` / `.sh` | 기존 보안 토큰을 폐기하고 재발급·직접 변경하는 툴 |
 | `change-risustand-port.bat` / `.sh` | 중계 서버 포트를 변경·초기화하는 툴 (`.risustand-port`) |
 | `update-risustand.bat` / `.sh` | 서버를 끈 상태에서 PC에서 직접 업데이트하는 런처 |
-| `prompt/Leave_RisuAI_Preset.json` / `.html` | 내장 **Leave r1.1** AI 프리셋 파일 및 HTML 사용 가이드 (모바일 원클릭 등록·다운로드) |
+| `prompt/Leave_RisuAI_Preset.risup` / `.html` | 내장 **Leave r1.1** AI 프리셋 파일(`.risup`) 및 HTML 사용 가이드 (모바일 원클릭 등록·다운로드) |
 
 ---
 
@@ -105,7 +105,7 @@ Tailscale은 내 기기끼리만 보이는 사설 네트워크를 만들어 줍�
 
 ### 5단계 — (선택) 프롬프트 프리셋 토글 등록 (Leave r1.1 내장)
 RisuAI 보안 정책상 프롬프트 프리셋의 커스텀 토글 정의는 플러그인이 직접 읽을 수 없습니다.
-휴대폰 **`🧩 모듈/설정`** 탭 상단의 **`🍃 Leave r1.1 토글 등록`** 버튼을 누르면 내장된 **Leave — Wandering Librarian Engine r1.1** 토글·가이드·JSON을 원클릭으로 등록·내려받을 수 있으며, 다른 프리셋은 **`+ 프리셋 토글`**에 커스텀 토글 텍스트를 한 번만 붙여넣으면 채팅방의 **로컬 토글**로 연동됩니다.
+휴대폰 **`🧩 모듈/설정`** 탭 상단의 **`🍃 Leave r1.1 토글 등록`** 버튼을 누르면 내장된 **Leave — Wandering Librarian Engine r1.1** 토글·가이드·RISUP 프리셋(`.risup`)을 원클릭으로 등록·내려받을 수 있으며, 다른 프리셋은 **`+ 프리셋 토글`**에 커스텀 토글 텍스트를 한 번만 붙여넣으면 채팅방의 **로컬 토글**로 연동됩니다.
 
 ---
 

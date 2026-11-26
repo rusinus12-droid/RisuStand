@@ -5204,6 +5204,7 @@
 
             let greetingControls = [];
             let inferredDefaults = {};
+            let botWidgetHtml = '';
             if (charObj.firstMessage && startOffset === 0) {
                 const firstRaw = fmIdx >= 0 && altGreetings[fmIdx] ? altGreetings[fmIdx] : charObj.firstMessage;
                 if (firstRaw) {
@@ -5255,7 +5256,8 @@
             } else if (charObj.firstMessage) {
                 const firstRaw = fmIdx >= 0 && altGreetings[fmIdx] ? altGreetings[fmIdx] : charObj.firstMessage;
                 if (firstRaw) {
-                    const greetingMeta = discoverGreetingVariables(String(firstRaw));
+                    const firstStr = String(firstRaw);
+                    const greetingMeta = discoverGreetingVariables(firstStr);
                     inferredDefaults = greetingMeta.defaults;
                     greetingControls = Object.entries(greetingMeta.options)
                         .filter(([, opts]) => opts.length > 1)
@@ -5266,6 +5268,28 @@
                                 : String(greetingMeta.defaults[key] ?? opts[0] ?? ''),
                             options: opts,
                         }));
+                    const firstCtx = {
+                        ...renderCtx,
+                        vars: { ...renderCtx.vars },
+                        tempVars: Object.create(null),
+                        slots: Object.create(null),
+                        chatIndex: -1,
+                    };
+                    let renderedFirst = renderRemoteMessage(firstStr, firstCtx);
+                    if (!/position\s*:\s*fixed/i.test(renderedFirst) && !/(?:buttons-container|side-panel|floating)/i.test(renderedFirst) && /\{\{#(?:when|if|if_pure)/i.test(firstStr)) {
+                        let filled = false;
+                        for (const [k, v] of Object.entries(greetingMeta.defaults)) {
+                            if (!Object.prototype.hasOwnProperty.call(firstCtx.vars, k)) {
+                                firstCtx.vars[k] = v;
+                                filled = true;
+                            }
+                        }
+                        if (filled) renderedFirst = renderRemoteMessage(firstStr, firstCtx);
+                    }
+                    if (renderedFirst && (/position\s*:\s*fixed/i.test(renderedFirst) || /(?:buttons-container|side-panel|floating)/i.test(renderedFirst))) {
+                        const parsedWidget = await renderMessageHtmlAndText(renderedFirst, collector);
+                        botWidgetHtml = parsedWidget.html || '';
+                    }
                 }
             }
 
@@ -5333,6 +5357,7 @@
                     localToggleValues: localVars,
                     customToggleBlocks: toggleBlocks,
                     backgroundHtml,
+                    botWidgetHtml,
                     assetMap: collector.assetMap,
                     messages: outMsgs,
                     charContext: {
