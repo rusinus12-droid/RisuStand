@@ -3,7 +3,7 @@
 //@api 3.0
 //@version 1.0.0
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
-// Required Notice: Copyright (c) 2026 RisuStand Contributors
+// Required Notice: Copyright (c) 2026 rusinus12
 
 (async () => {
     const STORAGE_KEY = 'risustand_v1';

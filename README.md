@@ -76,4 +76,4 @@
 - ❌ **상업적 이용 불가** (유료 판매, 유료 서비스 포함 등)
 - 재배포 시 라이선스 전문(또는 URL)과 `Required Notice:` 문구를 함께 포함해야 합니다.
 
-> Required Notice: Copyright (c) 2026 RisuStand Contributors
+> Required Notice: Copyright (c) 2026 rusinus12

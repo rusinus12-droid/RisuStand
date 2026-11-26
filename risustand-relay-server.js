@@ -9,7 +9,7 @@
  *  4) Mobile-first Pocket Web UI (Gemini / Claude / ChatGPT / EPUB Day & Night)
  *
  * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
- * Required Notice: Copyright (c) 2026 RisuStand Contributors
+ * Required Notice: Copyright (c) 2026 rusinus12
  */
 
 const http = require('http');
