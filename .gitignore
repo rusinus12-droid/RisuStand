@@ -1,0 +1,6 @@
+# RisuStand local secrets & user settings (NEVER commit!)
+.risustand-token
+.risustand-config.json
+.DS_Store
+Thumbs.db
+node_modules/

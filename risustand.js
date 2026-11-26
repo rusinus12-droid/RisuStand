@@ -1,0 +1,4360 @@
+//@name risustand
+//@display-name RisuStand
+//@api 3.0
+//@version 1.0.0
+
+(async () => {
+    const STORAGE_KEY = 'risustand_v1';
+    const LEGACY_STORAGE_KEY = 'risu_ultra_custom_shell_v2';
+    const STYLE_ATTR = 'x-risustand-style';
+    const SHELL_BAR_ATTR = 'x-risustand-topbar';
+
+    const FONT_STACKS = {
+        inherit: {
+            label: 'RisuAI 기본 글꼴 유지',
+            css: 'inherit',
+        },
+        'epub-serif': {
+            label: '전자책 명조 (리디바탕 / KoPub 바탕 / AppleMyungjo / 바탕)',
+            css: '"RIDIBatang", "KoPub Batang", "AppleMyungjo", "Batang", "바탕", "NanumMyeongjo", "Noto Serif KR", Georgia, serif',
+        },
+        'epub-sans': {
+            label: '눈 편한 고딕 (Pretendard / Apple SD Gothic Neo / 맑은 고딕)',
+            css: '"Pretendard", "Apple SD Gothic Neo", "Malgun Gothic", "맑은 고딕", "Noto Sans KR", system-ui, -apple-system, sans-serif',
+        },
+        'epub-clean': {
+            label: '챗봇 공홈 산세리프 (시스템 기본)',
+            css: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "Malgun Gothic", "맑은 고딕", Roboto, sans-serif',
+        },
+    };
+
+    // stealth.mode: 'off' | 'soft' (공홈/EPUB 수준 에셋 숨김) | 'full' (완전 감추기)
+    const DEFAULT_CONFIG = {
+        antiFlicker: {
+            enabled: true,
+            lockMs: 850,
+            preserveScrollAnchor: false,
+            smoothFade: true,
+        },
+        stealth: {
+            mode: 'off', // 'off' | 'soft' | 'full'
+            hideSidebarAvatars: false,
+        },
+        layout: {
+            showFloatingTopBar: true,
+            autoMinimizeSec: 5,
+            topBarPos: null, // { x: number, y: number } or null (top-center)
+            floatingCapsuleInput: true,
+            zenMode: false,
+            sidebarRight: false,
+            hoverActionsOnly: true,
+            compactHeaders: true,
+            customScrollbar: true,
+            epubTwoPage: true,
+            epubShowAssets: true,
+            autoRefreshClone: true,
+        },
+        theme: {
+            preset: 'ai-gemini',
+            bubbleStyle: 'chatbot', // 'default' | 'card' | 'glass' | 'flat' | 'epub' | 'chatbot'
+            fontFamily: 'epub-clean',
+            justifyText: false,
+            bubbleRadius: 20,
+            chatMaxWidth: 780,
+            fontSize: 15,
+            lineHeight: 1.75,
+            accentColor: '#8ab4f8',
+            quoteColor: '#a8c7fa',
+            surfaceAlpha: 0.78,
+            customCSS: '',
+        },
+    };
+
+    const PRESETS = {
+        original: {
+            label: '기본값 (원본)',
+            brandTitle: 'RisuAI',
+            brandModel: '',
+            shortIcon: '✦',
+            desc: '커스텀 레이아웃·테마를 끄고 RisuAI 원본으로 복원합니다.',
+            useNativeDefault: true,
+            scheme: null,
+            textTheme: null,
+            defaults: {
+                bubbleStyle: 'default',
+                fontFamily: 'inherit',
+                justifyText: false,
+                bubbleRadius: 8,
+                chatMaxWidth: 860,
+                fontSize: 15,
+                lineHeight: 1.6,
+                accentColor: '#5c7cfa',
+                quoteColor: '#8be9fd',
+                surfaceAlpha: 0,
+            },
+            stealthDefaults: { mode: 'off', hideSidebarAvatars: false },
+            layoutDefaults: { floatingCapsuleInput: false, hoverActionsOnly: false, compactHeaders: false },
+            bgGradient: '',
+            cardBgRgb: '',
+            borderColor: '',
+        },
+        'ai-gemini': {
+            label: '✦ Gemini 공홈 (외출용)',
+            brandTitle: 'Gemini',
+            brandModel: '2.5 Pro',
+            shortIcon: '✦',
+            desc: '구글 Gemini 공식 다크 UI · 캡슐 입력창 · 에셋 자동 숨김',
+            isChatbot: true,
+            badgeBg: 'linear-gradient(135deg, #4285f4 0%, #9b72cb 60%, #d96570 100%)',
+            inputBg: '#1e1f20',
+            inputBorder: '#3c4043',
+            topBarBg: 'rgba(19, 19, 20, 0.90)',
+            topBarText: '#e3e3e3',
+            userBubbleBg: '#282a2c',
+            scheme: {
+                bgcolor: '#131314',
+                darkbg: '#1e1f20',
+                borderc: '#2e2f31',
+                selected: '#282a2c',
+                draculared: '#f28b82',
+                textcolor: '#e3e3e3',
+                textcolor2: '#9aa0a6',
+                darkBorderc: '#2d2e30',
+                darkbutton: '#1e1f20',
+                type: 'dark',
+            },
+            textTheme: {
+                FontColorStandard: '#e3e3e3',
+                FontColorBold: '#ffffff',
+                FontColorItalic: '#c4c7c5',
+                FontColorItalicBold: '#e3e3e3',
+                FontColorQuote1: '#a8c7fa',
+                FontColorQuote2: '#c2e7ff',
+            },
+            defaults: {
+                bubbleStyle: 'chatbot',
+                fontFamily: 'epub-clean',
+                justifyText: false,
+                bubbleRadius: 24,
+                chatMaxWidth: 780,
+                fontSize: 15,
+                lineHeight: 1.75,
+                accentColor: '#8ab4f8',
+                quoteColor: '#a8c7fa',
+                surfaceAlpha: 0,
+            },
+            stealthDefaults: { mode: 'soft', hideSidebarAvatars: true },
+            layoutDefaults: { floatingCapsuleInput: true, hoverActionsOnly: true, compactHeaders: true },
+            bgGradient: '#131314',
+            cardBgRgb: '30, 31, 32',
+            borderColor: 'rgba(255, 255, 255, 0.08)',
+            dividerColor: 'rgba(255, 255, 255, 0.06)',
+        },
+        'ai-claude': {
+            label: '✴ Claude 공홈 (외출용)',
+            brandTitle: 'Claude',
+            brandModel: 'Sonnet',
+            shortIcon: '✴',
+            desc: 'Anthropic Claude 웜 페이퍼 UI · 캡슐 입력창 · 에셋 자동 숨김',
+            isChatbot: true,
+            badgeBg: '#d97757',
+            inputBg: '#ffffff',
+            inputBorder: '#dcd8cc',
+            topBarBg: 'rgba(250, 249, 245, 0.94)',
+            topBarText: '#1a1918',
+            userBubbleBg: '#f0eee6',
+            scheme: {
+                bgcolor: '#faf9f5',
+                darkbg: '#f0eee6',
+                borderc: '#e2dfd5',
+                selected: '#e8e5db',
+                draculared: '#c84b31',
+                textcolor: '#1a1918',
+                textcolor2: '#6b6860',
+                darkBorderc: '#dcd8cc',
+                darkbutton: '#ece9df',
+                type: 'light',
+            },
+            textTheme: {
+                FontColorStandard: '#1a1918',
+                FontColorBold: '#0f0e0d',
+                FontColorItalic: '#57544d',
+                FontColorItalicBold: '#2b2926',
+                FontColorQuote1: '#9e4a2f',
+                FontColorQuote2: '#3f5f58',
+            },
+            defaults: {
+                bubbleStyle: 'chatbot',
+                fontFamily: 'epub-serif',
+                justifyText: false,
+                bubbleRadius: 18,
+                chatMaxWidth: 740,
+                fontSize: 16,
+                lineHeight: 1.82,
+                accentColor: '#d97757',
+                quoteColor: '#9e4a2f',
+                surfaceAlpha: 0,
+            },
+            stealthDefaults: { mode: 'soft', hideSidebarAvatars: true },
+            layoutDefaults: { floatingCapsuleInput: true, hoverActionsOnly: true, compactHeaders: true },
+            bgGradient: '#faf9f5',
+            cardBgRgb: '240, 238, 230',
+            borderColor: 'rgba(26, 25, 24, 0.10)',
+            dividerColor: 'rgba(26, 25, 24, 0.07)',
+        },
+        'ai-chatgpt': {
+            label: '● ChatGPT 공홈 (외출용)',
+            brandTitle: 'ChatGPT',
+            brandModel: '5',
+            shortIcon: '●',
+            desc: 'OpenAI ChatGPT 다크 UI · 캡슐 입력창 · 에셋 자동 숨김',
+            isChatbot: true,
+            badgeBg: '#10a37f',
+            inputBg: '#2f2f2f',
+            inputBorder: '#424242',
+            topBarBg: 'rgba(33, 33, 33, 0.92)',
+            topBarText: '#ececec',
+            userBubbleBg: '#2f2f2f',
+            scheme: {
+                bgcolor: '#212121',
+                darkbg: '#171717',
+                borderc: '#343434',
+                selected: '#2f2f2f',
+                draculared: '#ef4444',
+                textcolor: '#ececec',
+                textcolor2: '#9b9b9b',
+                darkBorderc: '#2f2f2f',
+                darkbutton: '#2a2a2a',
+                type: 'dark',
+            },
+            textTheme: {
+                FontColorStandard: '#ececec',
+                FontColorBold: '#ffffff',
+                FontColorItalic: '#bdbdbd',
+                FontColorItalicBold: '#e0e0e0',
+                FontColorQuote1: '#ececec',
+                FontColorQuote2: '#d4d4d4',
+            },
+            defaults: {
+                bubbleStyle: 'chatbot',
+                fontFamily: 'epub-clean',
+                justifyText: false,
+                bubbleRadius: 24,
+                chatMaxWidth: 768,
+                fontSize: 15,
+                lineHeight: 1.75,
+                accentColor: '#10a37f',
+                quoteColor: '#ececec',
+                surfaceAlpha: 0,
+            },
+            stealthDefaults: { mode: 'soft', hideSidebarAvatars: true },
+            layoutDefaults: { floatingCapsuleInput: true, hoverActionsOnly: true, compactHeaders: true },
+            bgGradient: '#212121',
+            cardBgRgb: '47, 47, 47',
+            borderColor: 'rgba(255, 255, 255, 0.08)',
+            dividerColor: 'rgba(255, 255, 255, 0.06)',
+        },
+        'epub-sepia-scroll': {
+            label: '📜 EPUB 세피아 (1쪽 스크롤)',
+            brandTitle: 'EPUB',
+            brandModel: '1쪽 세피아',
+            shortIcon: '📜',
+            desc: '전자책 명조 기본 · 위아래로 쭈욱 읽는 1쪽 스크롤 · 이미지 포함',
+            isEpub: true,
+            epubSpread: false,
+            badgeBg: '#9c5a34',
+            inputBg: '#f6efe0',
+            inputBorder: '#cfc1a3',
+            topBarBg: 'rgba(232, 222, 198, 0.94)',
+            topBarText: '#2c241b',
+            userBubbleBg: '#efe5ce',
+            pageBg: '#f7f0e1',
+            scheme: {
+                bgcolor: '#e8dec6',
+                darkbg: '#dfd3b8',
+                borderc: '#cfc1a3',
+                selected: '#d9ccb0',
+                draculared: '#b8432e',
+                textcolor: '#2c241b',
+                textcolor2: '#6d5e4c',
+                darkBorderc: '#c7b897',
+                darkbutton: '#dfd4bb',
+                type: 'light',
+            },
+            textTheme: {
+                FontColorStandard: '#2c241b',
+                FontColorBold: '#17120c',
+                FontColorItalic: '#665746',
+                FontColorItalicBold: '#493c2e',
+                FontColorQuote1: '#7c3626',
+                FontColorQuote2: '#2b5954',
+            },
+            defaults: {
+                bubbleStyle: 'epub',
+                fontFamily: 'epub-serif',
+                justifyText: true,
+                bubbleRadius: 0,
+                chatMaxWidth: 700,
+                fontSize: 16,
+                lineHeight: 1.95,
+                accentColor: '#9c5a34',
+                quoteColor: '#7c3626',
+                surfaceAlpha: 1,
+            },
+            stealthDefaults: { mode: 'off', hideSidebarAvatars: false },
+            layoutDefaults: { floatingCapsuleInput: true, hoverActionsOnly: true, compactHeaders: true, epubTwoPage: false },
+            bgGradient: '#e8dec6',
+            cardBgRgb: '246, 239, 224',
+            borderColor: 'rgba(130, 108, 76, 0.22)',
+            dividerColor: 'rgba(130, 108, 76, 0.14)',
+        },
+        'epub-night-scroll': {
+            label: '📜 EPUB 다크 (1쪽 스크롤)',
+            brandTitle: 'EPUB',
+            brandModel: '1쪽 다크',
+            shortIcon: '📜',
+            desc: '야간 전자책 명조 기본 · 위아래로 쭈욱 읽는 1쪽 스크롤 · 이미지 포함',
+            isEpub: true,
+            epubSpread: false,
+            badgeBg: '#c49b66',
+            inputBg: '#1d1d22',
+            inputBorder: '#32323a',
+            topBarBg: 'rgba(18, 18, 21, 0.92)',
+            topBarText: '#d6d2c9',
+            userBubbleBg: '#232329',
+            pageBg: '#1b1b20',
+            scheme: {
+                bgcolor: '#121215',
+                darkbg: '#0d0d10',
+                borderc: '#2a2a30',
+                selected: '#202026',
+                draculared: '#e06c75',
+                textcolor: '#d6d2c9',
+                textcolor2: '#8d8980',
+                darkBorderc: '#232329',
+                darkbutton: '#18181c',
+                type: 'dark',
+            },
+            textTheme: {
+                FontColorStandard: '#d6d2c9',
+                FontColorBold: '#f0ece3',
+                FontColorItalic: '#a8a399',
+                FontColorItalicBold: '#c7c2b8',
+                FontColorQuote1: '#e3bf88',
+                FontColorQuote2: '#9ac4c2',
+            },
+            defaults: {
+                bubbleStyle: 'epub',
+                fontFamily: 'epub-serif',
+                justifyText: true,
+                bubbleRadius: 0,
+                chatMaxWidth: 700,
+                fontSize: 16,
+                lineHeight: 1.95,
+                accentColor: '#c49b66',
+                quoteColor: '#e3bf88',
+                surfaceAlpha: 1,
+            },
+            stealthDefaults: { mode: 'off', hideSidebarAvatars: false },
+            layoutDefaults: { floatingCapsuleInput: true, hoverActionsOnly: true, compactHeaders: true, epubTwoPage: false },
+            bgGradient: '#121215',
+            cardBgRgb: '26, 26, 30',
+            borderColor: 'rgba(255, 255, 255, 0.08)',
+            dividerColor: 'rgba(255, 255, 255, 0.06)',
+        },
+        'epub-sepia': {
+            label: '📖 EPUB 세피아',
+            brandTitle: 'EPUB',
+            brandModel: '2쪽 세피아',
+            shortIcon: '📖',
+            desc: '눈이 편안한 종이책 세피아 톤과 전자책 명조 스타일',
+            isEpub: true,
+            epubSpread: true,
+            badgeBg: '#9c5a34',
+            inputBg: '#f6efe0',
+            inputBorder: '#cfc1a3',
+            topBarBg: 'rgba(232, 222, 198, 0.94)',
+            topBarText: '#2c241b',
+            userBubbleBg: '#efe5ce',
+            pageBg: '#f7f0e1',
+            scheme: {
+                bgcolor: '#e8dec6',
+                darkbg: '#dfd3b8',
+                borderc: '#cfc1a3',
+                selected: '#d9ccb0',
+                draculared: '#b8432e',
+                textcolor: '#2c241b',
+                textcolor2: '#6d5e4c',
+                darkBorderc: '#c7b897',
+                darkbutton: '#dfd4bb',
+                type: 'light',
+            },
+            textTheme: {
+                FontColorStandard: '#2c241b',
+                FontColorBold: '#17120c',
+                FontColorItalic: '#665746',
+                FontColorItalicBold: '#493c2e',
+                FontColorQuote1: '#7c3626',
+                FontColorQuote2: '#2b5954',
+            },
+            defaults: {
+                bubbleStyle: 'epub',
+                fontFamily: 'epub-serif',
+                justifyText: true,
+                bubbleRadius: 0,
+                chatMaxWidth: 700,
+                fontSize: 16,
+                lineHeight: 1.95,
+                accentColor: '#9c5a34',
+                quoteColor: '#7c3626',
+                surfaceAlpha: 1,
+            },
+            stealthDefaults: { mode: 'off', hideSidebarAvatars: false },
+            layoutDefaults: { floatingCapsuleInput: true, hoverActionsOnly: true, compactHeaders: true },
+            bgGradient: '#e8dec6',
+            cardBgRgb: '246, 239, 224',
+            borderColor: 'rgba(130, 108, 76, 0.22)',
+            dividerColor: 'rgba(130, 108, 76, 0.14)',
+        },
+        'epub-night': {
+            label: '🌙 EPUB 다크',
+            brandTitle: 'EPUB',
+            brandModel: '2쪽 다크',
+            shortIcon: '🌙',
+            desc: '야간 장시간 독서를 위한 저자극 다크 전자책 스타일',
+            isEpub: true,
+            epubSpread: true,
+            badgeBg: '#c49b66',
+            inputBg: '#1d1d22',
+            inputBorder: '#32323a',
+            topBarBg: 'rgba(18, 18, 21, 0.92)',
+            topBarText: '#d6d2c9',
+            userBubbleBg: '#232329',
+            pageBg: '#1b1b20',
+            scheme: {
+                bgcolor: '#121215',
+                darkbg: '#0d0d10',
+                borderc: '#2a2a30',
+                selected: '#202026',
+                draculared: '#e06c75',
+                textcolor: '#d6d2c9',
+                textcolor2: '#8d8980',
+                darkBorderc: '#232329',
+                darkbutton: '#18181c',
+                type: 'dark',
+            },
+            textTheme: {
+                FontColorStandard: '#d6d2c9',
+                FontColorBold: '#f0ece3',
+                FontColorItalic: '#a8a399',
+                FontColorItalicBold: '#c7c2b8',
+                FontColorQuote1: '#e3bf88',
+                FontColorQuote2: '#9ac4c2',
+            },
+            defaults: {
+                bubbleStyle: 'epub',
+                fontFamily: 'epub-serif',
+                justifyText: true,
+                bubbleRadius: 0,
+                chatMaxWidth: 700,
+                fontSize: 16,
+                lineHeight: 1.95,
+                accentColor: '#c49b66',
+                quoteColor: '#e3bf88',
+                surfaceAlpha: 1,
+            },
+            stealthDefaults: { mode: 'off', hideSidebarAvatars: false },
+            layoutDefaults: { floatingCapsuleInput: true, hoverActionsOnly: true, compactHeaders: true },
+            bgGradient: '#121215',
+            cardBgRgb: '26, 26, 30',
+            borderColor: 'rgba(255, 255, 255, 0.08)',
+            dividerColor: 'rgba(255, 255, 255, 0.06)',
+        },
+        'midnight-glass': {
+            label: '미드나잇 글래스',
+            brandTitle: 'Midnight',
+            brandModel: 'Studio',
+            shortIcon: '✨',
+            desc: '깊은 밤하늘 톤과 은은한 광택의 다크 채팅 카드',
+            badgeBg: '#7c8cff',
+            inputBg: '#161e31',
+            inputBorder: '#2a3759',
+            topBarBg: 'rgba(15, 20, 34, 0.90)',
+            topBarText: '#e6ecf8',
+            userBubbleBg: '#1c2640',
+            scheme: {
+                bgcolor: '#0f1422',
+                darkbg: '#0a0e19',
+                borderc: '#26314d',
+                selected: '#1e2a45',
+                draculared: '#ff6b81',
+                textcolor: '#e6ecf8',
+                textcolor2: '#94a3c4',
+                darkBorderc: '#1d263d',
+                darkbutton: '#161e31',
+                type: 'dark',
+            },
+            textTheme: {
+                FontColorStandard: '#e6ecf8',
+                FontColorBold: '#ffffff',
+                FontColorItalic: '#a8b7d9',
+                FontColorItalicBold: '#c7d4f4',
+                FontColorQuote1: '#ffd480',
+                FontColorQuote2: '#9be7ff',
+            },
+            defaults: {
+                bubbleStyle: 'glass',
+                fontFamily: 'epub-sans',
+                justifyText: false,
+                bubbleRadius: 16,
+                chatMaxWidth: 820,
+                fontSize: 15,
+                lineHeight: 1.75,
+                accentColor: '#7c8cff',
+                quoteColor: '#ffd480',
+                surfaceAlpha: 0.78,
+            },
+            stealthDefaults: { mode: 'off', hideSidebarAvatars: false },
+            layoutDefaults: { floatingCapsuleInput: true, hoverActionsOnly: true, compactHeaders: false },
+            bgGradient: 'radial-gradient(circle at 20% 10%, rgba(124, 140, 255, 0.14), transparent 45%), radial-gradient(circle at 85% 85%, rgba(56, 189, 248, 0.10), transparent 45%), #0f1422',
+            cardBgRgb: '20, 27, 46',
+            borderColor: 'rgba(124, 140, 255, 0.24)',
+        },
+        'sakura-dream': {
+            label: '사쿠라 파스텔',
+            brandTitle: 'Sakura',
+            brandModel: 'Pastel',
+            shortIcon: '🌸',
+            desc: '부드러운 로즈 플럼 다크 톤과 은은한 핑크 포인트',
+            badgeBg: '#f48fb1',
+            inputBg: '#261a28',
+            inputBorder: '#47304a',
+            topBarBg: 'rgba(27, 20, 28, 0.90)',
+            topBarText: '#f6eaf4',
+            userBubbleBg: '#322035',
+            scheme: {
+                bgcolor: '#1b141c',
+                darkbg: '#140e15',
+                borderc: '#3d2a3f',
+                selected: '#322035',
+                draculared: '#ff7597',
+                textcolor: '#f6eaf4',
+                textcolor2: '#bfa4bc',
+                darkBorderc: '#312133',
+                darkbutton: '#261a28',
+                type: 'dark',
+            },
+            textTheme: {
+                FontColorStandard: '#f6eaf4',
+                FontColorBold: '#ffffff',
+                FontColorItalic: '#d1b3ce',
+                FontColorItalicBold: '#e6cce3',
+                FontColorQuote1: '#ffb3c9',
+                FontColorQuote2: '#ffd6a5',
+            },
+            defaults: {
+                bubbleStyle: 'glass',
+                fontFamily: 'epub-sans',
+                justifyText: false,
+                bubbleRadius: 20,
+                chatMaxWidth: 800,
+                fontSize: 15,
+                lineHeight: 1.78,
+                accentColor: '#f48fb1',
+                quoteColor: '#ffb3c9',
+                surfaceAlpha: 0.8,
+            },
+            stealthDefaults: { mode: 'off', hideSidebarAvatars: false },
+            layoutDefaults: { floatingCapsuleInput: true, hoverActionsOnly: true, compactHeaders: false },
+            bgGradient: 'radial-gradient(circle at 15% 15%, rgba(244, 143, 177, 0.14), transparent 45%), radial-gradient(circle at 80% 80%, rgba(186, 104, 200, 0.12), transparent 50%), #1b141c',
+            cardBgRgb: '39, 27, 41',
+            borderColor: 'rgba(244, 143, 177, 0.25)',
+        },
+        'forest-moss': {
+            label: '포레스트 모스',
+            brandTitle: 'Forest',
+            brandModel: 'Moss',
+            shortIcon: '🌿',
+            desc: '차분한 딥 에메랄드와 세이지 톤의 장시간 독서용 테마',
+            badgeBg: '#68b892',
+            inputBg: '#16231e',
+            inputBorder: '#2a4037',
+            topBarBg: 'rgba(17, 25, 22, 0.90)',
+            topBarText: '#e4efe9',
+            userBubbleBg: '#1c2e27',
+            scheme: {
+                bgcolor: '#111916',
+                darkbg: '#0c1210',
+                borderc: '#24372f',
+                selected: '#1c2e27',
+                draculared: '#e06c75',
+                textcolor: '#e4efe9',
+                textcolor2: '#95afa2',
+                darkBorderc: '#1d2d26',
+                darkbutton: '#16231e',
+                type: 'dark',
+            },
+            textTheme: {
+                FontColorStandard: '#e4efe9',
+                FontColorBold: '#f7fcf9',
+                FontColorItalic: '#9cb7a9',
+                FontColorItalicBold: '#bdd6c9',
+                FontColorQuote1: '#f0c674',
+                FontColorQuote2: '#8abeb7',
+            },
+            defaults: {
+                bubbleStyle: 'card',
+                fontFamily: 'epub-sans',
+                justifyText: false,
+                bubbleRadius: 14,
+                chatMaxWidth: 800,
+                fontSize: 15,
+                lineHeight: 1.8,
+                accentColor: '#68b892',
+                quoteColor: '#f0c674',
+                surfaceAlpha: 0.82,
+            },
+            stealthDefaults: { mode: 'off', hideSidebarAvatars: false },
+            layoutDefaults: { floatingCapsuleInput: true, hoverActionsOnly: true, compactHeaders: false },
+            bgGradient: 'radial-gradient(circle at 25% 10%, rgba(104, 184, 146, 0.12), transparent 45%), #111916',
+            cardBgRgb: '22, 34, 29',
+            borderColor: 'rgba(104, 184, 146, 0.22)',
+        },
+        'minimal-amoled': {
+            label: '미니멀 리얼블랙',
+            brandTitle: 'Minimal',
+            brandModel: 'AMOLED',
+            shortIcon: '◼',
+            desc: '순수 블랙 배경과 미니멀한 타이포그래피 중심 테마',
+            badgeBg: '#a1a1aa',
+            inputBg: '#0e0e11',
+            inputBorder: '#27272c',
+            topBarBg: 'rgba(0, 0, 0, 0.92)',
+            topBarText: '#ececef',
+            userBubbleBg: '#141417',
+            scheme: {
+                bgcolor: '#000000',
+                darkbg: '#000000',
+                borderc: '#242428',
+                selected: '#141417',
+                draculared: '#ff5555',
+                textcolor: '#ececef',
+                textcolor2: '#8a8a94',
+                darkBorderc: '#1c1c20',
+                darkbutton: '#0e0e11',
+                type: 'dark',
+            },
+            textTheme: {
+                FontColorStandard: '#ececef',
+                FontColorBold: '#ffffff',
+                FontColorItalic: '#9d9da8',
+                FontColorItalicBold: '#c7c7d1',
+                FontColorQuote1: '#f5d08a',
+                FontColorQuote2: '#9ecbff',
+            },
+            defaults: {
+                bubbleStyle: 'flat',
+                fontFamily: 'epub-sans',
+                justifyText: false,
+                bubbleRadius: 10,
+                chatMaxWidth: 780,
+                fontSize: 15,
+                lineHeight: 1.8,
+                accentColor: '#a1a1aa',
+                quoteColor: '#f5d08a',
+                surfaceAlpha: 0.9,
+            },
+            stealthDefaults: { mode: 'off', hideSidebarAvatars: false },
+            layoutDefaults: { floatingCapsuleInput: true, hoverActionsOnly: true, compactHeaders: false },
+            bgGradient: '#000000',
+            cardBgRgb: '14, 14, 17',
+            borderColor: 'rgba(255, 255, 255, 0.10)',
+        },
+    };
+
+    let config = structuredClone(DEFAULT_CONFIG);
+    let rootDoc = null;
+    let pointerListenerId = null;
+    let docMoveListenerId = null;
+    let docUpListenerId = null;
+    let mutationObserver = null;
+    let lockReleaseTimer = null;
+    let isLockActive = false;
+    let lastKnownHeights = [];
+    let lastAnchorIndex = -1;
+    let domPermissionGranted = false;
+    let currentIframeMode = null; // 'studio' | 'clone' | null
+    let lastCloneMode = 'ai-gemini';
+    let chatOutputListener = null;
+    let cloneWatcherTimer = null;
+    let lastCloneSignature = '';
+    let pendingCloneRefresh = false;
+
+    function stopCloneWatcher() {
+        if (cloneWatcherTimer) {
+            clearInterval(cloneWatcherTimer);
+            cloneWatcherTimer = null;
+        }
+    }
+
+    async function computeChatSignature() {
+        try {
+            const charIdx = await risuai.getCurrentCharacterIndex();
+            const chatIdx = await risuai.getCurrentChatIndex();
+            if (charIdx < 0 || chatIdx < 0) return '';
+            const chatObj = await risuai.getChatFromIndex(charIdx, chatIdx);
+            const msgs = chatObj && Array.isArray(chatObj.message) ? chatObj.message : [];
+            const len = msgs.length;
+            const last = len > 0 ? msgs[len - 1] : null;
+            const lastDataLen = last && last.data ? String(last.data).length : 0;
+            const prev = len > 1 ? msgs[len - 2] : null;
+            const prevDataLen = prev && prev.data ? String(prev.data).length : 0;
+            return `${charIdx}:${chatIdx}:${len}:${lastDataLen}:${prevDataLen}`;
+        } catch (_) {
+            return '';
+        }
+    }
+
+    function startCloneWatcher() {
+        stopCloneWatcher();
+        if (!config.layout.autoRefreshClone) return;
+        cloneWatcherTimer = setInterval(async () => {
+            if (currentIframeMode !== 'clone' || !config.layout.autoRefreshClone || pendingCloneRefresh) return;
+            const sig = await computeChatSignature();
+            if (sig && lastCloneSignature && sig !== lastCloneSignature) {
+                // Mark dirty silently — DO NOT interrupt the user's current page!
+                pendingCloneRefresh = true;
+            }
+        }, 4000);
+    }
+
+    // Top bar state (minimizable, auto-minimizing, draggable, eye dropdown)
+    let topBarMinimized = true;
+    let eyeDropdownOpen = false;
+    let autoMinimizeTimer = null;
+    let dragState = null; // { startX, startY, origLeft, origTop, moved, barEl }
+
+    async function unwrapArray(safeArr) {
+        if (!safeArr) return [];
+        if (typeof risuai.unwarpSafeArray === 'function') {
+            return await risuai.unwarpSafeArray(safeArr);
+        }
+        const len = await safeArr.length();
+        const out = [];
+        for (let i = 0; i < len; i++) {
+            out.push(await safeArr.at(i));
+        }
+        return out;
+    }
+
+    function mergeConfig(saved) {
+        if (!saved || typeof saved !== 'object') return structuredClone(DEFAULT_CONFIG);
+        const merged = {
+            antiFlicker: { ...DEFAULT_CONFIG.antiFlicker, ...(saved.antiFlicker || {}) },
+            stealth: { ...DEFAULT_CONFIG.stealth, ...(saved.stealth || {}) },
+            layout: { ...DEFAULT_CONFIG.layout, ...(saved.layout || {}) },
+            theme: { ...DEFAULT_CONFIG.theme, ...(saved.theme || {}) },
+        };
+        // Migrate legacy stealth fields
+        if (saved.stealth && typeof saved.stealth.hideChatAssets === 'boolean' && !saved.stealth.mode) {
+            merged.stealth.mode = saved.stealth.hideChatAssets ? 'soft' : 'off';
+        }
+        if (merged.stealth.mode === 'full') {
+            merged.stealth.mode = 'soft';
+        }
+        if (merged.theme.preset === 'epub-sepia-scroll') merged.theme.preset = 'epub-sepia';
+        if (merged.theme.preset === 'epub-night-scroll') merged.theme.preset = 'epub-night';
+        return merged;
+    }
+
+    async function loadConfig() {
+        try {
+            let raw = await risuai.pluginStorage.getItem(STORAGE_KEY);
+            if (!raw) {
+                raw = await risuai.pluginStorage.getItem(LEGACY_STORAGE_KEY);
+            }
+            if (raw) {
+                const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+                config = mergeConfig(parsed);
+            }
+        } catch (err) {
+            console.warn('[RisuStand] 설정 불러오기 실패:', err);
+        }
+    }
+
+    async function saveConfig() {
+        try {
+            await risuai.pluginStorage.setItem(STORAGE_KEY, JSON.stringify(config));
+        } catch (err) {
+            console.warn('[RisuStand] 설정 저장 실패:', err);
+        }
+    }
+
+    async function ensureRootDocument() {
+        if (rootDoc) return rootDoc;
+        try {
+            rootDoc = await risuai.getRootDocument();
+            domPermissionGranted = Boolean(rootDoc);
+        } catch (_) {
+            domPermissionGranted = false;
+            rootDoc = null;
+        }
+        return rootDoc;
+    }
+
+    async function upsertStyleTag(styleKey, cssText) {
+        const doc = await ensureRootDocument();
+        if (!doc) return false;
+
+        const selector = `style[${STYLE_ATTR}="${styleKey}"]`;
+        let styleEl = await doc.querySelector(selector);
+        if (!cssText || !cssText.trim()) {
+            if (styleEl) await styleEl.remove();
+            return true;
+        }
+
+        if (!styleEl) {
+            styleEl = await doc.createElement('style');
+            await styleEl.setAttribute(STYLE_ATTR, styleKey);
+            const head = await doc.querySelector('head');
+            if (head) await head.appendChild(styleEl);
+            else await doc.appendChild(styleEl);
+        }
+        await styleEl.setTextContent(cssText);
+        return true;
+    }
+
+    // =========================================================================
+    // 1. Draggable, Auto-Minimizing Top Bar with Eye Dropdown
+    // =========================================================================
+    function clearAutoMinimize() {
+        if (autoMinimizeTimer) {
+            clearTimeout(autoMinimizeTimer);
+            autoMinimizeTimer = null;
+        }
+    }
+
+    function scheduleAutoMinimize() {
+        clearAutoMinimize();
+        const sec = Math.max(2, Math.min(30, Number(config.layout.autoMinimizeSec) || 5));
+        autoMinimizeTimer = setTimeout(async () => {
+            if (!dragState && !topBarMinimized) {
+                topBarMinimized = true;
+                eyeDropdownOpen = false;
+                await syncTopBar();
+            }
+        }, sec * 1000);
+    }
+
+    async function removeTopBar() {
+        if (!rootDoc) return;
+        try {
+            const existing = await rootDoc.querySelector(`[${SHELL_BAR_ATTR}="root"]`);
+            if (existing) await existing.remove();
+        } catch (_) {}
+    }
+
+    async function setupDragDocumentListeners() {
+        if (!rootDoc) return;
+        if (docMoveListenerId) {
+            await rootDoc.removeEventListener('pointermove', docMoveListenerId);
+            docMoveListenerId = null;
+        }
+        if (docUpListenerId) {
+            await rootDoc.removeEventListener('pointerup', docUpListenerId);
+            docUpListenerId = null;
+        }
+
+        docMoveListenerId = await rootDoc.addEventListener('pointermove', async (ev) => {
+            const st = dragState;
+            if (!st || !st.barEl) return;
+            const dx = ev.clientX - st.startX;
+            const dy = ev.clientY - st.startY;
+            if (!st.moved && Math.hypot(dx, dy) > 5) {
+                st.moved = true;
+                clearAutoMinimize();
+            }
+            if (st.moved) {
+                const newLeft = Math.max(8, Math.round(st.origLeft + dx));
+                const newTop = Math.max(8, Math.round(st.origTop + dy));
+                st.lastLeft = newLeft;
+                st.lastTop = newTop;
+                const now = Date.now();
+                if (st.updating || (st.lastMoveAt && now - st.lastMoveAt < 16)) return;
+                st.lastMoveAt = now;
+                st.updating = true;
+                const barEl = st.barEl;
+                try {
+                    // Single GPU-composited transform IPC call (zero layout reflow!)
+                    if (!st.primed) {
+                        st.primed = true;
+                        await barEl.setStyleAttribute(`${st.baseStyle} left:0; top:0; transform:translate3d(${newLeft}px,${newTop}px,0);`);
+                    } else {
+                        await barEl.setStyle('transform', `translate3d(${newLeft}px,${newTop}px,0)`);
+                    }
+                } catch (_) {
+                    // Ignore if bar was re-rendered or detached mid-drag
+                } finally {
+                    st.updating = false;
+                }
+            }
+        });
+
+        docUpListenerId = await rootDoc.addEventListener('pointerup', async () => {
+            if (!dragState) return;
+            const st = dragState;
+            dragState = null;
+            if (st.moved && typeof st.lastLeft === 'number') {
+                config.layout.topBarPos = { x: st.lastLeft, y: st.lastTop };
+                await saveConfig();
+                if (!topBarMinimized) scheduleAutoMinimize();
+            } else if (st.onTap) {
+                await st.onTap();
+            }
+        });
+    }
+
+    async function syncTopBar() {
+        const doc = await ensureRootDocument();
+        if (!doc) return;
+
+        const preset = PRESETS[config.theme.preset] || PRESETS['ai-gemini'];
+        if (!config.layout.showFloatingTopBar || preset.useNativeDefault) {
+            clearAutoMinimize();
+            await removeTopBar();
+            return;
+        }
+
+        const [_, bar, body] = await Promise.all([
+            removeTopBar(),
+            doc.createElement('div'),
+            doc.querySelector('body'),
+        ]);
+
+        const isLight = preset.scheme && preset.scheme.type === 'light';
+        const pillBg = isLight ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.08)';
+        const pillBorder = isLight ? 'rgba(0,0,0,0.13)' : 'rgba(255,255,255,0.14)';
+        const textCol = preset.topBarText || '#e3e3e3';
+        const barBg = preset.topBarBg || 'rgba(19, 19, 20, 0.90)';
+
+        const pos = config.layout.topBarPos;
+        const posStyle = pos
+            ? `left:0; top:0; transform:translate3d(${pos.x}px,${pos.y}px,0);`
+            : `left:50%; top:10px; transform:translateX(-50%);`;
+
+        if (topBarMinimized) {
+            const minBaseStyle =
+                `position:fixed; z-index:46; display:flex; align-items:center; gap:5px; ` +
+                `padding:4px 9px; border-radius:999px; background:${barBg}; color:${textCol}; ` +
+                `border:1px solid ${pillBorder}; box-shadow:0 3px 10px rgba(0,0,0,0.20); ` +
+                `font-size:11.5px; font-weight:700; cursor:grab; user-select:none; opacity:0.74; ` +
+                `will-change:transform; font-family:system-ui,-apple-system,"Malgun Gothic",sans-serif;`;
+            const stealthDot = config.stealth.mode !== 'off' ? ' 🕶️' : '';
+
+            await Promise.all([
+                bar.setAttribute(SHELL_BAR_ATTR, 'root'),
+                bar.setStyleAttribute(`${minBaseStyle} ${posStyle}`),
+                bar.setTextContent(`${preset.shortIcon || '✦'}${stealthDot}`),
+                bar.addEventListener('pointerdown', async (ev) => {
+                    const rect = await bar.getBoundingClientRect();
+                    dragState = {
+                        startX: ev.clientX,
+                        startY: ev.clientY,
+                        origLeft: rect.left,
+                        origTop: rect.top,
+                        moved: false,
+                        primed: false,
+                        baseStyle: minBaseStyle,
+                        barEl: bar,
+                        onTap: async () => {
+                            topBarMinimized = false;
+                            eyeDropdownOpen = false;
+                            await syncTopBar();
+                            scheduleAutoMinimize();
+                        },
+                    };
+                }),
+            ]);
+
+            if (body) await body.appendChild(bar);
+            else await doc.appendChild(bar);
+            return;
+        }
+
+        const expBaseStyle =
+            `position:fixed; z-index:46; display:flex; align-items:center; gap:6px; ` +
+            `padding:5px 10px; border-radius:999px; background:${barBg}; color:${textCol}; ` +
+            `border:1px solid ${pillBorder}; box-shadow:0 4px 14px rgba(0,0,0,0.24); ` +
+            `font-size:12px; font-weight:600; user-select:none; will-change:transform; ` +
+            `font-family:system-ui,-apple-system,"Malgun Gothic",sans-serif; max-width:calc(100vw - 16px); overflow-x:auto; scrollbar-width:none;`;
+
+        const makePill = async (label, active, onClick) => {
+            const btn = await doc.createElement('button');
+            const bg = active ? (config.theme.accentColor || '#6366f1') : pillBg;
+            const fg = active ? getContrastText(config.theme.accentColor || '#6366f1') : textCol;
+            await Promise.all([
+                btn.setStyleAttribute(
+                    `border:1px solid ${pillBorder}; background:${bg}; color:${fg}; border-radius:999px; ` +
+                    `padding:4px 9px; font-size:11.5px; font-weight:600; cursor:pointer; white-space:nowrap;`
+                ),
+                btn.setTextContent(label),
+                btn.addEventListener('click', async () => {
+                    scheduleAutoMinimize();
+                    await onClick();
+                }),
+            ]);
+            return btn;
+        };
+
+        const dragHandlePromise = (async () => {
+            const dh = await doc.createElement('span');
+            await Promise.all([
+                dh.setStyleAttribute(
+                    `display:flex; align-items:center; gap:5px; padding:2px 6px; cursor:grab; white-space:nowrap; opacity:0.9;`
+                ),
+                dh.setTextContent(`⠿ ${preset.brandTitle || 'AI'} ${preset.brandModel || ''}`.trim()),
+                dh.addEventListener('pointerdown', async (ev) => {
+                    const rect = await bar.getBoundingClientRect();
+                    dragState = {
+                        startX: ev.clientX,
+                        startY: ev.clientY,
+                        origLeft: rect.left,
+                        origTop: rect.top,
+                        moved: false,
+                        primed: false,
+                        baseStyle: expBaseStyle,
+                        barEl: bar,
+                        onTap: null,
+                    };
+                }),
+            ]);
+            return dh;
+        })();
+
+        const eyeLabel = config.stealth.mode !== 'off' ? '🕶️ 가리기 ON' : '👁️ 가리기 OFF';
+
+        const [, , dragHandle, btnBottom, eyeBtn, btnZen, btnClone, btnStudio, btnMin] = await Promise.all([
+            bar.setAttribute(SHELL_BAR_ATTR, 'root'),
+            bar.setStyleAttribute(`${expBaseStyle} ${posStyle}`),
+            dragHandlePromise,
+            makePill('⬇', false, async () => {
+                try {
+                    const latestMsg = await doc.querySelector('.default-chat-screen .chat-message-container');
+                    if (latestMsg) {
+                        await latestMsg.scrollIntoView({ behavior: 'smooth', block: 'end' });
+                    }
+                } catch (_) {}
+            }),
+            makePill(eyeLabel, config.stealth.mode !== 'off', async () => {
+                const next = config.stealth.mode === 'off' ? 'soft' : 'off';
+                config.stealth.mode = next;
+                config.stealth.hideSidebarAvatars = next !== 'off';
+                saveConfig();
+                await Promise.all([
+                    upsertStyleTag('theme-layout-stealth', buildLayoutAndThemeCSS()),
+                    syncTopBar(),
+                ]);
+                scheduleAutoMinimize();
+            }),
+            makePill(config.layout.zenMode ? '🧘 집중 ON' : '🧘 집중', config.layout.zenMode, async () => {
+                config.layout.zenMode = !config.layout.zenMode;
+                saveConfig();
+                await Promise.all([
+                    upsertStyleTag('theme-layout-stealth', buildLayoutAndThemeCSS()),
+                    syncTopBar(),
+                ]);
+            }),
+            makePill('🖥️ 공홈·EPUB', false, async () => {
+                topBarMinimized = true;
+                eyeDropdownOpen = false;
+                await syncTopBar();
+                await openCloneView();
+            }),
+            makePill('🎨 테마', false, async () => {
+                topBarMinimized = true;
+                eyeDropdownOpen = false;
+                await syncTopBar();
+                await openStudio();
+            }),
+            makePill('—', false, async () => {
+                clearAutoMinimize();
+                topBarMinimized = true;
+                eyeDropdownOpen = false;
+                await syncTopBar();
+            }),
+        ]);
+
+        for (const child of [dragHandle, btnBottom, eyeBtn, btnZen, btnClone, btnStudio, btnMin]) {
+            await bar.appendChild(child);
+        }
+
+        if (body) await body.appendChild(bar);
+        else await doc.appendChild(bar);
+    }
+
+    // =========================================================================
+    // 2. Anti-Flicker Engine (position: fixed safe!)
+    // =========================================================================
+    function buildStabilityCSS() {
+        if (!config.antiFlicker.enabled) return '';
+        const fadeRule = config.antiFlicker.smoothFade
+            ? `.default-chat-screen .chat-message-container .chattext { transition: opacity 140ms ease-out; }`
+            : '';
+        return `
+            .default-chat-screen { overflow-anchor: auto !important; scroll-behavior: auto; }
+            .default-chat-screen .chat-message-container { overflow-anchor: auto; }
+            ${fadeRule}
+        `;
+    }
+
+    let lastSnapshotAt = 0;
+    let reapplyDebounceTimer = null;
+
+    async function snapshotAndLockMessageHeights() {
+        if (!config.antiFlicker.enabled || !rootDoc || currentIframeMode !== null) return;
+        const now = Date.now();
+        if (now - lastSnapshotAt < 250) return;
+        lastSnapshotAt = now;
+
+        try {
+            const containersSafe = await rootDoc.querySelectorAll('.default-chat-screen .chat-message-container');
+            const containers = await unwrapArray(containersSafe);
+            if (!containers.length) return;
+
+            // Batch-read clientHeight in parallel (avoids sequential IPC stalls)
+            const measured = await Promise.all(containers.map((el) => el.clientHeight()));
+            const heights = measured.map((h, i) => (h >= 48 ? h : (lastKnownHeights[i] || 0)));
+
+            // Batch-write minHeight in parallel
+            const writeJobs = [];
+            for (let i = 0; i < containers.length; i++) {
+                if (heights[i] >= 48) {
+                    writeJobs.push(containers[i].setStyle('minHeight', `${heights[i]}px`));
+                }
+            }
+            if (writeJobs.length) await Promise.all(writeJobs);
+
+            if (config.antiFlicker.preserveScrollAnchor) {
+                const screenEl = await rootDoc.querySelector('.default-chat-screen');
+                const screenRect = screenEl ? await screenEl.getBoundingClientRect() : null;
+                if (screenRect) {
+                    const rects = await Promise.all(containers.map((el) => el.getBoundingClientRect()));
+                    let bestIdx = -1;
+                    let bestScore = Infinity;
+                    for (let i = 0; i < rects.length; i++) {
+                        if (measured[i] < 48) continue;
+                        const rect = rects[i];
+                        if (rect.bottom > screenRect.top && rect.top < screenRect.bottom) {
+                            const dist = Math.abs(screenRect.bottom - rect.bottom);
+                            if (dist < bestScore) {
+                                bestScore = dist;
+                                bestIdx = i;
+                            }
+                        }
+                    }
+                    if (bestIdx !== -1) lastAnchorIndex = bestIdx;
+                }
+            }
+
+            if (heights.some((v) => v >= 48)) lastKnownHeights = heights;
+            isLockActive = true;
+            if (lockReleaseTimer) clearTimeout(lockReleaseTimer);
+            const lockDuration = Math.max(300, Math.min(3000, Number(config.antiFlicker.lockMs) || 850));
+            lockReleaseTimer = setTimeout(() => { releaseMessageHeightLocks(); }, lockDuration);
+        } catch (_) {}
+    }
+
+    function scheduleReapplyLocks() {
+        if (!isLockActive || reapplyDebounceTimer) return;
+        reapplyDebounceTimer = setTimeout(async () => {
+            reapplyDebounceTimer = null;
+            await reapplyLocksToNewNodes();
+        }, 120);
+    }
+
+    async function reapplyLocksToNewNodes() {
+        if (!isLockActive || !config.antiFlicker.enabled || !rootDoc || !lastKnownHeights.length) return;
+        try {
+            const containersSafe = await rootDoc.querySelectorAll('.default-chat-screen .chat-message-container');
+            const containers = await unwrapArray(containersSafe);
+            const jobs = [];
+            for (let i = 0; i < containers.length && i < lastKnownHeights.length; i++) {
+                if (lastKnownHeights[i] >= 48) {
+                    jobs.push(containers[i].setStyle('minHeight', `${lastKnownHeights[i]}px`));
+                }
+            }
+            if (jobs.length) await Promise.all(jobs);
+        } catch (_) {}
+    }
+
+    async function releaseMessageHeightLocks() {
+        isLockActive = false;
+        lockReleaseTimer = null;
+        if (reapplyDebounceTimer) {
+            clearTimeout(reapplyDebounceTimer);
+            reapplyDebounceTimer = null;
+        }
+        if (!rootDoc) return;
+        try {
+            const containersSafe = await rootDoc.querySelectorAll('.default-chat-screen .chat-message-container');
+            const containers = await unwrapArray(containersSafe);
+            await Promise.all(containers.map((el) => el.setStyle('minHeight', '')));
+            if (config.antiFlicker.preserveScrollAnchor && lastAnchorIndex >= 0 && lastAnchorIndex < containers.length) {
+                const screenEl = await rootDoc.querySelector('.default-chat-screen');
+                if (screenEl) {
+                    const screenRect = await screenEl.getBoundingClientRect();
+                    const anchorRect = await containers[lastAnchorIndex].getBoundingClientRect();
+                    if (anchorRect.bottom < screenRect.top + 20 || anchorRect.top > screenRect.bottom - 20) {
+                        await containers[lastAnchorIndex].scrollIntoView({ behavior: 'instant', block: 'nearest' });
+                    }
+                }
+            }
+        } catch (_) {}
+    }
+
+    async function setupAntiFlickerEngine() {
+        await upsertStyleTag('anti-flicker', buildStabilityCSS());
+        if (!rootDoc) return;
+
+        if (pointerListenerId) {
+            await rootDoc.removeEventListener('pointerdown', pointerListenerId);
+            pointerListenerId = null;
+        }
+        if (mutationObserver) {
+            await mutationObserver.disconnect();
+            mutationObserver = null;
+        }
+        if (!config.antiFlicker.enabled) return;
+
+        pointerListenerId = await rootDoc.addEventListener('pointerdown', async () => {
+            await snapshotAndLockMessageHeights();
+        }, { capture: true });
+
+        mutationObserver = await risuai.createMutationObserver(() => {
+            if (isLockActive) scheduleReapplyLocks();
+        });
+
+        const targetEl = (await rootDoc.querySelector('.default-chat-screen')) || (await rootDoc.querySelector('body'));
+        if (targetEl) {
+            await mutationObserver.observe(targetEl, { childList: true, subtree: false });
+        }
+    }
+
+    // =========================================================================
+    // 3. Layout Overhaul + Stealth (Soft / Full) + Theme CSS (position: fixed safe!)
+    // =========================================================================
+    function buildLayoutAndThemeCSS() {
+        const t = config.theme;
+        const l = config.layout;
+        const s = config.stealth;
+        const preset = PRESETS[t.preset] || PRESETS['ai-gemini'];
+        if (preset.useNativeDefault && !t.customCSS.trim() && !l.zenMode && s.mode === 'off') {
+            return '';
+        }
+
+        const rgb = preset.cardBgRgb || '20, 27, 46';
+        const alpha = Math.max(0, Math.min(1, Number(t.surfaceAlpha)));
+        const radius = Math.max(0, Math.min(28, Number(t.bubbleRadius)));
+        const maxWidth = Math.max(560, Math.min(1200, Number(t.chatMaxWidth) || 780));
+        const fontSize = Math.max(12, Math.min(22, Number(t.fontSize) || 15));
+        const lineHeight = Math.max(1.2, Math.min(2.4, Number(t.lineHeight) || 1.75));
+        const accent = t.accentColor || '#8ab4f8';
+        const borderCol = preset.borderColor || 'rgba(255, 255, 255, 0.10)';
+        const dividerCol = preset.dividerColor || 'rgba(128, 128, 128, 0.12)';
+        const fontStack = (FONT_STACKS[t.fontFamily] || FONT_STACKS.inherit).css;
+        const badgeBg = preset.badgeBg || accent;
+        const isEpub = t.bubbleStyle === 'epub';
+        const isChatbot = t.bubbleStyle === 'chatbot';
+
+        let css = '';
+
+        if (l.zenMode) {
+            css += `.rs-sidebar { display: none !important; }`;
+        }
+        if (l.sidebarRight) {
+            css += `main > div.w-full.h-full.flex, main.flex { flex-direction: row-reverse !important; }`;
+        }
+
+        // Floating Capsule Input Dock
+        if (l.floatingCapsuleInput && !preset.useNativeDefault) {
+            const inBg = preset.inputBg || `rgba(${rgb}, 0.92)`;
+            const inBorder = preset.inputBorder || borderCol;
+            css += `
+                .default-chat-screen > div:first-child {
+                    max-width: ${maxWidth}px !important;
+                    width: calc(100% - 28px) !important;
+                    margin: 10px auto 16px auto !important;
+                    padding: 6px 8px !important;
+                    background: ${inBg} !important;
+                    border: 1px solid ${inBorder} !important;
+                    border-radius: ${Math.max(radius, 22)}px !important;
+                    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.18) !important;
+                    align-items: center !important;
+                }
+                .default-chat-screen > div:first-child .text-input-area {
+                    border: none !important;
+                    background: transparent !important;
+                    margin-left: 6px !important;
+                    padding: 8px 10px !important;
+                    font-size: 15px !important;
+                    box-shadow: none !important;
+                }
+            `;
+        }
+
+        if (l.hoverActionsOnly) {
+            css += `
+                .default-chat-screen .risu-chat .button-icon-tray,
+                .default-chat-screen .risu-chat button.text-textcolor2 {
+                    opacity: 0.12;
+                    transition: opacity 160ms ease;
+                }
+                .default-chat-screen .risu-chat:hover .button-icon-tray,
+                .default-chat-screen .risu-chat:hover button.text-textcolor2 {
+                    opacity: 1;
+                }
+            `;
+        }
+
+        if (l.customScrollbar) {
+            css += `
+                .default-chat-screen::-webkit-scrollbar { width: 7px; }
+                .default-chat-screen::-webkit-scrollbar-track { background: transparent; }
+                .default-chat-screen::-webkit-scrollbar-thumb { background: ${borderCol}; border-radius: 999px; }
+                .default-chat-screen ::selection { background: ${accent}44; }
+            `;
+        }
+
+        if (preset.bgGradient) {
+            css += `.default-chat-screen { background: ${preset.bgGradient} !important; background-attachment: fixed !important; }`;
+        }
+
+        if (isChatbot) {
+            css += `
+                .default-chat-screen .risu-chat {
+                    background: transparent !important;
+                    border: none !important;
+                    border-bottom: 1px solid ${dividerCol} !important;
+                    border-radius: 0 !important;
+                    box-shadow: none !important;
+                    margin: 0 auto !important;
+                    padding: 18px 20px !important;
+                    max-width: ${maxWidth}px !important;
+                    width: 100% !important;
+                }
+            `;
+        } else if (isEpub) {
+            css += `
+                .default-chat-screen .risu-chat {
+                    background: rgba(${rgb}, ${Math.max(alpha, 0.94)}) !important;
+                    border-left: 1px solid ${borderCol} !important;
+                    border-right: 1px solid ${borderCol} !important;
+                    border-bottom: 1px solid ${dividerCol} !important;
+                    border-radius: 0 !important;
+                    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.06);
+                    margin: 0 auto !important;
+                    padding: 22px 40px !important;
+                    max-width: ${maxWidth}px !important;
+                    width: calc(100% - 24px) !important;
+                }
+                @media (max-width: 640px) {
+                    .default-chat-screen .risu-chat { padding: 18px 20px !important; width: 100% !important; }
+                }
+            `;
+        } else if (t.bubbleStyle === 'glass') {
+            css += `
+                .default-chat-screen .risu-chat {
+                    background: linear-gradient(145deg, rgba(${rgb}, ${Math.min(0.95, alpha + 0.08)}), rgba(${rgb}, ${alpha})) !important;
+                    border: 1px solid ${borderCol} !important;
+                    border-radius: ${radius}px !important;
+                    box-shadow: inset 0 1px 0 rgba(255,255,255,0.07), 0 4px 14px rgba(0,0,0,0.18);
+                    margin: 10px auto !important;
+                    padding: 18px 22px !important;
+                    max-width: ${maxWidth}px !important;
+                    width: calc(100% - 24px) !important;
+                }
+            `;
+        } else if (t.bubbleStyle === 'card') {
+            css += `
+                .default-chat-screen .risu-chat {
+                    background: rgba(${rgb}, ${Math.max(alpha, 0.85)}) !important;
+                    border: 1px solid ${borderCol} !important;
+                    border-radius: ${radius}px !important;
+                    box-shadow: 0 4px 16px rgba(0,0,0,0.14);
+                    margin: 10px auto !important;
+                    padding: 18px 22px !important;
+                    max-width: ${maxWidth}px !important;
+                    width: calc(100% - 24px) !important;
+                }
+            `;
+        } else if (t.bubbleStyle === 'flat') {
+            css += `
+                .default-chat-screen .risu-chat {
+                    background: rgba(${rgb}, ${alpha}) !important;
+                    border-left: 3px solid ${accent} !important;
+                    border-radius: ${radius}px !important;
+                    margin: 8px auto !important;
+                    padding: 14px 20px !important;
+                    max-width: ${maxWidth}px !important;
+                    width: calc(100% - 24px) !important;
+                }
+            `;
+        }
+
+        if (l.compactHeaders) {
+            css += `
+                .default-chat-screen .risu-chat .chat-width.text-xl {
+                    font-size: 0.86rem !important;
+                    font-weight: 600 !important;
+                    opacity: 0.72;
+                    margin-bottom: 4px !important;
+                }
+            `;
+        }
+
+        const fontRule = fontStack !== 'inherit' ? `font-family: ${fontStack} !important;` : '';
+        const justifyRule = t.justifyText ? 'text-align: justify; text-justify: inter-word;' : '';
+        const pGap = isEpub ? '0.9em' : isChatbot ? '0.72em' : '0.55em';
+
+        css += `
+            .default-chat-screen .chattext {
+                ${fontRule}
+                font-size: ${fontSize}px !important;
+                line-height: ${lineHeight} !important;
+                letter-spacing: ${isEpub ? '-0.015em' : '-0.01em'};
+                word-break: keep-all;
+                overflow-wrap: break-word;
+                -webkit-font-smoothing: antialiased;
+            }
+            .default-chat-screen .chattext p {
+                margin-top: ${pGap};
+                margin-bottom: ${pGap};
+                ${justifyRule}
+            }
+        `;
+
+        // Stealth Mode: Hide images/assets (and empty image border wrappers) & replace avatars with AI badge
+        if (s.mode !== 'off') {
+            css += `
+                .default-chat-screen .chattext img,
+                .default-chat-screen .chattext video,
+                .default-chat-screen .chattext picture,
+                .default-chat-screen .chattext canvas,
+                .default-chat-screen .chattext figure,
+                .default-chat-screen .root-loaded-image,
+                .default-chat-screen .chattext div:has(> img:only-child) {
+                    display: none !important;
+                }
+                .default-chat-screen .chattext [style*="background-image"] {
+                    background-image: none !important;
+                }
+                .default-chat-screen + div img,
+                .default-chat-screen + div video,
+                .default-chat-screen + div [style*="background-image"] {
+                    display: none !important;
+                    background-image: none !important;
+                }
+                .default-chat-screen .risu-chat > div > .shadow-lg.bg-textcolor2 {
+                    background-image: none !important;
+                    background: ${badgeBg} !important;
+                    width: 28px !important;
+                    height: 28px !important;
+                    min-width: 28px !important;
+                    min-height: 28px !important;
+                    border-radius: 9999px !important;
+                    box-shadow: none !important;
+                    margin-top: 2px !important;
+                    opacity: 0.92 !important;
+                }
+            `;
+        }
+
+        if (s.hideSidebarAvatars || s.mode !== 'off') {
+            css += `
+                .avatar img,
+                .avatar [style*="background-image"] {
+                    opacity: 0 !important;
+                    background-image: none !important;
+                }
+                .avatar {
+                    background: ${badgeBg} !important;
+                    border-radius: 9999px !important;
+                }
+            `;
+        }
+
+        // 8) WCAG Contrast Guard for RisuAI Alerts, Modals & Hardcoded Tailwind Classes
+        if (preset.scheme && preset.scheme.type === 'light') {
+            css += `
+                .bg-darkbg .text-gray-100,
+                .bg-darkbg .text-gray-200,
+                .bg-darkbg .text-gray-300,
+                .bg-bgcolor .text-gray-100,
+                .bg-bgcolor .text-gray-200,
+                .bg-bgcolor .text-gray-300,
+                .bg-selected .text-gray-100,
+                .bg-selected .text-gray-200,
+                .bg-selected .text-gray-300,
+                .bg-darkbg .text-white,
+                .bg-bgcolor .text-white {
+                    color: ${preset.scheme.textcolor} !important;
+                }
+                .bg-darkbg .text-gray-400,
+                .bg-darkbg .text-gray-500,
+                .bg-bgcolor .text-gray-400,
+                .bg-bgcolor .text-gray-500,
+                .bg-selected .text-gray-400,
+                .bg-selected .text-gray-500 {
+                    color: ${preset.scheme.textcolor2} !important;
+                }
+                .bg-blue-500, .bg-blue-600, .bg-red-500, .bg-red-600,
+                .bg-green-500, .bg-green-600, .bg-indigo-500, .bg-indigo-600,
+                .bg-blue-500 *, .bg-blue-600 *, .bg-red-500 *, .bg-red-600 *,
+                .bg-green-500 *, .bg-green-600 *, .bg-indigo-500 *, .bg-indigo-600 * {
+                    color: #ffffff !important;
+                }
+                .z-1100 > .bg-darkbg {
+                    border: 1px solid ${preset.scheme.borderc} !important;
+                    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25) !important;
+                }
+                .default-chat-screen .chattext {
+                    color: ${preset.scheme.textcolor};
+                }
+            `;
+        } else if (preset.scheme && preset.scheme.type === 'dark') {
+            css += `
+                .z-1100 > .bg-darkbg {
+                    border: 1px solid ${preset.scheme.borderc} !important;
+                    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.55) !important;
+                }
+                .z-1100 > .bg-darkbg .text-gray-300,
+                .z-1100 > .bg-darkbg .text-gray-200 {
+                    color: ${preset.scheme.textcolor} !important;
+                }
+                .z-1100 > .bg-darkbg .text-gray-500,
+                .z-1100 > .bg-darkbg .text-gray-400 {
+                    color: ${preset.scheme.textcolor2} !important;
+                }
+                .default-chat-screen .chattext {
+                    color: ${preset.scheme.textcolor};
+                }
+            `;
+        }
+
+        css += `\n${t.customCSS || ''}`;
+        return css;
+    }
+
+    async function applyAll() {
+        const t = config.theme;
+        const preset = PRESETS[t.preset] || PRESETS['ai-gemini'];
+
+        try {
+            if (preset.useNativeDefault) {
+                await risuai.changeColorScheme('default');
+                await risuai.changeTextTheme('standard');
+            } else {
+                if (preset.scheme) await risuai.setColorScheme(preset.scheme);
+                if (preset.textTheme) {
+                    await risuai.setCustomTextTheme({
+                        ...preset.textTheme,
+                        FontColorQuote1: t.quoteColor || preset.textTheme.FontColorQuote1,
+                    });
+                }
+            }
+        } catch (err) {
+            console.warn('[RisuStand] 네이티브 테마 적용 오류:', err);
+        }
+
+        await upsertStyleTag('theme-layout-stealth', buildLayoutAndThemeCSS());
+        await syncTopBar();
+        await updateQuickButtons();
+    }
+
+    // =========================================================================
+    // 4. Fullscreen Clone & 2-Page EPUB Book Reader (Preserves HUDs & Assets, Hides CoT!)
+    // =========================================================================
+    function escapeHtml(str) {
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    function getContrastText(hex) {
+        if (!hex || typeof hex !== 'string' || !hex.startsWith('#')) return '#ffffff';
+        const clean = hex.replace('#', '');
+        const full = clean.length === 3 ? clean.split('').map((c) => c + c).join('') : clean;
+        const r = parseInt(full.slice(0, 2), 16);
+        const g = parseInt(full.slice(2, 4), 16);
+        const b = parseInt(full.slice(4, 6), 16);
+        if (Number.isNaN(r) || Number.isNaN(g) || Number.isNaN(b)) return '#ffffff';
+        const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+        return lum > 0.62 ? '#111318' : '#ffffff';
+    }
+
+    function stripThinkingFromRaw(raw) {
+        if (!raw) return '';
+        return String(raw)
+            .replace(/<!--\s*HAYAKU[\s\S]*?-->/gi, '')
+            .replace(/<!--[\s\S]*?-->/g, '')
+            .replace(/<Thoughts>[\s\S]*?<\/Thoughts>/gi, '')
+            .replace(/<think>[\s\S]*?<\/think>/gi, '')
+            .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
+            .replace(/<thought>[\s\S]*?<\/thought>/gi, '')
+            .replace(/<reasoning>[\s\S]*?<\/reasoning>/gi, '')
+            .trim();
+    }
+
+    function cleanRenderedHtml(html, { hideAssets, fullHide }) {
+        if (!html) return '';
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+
+        // 1) Remove all CoT / Thinking blocks (<details> whose summary indicates thought/CoT, or raw tags)
+        doc.querySelectorAll('details').forEach((det) => {
+            const sum = det.querySelector('summary');
+            const sumText = (sum ? sum.textContent : '').trim().toLowerCase();
+            if (
+                sumText.includes('thought') ||
+                sumText.includes('think') ||
+                sumText.includes('추론') ||
+                sumText.includes('생각') ||
+                sumText.includes('cot') ||
+                sumText.includes('reason')
+            ) {
+                det.remove();
+            }
+        });
+        doc.querySelectorAll('thoughts, think, thinking, thought, reasoning').forEach((el) => el.remove());
+
+        // 2) Never allow position: fixed widgets inside clone/EPUB iframe to cover the reader UI
+        doc.querySelectorAll('[style*="position: fixed"], [style*="position:fixed"]').forEach((el) => {
+            el.style.position = 'static';
+        });
+
+        // 3) Asset visibility handling
+        if (hideAssets || fullHide) {
+            doc.querySelectorAll('img, video, picture, canvas, figure').forEach((el) => el.remove());
+            doc.querySelectorAll('[style*="background-image"]').forEach((el) => {
+                el.style.backgroundImage = 'none';
+            });
+        } else {
+            doc.querySelectorAll('img, picture, figure').forEach((el) => {
+                if (el.style && el.style.display === 'none') el.style.display = '';
+            });
+        }
+        if (fullHide) {
+            doc.querySelectorAll('table, [class*="hud"], [class*="HUD"], [class*="status"], [class*="card"]').forEach((el) => el.remove());
+        }
+
+        // Remove scripts for safety
+        doc.querySelectorAll('script').forEach((el) => el.remove());
+
+        return doc.body.innerHTML.trim();
+    }
+
+    const iframeAssetDataCache = new Map(); // assetPath -> data:<mime>;base64,...
+    const iframeInlayDataCache = new Map(); // inlayId -> data:<mime>;base64,...
+
+    async function getIframeDataUrlForInlay(inlayId) {
+        if (!inlayId) return null;
+        if (iframeInlayDataCache.has(inlayId)) {
+            return iframeInlayDataCache.get(inlayId);
+        }
+        try {
+            if (typeof risuai.readInlay !== 'function') return null;
+            const res = await risuai.readInlay(inlayId);
+            if (res && res.data && String(res.data).startsWith('data:')) {
+                iframeInlayDataCache.set(inlayId, res.data);
+                return res.data;
+            }
+        } catch (_) {}
+        return null;
+    }
+
+    function detectImageMime(bytes, assetPath) {
+        if (bytes && bytes.length >= 12) {
+            if (bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4E && bytes[3] === 0x47) return 'image/png';
+            if (bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) return 'image/jpeg';
+            if (bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38) return 'image/gif';
+            if (
+                bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+                bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50
+            ) return 'image/webp';
+            if (bytes[4] === 0x66 && bytes[5] === 0x74 && bytes[6] === 0x79 && bytes[7] === 0x70) return 'image/avif';
+        }
+        const lower = String(assetPath || '').toLowerCase();
+        if (lower.endsWith('.png')) return 'image/png';
+        if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+        if (lower.endsWith('.gif')) return 'image/gif';
+        if (lower.endsWith('.avif')) return 'image/avif';
+        return 'image/webp';
+    }
+
+    function uint8ToBase64(bytes) {
+        let binary = '';
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+        }
+        return btoa(binary);
+    }
+
+    async function getIframeDataUrlForAsset(assetPath) {
+        if (!assetPath) return null;
+        if (iframeAssetDataCache.has(assetPath)) {
+            return iframeAssetDataCache.get(assetPath);
+        }
+        try {
+            const raw = await risuai.readImage(assetPath);
+            if (!raw) return null;
+            const bytes = raw instanceof Uint8Array
+                ? raw
+                : ArrayBuffer.isView(raw)
+                ? new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength)
+                : raw instanceof ArrayBuffer
+                ? new Uint8Array(raw)
+                : new Uint8Array(Object.values(raw));
+            if (!bytes.length) return null;
+            const mime = detectImageMime(bytes, assetPath);
+            let url = null;
+            try {
+                const blob = new Blob([bytes], { type: mime });
+                url = URL.createObjectURL(blob);
+            } catch (_) {
+                url = `data:${mime};base64,${uint8ToBase64(bytes)}`;
+            }
+            iframeAssetDataCache.set(assetPath, url);
+            return url;
+        } catch (err) {
+            console.warn('[RisuStand] readImage 실패:', assetPath, err);
+            return null;
+        }
+    }
+
+    function buildAssetLookup(charObj) {
+        const list = [];
+        const pushAsset = (name, path) => {
+            if (name && path) {
+                list.push({ name: String(name).trim().toLowerCase(), path: String(path).trim() });
+            }
+        };
+        if (charObj && Array.isArray(charObj.additionalAssets)) {
+            for (const a of charObj.additionalAssets) {
+                if (Array.isArray(a)) pushAsset(a[0], a[1]);
+            }
+        }
+        if (charObj && Array.isArray(charObj.emotionImages)) {
+            for (const e of charObj.emotionImages) {
+                if (Array.isArray(e)) pushAsset(e[0], e[1]);
+            }
+        }
+        const exact = new Map(list.map((item) => [item.name, item.path]));
+        const findPath = (rawName) => {
+            if (!rawName) return null;
+            const key = String(rawName).trim().toLowerCase();
+            if (!key) return null;
+            if (exact.has(key)) return exact.get(key);
+            const noExt = key.replace(/\.[a-z0-9]{2,5}$/i, '');
+            if (exact.has(noExt)) return exact.get(noExt);
+            for (const item of list) {
+                const itemNoExt = item.name.replace(/\.[a-z0-9]{2,5}$/i, '');
+                if (itemNoExt === noExt || item.name.startsWith(noExt + '.')) {
+                    return item.path;
+                }
+            }
+            // Normalized fallback (ignores _, -, spaces, extension)
+            const norm = (s) => s.replace(/\.[a-z0-9]{2,5}$/i, '').replace(/[\s_\-]+/g, '').toLowerCase();
+            const normKey = norm(key);
+            if (normKey.length >= 2) {
+                for (const item of list) {
+                    if (norm(item.name) === normKey) return item.path;
+                }
+                for (const item of list) {
+                    if (norm(item.name).includes(normKey) || normKey.includes(norm(item.name))) {
+                        return item.path;
+                    }
+                }
+            }
+            return null;
+        };
+        return { findPath };
+    }
+
+    function extractRawAssetNames(rawMsg) {
+        if (!rawMsg) return [];
+        const text = String(rawMsg);
+        const patterns = [
+            /\{\{(?:img|raw|asset|image|emotion)::([^}]+)\}\}/gi,
+            /<img\s*=\s*["']?([^"'\s>]+)["']?\s*\/?>/gi,
+            /<img[^>]+src\s*=\s*["']([^"']+)["']/gi,
+            /!\[[^\]]*\]\(([^)\s]+)\)/gi,
+            /\[(?:img|image)\s*[:=]\s*([^\]]+)\]/gi,
+        ];
+        const matches = [];
+        for (const re of patterns) {
+            let m;
+            while ((m = re.exec(text)) !== null) {
+                const val = (m[1] || '').trim();
+                if (val && !val.startsWith('http://') && !val.startsWith('https://') && !val.startsWith('data:')) {
+                    matches.push({ idx: m.index, val });
+                }
+            }
+        }
+        matches.sort((a, b) => a.idx - b.idx);
+        return matches.map((m) => m.val);
+    }
+
+    async function rehydrateBlockedImagesInHtml(html, rawMsg, assetLookup) {
+        if (!html) return html;
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(html, 'text/html');
+        const rawNames = extractRawAssetNames(rawMsg);
+        let rawCursor = 0;
+        let resolvedCount = 0;
+
+        const isBlockedSrc = (s) => {
+            if (!s) return true;
+            const low = s.toLowerCase();
+            return (
+                low.startsWith('blob:') ||
+                low.startsWith('asset:') ||
+                low.startsWith('tauri:') ||
+                low.startsWith('file:') ||
+                low.includes('asset.localhost') ||
+                low.includes('tauri.localhost') ||
+                low.startsWith('http://localhost') ||
+                low.startsWith('http://127.0.0.1') ||
+                (!low.startsWith('http://') && !low.startsWith('https://') && !low.startsWith('data:'))
+            );
+        };
+
+        const extractAssetPathFromTauriUrl = (s) => {
+            if (!s) return null;
+            try {
+                const decoded = decodeURIComponent(s).replace(/\\/g, '/');
+                const m = decoded.match(/(assets\/[^/?#]+)$/i);
+                if (m) return m[1];
+            } catch (_) {}
+            return null;
+        };
+
+        const resolveNext = async (candidates, rawUrl) => {
+            const directPath = extractAssetPathFromTauriUrl(rawUrl);
+            if (directPath) {
+                const directData = await getIframeDataUrlForAsset(directPath);
+                if (directData) return directData;
+            }
+            for (const cand of candidates) {
+                const assetPath = assetLookup.findPath(cand);
+                if (assetPath) {
+                    const dataUrl = await getIframeDataUrlForAsset(assetPath);
+                    if (dataUrl) return dataUrl;
+                }
+            }
+            return null;
+        };
+
+        let rehydratedAssetCount = 0;
+
+        // 1) Rehydrate <img> tags
+        const imgs = Array.from(doc.querySelectorAll('img'));
+        for (const img of imgs) {
+            const srcAttr = (img.getAttribute('src') || '').trim();
+            if (!isBlockedSrc(srcAttr)) {
+                continue;
+            }
+            const candidates = [];
+            if (srcAttr && !srcAttr.includes(':')) candidates.push(srcAttr);
+            const altAttr = (img.getAttribute('alt') || '').trim();
+            if (altAttr) candidates.push(altAttr);
+            if (rawCursor < rawNames.length) {
+                candidates.push(rawNames[rawCursor]);
+                rawCursor += 1;
+            }
+            const dataUrl = await resolveNext(candidates, srcAttr);
+            if (dataUrl) {
+                img.setAttribute('src', dataUrl);
+                img.removeAttribute('noimage');
+                img.style.display = 'block';
+                img.setAttribute('decoding', 'async');
+                rehydratedAssetCount += 1;
+            }
+        }
+
+        // 2) Rehydrate CSS background-image: url(blob:/asset:/...) elements
+        const bgEls = Array.from(doc.querySelectorAll('[style*="background-image"], [style*="background:"]'));
+        for (const el of bgEls) {
+            const st = el.getAttribute('style') || '';
+            const m = st.match(/url\(\s*["']?([^"')]+)["']?\s*\)/i);
+            if (!m) continue;
+            const urlVal = m[1].trim();
+            if (!isBlockedSrc(urlVal)) {
+                continue;
+            }
+            const candidates = [];
+            if (!urlVal.includes(':')) candidates.push(urlVal);
+            if (rawCursor < rawNames.length) {
+                candidates.push(rawNames[rawCursor]);
+                rawCursor += 1;
+            }
+            const dataUrl = await resolveNext(candidates, urlVal);
+            if (dataUrl) {
+                // Convert CSS background-image asset into a real <img> so it never collapses to height:0px
+                el.style.backgroundImage = 'none';
+                const realImg = doc.createElement('img');
+                realImg.setAttribute('src', dataUrl);
+                realImg.setAttribute('alt', candidates[0] || 'asset');
+                realImg.style.display = 'block';
+                realImg.setAttribute('decoding', 'async');
+                el.appendChild(realImg);
+                rehydratedAssetCount += 1;
+            }
+        }
+
+        // 2.5) Rehydrate blocked url(...) inside inline <style> blocks
+        const styleEls = Array.from(doc.querySelectorAll('style'));
+        for (const stEl of styleEls) {
+            let cssTxt = stEl.textContent || '';
+            const urlMatches = Array.from(cssTxt.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/gi));
+            let changed = false;
+            for (const um of urlMatches) {
+                const rawUrl = (um[1] || '').trim();
+                if (!isBlockedSrc(rawUrl)) continue;
+                const candidates = [];
+                if (!rawUrl.includes(':')) candidates.push(rawUrl);
+                if (rawCursor < rawNames.length) {
+                    candidates.push(rawNames[rawCursor]);
+                    rawCursor += 1;
+                }
+                const dataUrl = await resolveNext(candidates, rawUrl);
+                if (dataUrl) {
+                    cssTxt = cssTxt.replace(um[0], `url("${dataUrl}")`);
+                    changed = true;
+                }
+            }
+            if (changed) stEl.textContent = cssTxt;
+        }
+
+        // 3) Guaranteed fallback: if rawMsg referenced character assets that weren't rehydrated in DOM, inject them cleanly
+        if (rehydratedAssetCount === 0 && rawNames.length > 0) {
+            for (const name of rawNames.slice(0, 3)) {
+                const assetPath = assetLookup.findPath(name);
+                if (!assetPath) continue;
+                const dataUrl = await getIframeDataUrlForAsset(assetPath);
+                if (dataUrl) {
+                    const fallbackImg = doc.createElement('img');
+                    fallbackImg.setAttribute('src', dataUrl);
+                    fallbackImg.setAttribute('alt', name);
+                    fallbackImg.setAttribute('decoding', 'async');
+                    doc.body.insertBefore(fallbackImg, doc.body.firstChild);
+                }
+            }
+        }
+
+        return doc.body.innerHTML;
+    }
+
+    async function collectMessagesForReader(modeKey) {
+        const isEpub = Boolean(PRESETS[modeKey]?.isEpub);
+        const fullHide = false;
+        const hideAssets = isEpub
+            ? !config.layout.epubShowAssets
+            : (config.stealth.mode !== 'off' || Boolean(PRESETS[modeKey]?.isChatbot));
+
+        // Map rendered HTML directly from RisuAI's live DOM so Status HUDs & Image Assets stay intact!
+        const renderedMap = new Map();
+        if (rootDoc) {
+            try {
+                const containersSafe = await rootDoc.querySelectorAll('.default-chat-screen .chat-message-container');
+                const containers = await unwrapArray(containersSafe);
+                // Chats.svelte uses flex-col-reverse, so containers[0] is latest message
+                // Batch-read .chattext innerHTML in parallel (reduces IPC round-trips from ~60 to 2!)
+                const textEls = await Promise.all(containers.map((c) => c.querySelector('.chattext')));
+                const htmls = await Promise.all(textEls.map((t) => (t ? t.getInnerHTML() : Promise.resolve(null))));
+                for (let i = 0; i < htmls.length; i++) {
+                    if (htmls[i]) renderedMap.set(i, htmls[i]);
+                }
+            } catch (_) {}
+        }
+
+        let rawMessages = [];
+        let charObj = null;
+        try {
+            const charIdx = await risuai.getCurrentCharacterIndex();
+            const chatIdx = await risuai.getCurrentChatIndex();
+            charObj = await risuai.getCharacter();
+            if (charIdx >= 0 && chatIdx >= 0) {
+                const chatObj = await risuai.getChatFromIndex(charIdx, chatIdx);
+                if (chatObj && Array.isArray(chatObj.message)) {
+                    rawMessages = chatObj.message;
+                }
+            }
+        } catch (_) {}
+        const assetLookup = buildAssetLookup(charObj);
+
+        const total = rawMessages.length;
+        const startIdx = Math.max(0, total - 30);
+        const items = [];
+
+        for (let idx = startIdx; idx < total; idx++) {
+            const m = rawMessages[idx];
+            const reverseIdx = total - 1 - idx;
+            let html = '';
+
+            // Use RisuAI's live rendered HTML (preserves all bot Display-Regex status windows & HUDs!)
+            // while converting any blocked Tauri/blob/background-image assets into real data-URI <img> tags!
+            if (renderedMap.has(reverseIdx)) {
+                html = cleanRenderedHtml(renderedMap.get(reverseIdx), { hideAssets, fullHide });
+                if (!hideAssets && !fullHide) {
+                    html = await rehydrateBlockedImagesInHtml(html, m.data, assetLookup);
+                }
+            } else {
+                // Fallback for unmounted older messages: strip CoT & HTML comments, preserve HTML status HUDs, resolve asset tags in-place!
+                const stripped = stripThinkingFromRaw(m.data);
+
+                // Step A: Protect HTML status/HUD blocks (<statusdata>, <details>, <div...>, <table>, <style>) from escapeHtml
+                const htmlBlocks = [];
+                const htmlBlockRegex = /<statusdata\b[^>]*>[\s\S]*?<\/statusdata>|<details\b[^>]*>[\s\S]*?<\/details>|<table\b[^>]*>[\s\S]*?<\/table>|<div\b[^>]*>[\s\S]*?<\/div>|<style\b[^>]*>[\s\S]*?<\/style>/gi;
+                const withHtmlTokens = stripped.replace(htmlBlockRegex, (match) => {
+                    const hIdx = htmlBlocks.length;
+                    htmlBlocks.push(match);
+                    return `\n\n@@RISU_HTML_BLOCK_${hIdx}@@\n\n`;
+                });
+
+                // Step B: Protect image asset tags
+                const tagRegex = /<img\s*=\s*["']?([^"'\s>]+)["']?\s*\/?>|\{\{(?:img|raw|asset|image|emotion)::([^}]+)\}\}|\{\{(?:inlay|inlayed)::([a-f0-9-]+)\}\}|\[(?:img|image)\s*[:=]\s*([^\]]+)\]/gi;
+                const tokens = [];
+                const tokenized = withHtmlTokens.replace(tagRegex, (_full, g1, g2, gInlay, g4) => {
+                    const idxToken = tokens.length;
+                    if (gInlay) {
+                        tokens.push({ kind: 'inlay', val: gInlay.trim() });
+                    } else {
+                        tokens.push({ kind: 'asset', val: (g1 || g2 || g4 || '').trim() });
+                    }
+                    return `\n\n@@RISU_ASSET_TOKEN_${idxToken}@@\n\n`;
+                });
+
+                const safeText = escapeHtml(tokenized)
+                    .replace(/\*\*([\s\S]+?)\*\*/g, '<strong>$1</strong>')
+                    .replace(/\*([^*\n]+)\*/g, '<em>$1</em>')
+                    .replace(/"([^"\n]+)"/g, '<span class="q-text">"$1"</span>');
+
+                let built = safeText
+                    .split(/\n{2,}/)
+                    .map((p) => {
+                        const trimmed = p.trim();
+                        if (!trimmed) return '';
+                        if (/^@@RISU_(?:ASSET_TOKEN|HTML_BLOCK)_\d+@@$/.test(trimmed)) return trimmed;
+                        const statusMatch = trimmed.match(/^\[\s*([^|\]]+)\|\s*([^|\]]+)\|\s*([^|\]]+)\|\s*([^\]]+)\s*\]$/);
+                        if (statusMatch) {
+                            return `<div class="epub-status-card"><div>📅 <strong>날짜:</strong> ${statusMatch[1].trim()}</div><div>🕒 <strong>시간:</strong> ${statusMatch[2].trim()}</div><div>🗺️ <strong>위치:</strong> ${statusMatch[3].trim()}</div><div>💬 <strong>상황:</strong> ${statusMatch[4].trim()}</div></div>`;
+                        }
+                        return `<p>${trimmed.replace(/\n/g, '<br>')}</p>`;
+                    })
+                    .join('');
+
+                // Step C: Restore sanitized HTML status blocks (keeps original <details>/HUD design!)
+                for (let hIdx = 0; hIdx < htmlBlocks.length; hIdx++) {
+                    const marker = `@@RISU_HTML_BLOCK_${hIdx}@@`;
+                    if (fullHide) {
+                        built = built.replace(marker, '');
+                    } else {
+                        let cleanedBlock = cleanRenderedHtml(htmlBlocks[hIdx], { hideAssets, fullHide });
+                        if (!hideAssets && cleanedBlock) {
+                            cleanedBlock = await rehydrateBlockedImagesInHtml(cleanedBlock, htmlBlocks[hIdx], assetLookup);
+                        }
+                        built = built.replace(marker, cleanedBlock ? `<div class="epub-hud-wrap">${cleanedBlock}</div>` : '');
+                    }
+                }
+
+                // Step D: Restore image assets in-place
+                for (let tIdx = 0; tIdx < tokens.length; tIdx++) {
+                    const marker = `@@RISU_ASSET_TOKEN_${tIdx}@@`;
+                    if (hideAssets || fullHide) {
+                        built = built.replace(marker, '');
+                    } else {
+                        const tok = tokens[tIdx];
+                        let dataUrl = null;
+                        if (tok && tok.kind === 'inlay') {
+                            dataUrl = await getIframeDataUrlForInlay(tok.val);
+                        } else if (tok) {
+                            const assetPath = assetLookup.findPath(tok.val);
+                            dataUrl = assetPath ? await getIframeDataUrlForAsset(assetPath) : null;
+                        }
+                        if (dataUrl) {
+                            built = built.replace(marker, `<img src="${dataUrl}" alt="${escapeHtml(tok.val)}" decoding="async" />`);
+                        } else {
+                            built = built.replace(marker, '');
+                        }
+                    }
+                }
+                html = built;
+            }
+
+            if (html) {
+                items.push({ role: m.role, html });
+            }
+        }
+        return items;
+    }
+
+    async function renderCloneView(selectedMode, options = {}) {
+        currentIframeMode = 'clone';
+        pendingCloneRefresh = false;
+        lastCloneSignature = await computeChatSignature();
+        startCloneWatcher();
+        let defaultModeKey = lastCloneMode;
+        const curPresetObj = PRESETS[config.theme.preset];
+        if (curPresetObj?.isChatbot) {
+            defaultModeKey = config.theme.preset;
+        } else if (curPresetObj?.isEpub) {
+            const isDarkEpub = curPresetObj.scheme?.type === 'dark';
+            defaultModeKey = config.layout.epubTwoPage
+                ? (isDarkEpub ? 'epub-night' : 'epub-sepia')
+                : (isDarkEpub ? 'epub-night-scroll' : 'epub-sepia-scroll');
+        }
+        const modeKey = selectedMode || defaultModeKey;
+        lastCloneMode = modeKey;
+
+        const preset = PRESETS[modeKey] || PRESETS['ai-gemini'];
+        const isEpub = Boolean(preset.isEpub);
+        const isLight = preset.scheme && preset.scheme.type === 'light';
+        const activeFontKey =
+            config.theme.fontFamily && FONT_STACKS[config.theme.fontFamily] && config.theme.fontFamily !== 'inherit'
+                ? config.theme.fontFamily
+                : (isEpub ? 'epub-serif' : 'epub-clean');
+        const fontStack = (FONT_STACKS[activeFontKey] || FONT_STACKS['epub-serif']).css;
+
+        const items = await collectMessagesForReader(modeKey);
+        const twoPage = isEpub && (typeof preset.epubSpread === 'boolean' ? preset.epubSpread : config.layout.epubTwoPage);
+
+        let turnCounter = 0;
+        const userTurns = [];
+        const extractSnippet = (htmlStr) => {
+            const plain = String(htmlStr || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+            return plain.length > 22 ? plain.slice(0, 22) + '…' : plain;
+        };
+        const msgHtml = items.length
+            ? items
+                  .map((item, idx) => {
+                      const isUser = item.role === 'user';
+                      if (isUser || idx === 0) turnCounter += 1;
+                      if (isUser) {
+                          userTurns.push({ turnNum: turnCounter, snippet: extractSnippet(item.html) });
+                      }
+                      if (isEpub) {
+                          if (isUser) {
+                              return `
+                                  <div class="epub-user-block" data-user-turn="${turnCounter}">
+                                      <div class="epub-turn-tag">▸ 나 · Turn ${turnCounter}</div>
+                                      <div class="epub-turn-body">${item.html}</div>
+                                  </div>
+                              `;
+                          }
+                          return `
+                              <div class="epub-bot-block">
+                                  <div class="epub-turn-divider"><span>✦ Turn ${turnCounter}</span></div>
+                                  <div class="epub-turn-body">${item.html}</div>
+                              </div>
+                          `;
+                      }
+                      if (isUser) {
+                          return `
+                              <div class="msg-row user" data-user-turn="${turnCounter}">
+                                  <div class="user-bubble">${item.html}</div>
+                              </div>
+                          `;
+                      }
+                      return `
+                          <div class="msg-row bot">
+                              <div class="bot-avatar" style="background:${preset.badgeBg}"></div>
+                              <div class="bot-content">
+                                  <div class="bot-label">${escapeHtml(preset.brandTitle || 'Assistant')}</div>
+                                  <div class="bot-body">${item.html}</div>
+                              </div>
+                          </div>
+                      `;
+                  })
+                  .join('')
+            : `<div class="empty-state">표시할 메시지가 없습니다. 아래 입력창에서 대화를 시작해 보세요.</div>`;
+
+        const epubCSS = isEpub
+            ? `
+                .epub-stage {
+                    flex: 1; min-height: 0; display: flex; flex-direction: column;
+                    align-items: center; justify-content: center;
+                    padding: 16px 24px 8px; overflow: hidden;
+                }
+                .epub-book-frame {
+                    position: relative;
+                    width: 100%; max-width: ${twoPage ? '1240px' : '760px'};
+                    height: 100%;
+                    background: ${preset.pageBg || preset.scheme.bgcolor};
+                    border: 1px solid ${preset.borderColor};
+                    border-radius: 10px;
+                    box-shadow: 0 4px 16px rgba(0,0,0,${isLight ? '0.10' : '0.28'});
+                    overflow: hidden;
+                    contain: layout paint;
+                    perspective: 1750px;
+                    display: flex; flex-direction: column;
+                }
+                .epub-flip-leaf {
+                    position: absolute;
+                    top: 0;
+                    bottom: 40px;
+                    width: 50%;
+                    pointer-events: none;
+                    z-index: 8;
+                    display: none;
+                    backface-visibility: visible;
+                    will-change: transform, opacity;
+                    background: ${preset.pageBg || preset.scheme.bgcolor};
+                }
+                .epub-flip-leaf.flip-next {
+                    display: block;
+                    left: 50%;
+                    transform-origin: left center;
+                    border-left: 1px solid ${preset.borderColor};
+                    background: linear-gradient(90deg, ${isLight ? 'rgba(0,0,0,0.11)' : 'rgba(255,255,255,0.07)'} 0%, ${preset.pageBg || preset.scheme.bgcolor} 16%, ${preset.pageBg || preset.scheme.bgcolor} 82%, ${isLight ? 'rgba(0,0,0,0.14)' : 'rgba(0,0,0,0.55)'} 100%);
+                    box-shadow: -14px 0 34px rgba(0, 0, 0, ${isLight ? '0.24' : '0.62'});
+                    animation: epubFlipNext 640ms cubic-bezier(0.36, 0.06, 0.22, 1) forwards;
+                }
+                .epub-flip-leaf.flip-prev {
+                    display: block;
+                    left: 0;
+                    transform-origin: right center;
+                    border-right: 1px solid ${preset.borderColor};
+                    background: linear-gradient(270deg, ${isLight ? 'rgba(0,0,0,0.11)' : 'rgba(255,255,255,0.07)'} 0%, ${preset.pageBg || preset.scheme.bgcolor} 16%, ${preset.pageBg || preset.scheme.bgcolor} 82%, ${isLight ? 'rgba(0,0,0,0.14)' : 'rgba(0,0,0,0.55)'} 100%);
+                    box-shadow: 14px 0 34px rgba(0, 0, 0, ${isLight ? '0.24' : '0.62'});
+                    animation: epubFlipPrev 640ms cubic-bezier(0.36, 0.06, 0.22, 1) forwards;
+                }
+                @keyframes epubFlipNext {
+                    0% { transform: rotateY(0deg); opacity: 0.94; }
+                    22% { transform: rotateY(-32deg); opacity: 0.98; }
+                    50% { transform: rotateY(-90deg); opacity: 1; }
+                    82% { transform: rotateY(-156deg); opacity: 0.88; }
+                    100% { transform: rotateY(-180deg); opacity: 0; }
+                }
+                @keyframes epubFlipPrev {
+                    0% { transform: rotateY(0deg); opacity: 0.94; }
+                    22% { transform: rotateY(32deg); opacity: 0.98; }
+                    50% { transform: rotateY(90deg); opacity: 1; }
+                    82% { transform: rotateY(156deg); opacity: 0.88; }
+                    100% { transform: rotateY(180deg); opacity: 0; }
+                }
+                ${
+                    twoPage
+                        ? `.epub-book-frame::before {
+                            content: ''; position: absolute; top: 0; bottom: 40px; left: 50%;
+                            width: 1px; background: ${preset.borderColor}; pointer-events: none; z-index: 3;
+                        }
+                        .epub-book-frame::after {
+                            content: ''; position: absolute; top: 0; bottom: 40px; left: 50%;
+                            width: 48px; transform: translateX(-50%); pointer-events: none;
+                            background: linear-gradient(90deg, transparent, rgba(0,0,0,${isLight ? '0.07' : '0.34'}) 50%, transparent);
+                            z-index: 2;
+                        }`
+                        : ''
+                }
+                .epub-viewport {
+                    flex: 1; min-height: 0;
+                    overflow: ${twoPage ? 'hidden' : 'auto'};
+                    ${twoPage ? 'margin: 30px auto; padding: 0;' : 'padding: 30px 42px;'}
+                    scrollbar-width: none;
+                    position: relative;
+                }
+                .epub-tap-zone {
+                    position: absolute;
+                    top: 0;
+                    bottom: 40px;
+                    width: 12%;
+                    min-width: 48px;
+                    max-width: 110px;
+                    z-index: 4;
+                    cursor: pointer;
+                    background: transparent !important;
+                    user-select: none;
+                }
+                .epub-tap-zone:hover {
+                    background: transparent !important;
+                }
+                .epub-tap-left { left: 0; }
+                .epub-tap-right { right: 0; }
+                .epub-viewport::-webkit-scrollbar { display: none; }
+                .epub-columns {
+                    ${
+                        twoPage
+                            ? `height: 100%; column-fill: auto;`
+                            : `max-width: 660px; margin: 0 auto;`
+                    }
+                    font-size: ${Math.max(15, config.theme.fontSize)}px;
+                    line-height: 1.92;
+                    letter-spacing: -0.015em;
+                    word-break: keep-all;
+                    overflow-wrap: break-word;
+                    text-align: justify;
+                }
+                .epub-columns img, .epub-columns table, .epub-columns pre, .epub-columns div { max-width: 100%; }
+                .epub-columns p { margin: 0 0 0.85em; }
+                .epub-status-card {
+                    background: ${preset.userBubbleBg};
+                    border: 1px solid ${preset.borderColor};
+                    border-radius: 10px;
+                    padding: 10px 14px;
+                    margin: 12px 0;
+                    font-size: 12.5px;
+                    line-height: 1.65;
+                    text-align: left;
+                    break-inside: avoid;
+                    font-family: system-ui, -apple-system, "Malgun Gothic", sans-serif;
+                }
+                .epub-hud-wrap, .epub-columns statusdata, .epub-columns details {
+                    display: block;
+                    text-align: left !important;
+                    break-inside: avoid;
+                    margin: 12px 0;
+                    font-family: system-ui, -apple-system, "Malgun Gothic", sans-serif;
+                }
+                .epub-columns img {
+                    max-width: 100% !important;
+                    max-height: 42vh !important;
+                    width: auto !important;
+                    height: auto !important;
+                    object-fit: contain;
+                    display: block;
+                    margin: 12px auto;
+                    border-radius: 8px;
+                    break-inside: avoid;
+                }
+                .epub-user-block {
+                    background: ${preset.userBubbleBg};
+                    border: 1px solid ${preset.borderColor};
+                    border-left: 3.5px solid ${preset.defaults.accentColor};
+                    padding: 11px 15px;
+                    border-radius: 8px;
+                    margin: 16px 0 18px;
+                    break-inside: avoid;
+                    font-size: 0.94em;
+                }
+                .epub-turn-tag {
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: ${preset.defaults.accentColor};
+                    letter-spacing: 0.03em;
+                    margin-bottom: 6px;
+                    opacity: 0.92;
+                }
+                .epub-bot-block {
+                    margin-bottom: 26px;
+                    padding-left: 4px;
+                    padding-right: 4px;
+                    ${!twoPage ? 'content-visibility: auto; contain-intrinsic-size: auto 320px;' : ''}
+                }
+                .epub-turn-divider {
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                    margin: 6px 0 14px;
+                    font-size: 11px;
+                    font-weight: 700;
+                    color: ${preset.scheme.textcolor2};
+                    letter-spacing: 0.05em;
+                    break-after: avoid;
+                }
+                .epub-turn-divider::before,
+                .epub-turn-divider::after {
+                    content: '';
+                    flex: 1;
+                    height: 1px;
+                    background: ${preset.borderColor};
+                }
+                .epub-nav {
+                    height: 40px; flex-shrink: 0;
+                    display: flex; align-items: center; justify-content: center; gap: 10px;
+                    padding: 0 10px;
+                    border-top: 1px solid ${preset.borderColor};
+                    font-size: 12px; color: ${preset.scheme.textcolor2};
+                }
+                .nav-btn {
+                    white-space: nowrap; flex-shrink: 0;
+                    border: 1px solid ${preset.borderColor};
+                    background: transparent; color: ${preset.scheme.textcolor};
+                    border-radius: 8px; padding: 4px 10px; font-size: 12px; font-weight: 600; cursor: pointer;
+                }
+                .epub-book-frame.mobile-single-page::before,
+                .epub-book-frame.mobile-single-page::after {
+                    display: none !important;
+                }
+                .epub-book-frame.mobile-single-page .epub-columns {
+                    text-align: left !important;
+                }
+                .epub-book-frame.mobile-single-page .epub-flip-leaf {
+                    width: 100% !important;
+                    left: 0 !important;
+                }
+                @media (max-width: 759px) {
+                    .epub-stage { padding: 8px 10px 4px; }
+                    .epub-viewport { margin: 18px auto !important; }
+                    .clone-scroll { padding: 16px 12px 24px; }
+                    .user-bubble { max-width: 88%; padding: 10px 14px; }
+                    .clone-dock { padding: 8px 10px 10px; }
+                    .dock-pill { padding: 7px 11px; }
+                }
+                .nav-btn:hover { background: ${isLight ? 'rgba(0,0,0,0.06)' : 'rgba(255,255,255,0.08)'}; }
+            `
+            : '';
+
+        const mainContentHtml = isEpub
+            ? `
+                <div class="epub-stage">
+                    <div class="epub-book-frame">
+                        ${
+                            twoPage
+                                ? `<div class="epub-tap-zone epub-tap-left" id="epub-tap-prev" aria-label="이전 페이지"></div>
+                                   <div class="epub-tap-zone epub-tap-right" id="epub-tap-next" aria-label="다음 페이지"></div>
+                                   <div class="epub-flip-leaf" id="epub-flip-leaf"></div>`
+                                : ''
+                        }
+                        <div class="epub-viewport" id="epub-viewport">
+                            <div class="epub-columns" id="epub-columns">${msgHtml}</div>
+                        </div>
+                        ${
+                            twoPage
+                                ? `<div class="epub-nav">
+                                    <button class="nav-btn" id="epub-prev">◀ 이전 펼침</button>
+                                    <span id="epub-page-info">1 / 1 펼침</span>
+                                    <button class="nav-btn" id="epub-next">다음 펼침 ▶</button>
+                                </div>`
+                                : ''
+                        }
+                    </div>
+                </div>
+            `
+            : `
+                <div class="clone-scroll" id="clone-scroll">
+                    <div class="clone-col">${msgHtml}</div>
+                </div>
+            `;
+
+        document.body.innerHTML = `
+            <style>
+                * { box-sizing: border-box; }
+                html, body {
+                    margin: 0; padding: 0; width: 100%; height: 100%;
+                    background: ${preset.scheme.bgcolor};
+                    color: ${preset.scheme.textcolor};
+                    font-family: ${fontStack};
+                    display: flex; flex-direction: column; overflow: hidden;
+                }
+                .clone-header {
+                    min-height: 50px; height: 50px; flex-shrink: 0;
+                    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+                    padding: 0 14px;
+                    border-bottom: 1px solid ${preset.borderColor};
+                    background: ${preset.scheme.bgcolor};
+                    overflow: hidden;
+                }
+                .brand-group { display: flex; align-items: center; gap: 8px; font-weight: 700; font-size: 14.5px; flex-shrink: 0; white-space: nowrap; }
+                .brand-dot { width: 12px; height: 12px; border-radius: 50%; background: ${preset.badgeBg}; flex-shrink: 0; }
+                .mode-tabs {
+                    display: flex; align-items: center; gap: 6px; flex-wrap: nowrap;
+                    overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch;
+                    min-width: 0; padding: 2px 0;
+                }
+                .mode-tabs::-webkit-scrollbar { display: none; }
+                .tab-btn {
+                    flex-shrink: 0; white-space: nowrap;
+                    border: 1px solid ${preset.borderColor};
+                    background: ${isLight ? 'rgba(0,0,0,0.04)' : 'rgba(255,255,255,0.05)'};
+                    color: ${preset.scheme.textcolor};
+                    border-radius: 999px; padding: 5px 10px; font-size: 12px; font-weight: 600; cursor: pointer;
+                }
+                .font-ctrl-group { flex-shrink: 0; }
+                @media (max-width: 820px) {
+                    .brand-text { display: none; }
+                    .clone-header { padding: 0 10px; gap: 6px; }
+                    .tab-btn { padding: 4px 9px; font-size: 11.5px; }
+                }
+                .tab-btn.active {
+                    background: ${preset.defaults.accentColor}; color: ${getContrastText(preset.defaults.accentColor)}; border-color: transparent;
+                }
+                .font-ctrl-group {
+                    display: inline-flex; align-items: center; gap: 4px;
+                    padding: 2px 6px; border-radius: 999px;
+                    border: 1px solid ${preset.borderColor};
+                    background: ${isLight ? 'rgba(0,0,0,0.03)' : 'rgba(255,255,255,0.04)'};
+                }
+                .font-select {
+                    border: none; outline: none; background: transparent;
+                    color: ${preset.scheme.textcolor}; font-size: 11.5px; font-weight: 600;
+                    cursor: pointer; padding: 2px 4px;
+                }
+                .font-select option {
+                    background: ${isLight ? '#ffffff' : '#1b1d24'};
+                    color: ${isLight ? '#1a1918' : '#ececec'};
+                }
+                .font-step-btn {
+                    border: none; background: transparent; color: ${preset.scheme.textcolor};
+                    font-size: 12px; font-weight: 700; cursor: pointer;
+                    padding: 2px 5px; border-radius: 6px;
+                }
+                .font-step-btn:hover { background: ${isLight ? 'rgba(0,0,0,0.08)' : 'rgba(255,255,255,0.10)'}; }
+                .font-size-lbl {
+                    font-size: 11px; font-weight: 700; opacity: 0.78; min-width: 28px; text-align: center;
+                }
+                .clone-scroll { flex: 1; overflow-y: auto; padding: 26px 20px 38px; contain: strict; }
+                .msg-row { content-visibility: auto; contain-intrinsic-size: auto 180px; }
+                .clone-col { max-width: ${preset.defaults.chatMaxWidth}px; margin: 0 auto; display: flex; flex-direction: column; gap: 22px; }
+                .msg-row.user { display: flex; justify-content: flex-end; }
+                .user-bubble {
+                    background: ${preset.userBubbleBg};
+                    color: ${preset.scheme.textcolor};
+                    padding: 12px 18px; border-radius: 20px; max-width: 78%;
+                    font-size: ${config.theme.fontSize}px; line-height: ${config.theme.lineHeight};
+                }
+                .user-bubble p, .bot-body p { margin: 0 0 0.7em; }
+                .user-bubble p:last-child, .bot-body p:last-child { margin-bottom: 0; }
+                .msg-row.bot { display: flex; align-items: flex-start; gap: 14px; }
+                .bot-avatar { width: 26px; height: 26px; border-radius: 50%; flex-shrink: 0; margin-top: 2px; }
+                .bot-content { flex: 1; min-width: 0; }
+                .bot-label { font-size: 12px; font-weight: 700; opacity: 0.65; margin-bottom: 6px; }
+                .bot-body {
+                    font-size: ${config.theme.fontSize}px;
+                    line-height: ${config.theme.lineHeight};
+                    word-break: keep-all;
+                }
+                .bot-body img { max-width: 100%; border-radius: 10px; margin: 10px 0; }
+                .q-text { color: ${preset.textTheme.FontColorQuote1}; }
+                mark {
+                    background: transparent !important;
+                    color: ${preset.textTheme.FontColorQuote1} !important;
+                    padding: 0 !important;
+                }
+                mark[risu-mark="quote2"] {
+                    color: ${preset.textTheme.FontColorQuote2} !important;
+                }
+                .empty-state { text-align: center; opacity: 0.6; padding: 80px 20px; font-size: 14px; }
+                .clone-dock { flex-shrink: 0; padding: 10px 20px 14px; background: ${preset.scheme.bgcolor}; }
+                .dock-pill {
+                    max-width: ${isEpub && twoPage ? '920px' : `${preset.defaults.chatMaxWidth}px`};
+                    margin: 0 auto; display: flex; align-items: flex-end; gap: 10px;
+                    background: ${preset.inputBg}; border: 1px solid ${preset.inputBorder};
+                    border-radius: 24px; padding: 9px 14px; box-shadow: 0 3px 12px rgba(0,0,0,0.12);
+                }
+                .dock-pill textarea {
+                    flex: 1; border: none; outline: none; resize: none; background: transparent;
+                    color: ${preset.scheme.textcolor}; font-family: inherit; font-size: 15px; line-height: 1.5;
+                    max-height: 120px; min-height: 24px; overflow-y: auto; scrollbar-width: none;
+                }
+                .send-btn {
+                    background: ${preset.defaults.accentColor}; color: ${getContrastText(preset.defaults.accentColor)}; border: none;
+                    border-radius: 999px; padding: 7px 14px; font-size: 13px; font-weight: 700; cursor: pointer;
+                }
+                .send-btn:disabled { opacity: 0.5; cursor: wait; }
+                .turn-ruler-wrap {
+                    flex-shrink: 0;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    padding: 4px 20px 2px;
+                    background: ${preset.scheme.bgcolor};
+                    position: relative;
+                    z-index: 15;
+                }
+                .turn-ruler-track {
+                    display: flex;
+                    align-items: flex-end;
+                    justify-content: center;
+                    gap: 2px;
+                    max-width: ${isEpub && twoPage ? '920px' : `${preset.defaults.chatMaxWidth}px`};
+                    width: 100%;
+                    height: 22px;
+                    overflow: visible;
+                }
+                .turn-tick {
+                    position: relative;
+                    border: none;
+                    background: transparent;
+                    padding: 5px 4px 3px;
+                    margin: 0;
+                    cursor: pointer;
+                    display: inline-flex;
+                    align-items: flex-end;
+                    justify-content: center;
+                    height: 22px;
+                    outline: none;
+                }
+                .tick-bar {
+                    display: block;
+                    width: 2px;
+                    height: 8px;
+                    border-radius: 2px;
+                    background: ${preset.scheme.textcolor2};
+                    opacity: 0.36;
+                    transform-origin: bottom center;
+                    will-change: transform, opacity;
+                    transition: transform 120ms ease, opacity 120ms ease;
+                }
+                .turn-tick.major .tick-bar {
+                    transform: scaleY(1.35);
+                    opacity: 0.55;
+                }
+                .turn-tick.active .tick-bar {
+                    transform: scaleY(1.5);
+                    background: ${preset.defaults.accentColor};
+                    opacity: 0.92;
+                }
+                .turn-tick:hover .tick-bar {
+                    transform: scaleX(1.5) scaleY(2.15);
+                    background: ${preset.defaults.accentColor};
+                    opacity: 1;
+                }
+                .tick-tip {
+                    position: absolute;
+                    bottom: calc(100% + 6px);
+                    left: 50%;
+                    transform: translateX(-50%) translateY(4px);
+                    background: ${isLight ? '#1f1d1a' : '#2a2d38'};
+                    color: #f4f4f6;
+                    border: 1px solid ${isLight ? 'rgba(0,0,0,0.18)' : 'rgba(255,255,255,0.14)'};
+                    font-size: 11px;
+                    font-weight: 600;
+                    padding: 4px 9px;
+                    border-radius: 8px;
+                    white-space: nowrap;
+                    pointer-events: none;
+                    opacity: 0;
+                    box-shadow: 0 6px 18px rgba(0,0,0,0.28);
+                    transition: opacity 130ms ease, transform 130ms ease;
+                    z-index: 50;
+                    font-family: system-ui, -apple-system, "Malgun Gothic", sans-serif;
+                }
+                .turn-tick:hover .tick-tip {
+                    opacity: 1;
+                    transform: translateX(-50%) translateY(0);
+                }
+                ${epubCSS}
+            </style>
+            <div class="clone-header">
+                <div class="brand-group">
+                    <span class="brand-dot"></span>
+                    <span class="brand-text">${escapeHtml(preset.brandTitle)} ${escapeHtml(preset.brandModel)}</span>
+                </div>
+                <div class="mode-tabs">
+                    <div class="font-ctrl-group" title="글꼴 및 크기 설정">
+                        <select class="font-select" id="reader-font-select">
+                            <option value="epub-serif" ${activeFontKey === 'epub-serif' ? 'selected' : ''}>명조체</option>
+                            <option value="epub-sans" ${activeFontKey === 'epub-sans' ? 'selected' : ''}>고딕체</option>
+                            <option value="epub-clean" ${activeFontKey === 'epub-clean' ? 'selected' : ''}>산세리프</option>
+                            <option value="inherit" ${config.theme.fontFamily === 'inherit' ? 'selected' : ''}>기본</option>
+                        </select>
+                        <button class="font-step-btn" id="reader-font-dec" title="글자 작게">A-</button>
+                        <span class="font-size-lbl" id="reader-font-val">${config.theme.fontSize}</span>
+                        <button class="font-step-btn" id="reader-font-inc" title="글자 크게">A+</button>
+                    </div>
+                    <button class="tab-btn ${modeKey === 'ai-gemini' ? 'active' : ''}" data-cmode="ai-gemini">Gemini</button>
+                    <button class="tab-btn ${modeKey === 'ai-claude' ? 'active' : ''}" data-cmode="ai-claude">Claude</button>
+                    <button class="tab-btn ${modeKey === 'ai-chatgpt' ? 'active' : ''}" data-cmode="ai-chatgpt">ChatGPT</button>
+                    <button class="tab-btn ${modeKey === 'epub-sepia-scroll' ? 'active' : ''}" data-cmode="epub-sepia-scroll">📜 1쪽(낮)</button>
+                    <button class="tab-btn ${modeKey === 'epub-night-scroll' ? 'active' : ''}" data-cmode="epub-night-scroll">📜 1쪽(밤)</button>
+                    <button class="tab-btn ${modeKey === 'epub-sepia' ? 'active' : ''}" data-cmode="epub-sepia">📖 2쪽(낮)</button>
+                    <button class="tab-btn ${modeKey === 'epub-night' ? 'active' : ''}" data-cmode="epub-night">🌙 2쪽(밤)</button>
+                    ${isEpub ? `<button class="tab-btn ${config.layout.epubShowAssets ? 'active' : ''}" id="btn-epub-assets">${config.layout.epubShowAssets ? '🖼️ 에셋 ON' : '🖼️ 에셋 OFF'}</button>` : ''}
+                    <button class="tab-btn" id="btn-refresh-clone" title="화면 새로고침 (인레이·에셋 다시 불러오기)">🔄</button>
+                    <button class="tab-btn" id="btn-open-studio-from-clone" title="테마 & UX 설정">🎨</button>
+                    <button class="tab-btn" id="btn-exit-clone">원래 화면</button>
+                </div>
+            </div>
+            ${mainContentHtml}
+            ${
+                userTurns.length > 0
+                    ? `<div class="turn-ruler-wrap" id="turn-ruler">
+                        <div class="turn-ruler-track">
+                            ${userTurns
+                                .map(
+                                    (ut, i) => `
+                                <button class="turn-tick ${i === userTurns.length - 1 ? 'active' : ''} ${ut.turnNum % 5 === 0 ? 'major' : ''}" data-jump-turn="${ut.turnNum}" aria-label="${ut.turnNum}턴">
+                                    <span class="tick-tip">${ut.turnNum}턴${ut.snippet ? ` · ${escapeHtml(ut.snippet)}` : ''}</span>
+                                    <span class="tick-bar"></span>
+                                </button>`
+                                )
+                                .join('')}
+                        </div>
+                    </div>`
+                    : ''
+            }
+            <div class="clone-dock">
+                <div class="dock-pill">
+                    <textarea id="clone-input" rows="1" placeholder="${escapeHtml(preset.brandTitle)}에게 메시지 보내기... (Enter 전송)"></textarea>
+                    <button class="send-btn" id="clone-send">전송</button>
+                </div>
+            </div>
+        `;
+
+        if (isEpub && twoPage) {
+            const vp = document.getElementById('epub-viewport');
+            const cols = document.getElementById('epub-columns');
+            const info = document.getElementById('epub-page-info');
+            let colGap = 96;
+            let colsPerSpread = 2;
+            let spreadStride = 1;
+            let totalSpreads = 1;
+            let curSpread = 0;
+            let wheelLock = false;
+
+            const updatePageInfo = () => {
+                if (!info) return;
+                if (colsPerSpread === 1) {
+                    info.textContent = `${curSpread + 1} / ${totalSpreads}쪽`;
+                } else {
+                    const pLeft = curSpread * 2 + 1;
+                    const pRight = curSpread * 2 + 2;
+                    info.textContent = `${pLeft}–${pRight}쪽 (${curSpread + 1} / ${totalSpreads} 펼침)`;
+                }
+            };
+
+            const flipLeaf = document.getElementById('epub-flip-leaf');
+            let flipMidTimer = null;
+            let flipEndTimer = null;
+
+            const goToSpread = (idx, animateFlip) => {
+                if (!vp) return;
+                const prevSpread = curSpread;
+                const nextSpread = Math.max(0, Math.min(totalSpreads - 1, idx));
+                curSpread = nextSpread;
+
+                if (flipMidTimer) { clearTimeout(flipMidTimer); flipMidTimer = null; }
+                if (flipEndTimer) { clearTimeout(flipEndTimer); flipEndTimer = null; }
+
+                if (animateFlip && flipLeaf && nextSpread !== prevSpread) {
+                    const dirClass = nextSpread > prevSpread ? 'flip-next' : 'flip-prev';
+                    flipLeaf.classList.remove('flip-next', 'flip-prev');
+                    // Restart GPU animation cleanly
+                    void flipLeaf.offsetWidth;
+                    flipLeaf.classList.add(dirClass);
+
+                    // Swap the underlying spread at the exact midpoint when the paper stands upright
+                    flipMidTimer = setTimeout(() => {
+                        flipMidTimer = null;
+                        vp.scrollLeft = curSpread * spreadStride;
+                        updatePageInfo();
+                    }, 300);
+
+                    flipEndTimer = setTimeout(() => {
+                        flipEndTimer = null;
+                        flipLeaf.classList.remove('flip-next', 'flip-prev');
+                    }, 650);
+                } else {
+                    if (flipLeaf) flipLeaf.classList.remove('flip-next', 'flip-prev');
+                    vp.scrollLeft = curSpread * spreadStride;
+                    updatePageInfo();
+                }
+            };
+
+            const layoutSpreads = (jumpToLast) => {
+                if (!vp || !cols) return;
+                const frame = vp.parentElement;
+                const frameW = frame ? frame.clientWidth : vp.clientWidth;
+                const isNarrow = frameW < 760;
+                colsPerSpread = isNarrow ? 1 : 2;
+                colGap = isNarrow ? 36 : 96;
+                const sideMargin = isNarrow ? 36 : 96;
+
+                if (frame) {
+                    frame.classList.toggle('mobile-single-page', isNarrow);
+                }
+
+                const rawInnerW = Math.max(220, frameW - sideMargin);
+                const evenW = Math.floor(rawInnerW / 2) * 2;
+                vp.style.width = `${evenW}px`;
+                cols.style.width = `${evenW}px`;
+                cols.style.margin = '0';
+                cols.style.padding = '0';
+                cols.style.boxSizing = 'border-box';
+                cols.style.columnWidth = 'auto';
+                cols.style.columnCount = String(colsPerSpread);
+                cols.style.columnGap = `${colGap}px`;
+                cols.style.columnFill = 'auto';
+                cols.style.height = '100%';
+                spreadStride = evenW + colGap;
+                totalSpreads = Math.max(1, Math.ceil((cols.scrollWidth - 4) / spreadStride));
+                if (jumpToLast && typeof options.targetSpread === 'number') {
+                    goToSpread(options.targetSpread, false);
+                } else if (jumpToLast && options.jumpToTurn) {
+                    const tEl = cols.querySelector(`[data-user-turn="${options.jumpToTurn}"]`);
+                    if (tEl) {
+                        const vpRect = vp.getBoundingClientRect();
+                        const tRect = tEl.getBoundingClientRect();
+                        const absLeft = (tRect.left - vpRect.left) + vp.scrollLeft;
+                        goToSpread(Math.floor(Math.max(0, absLeft + 4) / spreadStride), false);
+                    } else {
+                        goToSpread(curSpread, false);
+                    }
+                } else if (jumpToLast && options.preservePosition && typeof options.scrollRatio === 'number') {
+                    const targetSpread = Math.round(options.scrollRatio * Math.max(0, totalSpreads - 1));
+                    goToSpread(targetSpread, false);
+                } else if (jumpToLast) {
+                    const userBlocks = cols.querySelectorAll('.epub-user-block');
+                    const targetEl = userBlocks.length
+                        ? userBlocks[userBlocks.length - 1]
+                        : cols.querySelector('.epub-bot-block:last-of-type');
+                    if (targetEl) {
+                        const vpRect = vp.getBoundingClientRect();
+                        const tRect = targetEl.getBoundingClientRect();
+                        const absLeft = (tRect.left - vpRect.left) + vp.scrollLeft;
+                        const targetSpread = Math.floor(Math.max(0, absLeft + 4) / spreadStride);
+                        goToSpread(targetSpread, false);
+                    } else {
+                        goToSpread(totalSpreads - 1, false);
+                    }
+                } else {
+                    goToSpread(curSpread, false);
+                }
+            };
+
+            const turnPage = (dir) => {
+                const nextSpread = Math.max(0, Math.min(totalSpreads - 1, curSpread + dir));
+                if (pendingCloneRefresh && config.layout.autoRefreshClone) {
+                    pendingCloneRefresh = false;
+                    renderCloneView(modeKey, { targetSpread: nextSpread });
+                    return;
+                }
+                goToSpread(nextSpread, true);
+            };
+
+            setTimeout(() => layoutSpreads(true), 60);
+            let resizeTimer = null;
+            window.onresize = () => {
+                if (resizeTimer) clearTimeout(resizeTimer);
+                resizeTimer = setTimeout(() => layoutSpreads(false), 110);
+            };
+
+            let touchStartX = 0;
+            let touchStartY = 0;
+            const bookFrameEl = vp ? vp.parentElement : null;
+            if (bookFrameEl) {
+                bookFrameEl.ontouchstart = (e) => {
+                    if (e.touches && e.touches.length === 1) {
+                        touchStartX = e.touches[0].clientX;
+                        touchStartY = e.touches[0].clientY;
+                    }
+                };
+                bookFrameEl.ontouchend = (e) => {
+                    if (!e.changedTouches || !e.changedTouches.length) return;
+                    const dx = e.changedTouches[0].clientX - touchStartX;
+                    const dy = e.changedTouches[0].clientY - touchStartY;
+                    if (Math.abs(dx) > 45 && Math.abs(dx) > Math.abs(dy) * 1.25) {
+                        turnPage(dx < 0 ? 1 : -1);
+                    }
+                };
+            }
+
+            vp.onwheel = (e) => {
+                if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+                    e.preventDefault();
+                    if (wheelLock) return;
+                    wheelLock = true;
+                    turnPage(e.deltaY > 0 ? 1 : -1);
+                    setTimeout(() => { wheelLock = false; }, 260);
+                }
+            };
+            document.getElementById('epub-prev').onclick = () => turnPage(-1);
+            document.getElementById('epub-next').onclick = () => turnPage(1);
+            const tapPrev = document.getElementById('epub-tap-prev');
+            const tapNext = document.getElementById('epub-tap-next');
+            if (tapPrev) tapPrev.onclick = () => turnPage(-1);
+            if (tapNext) tapNext.onclick = () => turnPage(1);
+            document.onkeydown = (e) => {
+                if (document.activeElement && document.activeElement.tagName === 'TEXTAREA') return;
+                if (e.key === 'ArrowRight') turnPage(1);
+                if (e.key === 'ArrowLeft') turnPage(-1);
+            };
+
+            // Bind Turn Ruler ticks for 2-page EPUB spread
+            document.querySelectorAll('[data-jump-turn]').forEach((tickBtn) => {
+                tickBtn.onclick = () => {
+                    const tNum = tickBtn.getAttribute('data-jump-turn');
+                    if (pendingCloneRefresh && config.layout.autoRefreshClone) {
+                        pendingCloneRefresh = false;
+                        renderCloneView(modeKey, { jumpToTurn: tNum });
+                        return;
+                    }
+                    const targetEl = cols ? cols.querySelector(`[data-user-turn="${tNum}"]`) : null;
+                    if (!targetEl || !vp) return;
+                    const vpRect = vp.getBoundingClientRect();
+                    const tRect = targetEl.getBoundingClientRect();
+                    const absLeft = (tRect.left - vpRect.left) + vp.scrollLeft;
+                    const targetSpread = Math.floor(Math.max(0, absLeft + 4) / spreadStride);
+                    goToSpread(targetSpread, true);
+                    document.querySelectorAll('.turn-tick').forEach((b) => b.classList.remove('active'));
+                    tickBtn.classList.add('active');
+                };
+            });
+        } else {
+            document.onkeydown = null;
+            const scrollEl = document.getElementById('clone-scroll') || document.getElementById('epub-viewport');
+            if (scrollEl) {
+                if (options.jumpToTurn) {
+                    const tEl = scrollEl.querySelector(`[data-user-turn="${options.jumpToTurn}"]`);
+                    if (tEl) tEl.scrollIntoView({ behavior: 'auto', block: 'start' });
+                } else if (options.preservePosition && typeof options.scrollRatio === 'number') {
+                    const maxScroll = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight);
+                    scrollEl.scrollTop = Math.round(options.scrollRatio * maxScroll);
+                } else {
+                const userEls = scrollEl.querySelectorAll('.epub-user-block, .msg-row.user');
+                const target = userEls.length ? userEls[userEls.length - 1] : null;
+                if (target) {
+                    target.scrollIntoView({ behavior: 'auto', block: 'start' });
+                } else {
+                    scrollEl.scrollTop = scrollEl.scrollHeight;
+                }
+                }
+            }
+
+            // Bind Turn Ruler ticks for 1-page EPUB scroll & Official Chatbot views
+            document.querySelectorAll('[data-jump-turn]').forEach((tickBtn) => {
+                tickBtn.onclick = () => {
+                    const tNum = tickBtn.getAttribute('data-jump-turn');
+                    if (pendingCloneRefresh && config.layout.autoRefreshClone) {
+                        pendingCloneRefresh = false;
+                        renderCloneView(modeKey, { jumpToTurn: tNum });
+                        return;
+                    }
+                    const targetEl = document.querySelector(`[data-user-turn="${tNum}"]`);
+                    if (!targetEl) return;
+                    targetEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    document.querySelectorAll('.turn-tick').forEach((b) => b.classList.remove('active'));
+                    tickBtn.classList.add('active');
+                };
+            });
+        }
+
+        const spreadBtn = document.getElementById('btn-toggle-spread');
+        if (spreadBtn) {
+            spreadBtn.onclick = async () => {
+                config.layout.epubTwoPage = !config.layout.epubTwoPage;
+                await saveConfig();
+                await renderCloneView(modeKey);
+            };
+        }
+
+        const getCurrentReadingRatio = () => {
+            const vpEl = document.getElementById('epub-viewport');
+            if (isEpub && twoPage && vpEl) {
+                const maxLeft = Math.max(1, vpEl.scrollWidth - vpEl.clientWidth);
+                return Math.max(0, Math.min(1, vpEl.scrollLeft / maxLeft));
+            }
+            const scEl = document.getElementById('clone-scroll') || vpEl;
+            if (scEl) {
+                const maxTop = Math.max(1, scEl.scrollHeight - scEl.clientHeight);
+                return Math.max(0, Math.min(1, scEl.scrollTop / maxTop));
+            }
+            return 1;
+        };
+
+        const fontSel = document.getElementById('reader-font-select');
+        if (fontSel) {
+            fontSel.onchange = async (e) => {
+                const ratio = getCurrentReadingRatio();
+                config.theme.fontFamily = e.target.value;
+                await saveConfig();
+                await upsertStyleTag('theme-layout-stealth', buildLayoutAndThemeCSS());
+                await renderCloneView(modeKey, { preservePosition: true, scrollRatio: ratio });
+            };
+        }
+        const stepFontSize = async (delta) => {
+            const nextSize = Math.max(12, Math.min(24, (Number(config.theme.fontSize) || 15) + delta));
+            if (nextSize === config.theme.fontSize) return;
+            const ratio = getCurrentReadingRatio();
+            config.theme.fontSize = nextSize;
+            await saveConfig();
+            await upsertStyleTag('theme-layout-stealth', buildLayoutAndThemeCSS());
+            await renderCloneView(modeKey, { preservePosition: true, scrollRatio: ratio });
+        };
+        const btnDec = document.getElementById('reader-font-dec');
+        const btnInc = document.getElementById('reader-font-inc');
+        if (btnDec) btnDec.onclick = () => stepFontSize(-1);
+        if (btnInc) btnInc.onclick = () => stepFontSize(1);
+
+        document.querySelectorAll('[data-cmode]').forEach((btn) => {
+            btn.onclick = () => renderCloneView(btn.getAttribute('data-cmode'));
+        });
+
+        const epubAssetsBtn = document.getElementById('btn-epub-assets');
+        if (epubAssetsBtn) {
+            epubAssetsBtn.onclick = async () => {
+                const ratio = getCurrentReadingRatio();
+                config.layout.epubShowAssets = !config.layout.epubShowAssets;
+                await saveConfig();
+                await renderCloneView(modeKey, { preservePosition: true, scrollRatio: ratio });
+            };
+        }
+
+        const refreshCloneBtn = document.getElementById('btn-refresh-clone');
+        if (refreshCloneBtn) {
+            refreshCloneBtn.onclick = async () => {
+                const ratio = getCurrentReadingRatio();
+                refreshCloneBtn.disabled = true;
+                await renderCloneView(modeKey, { preservePosition: true, scrollRatio: ratio });
+            };
+        }
+
+        const openStudioBtn = document.getElementById('btn-open-studio-from-clone');
+        if (openStudioBtn) {
+            openStudioBtn.onclick = () => {
+                document.onkeydown = null;
+                renderStudioUI();
+            };
+        }
+
+        document.getElementById('btn-exit-clone').onclick = async () => {
+            currentIframeMode = null;
+            stopCloneWatcher();
+            document.onkeydown = null;
+            await risuai.hideContainer();
+        };
+
+        const inputEl = document.getElementById('clone-input');
+        const sendBtn = document.getElementById('clone-send');
+        const doSend = async () => {
+            const val = inputEl.value.trim();
+            if (!val) return;
+            inputEl.value = '';
+            sendBtn.disabled = true;
+            sendBtn.textContent = '생성 중...';
+            try {
+                await risuai.sendChat(val);
+            } catch (err) {
+                console.warn('[RisuStand] 메시지 전송 실패:', err);
+            } finally {
+                if (currentIframeMode === 'clone') {
+                    setTimeout(() => renderCloneView(modeKey), 250);
+                }
+            }
+        };
+
+        sendBtn.onclick = doSend;
+        inputEl.onkeydown = (e) => {
+            if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+                e.preventDefault();
+                doSend();
+            }
+        };
+    }
+
+    async function openCloneView() {
+        await risuai.showContainer('fullscreen');
+        await renderCloneView();
+    }
+
+    // =========================================================================
+    // 5. Fullscreen Theme & Layout Studio UI
+    // =========================================================================
+    function renderStudioUI() {
+        currentIframeMode = 'studio';
+        stopCloneWatcher();
+        document.onkeydown = null;
+        const renderPresetCard = ([key, p]) => {
+            const active =
+                config.theme.preset === key ||
+                (key === 'epub-sepia' && config.theme.preset === 'epub-sepia-scroll') ||
+                (key === 'epub-night' && config.theme.preset === 'epub-night-scroll')
+                    ? 'active'
+                    : '';
+            const swatchBg = p.scheme ? p.scheme.bgcolor : '#1e1f26';
+            const swatchAccent = p.defaults.accentColor;
+            const swatchQuote = p.defaults.quoteColor;
+            const tag = p.isChatbot ? '<span class="pill">에셋 자동숨김</span>' : '';
+            return `
+                <button class="preset-card ${active}" data-preset="${key}">
+                    <div class="swatch-row">
+                        <span class="swatch" style="background:${swatchBg}"></span>
+                        <span class="swatch" style="background:${swatchAccent}"></span>
+                        <span class="swatch" style="background:${swatchQuote}"></span>
+                        ${tag}
+                    </div>
+                    <div class="preset-title">${escapeHtml(p.label)}</div>
+                    <div class="preset-desc">${escapeHtml(p.desc)}</div>
+                </button>
+            `;
+        };
+        const mainSkinCards = Object.entries(PRESETS)
+            .filter(([key]) => key !== 'epub-sepia-scroll' && key !== 'epub-night-scroll')
+            .map(renderPresetCard)
+            .join('');
+
+        const fontOptions = Object.entries(FONT_STACKS)
+            .map(([key, f]) => `<option value="${key}" ${config.theme.fontFamily === key ? 'selected' : ''}>${escapeHtml(f.label)}</option>`)
+            .join('');
+
+        const permBanner = domPermissionGranted
+            ? `<div class="badge ok">mainDom 권한 활성 · 자동 최소화 드래그 바, 2단 스텔스, 2쪽 EPUB &amp; 테마 전체 작동 중</div>`
+            : `<div class="badge warn">mainDom 권한 미승인 · 기본 색상 테마만 적용됩니다. 아래 버튼으로 권한을 허용해 주세요.</div>`;
+
+        document.body.innerHTML = `
+            <style>
+                * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Pretendard", "Malgun Gothic", "Noto Sans KR", sans-serif; }
+                html { margin: 0; padding: 0; width: 100%; height: 100%; background: transparent !important; }
+                body { margin: 0; padding: 0; width: 100%; height: 100%; background: rgba(10, 12, 18, 0.86); color: #eef2ff; backdrop-filter: blur(8px); }
+                .shell { max-width: 980px; margin: 20px auto; background: #141824; border: 1px solid #283047; border-radius: 18px; overflow: hidden; box-shadow: 0 24px 64px rgba(0,0,0,0.55); display: flex; flex-direction: column; max-height: calc(100vh - 40px); }
+                @media (max-width: 680px) {
+                    .shell { margin: 8px; max-height: calc(100vh - 16px); border-radius: 14px; }
+                    .header { padding: 12px 14px; flex-wrap: wrap; gap: 8px; }
+                    .content { padding: 12px 14px; gap: 12px; }
+                    .section { padding: 14px; }
+                    .preset-grid { grid-template-columns: repeat(auto-fill, minmax(145px, 1fr)); }
+                    .footer { padding: 10px 14px; flex-wrap: wrap; }
+                }
+                .header { display: flex; justify-content: space-between; align-items: center; padding: 16px 24px; background: #101420; border-bottom: 1px solid #232b40; }
+                .header h1 { margin: 0; font-size: 17px; font-weight: 700; display: flex; align-items: center; gap: 10px; }
+                .hdr-actions { display: flex; gap: 8px; }
+                .close-btn { background: #232a3e; color: #dbe4ff; border: 1px solid #35405e; border-radius: 10px; padding: 7px 13px; cursor: pointer; font-weight: 600; font-size: 13px; }
+                .close-btn:hover { background: #2f3854; }
+                .content { padding: 18px 24px; overflow-y: auto; display: flex; flex-direction: column; gap: 18px; }
+                .badge { padding: 10px 14px; border-radius: 10px; font-size: 13px; }
+                .badge.ok { background: rgba(52, 211, 153, 0.12); border: 1px solid rgba(52, 211, 153, 0.35); color: #a7f3d0; }
+                .badge.warn { background: rgba(251, 191, 36, 0.12); border: 1px solid rgba(251, 191, 36, 0.35); color: #fde68a; }
+                .section { background: #191f30; border: 1px solid #26304a; border-radius: 14px; padding: 16px 18px; }
+                .section h2 { margin: 0 0 6px; font-size: 15px; font-weight: 700; }
+                .section .sub { margin: 0 0 12px; font-size: 12.5px; color: #9aa7c7; line-height: 1.5; }
+                .preset-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(195px, 1fr)); gap: 10px; }
+                .preset-card { text-align: left; background: #121726; border: 1px solid #293350; border-radius: 12px; padding: 12px; color: #e8eeff; cursor: pointer; transition: transform 120ms ease, border-color 120ms ease; }
+                .preset-card:hover { transform: translateY(-1px); border-color: #6b7cff; }
+                .preset-card.active { border-color: #818cf8; background: #1d2540; box-shadow: 0 0 0 2px rgba(129, 140, 248, 0.25); }
+                .swatch-row { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+                .swatch { width: 15px; height: 15px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.22); flex-shrink: 0; }
+                .pill { margin-left: auto; font-size: 10px; font-weight: 700; padding: 2px 6px; border-radius: 999px; background: rgba(16, 185, 129, 0.18); color: #6ee7b7; border: 1px solid rgba(16, 185, 129, 0.35); }
+                .pill.epub { background: rgba(245, 158, 11, 0.18); color: #fcd34d; border-color: rgba(245, 158, 11, 0.35); }
+                .pill.scroll { background: rgba(96, 165, 250, 0.18); color: #93c5fd; border-color: rgba(96, 165, 250, 0.35); }
+                .preset-title { font-size: 13.5px; font-weight: 700; margin-bottom: 4px; }
+                .preset-desc { font-size: 11.5px; color: #9aa7c7; line-height: 1.4; }
+                .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+                .field { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+                .field label { display: flex; justify-content: space-between; color: #c7d2f0; font-weight: 600; }
+                .field input[type="range"], .field select, .field textarea { width: 100%; }
+                .field select, .field textarea { background: #101420; color: #eef2ff; border: 1px solid #2c3754; border-radius: 8px; padding: 8px 10px; font-size: 13px; }
+                .field input[type="color"] { width: 100%; height: 36px; border: 1px solid #2c3754; border-radius: 8px; background: #101420; cursor: pointer; }
+                .toggle-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #232c45; font-size: 13.5px; }
+                .toggle-row:last-child { border-bottom: none; }
+                .footer { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 14px 24px; background: #101420; border-top: 1px solid #232b40; }
+                .btn { padding: 9px 16px; border-radius: 10px; border: 1px solid transparent; font-size: 13.5px; font-weight: 700; cursor: pointer; }
+                .btn-primary { background: #6366f1; color: #fff; }
+                .btn-primary:hover { background: #4f46e5; }
+                .btn-ghost { background: #1f263b; color: #cbd5f5; border-color: #313d5e; }
+                .btn-ghost:hover { background: #29324d; }
+                body { transition: background 140ms ease; }
+                .shell, .section, .header, .footer, .badge, .field, .toggle-row, .preset-grid {
+                    transition: opacity 140ms ease, background 140ms ease, border-color 140ms ease;
+                }
+                body.live-previewing {
+                    background: transparent !important;
+                    backdrop-filter: none !important;
+                    -webkit-backdrop-filter: none !important;
+                }
+                body.live-previewing .content {
+                    scrollbar-width: none !important;
+                }
+                body.live-previewing .content::-webkit-scrollbar {
+                    display: none !important;
+                }
+                body.live-previewing .shell,
+                body.live-previewing .section,
+                body.live-previewing .header,
+                body.live-previewing .footer {
+                    background: transparent !important;
+                    border-color: transparent !important;
+                    box-shadow: none !important;
+                }
+                body.live-previewing .header,
+                body.live-previewing .footer,
+                body.live-previewing .badge,
+                body.live-previewing .section h2,
+                body.live-previewing .section .sub,
+                body.live-previewing .preset-grid,
+                body.live-previewing .toggle-row:not(.active-preview-field),
+                body.live-previewing .field:not(.active-preview-field) {
+                    opacity: 0 !important;
+                    visibility: hidden !important;
+                    pointer-events: none !important;
+                }
+                body.live-previewing .active-preview-field {
+                    opacity: 0.96 !important;
+                    visibility: visible !important;
+                    background: rgba(16, 20, 32, 0.84) !important;
+                    border: 1px solid rgba(129, 140, 248, 0.65) !important;
+                    border-radius: 12px;
+                    padding: 10px 14px !important;
+                    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.38);
+                }
+            </style>
+            <div class="shell">
+                <div class="header">
+                    <h1>📖 RisuStand v1.0.0</h1>
+                    <div class="hdr-actions">
+                        <button class="close-btn" id="btn-open-clone">🖥️ 공홈 · 2쪽 EPUB 뷰 열기</button>
+                        <button class="close-btn" id="btn-close">닫기</button>
+                    </div>
+                </div>
+                <div class="content">
+                    ${permBanner}
+
+                    <div class="section">
+                        <h2>🎨 기존 RisuAI 채팅 화면 꾸미기 (메인 화면 스킨)</h2>
+                        <p class="sub">원래 RisuAI 채팅창과 봇 메뉴를 그대로 유지하면서 배경·카드·배색을 적용합니다.</p>
+                        <div class="preset-grid">${mainSkinCards}</div>
+
+                        <h2 style="margin-top:20px;">🖥️ 전체 화면 전용 뷰 바로 열기 (새 화면 렌더링)</h2>
+                        <p class="sub">메인 채팅창 대신 전용 공홈 화면이나 1쪽·2쪽 전자책 뷰어를 전체 화면으로 바로 띄웁니다.</p>
+                        <div style="display:flex; flex-wrap:wrap; gap:8px;">
+                            <button class="btn btn-ghost" data-launch-clone="ai-gemini">✦ Gemini 공홈 뷰</button>
+                            <button class="btn btn-ghost" data-launch-clone="ai-claude">✴ Claude 공홈 뷰</button>
+                            <button class="btn btn-ghost" data-launch-clone="ai-chatgpt">● ChatGPT 공홈 뷰</button>
+                            <button class="btn btn-ghost" data-launch-clone="epub-sepia-scroll">📜 EPUB 1쪽 (낮)</button>
+                            <button class="btn btn-ghost" data-launch-clone="epub-night-scroll">📜 EPUB 1쪽 (밤)</button>
+                            <button class="btn btn-ghost" data-launch-clone="epub-sepia">📖 EPUB 2쪽 펼침 (낮)</button>
+                            <button class="btn btn-ghost" data-launch-clone="epub-night">🌙 EPUB 2쪽 펼침 (밤)</button>
+                        </div>
+                    </div>
+
+                    <div class="section">
+                        <h2>🎨 테마 · 화면 스타일 세부 조정</h2>
+                        <p class="sub">게이지를 드래그하거나 토글을 누르면 창이 투명해지며 뒤쪽 RisuAI 화면에 실시간으로 반영됩니다.</p>
+                        <div class="grid-2">
+                            <div class="field">
+                                <label>메시지 레이아웃 스타일</label>
+                                <select id="th-bubble">
+                                    <option value="chatbot" ${config.theme.bubbleStyle === 'chatbot' ? 'selected' : ''}>🤖 AI 챗봇 공홈</option>
+                                    <option value="epub" ${config.theme.bubbleStyle === 'epub' ? 'selected' : ''}>📖 EPUB 전자책</option>
+                                    <option value="glass" ${config.theme.bubbleStyle === 'glass' ? 'selected' : ''}>글래스 톤 카드</option>
+                                    <option value="card" ${config.theme.bubbleStyle === 'card' ? 'selected' : ''}>솔리드 카드</option>
+                                    <option value="flat" ${config.theme.bubbleStyle === 'flat' ? 'selected' : ''}>플랫 액센트 바</option>
+                                    <option value="default" ${config.theme.bubbleStyle === 'default' ? 'selected' : ''}>기본 레이아웃</option>
+                                </select>
+                            </div>
+                            <div class="field">
+                                <label>기본 시스템 글꼴 (무용량)</label>
+                                <select id="th-font-family">${fontOptions}</select>
+                            </div>
+                            <div class="field">
+                                <label>본문 최대 너비 <span id="th-width-val">${config.theme.chatMaxWidth}px</span></label>
+                                <input type="range" id="th-width" min="580" max="1160" step="20" value="${config.theme.chatMaxWidth}" />
+                            </div>
+                            <div class="field">
+                                <label>글자 크기 <span id="th-font-val">${config.theme.fontSize}px</span></label>
+                                <input type="range" id="th-font" min="13" max="21" step="1" value="${config.theme.fontSize}" />
+                            </div>
+                            <div class="field">
+                                <label>줄 간격 <span id="th-lh-val">${config.theme.lineHeight}</span></label>
+                                <input type="range" id="th-lh" min="1.3" max="2.3" step="0.05" value="${config.theme.lineHeight}" />
+                            </div>
+                        </div>
+                        <div style="margin-top:12px;">
+                            <div class="toggle-row">
+                                <span>문단 양쪽 정렬</span>
+                                <input type="checkbox" id="th-justify" ${config.theme.justifyText ? 'checked' : ''} />
+                            </div>
+                            <div class="toggle-row">
+                                <span>입력창을 중앙 캡슐 도크 형태로 변환</span>
+                                <input type="checkbox" id="ly-capsule" ${config.layout.floatingCapsuleInput ? 'checked' : ''} />
+                            </div>
+                            <div class="toggle-row">
+                                <span>젠(Zen) 집중 모드 — 사이드바 숨기기</span>
+                                <input type="checkbox" id="ly-zen" ${config.layout.zenMode ? 'checked' : ''} />
+                            </div>
+                            <div class="toggle-row">
+                                <span>사이드바 좌↔우 반전 배치</span>
+                                <input type="checkbox" id="ly-right" ${config.layout.sidebarRight ? 'checked' : ''} />
+                            </div>
+                            <div class="toggle-row">
+                                <span>메시지 수정/삭제 버튼을 마우스 올릴 때만 표시</span>
+                                <input type="checkbox" id="ly-hover" ${config.layout.hoverActionsOnly ? 'checked' : ''} />
+                            </div>
+                        </div>
+                        <div class="field" style="margin-top:12px;">
+                            <label>추가 커스텀 CSS</label>
+                            <textarea id="th-css" rows="3">${escapeHtml(config.theme.customCSS)}</textarea>
+                        </div>
+                    </div>
+
+                    <div class="section">
+                        <h2>🛠️ 편의 기능 &amp; UX 설정</h2>
+                        <p class="sub">외출용 에셋 가리기, 상단 미니 바 동작, EPUB 기본 보기 및 리로드 깜빡임 완화를 설정합니다.</p>
+                        <div>
+                            <div class="toggle-row">
+                                <span>🕶️ 외출(에셋 가리기) — 채팅 이미지 숨김 + AI 원형 배지</span>
+                                <input type="checkbox" id="st-enabled" ${config.stealth.mode !== 'off' ? 'checked' : ''} />
+                            </div>
+                            <div class="toggle-row">
+                                <span>상단 드래그·자동 최소화 미니 바 표시</span>
+                                <input type="checkbox" id="ly-topbar" ${config.layout.showFloatingTopBar ? 'checked' : ''} />
+                            </div>
+                            <div class="toggle-row">
+                                <span>EPUB 풀스크린 기본 2쪽 양면 펼침 보기</span>
+                                <input type="checkbox" id="ly-epub2" ${config.layout.epubTwoPage ? 'checked' : ''} />
+                            </div>
+                            <div class="toggle-row">
+                                <span>전체 화면 뷰 자동 새로고침 (페이지 넘길 때 자연스럽게 반영)</span>
+                                <input type="checkbox" id="ly-autorefresh" ${config.layout.autoRefreshClone ? 'checked' : ''} />
+                            </div>
+                            <div class="toggle-row">
+                                <span>리로드 높이 잠금(Anti-Collapse) 활성화 — 깜빡임 완화</span>
+                                <input type="checkbox" id="af-enabled" ${config.antiFlicker.enabled ? 'checked' : ''} />
+                            </div>
+                        </div>
+                        <div class="grid-2" style="margin-top:12px;">
+                            <div class="field">
+                                <label>미니 바 자동 최소화 대기 시간 <span id="ly-minsec-val">${config.layout.autoMinimizeSec}초</span></label>
+                                <input type="range" id="ly-minsec" min="2" max="15" step="1" value="${config.layout.autoMinimizeSec}" />
+                            </div>
+                            <div class="field">
+                                <label>리로드 높이 유지 시간 <span id="af-lock-val">${config.antiFlicker.lockMs}ms</span></label>
+                                <input type="range" id="af-lock-ms" min="350" max="2400" step="50" value="${config.antiFlicker.lockMs}" />
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="footer">
+                    <div style="display:flex; gap:8px;">
+                        <button class="btn btn-ghost" id="btn-reset">기본값 복원</button>
+                        <button class="btn btn-ghost" id="btn-reset-pos">상단 바 위치 초기화</button>
+                        ${!domPermissionGranted ? '<button class="btn btn-ghost" id="btn-perm">mainDom 권한 요청</button>' : ''}
+                    </div>
+                    <button class="btn btn-primary" id="btn-apply">저장 및 적용</button>
+                </div>
+            </div>
+        `;
+
+        document.getElementById('btn-close').onclick = async () => {
+            currentIframeMode = null;
+            await risuai.hideContainer();
+        };
+        document.getElementById('btn-open-clone').onclick = async () => {
+            const cur = PRESETS[config.theme.preset];
+            if (cur?.isChatbot) {
+                await renderCloneView(config.theme.preset);
+            } else {
+                const isDark = cur?.scheme?.type === 'dark';
+                await renderCloneView(isDark ? 'epub-night' : 'epub-sepia');
+            }
+        };
+        document.getElementById('btn-reset-pos').onclick = async () => {
+            config.layout.topBarPos = null;
+            await saveConfig();
+            await syncTopBar();
+        };
+
+        let liveCssTimer = null;
+        const scheduleLiveCSSPreview = () => {
+            if (liveCssTimer) return;
+            liveCssTimer = setTimeout(async () => {
+                liveCssTimer = null;
+                await upsertStyleTag('theme-layout-stealth', buildLayoutAndThemeCSS());
+            }, 50);
+        };
+
+        let flashPreviewTimer = null;
+        const enterLivePreview = (inputEl) => {
+            if (flashPreviewTimer) {
+                clearTimeout(flashPreviewTimer);
+                flashPreviewTimer = null;
+            }
+            document.body.classList.add('live-previewing');
+            document.querySelectorAll('.active-preview-field').forEach((el) => el.classList.remove('active-preview-field'));
+            const wrap = inputEl && inputEl.closest ? inputEl.closest('.field, .toggle-row') : null;
+            if (wrap) wrap.classList.add('active-preview-field');
+        };
+        const exitLivePreview = () => {
+            if (flashPreviewTimer) {
+                clearTimeout(flashPreviewTimer);
+                flashPreviewTimer = null;
+            }
+            document.body.classList.remove('live-previewing');
+            document.querySelectorAll('.active-preview-field').forEach((el) => el.classList.remove('active-preview-field'));
+        };
+        const flashLivePreview = (inputEl, ms = 2000) => {
+            enterLivePreview(inputEl);
+            flashPreviewTimer = setTimeout(() => {
+                flashPreviewTimer = null;
+                exitLivePreview();
+            }, ms);
+        };
+
+        const bindLiveRange = (id, valId, fmt, onVal) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.onpointerdown = () => enterLivePreview(el);
+            el.onpointerup = exitLivePreview;
+            el.onpointercancel = exitLivePreview;
+            el.onchange = exitLivePreview;
+            el.oninput = (e) => {
+                const v = e.target.value;
+                const lbl = document.getElementById(valId);
+                if (lbl) lbl.textContent = fmt(v);
+                onVal(v);
+                scheduleLiveCSSPreview();
+            };
+        };
+
+        window.addEventListener('pointerup', () => { if (!flashPreviewTimer) exitLivePreview(); }, { passive: true });
+
+        document.getElementById('ly-minsec').oninput = (e) => { document.getElementById('ly-minsec-val').textContent = `${e.target.value}초`; };
+        document.getElementById('af-lock-ms').oninput = (e) => { document.getElementById('af-lock-val').textContent = `${e.target.value}ms`; };
+
+        bindLiveRange('th-width', 'th-width-val', (v) => `${v}px`, (v) => { config.theme.chatMaxWidth = Number(v); });
+        bindLiveRange('th-font', 'th-font-val', (v) => `${v}px`, (v) => { config.theme.fontSize = Number(v); });
+        bindLiveRange('th-lh', 'th-lh-val', (v) => `${v}`, (v) => { config.theme.lineHeight = Number(v); });
+
+        // Apply live 2-second crystal-clear preview on typography/layout/stealth toggles & dropdowns
+        const bindFlashControl = (id, applyFn) => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.onchange = (e) => {
+                applyFn(e.target);
+                scheduleLiveCSSPreview();
+                flashLivePreview(el, 2000);
+            };
+        };
+        bindFlashControl('th-bubble', (el) => { config.theme.bubbleStyle = el.value; });
+        bindFlashControl('th-font-family', (el) => { config.theme.fontFamily = el.value; });
+        bindFlashControl('th-justify', (el) => { config.theme.justifyText = el.checked; });
+        bindFlashControl('st-enabled', (el) => {
+            config.stealth.mode = el.checked ? 'soft' : 'off';
+            config.stealth.hideSidebarAvatars = config.stealth.mode !== 'off';
+        });
+        bindFlashControl('ly-capsule', (el) => { config.layout.floatingCapsuleInput = el.checked; });
+        bindFlashControl('ly-zen', (el) => { config.layout.zenMode = el.checked; });
+        bindFlashControl('ly-right', (el) => { config.layout.sidebarRight = el.checked; });
+        bindFlashControl('ly-hover', (el) => { config.layout.hoverActionsOnly = el.checked; });
+
+        document.querySelectorAll('[data-launch-clone]').forEach((btn) => {
+            btn.onclick = async () => {
+                const targetMode = btn.getAttribute('data-launch-clone');
+                await renderCloneView(targetMode);
+            };
+        });
+
+        document.querySelectorAll('.preset-card').forEach((btn) => {
+            btn.onclick = async () => {
+                const key = btn.getAttribute('data-preset');
+                const p = PRESETS[key];
+                if (!p) return;
+                config.theme = { ...config.theme, preset: key, ...p.defaults };
+                if (p.stealthDefaults) config.stealth = { ...config.stealth, ...p.stealthDefaults };
+                if (p.layoutDefaults) config.layout = { ...config.layout, ...p.layoutDefaults };
+                await saveConfig();
+                await applyAll();
+                renderStudioUI();
+            };
+        });
+
+        const permBtn = document.getElementById('btn-perm');
+        if (permBtn) {
+            permBtn.onclick = async () => {
+                await ensureRootDocument();
+                await setupDragDocumentListeners();
+                await setupAntiFlickerEngine();
+                await applyAll();
+                renderStudioUI();
+            };
+        }
+
+        document.getElementById('btn-reset').onclick = async () => {
+            config = structuredClone(DEFAULT_CONFIG);
+            config.theme.preset = 'original';
+            config.theme = { ...config.theme, ...PRESETS.original.defaults };
+            config.stealth = { ...PRESETS.original.stealthDefaults };
+            config.layout = { ...config.layout, showFloatingTopBar: false, floatingCapsuleInput: false, zenMode: false, sidebarRight: false, hoverActionsOnly: false, compactHeaders: false };
+            await saveConfig();
+            await setupAntiFlickerEngine();
+            await applyAll();
+            renderStudioUI();
+        };
+
+        document.getElementById('btn-apply').onclick = async () => {
+            config.stealth.mode = document.getElementById('st-enabled').checked ? 'soft' : 'off';
+            config.stealth.hideSidebarAvatars = config.stealth.mode !== 'off';
+
+            config.layout.showFloatingTopBar = document.getElementById('ly-topbar').checked;
+            config.layout.autoMinimizeSec = Number(document.getElementById('ly-minsec').value);
+            config.layout.epubTwoPage = document.getElementById('ly-epub2').checked;
+            config.layout.autoRefreshClone = document.getElementById('ly-autorefresh').checked;
+            config.layout.floatingCapsuleInput = document.getElementById('ly-capsule').checked;
+            config.layout.zenMode = document.getElementById('ly-zen').checked;
+            config.layout.sidebarRight = document.getElementById('ly-right').checked;
+            config.layout.hoverActionsOnly = document.getElementById('ly-hover').checked;
+
+            config.antiFlicker.enabled = document.getElementById('af-enabled').checked;
+            config.antiFlicker.lockMs = Number(document.getElementById('af-lock-ms').value);
+
+            config.theme.bubbleStyle = document.getElementById('th-bubble').value;
+            config.theme.fontFamily = document.getElementById('th-font-family').value;
+            config.theme.justifyText = document.getElementById('th-justify').checked;
+            config.theme.chatMaxWidth = Number(document.getElementById('th-width').value);
+            config.theme.fontSize = Number(document.getElementById('th-font').value);
+            config.theme.lineHeight = Number(document.getElementById('th-lh').value);
+            config.theme.customCSS = document.getElementById('th-css').value;
+
+            await saveConfig();
+            await setupAntiFlickerEngine();
+            await applyAll();
+            currentIframeMode = null;
+            await risuai.hideContainer();
+        };
+    }
+
+    async function openStudio() {
+        await risuai.showContainer('fullscreen');
+        renderStudioUI();
+    }
+
+    async function updateQuickButtons() {
+        await risuai.registerButton(
+            {
+                name: 'RisuStand 설정',
+                icon: '📖',
+                iconType: 'html',
+                location: 'hamburger',
+                id: 'risustand-studio-btn',
+            },
+            openStudio
+        );
+
+        await risuai.registerButton(
+            {
+                name: 'RisuStand 전용 뷰 (EPUB·공홈)',
+                icon: '📖',
+                iconType: 'html',
+                location: 'hamburger',
+                id: 'risustand-clone-btn',
+            },
+            openCloneView
+        );
+    }
+
+    // =========================================================================
+    // 6. Bootstrap & Cleanup
+    // =========================================================================
+    await loadConfig();
+    await ensureRootDocument();
+    await setupDragDocumentListeners();
+    await setupAntiFlickerEngine();
+    await applyAll();
+
+    await risuai.registerSetting(
+        'RisuStand (리수 독서대)',
+        openStudio,
+        '🚀',
+        'html',
+        'risustand-setting'
+    );
+
+    chatOutputListener = async () => {
+        if (currentIframeMode === 'clone' && config.layout.autoRefreshClone) {
+            pendingCloneRefresh = true;
+        }
+    };
+    try {
+        await risuai.addRisuChatListener('output', chatOutputListener);
+    } catch (_) {}
+
+
+    // =========================================================================
+    // 7. Integrated RisuStand Remote Bridge Engine (v2.0)
+    // =========================================================================
+    async function initIntegratedRemoteBridge() {
+    
+        const STORAGE_KEY = 'risustand_remote_bridge_v2';
+        const LEGACY_KEY = 'risustand_remote_bridge_v1';
+        const DEFAULT_CFG = {
+            enabled: false,
+            relayUrl: 'http://127.0.0.1:8787',
+            token: '',
+            includeImages: true,
+            pollIntervalMs: 1800,
+        };
+    
+        let cfg = { ...DEFAULT_CFG };
+        let pollTimer = null;
+        let isPolling = false;
+        let isGenerating = false;
+        let lastStatus = '대기 중';
+        let lastSyncTime = '';
+        let lastSnapSig = '';
+        let lastCatalogSig = '';
+        let viewCharIndex = -1;
+        let viewChatIndex = -1;
+        const assetDataCache = new Map();
+    
+        async function loadCfg() {
+            try {
+                let raw = await risuai.pluginStorage.getItem(STORAGE_KEY);
+                if (!raw) raw = await risuai.pluginStorage.getItem(LEGACY_KEY);
+                if (raw) {
+                    const parsed = typeof raw === 'string' ? JSON.parse(raw) : raw;
+                    cfg = { ...DEFAULT_CFG, ...parsed };
+                }
+            } catch (_) {}
+        }
+    
+        async function saveCfg() {
+            try {
+                await risuai.pluginStorage.setItem(STORAGE_KEY, JSON.stringify(cfg));
+            } catch (_) {}
+        }
+    
+        function cleanProse(raw) {
+            if (!raw) return '';
+            return String(raw)
+                .replace(/<!--\s*HAYAKU[\s\S]*?-->/gi, '')
+                .replace(/<!--[\s\S]*?-->/gi, '')
+                .replace(/<Thoughts>[\s\S]*?<\/Thoughts>/gi, '')
+                .replace(/<think>[\s\S]*?<\/think>/gi, '')
+                .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
+                .replace(/<statusdata\b[^>]*>[\s\S]*?<\/statusdata>/gi, '')
+                .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '')
+                .replace(/<img\s*=\s*["']?[^"'\s>]+["']?\s*\/?>/gi, '')
+                .replace(/\{\{(?:img|raw|asset|image|emotion|inlay|inlayed)::[^}]+\}\}/gi, '')
+                .replace(/<[^>]+>/g, '')
+                .trim();
+        }
+    
+        function detectMime(bytes, path) {
+            if (bytes && bytes.length >= 12) {
+                if (bytes[0] === 0x89 && bytes[1] === 0x50) return 'image/png';
+                if (bytes[0] === 0xFF && bytes[1] === 0xD8) return 'image/jpeg';
+                if (bytes[0] === 0x47 && bytes[1] === 0x49) return 'image/gif';
+                if (bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return 'image/webp';
+            }
+            return String(path || '').toLowerCase().endsWith('.png') ? 'image/png' : 'image/webp';
+        }
+    
+        function u8ToB64(bytes) {
+            let bin = '';
+            const chunk = 0x8000;
+            for (let i = 0; i < bytes.length; i += chunk) {
+                bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+            }
+            return btoa(bin);
+        }
+    
+        async function readAssetDataUrl(assetPath) {
+            if (!assetPath) return null;
+            if (assetDataCache.has(assetPath)) return assetDataCache.get(assetPath);
+            try {
+                const raw = await risuai.readImage(assetPath);
+                if (!raw) return null;
+                const bytes = raw instanceof Uint8Array
+                    ? raw
+                    : ArrayBuffer.isView(raw)
+                    ? new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength)
+                    : raw instanceof ArrayBuffer
+                    ? new Uint8Array(raw)
+                    : new Uint8Array(Object.values(raw));
+                if (!bytes.length || bytes.length > 2.5 * 1024 * 1024) return null;
+                const url = `data:${detectMime(bytes, assetPath)};base64,${u8ToB64(bytes)}`;
+                assetDataCache.set(assetPath, url);
+                return url;
+            } catch (_) {
+                return null;
+            }
+        }
+    
+        function buildLookup(charObj) {
+            const list = [];
+            if (charObj && Array.isArray(charObj.additionalAssets)) {
+                for (const a of charObj.additionalAssets) {
+                    if (Array.isArray(a) && a[0] && a[1]) list.push({ n: String(a[0]).toLowerCase(), p: String(a[1]) });
+                }
+            }
+            if (charObj && Array.isArray(charObj.emotionImages)) {
+                for (const e of charObj.emotionImages) {
+                    if (Array.isArray(e) && e[0] && e[1]) list.push({ n: String(e[0]).toLowerCase(), p: String(e[1]) });
+                }
+            }
+            const norm = (s) => String(s || '').replace(/\.[a-z0-9]{2,5}$/i, '').replace(/[\s_\-]+/g, '').toLowerCase();
+            return (rawName) => {
+                const k = norm(rawName);
+                if (!k) return null;
+                for (const item of list) {
+                    if (norm(item.n) === k) return item.p;
+                }
+                for (const item of list) {
+                    if (norm(item.n).includes(k) || k.includes(norm(item.n))) return item.p;
+                }
+                return null;
+            };
+        }
+    
+        async function extractInlineImages(rawMsg, findPath, allowImages) {
+            if (!rawMsg) return { text: '', images: [] };
+            const imgs = [];
+            const re = /<img\s*=\s*["']?([^"'\s>]+)["']?\s*\/?>|\{\{(?:img|raw|asset|image|emotion)::([^}]+)\}\}/gi;
+            const rawStr = String(rawMsg);
+            const matches = [];
+            let m;
+            while ((m = re.exec(rawStr)) !== null) {
+                matches.push({ start: m.index, end: re.lastIndex, name: (m[1] || m[2] || '').trim() });
+            }
+            let out = '';
+            let cursor = 0;
+            for (const mt of matches) {
+                out += rawStr.slice(cursor, mt.start);
+                cursor = mt.end;
+                if (allowImages && cfg.includeImages && imgs.length < 6) {
+                    const p = findPath(mt.name);
+                    if (p) {
+                        const url = await readAssetDataUrl(p);
+                        if (url) {
+                            const idx = imgs.length;
+                            imgs.push(url);
+                            out += `\n[[RSIMG:${idx}]]\n`;
+                        }
+                    }
+                }
+            }
+            out += rawStr.slice(cursor);
+            return { text: cleanProse(out), images: imgs };
+        }
+    
+        function makeUuid() {
+            if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+            return 'rs-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+        }
+    
+        async function buildCatalog(force = false) {
+            let db = null;
+            try {
+                db = await risuai.getDatabase([
+                    'characters',
+                    'modules',
+                    'enabledModules',
+                    'personas',
+                    'selectedPersona',
+                    'temperature',
+                    'maxContext',
+                    'maxResponse',
+                ]);
+            } catch (_) {
+                return null;
+            }
+            if (!db) return null;
+    
+            const pcActiveCharIndex = await risuai.getCurrentCharacterIndex();
+            const pcActiveChatIndex = pcActiveCharIndex >= 0 ? await risuai.getCurrentChatIndex() : -1;
+    
+            const charsRaw = Array.isArray(db.characters) ? db.characters : [];
+            const characters = charsRaw.map((c, idx) => {
+                const chats = Array.isArray(c && c.chats) ? c.chats : [];
+                return {
+                    index: idx,
+                    chaId: (c && c.chaId) || String(idx),
+                    name: (c && c.name) || `Character ${idx + 1}`,
+                    type: (c && c.type) || 'character',
+                    chatPage: typeof (c && c.chatPage) === 'number' ? c.chatPage : 0,
+                    isPcActive: idx === pcActiveCharIndex,
+                    chats: chats.map((ch, cIdx) => ({
+                        index: cIdx,
+                        id: (ch && ch.id) || String(cIdx),
+                        name: (ch && ch.name) || `Chat ${cIdx + 1}`,
+                        msgCount: Array.isArray(ch && ch.message) ? ch.message.length : 0,
+                    })),
+                };
+            });
+    
+            const enabledSet = new Set(Array.isArray(db.enabledModules) ? db.enabledModules : []);
+            const modulesRaw = Array.isArray(db.modules) ? db.modules : [];
+            const modules = modulesRaw.map((m) => ({
+                id: m.id,
+                name: m.name || m.id,
+                description: String(m.description || '').slice(0, 140),
+                enabled: enabledSet.has(m.id),
+                hasToggles: Boolean(m.customModuleToggle && String(m.customModuleToggle).trim()),
+            }));
+    
+            const personasRaw = Array.isArray(db.personas) ? db.personas : [];
+            const personas = personasRaw.map((p, idx) => ({
+                index: idx,
+                name: (p && p.name) || `Persona ${idx + 1}`,
+                prompt: String((p && p.personaPrompt) || '').slice(0, 400),
+            }));
+    
+            const params = {
+                temperature: typeof db.temperature === 'number' ? db.temperature : 80,
+                maxContext: typeof db.maxContext === 'number' ? db.maxContext : 8000,
+                maxResponse: typeof db.maxResponse === 'number' ? db.maxResponse : 1000,
+            };
+    
+            const catalog = {
+                pcActiveCharIndex,
+                pcActiveChatIndex,
+                selectedPersona: typeof db.selectedPersona === 'number' ? db.selectedPersona : 0,
+                params,
+                characters,
+                modules,
+                personas,
+            };
+    
+            const sig = JSON.stringify({
+                a: pcActiveCharIndex,
+                b: pcActiveChatIndex,
+                p: catalog.selectedPersona,
+                pr: params,
+                c: characters.map((x) => [x.index, x.name, x.chatPage, x.chats.length]),
+                m: modules.map((x) => [x.id, x.enabled]),
+                pe: personas.map((x) => x.name),
+            });
+    
+            if (!force && sig === lastCatalogSig) {
+                return null;
+            }
+            lastCatalogSig = sig;
+            return catalog;
+        }
+    
+        async function buildSnapshot(forceFull = false) {
+            const pcCharIdx = await risuai.getCurrentCharacterIndex();
+            const pcChatIdx = pcCharIdx >= 0 ? await risuai.getCurrentChatIndex() : -1;
+    
+            if (viewCharIndex < 0) {
+                viewCharIndex = pcCharIdx >= 0 ? pcCharIdx : 0;
+                viewChatIndex = pcChatIdx >= 0 ? pcChatIdx : 0;
+            }
+    
+            let charObj = await risuai.getCharacterFromIndex(viewCharIndex);
+            if (!charObj && pcCharIdx >= 0) {
+                viewCharIndex = pcCharIdx;
+                viewChatIndex = pcChatIdx >= 0 ? pcChatIdx : 0;
+                charObj = await risuai.getCharacterFromIndex(viewCharIndex);
+            }
+            if (!charObj) return null;
+    
+            const chats = Array.isArray(charObj.chats) ? charObj.chats : [];
+            if (viewChatIndex < 0 || viewChatIndex >= chats.length) {
+                viewChatIndex = typeof charObj.chatPage === 'number' && charObj.chatPage < chats.length ? charObj.chatPage : 0;
+            }
+    
+            const chatObj = chats[viewChatIndex] || { name: 'Chat 1', message: [] };
+            const allMsgs = Array.isArray(chatObj.message) ? chatObj.message : [];
+            const startOffset = Math.max(0, allMsgs.length - 36);
+            const recent = allMsgs.slice(startOffset);
+            const lastLen = recent.length ? String(recent[recent.length - 1].data || '').length : 0;
+            const isPcActive = viewCharIndex === pcCharIdx;
+    
+            const localVars = (chatObj && chatObj.GLGlobalVariables && typeof chatObj.GLGlobalVariables === 'object') ? chatObj.GLGlobalVariables : {};
+            const useLocalToggles = Boolean(chatObj && chatObj.useLocallySetGlobalVariables);
+            let toggleBlocks = [];
+            try {
+                const tdb = await risuai.getDatabase(['modules', 'enabledModules']);
+                if (tdb && Array.isArray(tdb.modules)) {
+                    const enSet = new Set(Array.isArray(tdb.enabledModules) ? tdb.enabledModules : []);
+                    if (Array.isArray(chatObj && chatObj.modules)) {
+                        for (const mid of chatObj.modules) enSet.add(mid);
+                    }
+                    for (const m of tdb.modules) {
+                        if (enSet.has(m.id) && m.customModuleToggle && String(m.customModuleToggle).trim()) {
+                            toggleBlocks.push({ source: m.name || m.id, syntax: String(m.customModuleToggle) });
+                        }
+                    }
+                }
+            } catch (_) {}
+            if (charObj && charObj.customModuleToggle && String(charObj.customModuleToggle).trim()) {
+                toggleBlocks.push({ source: charObj.name || 'Character', syntax: String(charObj.customModuleToggle) });
+            }
+            const toggleSig = `${useLocalToggles}:${Object.keys(localVars).length}:${JSON.stringify(localVars)}:${toggleBlocks.length}`;
+            const sig = `${viewCharIndex}:${viewChatIndex}:${isPcActive}:${allMsgs.length}:${lastLen}:${chatObj.name || ''}:${toggleSig}`;
+            if (!forceFull && sig === lastSnapSig) {
+                return null;
+            }
+            lastSnapSig = sig;
+    
+            const findPath = buildLookup(charObj);
+            const outMsgs = [];
+    
+            if (charObj.firstMessage && startOffset === 0) {
+                const fmIdx = typeof chatObj.fmIndex === 'number' ? chatObj.fmIndex : -1;
+                const altGreetings = Array.isArray(charObj.alternateGreetings) ? charObj.alternateGreetings : [];
+                const firstRaw = fmIdx >= 0 && altGreetings[fmIdx] ? altGreetings[fmIdx] : charObj.firstMessage;
+                if (firstRaw) {
+                    outMsgs.push({
+                        index: -1,
+                        role: 'char',
+                        text: cleanProse(firstRaw),
+                        raw: String(firstRaw),
+                        images: [],
+                        isFirstMessage: true,
+                    });
+                }
+            }
+    
+            for (let i = 0; i < recent.length; i++) {
+                const msg = recent[i];
+                const isRecent = i >= recent.length - 8;
+                const parsed = await extractInlineImages(msg.data, findPath, isRecent);
+                outMsgs.push({
+                    index: startOffset + i,
+                    role: msg.role,
+                    text: parsed.text,
+                    raw: String(msg.data || ''),
+                    images: parsed.images,
+                });
+            }
+    
+            let personaName = 'User';
+            let personaPrompt = '';
+            try {
+                const pdb = await risuai.getDatabase(['personas', 'selectedPersona']);
+                if (pdb && Array.isArray(pdb.personas)) {
+                    const p = pdb.personas[pdb.selectedPersona || 0];
+                    if (p) {
+                        personaName = p.name || 'User';
+                        personaPrompt = p.personaPrompt || '';
+                    }
+                }
+            } catch (_) {}
+    
+            return {
+                charName: charObj.name || 'Character',
+                charIndex: viewCharIndex,
+                chatIndex: viewChatIndex,
+                chatName: chatObj.name || `Chat ${viewChatIndex + 1}`,
+                isPcActive,
+                totalMessages: allMsgs.length,
+                useLocallySetGlobalVariables: useLocalToggles,
+                localToggleValues: localVars,
+                customToggleBlocks: toggleBlocks,
+                messages: outMsgs,
+                charContext: {
+                    name: charObj.name || 'Character',
+                    desc: String(charObj.desc || '').slice(0, 6000),
+                    personality: String(charObj.personality || '').slice(0, 2000),
+                    scenario: String(charObj.scenario || '').slice(0, 2000),
+                    systemPrompt: String(charObj.systemPrompt || '').slice(0, 3000),
+                    note: String(chatObj.note || '').slice(0, 2000),
+                    personaName,
+                    personaPrompt: String(personaPrompt || '').slice(0, 2000),
+                },
+            };
+        }
+    
+        async function handleCommand(cmd) {
+            const type = cmd.type;
+            const p = cmd.payload || {};
+    
+            if (type === 'sync_chat' || type === 'sync_all') {
+                lastSnapSig = '';
+                lastCatalogSig = '';
+                setTimeout(() => pollOnce(true), 80);
+                return;
+            }
+    
+            if (type === 'select_target') {
+                const nextChar = Number(p.charIndex);
+                const nextChat = Number(p.chatIndex);
+                if (!Number.isNaN(nextChar) && nextChar >= 0) {
+                    viewCharIndex = nextChar;
+                    viewChatIndex = !Number.isNaN(nextChat) && nextChat >= 0 ? nextChat : 0;
+                    const pcCharIdx = await risuai.getCurrentCharacterIndex();
+                    if (viewCharIndex === pcCharIdx) {
+                        try {
+                            const charObj = await risuai.getCharacterFromIndex(viewCharIndex);
+                            if (charObj && Array.isArray(charObj.chats) && viewChatIndex < charObj.chats.length) {
+                                charObj.chatPage = viewChatIndex;
+                                await risuai.setCharacterToIndex(viewCharIndex, charObj);
+                            }
+                        } catch (_) {}
+                    }
+                    lastSnapSig = '';
+                    lastCatalogSig = '';
+                    setTimeout(() => pollOnce(true), 120);
+                }
+                return;
+            }
+    
+            if (type === 'create_chat') {
+                const cIdx = Number(p.charIndex);
+                if (Number.isNaN(cIdx) || cIdx < 0) return;
+                const charObj = await risuai.getCharacterFromIndex(cIdx);
+                if (!charObj) return;
+                if (!Array.isArray(charObj.chats)) charObj.chats = [];
+                const newName = String(p.name || '').trim() || `New Chat ${charObj.chats.length + 1}`;
+                charObj.chats.unshift({
+                    message: [],
+                    note: '',
+                    name: newName,
+                    localLore: [],
+                    fmIndex: -1,
+                    id: makeUuid(),
+                });
+                charObj.chatPage = 0;
+                await risuai.setCharacterToIndex(cIdx, charObj);
+                viewCharIndex = cIdx;
+                viewChatIndex = 0;
+                lastSnapSig = '';
+                lastCatalogSig = '';
+                setTimeout(() => pollOnce(true), 150);
+                return;
+            }
+    
+            if (type === 'send_chat' && p.text) {
+                const targetChar = typeof p.charIndex === 'number' ? p.charIndex : viewCharIndex;
+                const targetChat = typeof p.chatIndex === 'number' ? p.chatIndex : viewChatIndex;
+                const pcCharIdx = await risuai.getCurrentCharacterIndex();
+    
+                if (targetChar === pcCharIdx && pcCharIdx >= 0) {
+                    isGenerating = true;
+                    try {
+                        const charObj = await risuai.getCharacterFromIndex(pcCharIdx);
+                        if (charObj && typeof targetChat === 'number' && targetChat >= 0 && charObj.chatPage !== targetChat) {
+                            charObj.chatPage = targetChat;
+                            await risuai.setCharacterToIndex(pcCharIdx, charObj);
+                        }
+                        await risuai.sendChat(String(p.text));
+                    } catch (err) {
+                        lastStatus = `⚠️ 전송 오류: ${err && err.message ? err.message : '실패'}`;
+                    } finally {
+                        isGenerating = false;
+                        lastSnapSig = '';
+                        lastCatalogSig = '';
+                        setTimeout(() => pollOnce(true), 350);
+                    }
+                }
+                return;
+            }
+    
+            if (type === 'append_messages') {
+                const cIdx = Number(p.charIndex);
+                const chIdx = Number(p.chatIndex);
+                const list = Array.isArray(p.messages) ? p.messages : [];
+                if (Number.isNaN(cIdx) || Number.isNaN(chIdx) || !list.length) return;
+                const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
+                if (!chatObj) return;
+                if (!Array.isArray(chatObj.message)) chatObj.message = [];
+                for (const m of list) {
+                    chatObj.message.push({
+                        role: m.role === 'user' ? 'user' : 'char',
+                        data: String(m.data || ''),
+                        time: Date.now(),
+                    });
+                }
+                await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                lastSnapSig = '';
+                lastCatalogSig = '';
+                setTimeout(() => pollOnce(true), 150);
+                return;
+            }
+    
+            if (type === 'edit_message') {
+                const cIdx = Number(p.charIndex);
+                const chIdx = Number(p.chatIndex);
+                const mIdx = Number(p.msgIndex);
+                if (Number.isNaN(cIdx) || Number.isNaN(chIdx) || Number.isNaN(mIdx) || mIdx < 0) return;
+                const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
+                if (!chatObj || !Array.isArray(chatObj.message) || !chatObj.message[mIdx]) return;
+                chatObj.message[mIdx].data = String(p.text || '');
+                await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                lastSnapSig = '';
+                setTimeout(() => pollOnce(true), 120);
+                return;
+            }
+    
+            if (type === 'delete_message') {
+                const cIdx = Number(p.charIndex);
+                const chIdx = Number(p.chatIndex);
+                const mIdx = Number(p.msgIndex);
+                if (Number.isNaN(cIdx) || Number.isNaN(chIdx) || Number.isNaN(mIdx) || mIdx < 0) return;
+                const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
+                if (!chatObj || !Array.isArray(chatObj.message) || !chatObj.message[mIdx]) return;
+                chatObj.message.splice(mIdx, 1);
+                await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                lastSnapSig = '';
+                lastCatalogSig = '';
+                setTimeout(() => pollOnce(true), 120);
+                return;
+            }
+    
+            if (type === 'toggle_module' && p.moduleId) {
+                const db = await risuai.getDatabase(['enabledModules']);
+                if (!db) return;
+                const set = new Set(Array.isArray(db.enabledModules) ? db.enabledModules : []);
+                if (p.enabled) set.add(String(p.moduleId));
+                else set.delete(String(p.moduleId));
+                await risuai.setDatabaseLite({ enabledModules: Array.from(set) });
+                lastCatalogSig = '';
+                setTimeout(() => pollOnce(true), 150);
+                return;
+            }
+    
+            if (type === 'select_persona') {
+                const idx = Number(p.personaIndex);
+                if (Number.isNaN(idx) || idx < 0) return;
+                await risuai.setDatabaseLite({ selectedPersona: idx });
+                lastCatalogSig = '';
+                lastSnapSig = '';
+                setTimeout(() => pollOnce(true), 150);
+                return;
+            }
+    
+            if (type === 'set_custom_toggle' && p.key) {
+                const cIdx = Number(p.charIndex);
+                const chIdx = Number(p.chatIndex);
+                if (Number.isNaN(cIdx) || Number.isNaN(chIdx)) return;
+                const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
+                if (!chatObj) return;
+                chatObj.useLocallySetGlobalVariables = true;
+                if (!chatObj.GLGlobalVariables || typeof chatObj.GLGlobalVariables !== 'object') {
+                    chatObj.GLGlobalVariables = {};
+                }
+                const fullKey = String(p.key).startsWith('toggle_') ? String(p.key) : ('toggle_' + String(p.key));
+                if (p.value === null || p.value === undefined) {
+                    delete chatObj.GLGlobalVariables[fullKey];
+                } else {
+                    chatObj.GLGlobalVariables[fullKey] = String(p.value);
+                }
+                await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                lastSnapSig = '';
+                setTimeout(() => pollOnce(true), 120);
+                return;
+            }
+
+            if (type === 'set_local_toggle_mode') {
+                const cIdx = Number(p.charIndex);
+                const chIdx = Number(p.chatIndex);
+                if (Number.isNaN(cIdx) || Number.isNaN(chIdx)) return;
+                const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
+                if (!chatObj) return;
+                chatObj.useLocallySetGlobalVariables = Boolean(p.enabled);
+                await risuai.setChatToIndex(cIdx, chIdx, chatObj);
+                lastSnapSig = '';
+                setTimeout(() => pollOnce(true), 120);
+                return;
+            }
+
+            if (type === 'update_params') {
+                const patch = {};
+                if (typeof p.temperature === 'number' && !Number.isNaN(p.temperature)) patch.temperature = p.temperature;
+                if (typeof p.maxContext === 'number' && !Number.isNaN(p.maxContext)) patch.maxContext = p.maxContext;
+                if (typeof p.maxResponse === 'number' && !Number.isNaN(p.maxResponse)) patch.maxResponse = p.maxResponse;
+                if (Object.keys(patch).length) {
+                    await risuai.setDatabaseLite(patch);
+                    lastCatalogSig = '';
+                    setTimeout(() => pollOnce(true), 150);
+                }
+                return;
+            }
+        }
+    
+        async function pollOnce(forceFull = false) {
+            if (!cfg.enabled || !cfg.relayUrl || !cfg.token || isPolling) return;
+            isPolling = true;
+            try {
+                const endpoint = cfg.relayUrl.replace(/\/+$/, '') + '/api/pc/poll';
+                const catalog = await buildCatalog(forceFull);
+                const snapshot = await buildSnapshot(forceFull);
+    
+                const res = await risuai.nativeFetch(endpoint, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-RisuStand-Token': cfg.token,
+                    },
+                    body: JSON.stringify({
+                        bridgeVersion: '2.0.0',
+                        generating: isGenerating,
+                        catalog,
+                        snapshot,
+                    }),
+                });
+    
+                if (!res || !res.ok) {
+                    lastStatus = `연결 오류 (HTTP ${res ? res.status : '?'})`;
+                    return;
+                }
+    
+                const data = await res.json();
+                lastStatus = '🟢 중계 서버 v2.0 연결됨';
+                lastSyncTime = new Date().toLocaleTimeString();
+    
+                if (data && data.command) {
+                    await handleCommand(data.command);
+                }
+            } catch (err) {
+                lastStatus = `🔴 연결 실패 (${err && err.message ? err.message : '네트워크 오류'})`;
+            } finally {
+                isPolling = false;
+            }
+        }
+    
+        function restartPolling() {
+            if (pollTimer) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+            }
+            if (!cfg.enabled) {
+                lastStatus = '꺼짐';
+                return;
+            }
+            const ms = Math.max(1200, Math.min(10000, Number(cfg.pollIntervalMs) || 1800));
+            pollOnce(true);
+            pollTimer = setInterval(() => pollOnce(false), ms);
+        }
+    
+        function esc(s) {
+            return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+        }
+    
+        function renderSettingsUI() {
+            document.body.innerHTML = `
+                <style>
+                    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Malgun Gothic", sans-serif; }
+                    html, body { margin:0; padding:0; width:100%; height:100%; background:rgba(10,12,18,0.85); color:#eef2ff; }
+                    .wrap { max-width:540px; margin:24px auto; background:#141824; border:1px solid #2b3347; border-radius:16px; padding:22px; box-shadow:0 20px 50px rgba(0,0,0,0.5); }
+                    h2 { margin:0 0 6px; font-size:18px; }
+                    .sub { font-size:12px; color:#9aa4b8; margin-bottom:16px; line-height:1.5; }
+                    .status { padding:10px 12px; border-radius:10px; background:#0d1018; border:1px solid #232a3b; font-size:13px; margin-bottom:14px; display:flex; justify-content:space-between; }
+                    label { display:block; font-size:12px; color:#b8c2d8; margin:12px 0 5px; }
+                    input[type="text"], input[type="password"], input[type="number"] {
+                        width:100%; padding:10px 12px; border-radius:10px; border:1px solid #303952;
+                        background:#0c0f17; color:#fff; font-size:13px; outline:none;
+                    }
+                    .chk { display:flex; align-items:center; gap:8px; margin-top:12px; font-size:13px; cursor:pointer; }
+                    .btns { display:flex; gap:8px; margin-top:18px; }
+                    button { flex:1; padding:11px; border:none; border-radius:10px; font-size:13px; font-weight:600; cursor:pointer; }
+                    .primary { background:#4f7cff; color:#fff; }
+                    .secondary { background:#232b3e; color:#dbe3f5; }
+                    .tip { margin-top:14px; font-size:11.5px; color:#8d97ad; line-height:1.55; background:#0d1018; padding:10px 12px; border-radius:10px; border:1px solid #1f2636; }
+                    code { background:#1c2334; padding:1px 5px; border-radius:4px; color:#a8c7fa; }
+                </style>
+                <div class="wrap">
+                    <h2>📡 RisuStand Remote Bridge v1.0</h2>
+                    <div class="sub">봇/방 전환 · 모듈 · 페르소나 · 파라미터 · 릴레이 모델 라우터 연동</div>
+                    <div class="status">
+                        <span id="stText">${esc(lastStatus)}</span>
+                        <span style="color:#7c879e;">${esc(lastSyncTime || '-')}</span>
+                    </div>
+                    <label class="chk">
+                        <input type="checkbox" id="enabled" ${cfg.enabled ? 'checked' : ''} />
+                        <span>원격 브릿지 활성화</span>
+                    </label>
+                    <label>중계 서버 주소 (PC 로컬)</label>
+                    <input type="text" id="relayUrl" value="${esc(cfg.relayUrl)}" placeholder="http://127.0.0.1:8787" />
+                    <label>보안 접속 토큰 (PC 터미널에 출력된 값)</label>
+                    <input type="password" id="token" value="${esc(cfg.token)}" placeholder="토큰 붙여넣기" />
+                    <label class="chk">
+                        <input type="checkbox" id="includeImages" ${cfg.includeImages ? 'checked' : ''} />
+                        <span>최근 메시지의 캐릭터 에셋 이미지 함께 전송</span>
+                    </label>
+                    <label>폴링 주기 (ms, 기본 1800)</label>
+                    <input type="number" id="pollIntervalMs" value="${esc(cfg.pollIntervalMs)}" min="1200" max="10000" />
+                    <div class="btns">
+                        <button class="primary" id="saveBtn">저장 및 연결</button>
+                        <button class="secondary" id="syncBtn">전체 동기화</button>
+                        <button class="secondary" id="closeBtn">닫기</button>
+                    </div>
+                    <div class="tip">
+                        <b>릴레이 모델 라우터 연동 팁</b><br>
+                        PC RisuAI 모델 설정(Reverse Proxy / OpenAI 호환)의 URL을 <code>http://127.0.0.1:8787/v1/chat/completions</code>로 지정하면 아이폰에서 모델·프롬프트·번역을 실시간 제어할 수 있습니다.
+                    </div>
+                </div>
+            `;
+    
+            document.getElementById('saveBtn').onclick = async () => {
+                cfg.enabled = document.getElementById('enabled').checked;
+                cfg.relayUrl = document.getElementById('relayUrl').value.trim() || 'http://127.0.0.1:8787';
+                cfg.token = document.getElementById('token').value.trim();
+                cfg.includeImages = document.getElementById('includeImages').checked;
+                cfg.pollIntervalMs = Number(document.getElementById('pollIntervalMs').value) || 1800;
+                await saveCfg();
+                lastSnapSig = '';
+                lastCatalogSig = '';
+                restartPolling();
+                setTimeout(renderSettingsUI, 700);
+            };
+    
+            document.getElementById('syncBtn').onclick = async () => {
+                lastSnapSig = '';
+                lastCatalogSig = '';
+                await pollOnce(true);
+                renderSettingsUI();
+            };
+    
+            document.getElementById('closeBtn').onclick = () => {
+                risuai.hideContainer();
+            };
+        }
+    
+        await loadCfg();
+    
+        await risuai.registerButton(
+            {
+                name: 'RisuStand 원격 접속',
+                icon: '📡',
+                iconType: 'html',
+                location: 'hamburger',
+                id: 'risustand-remote-btn',
+            },
+            async () => {
+                renderSettingsUI();
+                await risuai.showContainer('fullscreen');
+            }
+        );
+    
+        await risuai.registerSetting('📡 RisuStand 원격 접속 (Remote)', async () => {
+            renderSettingsUI();
+            await risuai.showContainer('fullscreen');
+        }, '📡', 'html');
+    
+        try {
+            await risuai.addRisuChatListener('output', async () => {
+                lastSnapSig = '';
+                lastCatalogSig = '';
+                setTimeout(() => pollOnce(true), 250);
+            });
+        } catch (_) {}
+    
+        if (cfg.enabled && cfg.token) {
+            restartPolling();
+        }
+    
+        return () => {
+            if (pollTimer) {
+                clearInterval(pollTimer);
+                pollTimer = null;
+            }
+        };
+    }
+
+    let stopRemoteBridge = null;
+    try {
+        stopRemoteBridge = await initIntegratedRemoteBridge();
+    } catch (e) {
+        console.warn('[RisuStand] Remote bridge init error:', e);
+    }
+
+    await risuai.onUnload(async () => {
+        if (typeof stopRemoteBridge === 'function') stopRemoteBridge();
+        clearAutoMinimize();
+        stopCloneWatcher();
+        if (lockReleaseTimer) {
+            clearTimeout(lockReleaseTimer);
+            lockReleaseTimer = null;
+        }
+        await releaseMessageHeightLocks();
+        if (rootDoc) {
+            if (pointerListenerId) await rootDoc.removeEventListener('pointerdown', pointerListenerId);
+            if (docMoveListenerId) await rootDoc.removeEventListener('pointermove', docMoveListenerId);
+            if (docUpListenerId) await rootDoc.removeEventListener('pointerup', docUpListenerId);
+        }
+        if (mutationObserver) await mutationObserver.disconnect();
+        if (chatOutputListener) {
+            try { await risuai.removeRisuChatListener('output', chatOutputListener); } catch (_) {}
+        }
+        await removeTopBar();
+        await upsertStyleTag('anti-flicker', '');
+        await upsertStyleTag('theme-layout-stealth', '');
+    });
+
+    console.log('[RisuStand] v1.0.0 initialized');
+})();
