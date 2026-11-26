@@ -17,6 +17,9 @@ if [ ! -f ".risustand-token" ]; then
 fi
 
 export RISU_REMOTE_TOKEN="$(cat .risustand-token | tr -d '\r\n')"
+if [ -z "$PORT" ] && [ -f ".risustand-port" ]; then
+  PORT="$(tr -d '\r\n' < .risustand-port)"
+fi
 export PORT="${PORT:-8787}"
 
 TS_IP=""

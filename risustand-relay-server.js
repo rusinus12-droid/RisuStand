@@ -20,11 +20,25 @@ const { spawn } = require('child_process');
 
 // Kept in sync with VERSION by tools/release_version.cjs
 const RELAY_VERSION = '1.0.1';
-const PORT = Number(process.env.PORT || 8787);
-const HOST = process.env.HOST || '0.0.0.0';
 const ROOT_DIR = __dirname;
 const TOKEN_PATH = path.join(ROOT_DIR, '.risustand-token');
 const CONFIG_PATH = path.join(ROOT_DIR, '.risustand-config.json');
+
+function loadSavedPort(rootDir = ROOT_DIR) {
+    try {
+        const portPath = path.join(rootDir, '.risustand-port');
+        if (!fs.existsSync(portPath)) return 8787;
+        const raw = fs.readFileSync(portPath, 'utf8').trim();
+        if (/^\d+$/.test(raw)) {
+            const n = Number(raw);
+            if (Number.isInteger(n) && n >= 1 && n <= 65535) return n;
+        }
+    } catch (_) {}
+    return 8787;
+}
+
+const PORT = Number(process.env.PORT || loadSavedPort(ROOT_DIR));
+const HOST = process.env.HOST || '0.0.0.0';
 
 function loadOrCreateToken(rootDir = ROOT_DIR) {
     const envToken = (process.env.RISU_REMOTE_TOKEN || '').trim();
@@ -4739,6 +4753,16 @@ function startServer() {
     }
 
     activeServer = createRelayServer({ token: TOKEN });
+    activeServer.on('error', (err) => {
+        if (err && err.code === 'EADDRINUSE') {
+            console.error('');
+            console.error(`[Server Error] 포트 ${PORT} 번이 이미 사용 중입니다.`);
+            console.error('이미 켜져 있는 중계 서버를 끄려면 stop-risustand-remote.bat 을 먼저 실행하거나 기존 창을 닫은 뒤 다시 시도하세요.');
+            process.exit(1);
+        }
+        console.error(`[Server Error] ${err && err.message ? err.message : String(err)}`);
+        process.exit(1);
+    });
     activeServer.listen(PORT, HOST, () => {
         if (updater) {
             try {
@@ -4772,6 +4796,7 @@ if (require.main === module) {
 
 module.exports = {
     RELAY_VERSION,
+    loadSavedPort,
     parseOptionalNumber,
     normalizeTurnMessages,
     applyPromptOverride,

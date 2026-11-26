@@ -48,6 +48,7 @@ const MAX_ENTRIES = 200;
 // Replaced in place on update.
 const PROGRAM_FILES = Object.freeze([
     'risustand-relay-server.js',
+    'risustand-admin.cjs',
     'risustand-updater.cjs',
     'risustand.js',
     'README.md',
@@ -61,12 +62,18 @@ const PROGRAM_FILES = Object.freeze([
 const LAUNCHER_FILES = Object.freeze([
     'start-risustand-remote.bat',
     'start-risustand-remote.sh',
+    'stop-risustand-remote.bat',
+    'stop-risustand-remote.sh',
+    'rotate-risustand-token.bat',
+    'rotate-risustand-token.sh',
+    'change-risustand-port.bat',
+    'change-risustand-port.sh',
     'update-risustand.bat',
     'update-risustand.sh',
 ]);
 const PAYLOAD_FILES = Object.freeze([...PROGRAM_FILES, ...LAUNCHER_FILES]);
 const META_FILES = Object.freeze(['update-manifest.json', 'SHA256SUMS.txt']);
-const EXECUTABLE_FILES = new Set(['start-risustand-remote.sh', 'update-risustand.sh']);
+const EXECUTABLE_FILES = new Set(['start-risustand-remote.sh', 'stop-risustand-remote.sh', 'rotate-risustand-token.sh', 'change-risustand-port.sh', 'update-risustand.sh']);
 
 const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 

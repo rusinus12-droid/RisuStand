@@ -345,3 +345,54 @@ test('bundled Leave preset & AI provider model loader APIs (including 22 Ollama 
         await new Promise((r) => upstream.close(r));
     }
 });
+
+test('risustand-admin: token rotation/revocation and port file management', () => {
+    const admin = require('../risustand-admin.cjs');
+    const { tmpDir } = require('./helpers.cjs');
+    const dir = tmpDir('rs-admin-');
+    try {
+        // Default state
+        assert.equal(admin.readTokenFile(dir), '');
+        assert.equal(admin.readPortFile(dir), 8787);
+        assert.equal(relay.loadSavedPort(dir), 8787);
+
+        // Random token rotation
+        const r1 = admin.rotateToken(dir);
+        assert.equal(r1.previous, '');
+        assert.match(r1.token, /^[a-f0-9]{32}$/);
+        assert.equal(admin.readTokenFile(dir), r1.token);
+
+        const r2 = admin.rotateToken(dir);
+        assert.equal(r2.previous, r1.token);
+        assert.notEqual(r2.token, r1.token);
+        assert.equal(admin.readTokenFile(dir), r2.token);
+
+        // Custom token validation
+        assert.throws(() => admin.rotateToken(dir, { customToken: 'short' }), /8자 이상/);
+        assert.throws(() => admin.rotateToken(dir, { customToken: 'has space 1234' }), /공백/);
+        const r3 = admin.rotateToken(dir, { customToken: 'my-secure-token-99' });
+        assert.equal(r3.token, 'my-secure-token-99');
+        assert.equal(admin.readTokenFile(dir), 'my-secure-token-99');
+
+        // Revocation
+        const rev = admin.revokeToken(dir);
+        assert.equal(rev.existed, true);
+        assert.equal(admin.readTokenFile(dir), '');
+        assert.equal(admin.revokeToken(dir).existed, false);
+
+        // Port management
+        assert.throws(() => admin.writePortFile(dir, 80), /1024~65535/);
+        assert.throws(() => admin.writePortFile(dir, 70000), /1024~65535/);
+        assert.throws(() => admin.writePortFile(dir, 'abc'), /올바른 포트 번호/);
+
+        assert.equal(admin.writePortFile(dir, '9090'), 9090);
+        assert.equal(admin.readPortFile(dir), 9090);
+        assert.equal(relay.loadSavedPort(dir), 9090);
+
+        assert.equal(admin.resetPortFile(dir), 8787);
+        assert.equal(admin.readPortFile(dir), 8787);
+        assert.equal(relay.loadSavedPort(dir), 8787);
+    } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+    }
+});

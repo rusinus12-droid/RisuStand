@@ -39,6 +39,9 @@ if not exist ".risustand-token" (
 )
 
 set /p RISU_REMOTE_TOKEN=<".risustand-token"
+if not defined PORT (
+    if exist ".risustand-port" set /p PORT=<".risustand-port"
+)
 if not defined PORT set "PORT=8787"
 
 set "TS_IP="

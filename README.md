@@ -39,7 +39,11 @@ RisuAI 원본 소스는 한 줄도 고치지 않습니다. 공식 **Plugin API v
 | `risustand.js` | PC RisuAI에 설치하는 플러그인 (API v3.0). RisuAI가 자동 업데이트를 확인합니다. |
 | `risustand-relay-server.js` | PC에서 켜 두는 중계 서버 · 모바일 웹앱 · 모델 라우터 (Node.js 18+, 외부 패키지 없음) |
 | `risustand-updater.cjs` | 공식 릴리즈 검증 · 설치 · 롤백을 맡는 업데이터 |
+| `risustand-admin.cjs` | 보안 토큰 폐기·재발급 및 서버 포트 설정 유틸리티 |
 | `start-risustand-remote.bat` / `.sh` | 중계 서버 실행 런처 (토큰 자동 생성 + Tailscale IP 표시) |
+| `stop-risustand-remote.bat` / `.sh` | 실행 중인 중계 서버를 찾아 안전하게 종료하는 런처 |
+| `rotate-risustand-token.bat` / `.sh` | 기존 보안 토큰을 폐기하고 재발급·직접 변경하는 툴 |
+| `change-risustand-port.bat` / `.sh` | 중계 서버 포트를 변경·초기화하는 툴 (`.risustand-port`) |
 | `update-risustand.bat` / `.sh` | 서버를 끈 상태에서 PC에서 직접 업데이트하는 런처 |
 | `prompt/Leave_RisuAI_Preset.json` / `.html` | 내장 **Leave r1.1** AI 프리셋 파일 및 HTML 사용 가이드 (모바일 원클릭 등록·다운로드) |
 
@@ -55,8 +59,9 @@ RisuAI 원본 소스는 한 줄도 고치지 않습니다. 공식 **Plugin API v
 ### 2단계 — PC에서 중계 서버 켜기
 1. [Node.js LTS (v18 이상)](https://nodejs.org)를 설치합니다.
 2. 압축을 푼 폴더에서 `start-risustand-remote.bat`(macOS/Linux는 `start-risustand-remote.sh`)을 실행합니다.
-   - 기본 포트는 `8787`이며, Windows(`.bat`) · macOS/Linux(`.sh`) 모두 `PORT` 환경변수로 포트를 바꿀 수 있습니다.
+   - 기본 포트는 `8787`이며, `change-risustand-port.bat`(`.sh`)로 포트를 영구 변경(`.risustand-port`)하거나 `PORT` 환경변수로 일시 지정할 수 있습니다.
    - 런처 없이 `node risustand-relay-server.js`를 직접 실행해도 같은 폴더의 `.risustand-token`을 자동으로 읽거나 새로 생성합니다.
+   - 기존 토큰이 노출됐거나 바꾸고 싶으면 `rotate-risustand-token.bat`(`.sh`)로 즉시 폐기 · 재발급할 수 있습니다.
 3. 창에 표시되는 **`Security Token`**을 복사해 둡니다. 휴대폰 접속과 원격 프록시 호출에 쓰는 열쇠입니다. 처음 한 번 만들어지고 이후에는 같은 토큰을 씁니다.
 4. PC RisuAI → **`📡 RisuStand 원격 접속`** → `원격 브릿지 활성화`를 켜고 주소 `http://127.0.0.1:8787`, 토큰을 붙여넣은 뒤 **저장 및 연결**을 누릅니다.
    처음 한 번 뜨는 RisuAI DB 권한 팝업은 허용해 주세요. 상태가 `🟢 중계 서버 연결됨`으로 바뀌면 됩니다.
