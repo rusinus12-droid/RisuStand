@@ -50,8 +50,8 @@ if not errorlevel 1 (
 )
 
 echo.
-echo   PC Bridge URL  : https://www.google.com/search?q=http://127.0.0.1:%PORT%
-echo   Proxy Router   : https://www.google.com/search?q=http://127.0.0.1:%PORT%/v1/chat/completions
+echo   PC Bridge URL  : http://127.0.0.1:%PORT%
+echo   Proxy Router   : http://127.0.0.1:%PORT%/v1/chat/completions
 if not "!TS_IP!"=="" (
     echo   iPhone / iPad  : http://!TS_IP!:%PORT%
 )
