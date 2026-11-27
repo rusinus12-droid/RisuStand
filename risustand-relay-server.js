@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * RisuStand Remote Relay Server v1.1.0
+ * RisuStand Remote Relay Server v1.2.0
  * Zero-dependency Node.js (v18+) server:
  *  1) PC RisuAI Plugin Bridge Relay (Bots, Chats, Modules, Personas, Params)
  *  2) OpenAI-Compatible Local LLM Proxy Router (/v1/chat/completions)
@@ -23,7 +23,7 @@ const { defaultImageGenConfig, normalizeImageGenConfig, sanitizeImageGenForClien
 const { createModuleAdapter } = require('./risustand-module-adapter.cjs');
 
 // Kept in sync with VERSION by tools/release_version.cjs
-const RELAY_VERSION = '1.1.0';
+const RELAY_VERSION = '1.2.0';
 const ROOT_DIR = __dirname;
 const TOKEN_PATH = path.join(ROOT_DIR, '.risustand-token');
 const CONFIG_PATH = path.join(ROOT_DIR, '.risustand-config.json');
