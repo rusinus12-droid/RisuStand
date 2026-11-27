@@ -338,15 +338,18 @@ test('relay server TTS routes, config persistence, and web UI integration', asyn
         assert.ok(html.includes('id="ttsTestVoiceInp"'));
         assert.ok(html.includes('id="ttsTestStatus"'));
         assert.ok(html.includes('id="ttsTestAudio"'));
-        assert.ok(html.includes('id="ttsCastQuickBtn"'));
-        assert.ok(html.includes('id="ttsCastModal"'));
+        assert.ok(!html.includes('id="ttsCastQuickBtn"'), 'per-chat quick button must be removed from topbar');
+        assert.ok(!html.includes('id="ttsCastModal"'), 'per-chat modal must be removed');
+        assert.ok(html.includes('id="ttsGlobalCastBox"'));
+        assert.ok(html.includes('id="ttsGlobalCastList"'));
+        assert.ok(html.includes('id="ttsGlobalCastEditor"'));
         assert.ok(html.includes('ttscVoiceGroupSel'));
         assert.ok(html.includes('ttscVoiceRefSel'));
         assert.ok(html.includes('ttscDlgTagSel'));
         assert.ok(html.includes('ttscThTagSel'));
         assert.ok(/\.book-tap-zone\s*\{[^}]*pointer-events:\s*none/i.test(html), '.book-tap-zone must not intercept pointer events');
         assert.ok(html.includes('function isInteractiveBookTarget('), 'book view must guard interactive targets in edge zones');
-        assert.ok(!html.includes('id="ttsCastScopeSel"'), 'per-character scope selector must not live in global settings');
+        assert.ok(!html.includes('id="ttsCastScopeSel"'), 'per-character scope selector must not exist');
         assert.ok(!html.includes('id="chatTtsCastCard"'), 'per-character summary card must not live in modules tab');
         const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
         assert.ok(scriptMatch && scriptMatch[1], 'embedded script block must exist');
@@ -434,60 +437,61 @@ test('relay server TTS routes, config persistence, and web UI integration', asyn
         assert.ok(Array.isArray(discRes.presets) && discRes.presets.length >= 5);
         assert.ok(Array.isArray(discRes.servers));
 
-        // 7) Per-chat character voice cast via /api/tts/chat-cast and /api/tts/synthesize
-        const castRoomA = await fetch(`${relayUrl}/api/tts/chat-cast`, {
+        // 7) Global character voice cast via /api/tts/characters (and legacy /api/tts/chat-cast) applies across all chat rooms
+        const castSaved = await fetch(`${relayUrl}/api/tts/characters`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
             body: JSON.stringify({
-                chatKey: 'charA:r0',
-                characters: [{ name: '이리스', gender: 'female', voiceId: 'ref-iris-roomA' }],
+                characters: [{ name: '이리스', gender: 'female', voiceId: 'ref-iris-global-v2' }],
             }),
         }).then((r) => r.json());
-        assert.equal(castRoomA.tts.chatCharacters['charA:r0'][0].voiceId, 'ref-iris-roomA');
+        assert.equal(castSaved.tts.characters[0].voiceId, 'ref-iris-global-v2');
+        assert.deepEqual(castSaved.tts.chatCharacters, {});
 
-        const castRoomB = await fetch(`${relayUrl}/api/tts/chat-cast`, {
+        // Legacy /api/tts/chat-cast with chatKey also writes globally without chatCharacters scoping
+        const legacyCastSave = await fetch(`${relayUrl}/api/tts/chat-cast`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
             body: JSON.stringify({
                 chatKey: 'charA:r1',
-                characters: [{ name: '이리스', gender: 'female', voiceId: 'ref-iris-roomB' }],
+                characters: [{ name: '이리스', gender: 'female', voiceId: 'ref-iris-global-v3' }],
             }),
         }).then((r) => r.json());
-        assert.equal(castRoomB.tts.chatCharacters['charA:r0'][0].voiceId, 'ref-iris-roomA');
-        assert.equal(castRoomB.tts.chatCharacters['charA:r1'][0].voiceId, 'ref-iris-roomB');
+        assert.equal(legacyCastSave.tts.characters[0].voiceId, 'ref-iris-global-v3');
+        assert.deepEqual(legacyCastSave.tts.chatCharacters, {});
 
-        // /api/router/config saving global TTS settings without chatCharacters preserves both rooms
-        const globalWithoutChatChars = { ...castRoomB.tts };
-        delete globalWithoutChatChars.chatCharacters;
+        // /api/router/config saving global TTS settings without characters preserves existing characters
+        const globalWithoutChars = { ...legacyCastSave.tts };
+        delete globalWithoutChars.characters;
         const afterRouterSave = await fetch(`${relayUrl}/api/router/config`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
-            body: JSON.stringify({ tts: globalWithoutChatChars }),
+            body: JSON.stringify({ tts: globalWithoutChars }),
         }).then((r) => r.json());
-        assert.equal(afterRouterSave.tts.chatCharacters['charA:r0'][0].voiceId, 'ref-iris-roomA');
-        assert.equal(afterRouterSave.tts.chatCharacters['charA:r1'][0].voiceId, 'ref-iris-roomB');
+        assert.equal(afterRouterSave.tts.characters[0].voiceId, 'ref-iris-global-v3');
+        assert.deepEqual(afterRouterSave.tts.chatCharacters, {});
 
         const synthRoomA = await fetch(`${relayUrl}/api/tts/synthesize`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
             body: JSON.stringify({
                 chatKey: 'charA:r0',
-                segment: { kind: 'dialogue', speaker: '이리스', gender: 'female', text: '방 A 대사입니다.' },
+                segment: { kind: 'dialogue', speaker: '이리스', gender: 'female', text: '전역 보이스 대사입니다.' },
             }),
         });
         assert.equal(synthRoomA.status, 200);
-        assert.equal(synthRoomA.headers.get('x-tts-voice'), 'ref-iris-roomA');
+        assert.equal(synthRoomA.headers.get('x-tts-voice'), 'ref-iris-global-v3');
 
         const synthRoomB = await fetch(`${relayUrl}/api/tts/synthesize`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
             body: JSON.stringify({
                 chatKey: 'charA:r1',
-                segment: { kind: 'dialogue', speaker: '이리스', gender: 'female', text: '방 A 대사입니다.' },
+                segment: { kind: 'dialogue', speaker: '이리스', gender: 'female', text: '전역 보이스 대사입니다.' },
             }),
         });
         assert.equal(synthRoomB.status, 200);
-        assert.equal(synthRoomB.headers.get('x-tts-voice'), 'ref-iris-roomB');
+        assert.equal(synthRoomB.headers.get('x-tts-voice'), 'ref-iris-global-v3');
     } finally {
         await closeServer(relay);
         await closeServer(mockTts);
@@ -552,7 +556,7 @@ test('normalizeTtsEndpointUrl and listTtsModels handle shorthand URLs and Fish/O
     }
 });
 
-test('per-chat character voice cast overrides global characters by chatKey', async () => {
+test('character voice cast applies globally across all chats and migrates legacy chatCharacters', async () => {
     const key1 = buildTtsChatKey({ charIndex: 0, chatIndex: 2, charContext: { charId: 'bot-uuid-1' } });
     assert.equal(key1, 'bot-uuid-1:r2');
 
@@ -564,41 +568,34 @@ test('per-chat character voice cast overrides global characters by chatKey', asy
         ],
         chatCharacters: {
             'bot-uuid-1:r0': [
-                { name: '아리아', gender: 'female', voiceId: 'v-aria-room0', dialogueToneTag: 'happy' },
-            ],
-            'bot-uuid-1:r1': [
-                { name: '아리아', gender: 'male', voiceId: 'v-aria-room1-alt' },
+                { name: '아리아', gender: 'male', voiceId: 'v-aria-room-ignored' },
+                { name: '세라', gender: 'female', voiceId: 'v-sera-migrated' },
             ],
         },
     });
 
+    assert.deepEqual(cfg.chatCharacters, {});
     const effRoom0 = getEffectiveTtsCharacters(cfg, 'bot-uuid-1:r0');
-    assert.equal(effRoom0.length, 2);
-    assert.equal(effRoom0[0].voiceId, 'v-aria-room0');
+    assert.equal(effRoom0.length, 3);
+    assert.equal(effRoom0[0].voiceId, 'v-aria-global');
     assert.equal(effRoom0[1].voiceId, 'v-kyle-global');
+    assert.equal(effRoom0[2].voiceId, 'v-sera-migrated');
 
     const r0 = await analyzeTtsSegments({
         text: '아리아: "안녕!"',
         chatKey: 'bot-uuid-1:r0',
         ttsConfig: cfg,
     });
-    assert.equal(r0.segments[0].voiceId, 'v-aria-room0');
+    assert.equal(r0.segments[0].voiceId, 'v-aria-global');
     assert.equal(r0.segments[0].gender, 'female');
 
     const r1 = await analyzeTtsSegments({
-        text: '아리아: "안녕!"',
+        text: '세라: "반가워."',
         chatKey: 'bot-uuid-1:r1',
         ttsConfig: cfg,
     });
-    assert.equal(r1.segments[0].voiceId, 'v-aria-room1-alt');
-    assert.equal(r1.segments[0].gender, 'male');
-
-    const rOther = await analyzeTtsSegments({
-        text: '아리아: "안녕!"',
-        chatKey: 'bot-uuid-1:r99',
-        ttsConfig: cfg,
-    });
-    assert.equal(rOther.segments[0].voiceId, 'v-aria-global');
+    assert.equal(r1.segments[0].voiceId, 'v-sera-migrated');
+    assert.equal(r1.segments[0].gender, 'female');
 });
 
 test('voice profile catalogs, 2-tier group inference, tone tag presets, and /api/tts/voice-profiles routes', async () => {

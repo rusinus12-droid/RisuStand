@@ -446,16 +446,24 @@ function normalizeTtsConfig(raw) {
     const characters = Array.isArray(raw.characters)
         ? raw.characters.map((c, i) => normalizeCharacterVoice(c, i)).filter(Boolean)
         : [];
+    const seenCharNames = new Set(characters.map((c) => c.name.toLowerCase()));
 
-    const chatCharacters = {};
+    // Migrate any legacy per-chat entries into global characters so existing casts keep working everywhere
     if (raw.chatCharacters && typeof raw.chatCharacters === 'object' && !Array.isArray(raw.chatCharacters)) {
-        for (const [k, v] of Object.entries(raw.chatCharacters)) {
-            const key = String(k || '').trim().slice(0, 200);
-            if (!key || !Array.isArray(v)) continue;
-            const list = v.map((c, i) => normalizeCharacterVoice(c, i)).filter(Boolean);
-            if (list.length) chatCharacters[key] = list;
+        for (const v of Object.values(raw.chatCharacters)) {
+            if (!Array.isArray(v)) continue;
+            for (const c of v) {
+                const normChar = normalizeCharacterVoice(c, characters.length);
+                if (!normChar) continue;
+                const lowerName = normChar.name.toLowerCase();
+                if (!seenCharNames.has(lowerName)) {
+                    seenCharNames.add(lowerName);
+                    characters.push(normChar);
+                }
+            }
         }
     }
+    const chatCharacters = {};
 
     const voiceProfiles = normalizeVoiceProfiles(raw.voiceProfiles);
 
@@ -936,23 +944,8 @@ function findCharacterProfile(speaker, characters = []) {
     return null;
 }
 
-function getEffectiveTtsCharacters(ttsConfig, chatKey = '') {
-    const cfg = normalizeTtsConfig(ttsConfig);
-    const key = String(chatKey || '').trim();
-    const roomList = (key && cfg.chatCharacters && Array.isArray(cfg.chatCharacters[key]))
-        ? cfg.chatCharacters[key]
-        : [];
-    if (!roomList.length) return cfg.characters;
-    const seen = new Set(roomList.map((c) => String(c.name || '').trim().toLowerCase()).filter(Boolean));
-    const merged = [...roomList];
-    for (const g of cfg.characters) {
-        const nm = String((g && g.name) || '').trim().toLowerCase();
-        if (nm && !seen.has(nm)) {
-            seen.add(nm);
-            merged.push(g);
-        }
-    }
-    return merged;
+function getEffectiveTtsCharacters(ttsConfig, _chatKey = '') {
+    return normalizeTtsConfig(ttsConfig).characters;
 }
 
 function resolveSegmentVoice(segment, ttsConfig, defaultCharName = 'Character', chatKey = '') {

@@ -30,8 +30,6 @@ const {
     normalizeVoiceProfiles,
     inferTtsVoiceGroup,
     normalizeTtsEndpointUrl,
-    buildTtsChatKey,
-    getEffectiveTtsCharacters,
     defaultTtsConfig,
     normalizeTtsConfig,
     sanitizeTtsForClient,
@@ -6781,12 +6779,11 @@ function renderWebApp() {
     font-size:12px; font-weight:600; cursor:pointer;
   }
   .rs-pbb-btn:hover { border-color:var(--accent); color:var(--accent); }
-  #sceneCtrlModal, #ttsCastModal {
+  #sceneCtrlModal {
     position:fixed; inset:0; z-index:168; background:rgba(0,0,0,0.68);
     -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
     display:flex; align-items:center; justify-content:center; padding:12px;
   }
-  #ttsCastModal { z-index:169; }
   .scene-ctrl-dialog {
     width:min(760px, 96vw); max-height:min(88dvh, 780px);
     background:var(--elev); color:var(--text);
@@ -7136,7 +7133,6 @@ function renderWebApp() {
   body.tab-home-active #assetCycleBtn,
   body.tab-home-active #autoTrBtn,
   body.tab-home-active #zenModeBtn { display:none !important; }
-  body:not(.tab-chat-active) #ttsCastQuickBtn { display:none !important; }
   .home-status-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:8px; }
   .home-stat-pill { background:var(--bg); border:1px solid var(--border); border-radius:12px; padding:9px 11px; min-width:0; }
   .home-stat-pill .k { font-size:11px; font-weight:700; color:var(--sub); margin-bottom:3px; }
@@ -7389,7 +7385,6 @@ function renderWebApp() {
 <div id="pluginGuiModal" style="display:none;" role="dialog" aria-modal="true" aria-label="플러그인 GUI"></div>
 <div id="pluginFloatingModal" style="display:none;" role="dialog" aria-modal="true" aria-label="플러그인 플로팅 컨트롤"></div>
 <div id="sceneCtrlModal" style="display:none;" role="dialog" aria-modal="true" aria-label="장면·삽화 제어함"></div>
-<div id="ttsCastModal" style="display:none;" role="dialog" aria-modal="true" aria-label="이 채팅방 캐릭터 보이스 설정"></div>
 <div id="thumbPickerModal" style="display:none;" role="dialog" aria-modal="true" aria-label="봇 썸네일 변경"></div>
 
 <div id="login">
@@ -7418,7 +7413,6 @@ function renderWebApp() {
       </div>
     </div>
     <div class="h-right">
-      <button class="pill icon-pill" id="ttsCastQuickBtn" title="이 채팅방 캐릭터 보이스 설정" aria-label="캐릭터 보이스 설정">🎙️</button>
       <button class="pill icon-pill" id="sceneCtrlQuickBtn" title="장면·삽화 제어함" aria-label="장면·삽화 제어함">🎨</button>
       <button class="pill icon-pill" id="reqLogQuickBtn" title="리퀘스트 로그 보기" aria-label="리퀘스트 로그">📜</button>
       <button class="pill icon-pill" id="assetCycleBtn" title="에셋 표시 / 가리기 / 감추기" aria-label="에셋 표시 모드">🖼️</button>
@@ -7996,8 +7990,18 @@ function renderWebApp() {
         <input class="f-inp" id="ttsDefThoughtSpeed" type="number" step="0.02" min="0.5" max="2.0" />
       </div>
 
-      <div class="hint" style="margin-top:8px;">
-        🎭 <b>개별 캐릭터 보이스 설정</b>은 채팅방 화면 상단바의 <b>🎙️</b> 버튼을 눌러 채팅방별로 설정합니다.
+      <div class="tts-subbox" id="ttsGlobalCastBox">
+        <div class="tts-subbox-title">
+          <span>🎭 등장인물별 캐릭터 보이스 설정 (전역 적용)</span>
+        </div>
+        <div class="hint" style="margin:2px 0 8px;">등장인물 이름(별칭 포함)마다 서로 다른 성별 · Voice ID · 대화/속마음 톤을 등록해 두면 모든 채팅방에서 해당 화자 대사에 자동 적용됩니다.</div>
+        <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+          <button type="button" class="pill active" id="ttscAddBtn">+ 캐릭터 추가</button>
+          <button type="button" class="pill" id="ttscFetchFishBtn">🐟 Fish 보이스 불러오기</button>
+          <button type="button" class="pill" id="ttscFetchOaBtn">🎙️ OpenAI/Qwen 불러오기</button>
+        </div>
+        <div class="tts-cast-list" id="ttsGlobalCastList" style="margin-top:8px;"></div>
+        <div id="ttsGlobalCastEditor"></div>
       </div>
 
       <div class="tts-subbox">
@@ -8915,7 +8919,6 @@ function renderWebApp() {
 
   function logoutToLogin(reason) {
     if (typeof stopTtsPlayback === 'function') stopTtsPlayback();
-    if (typeof closeTtsCastModal === 'function') closeTtsCastModal();
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     if (updPolling) { clearInterval(updPolling); updPolling = null; }
     if (typeof disconnectActivityStream === 'function') disconnectActivityStream();
@@ -10760,32 +10763,18 @@ function renderWebApp() {
     renderTtsPlayerBar();
   }
 
-  function getClientTtsChatKey(snap) {
-    if (!snap || typeof snap !== 'object') return '';
-    const charCtx = (snap.charContext && typeof snap.charContext === 'object') ? snap.charContext : null;
-    const rawCharId = (charCtx && (charCtx.charId || charCtx.chaId)) || snap.chaId || '';
-    const charIdx = Number(snap.charIndex);
-    const charPart = String(rawCharId || (!Number.isNaN(charIdx) && charIdx >= 0 ? ('c' + charIdx) : '')).trim();
-    const chatIdx = Number(snap.chatIndex);
-    const chatPart = (!Number.isNaN(chatIdx) && chatIdx >= 0)
-      ? ('r' + chatIdx)
-      : String(snap.chatUuid || snap.chatId || '').trim();
-    if (!charPart || !chatPart) return '';
-    return (charPart + ':' + chatPart).slice(0, 200);
-  }
-
-  async function fetchTtsSegmentAudio(seg, charName, signal, chatKey) {
+  async function fetchTtsSegmentAudio(seg, charName, signal) {
     const ttsCfg = (routerCfg && routerCfg.tts) || {};
     const sig = hashStr(JSON.stringify({
       p: ttsCfg.provider, u: ttsCfg.apiUrl, m: ttsCfg.model, f: ttsCfg.format, ts: ttsCfg.fishTagStyle,
-      ck: chatKey || '', k: seg.kind, s: seg.speaker, g: seg.gender, v: seg.voiceId, t: seg.toneTags, txt: seg.text,
+      k: seg.kind, s: seg.speaker, g: seg.gender, v: seg.voiceId, t: seg.toneTags, txt: seg.text,
     }));
     if (ttsAudioBufferCache.has(sig)) return ttsAudioBufferCache.get(sig);
     const res = await fetch('/api/tts/synthesize', {
       method: 'POST',
       signal,
       headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
-      body: JSON.stringify({ segment: seg, charName, chatKey: chatKey || '' }),
+      body: JSON.stringify({ segment: seg, charName }),
     });
     if (!res.ok) {
       const errData = await res.json().catch(() => ({}));
@@ -10904,11 +10893,10 @@ function renderWebApp() {
 
       // Prefetch next 2 segments while fetching/playing current
       const signal = ttsPlayerState.abortCtrl ? ttsPlayerState.abortCtrl.signal : undefined;
-      const ck = ttsPlayerState.chatKey || '';
-      const curProm = fetchTtsSegmentAudio(seg, ttsPlayerState.charName, signal, ck);
+      const curProm = fetchTtsSegmentAudio(seg, ttsPlayerState.charName, signal);
       for (let look = 1; look <= 2; look += 1) {
         if (idx + look < ttsPlayerState.segments.length) {
-          fetchTtsSegmentAudio(ttsPlayerState.segments[idx + look], ttsPlayerState.charName, signal, ck).catch(() => {});
+          fetchTtsSegmentAudio(ttsPlayerState.segments[idx + look], ttsPlayerState.charName, signal).catch(() => {});
         }
       }
 
@@ -10951,7 +10939,6 @@ function renderWebApp() {
     ttsPlayerState.playing = false;
     ttsPlayerState.paused = false;
     ttsPlayerState.charName = snap.charName || 'Character';
-    ttsPlayerState.chatKey = getClientTtsChatKey(snap);
     ttsPlayerState.segments = [];
     ttsPlayerState.segIdx = 0;
     updateTtsButtonsDom();
@@ -10959,7 +10946,7 @@ function renderWebApp() {
 
     try {
       const ttsCfg = (routerCfg && routerCfg.tts) || {};
-      const cacheKey = key + ':' + ttsPlayerState.chatKey + ':' + hashStr((found.text || '') + '|' + (found.html || '') + '|' + (ttsCfg.parseMode || 'hybrid'));
+      const cacheKey = key + ':' + hashStr((found.text || '') + '|' + (found.html || '') + '|' + (ttsCfg.parseMode || 'hybrid'));
       let segments = ttsAnalyzeCache.get(cacheKey);
       if (!segments) {
         const res = await fetch('/api/tts/analyze', {
@@ -10972,7 +10959,6 @@ function renderWebApp() {
             role: found.role || 'char',
             charName: snap.charName || 'Character',
             personaName: snap.personaName || '나',
-            chatKey: ttsPlayerState.chatKey,
           }),
         });
         const data = await res.json().catch(() => ({}));
@@ -13155,6 +13141,7 @@ function renderWebApp() {
       ['ttsMaleVoiceGroupSel', 'ttsMaleVoiceRefSel', 'ttsMaleVoiceId', '-- 미지정 (서버 기본) --'],
       ['ttsNeuVoiceGroupSel', 'ttsNeuVoiceRefSel', 'ttsNeuVoiceId', '-- 미지정 (서버 기본) --'],
       ['ttsTestVoiceGroupSel', 'ttsTestVoiceRefSel', 'ttsTestVoiceInp', '-- 기본 성별/나레이션 사용 --'],
+      ['ttscVoiceGroupSel', 'ttscVoiceRefSel', 'ttscVoiceIdInp', '-- 기본 성별 풀 사용 --'],
     ];
     for (const [gId, rId, iId, lbl] of pairs) {
       const gEl = document.getElementById(gId);
@@ -13236,6 +13223,95 @@ function renderWebApp() {
     fish_cloud: { url: 'https://api.fish.audio/v1/tts', model: 's2-pro', isFish: true, hint: 'Fish Audio 상용 클라우드 API입니다. 로컬 Fish와 동일한 Voice ID 및 감정 태그를 사용합니다.' },
     openai_compat_cloud: { url: 'https://api.openai.com/v1/audio/speech', model: 'gpt-4o-mini-tts', isFish: false, hint: 'OpenAI TTS(<code>gpt-4o-mini-tts</code>) 등 상용 <code>/v1/audio/speech</code> API입니다.' },
   };
+  let ttsGlobalCastDraft = [];
+  let ttsGlobalCastEditIdx = null;
+
+  function renderGlobalTtsCastBox() {
+    const listEl = document.getElementById('ttsGlobalCastList');
+    const editorEl = document.getElementById('ttsGlobalCastEditor');
+    if (listEl) {
+      listEl.innerHTML = ttsGlobalCastDraft.length
+        ? ttsGlobalCastDraft.map((c, idx) => {
+            const gLabel = c.gender === 'female' ? '♀ 여성' : (c.gender === 'male' ? '♂ 남성' : '중성');
+            const vTxt = c.voiceId ? ('Voice: ' + c.voiceId) : '기본 성별 풀';
+            const aliasTxt = (c.aliases && c.aliases.length) ? (' (' + c.aliases.join(', ') + ')') : '';
+            const toneTxt = [c.dialogueToneTag ? ('대화:' + c.dialogueToneTag) : '', c.thoughtToneTag ? ('속마음:' + c.thoughtToneTag) : ''].filter(Boolean).join(' · ');
+            return '<div class="tts-cast-item">' +
+              '<div style="min-width:0;">' +
+                '<div style="font-size:13.5px; font-weight:700;">' + esc(c.name) + '<span style="font-weight:500; color:var(--sub); font-size:11.5px;">' + esc(aliasTxt) + '</span></div>' +
+                '<div style="font-size:11.5px; color:var(--sub);">' + esc(gLabel + ' · ' + vTxt + (toneTxt ? ' · ' + toneTxt : '')) + '</div>' +
+              '</div>' +
+              '<div style="display:flex; gap:5px; flex-shrink:0;">' +
+                '<button type="button" class="pill" data-ttsc-preview="' + idx + '" title="미리듣기">▶</button>' +
+                '<button type="button" class="pill" data-ttsc-edit="' + idx + '">편집</button>' +
+                '<button type="button" class="pill" data-ttsc-del="' + idx + '" style="color:var(--danger);">삭제</button>' +
+              '</div>' +
+            '</div>';
+          }).join('')
+        : '<div class="hint" style="margin:2px 0;">등록된 등장인물 보이스가 없습니다. <b>+ 캐릭터 추가</b>로 화자별 목소리를 등록하거나, 미등록 화자는 위 기본 성별 풀을 사용합니다.</div>';
+    }
+    if (editorEl) {
+      if (ttsGlobalCastEditIdx === null) {
+        editorEl.innerHTML = '';
+        return;
+      }
+      const c = (ttsGlobalCastEditIdx >= 0 && ttsGlobalCastDraft[ttsGlobalCastEditIdx]) ? ttsGlobalCastDraft[ttsGlobalCastEditIdx] : {
+        id: 'tts-char-' + Date.now(), name: '', aliases: [], gender: 'female', voiceGroup: '', voiceId: '',
+        dialogueToneTag: '', thoughtToneTag: 'whispering', speed: 1.0, thoughtSpeed: 0.94,
+      };
+      const curVoiceGroup = inferClientVoiceGroup(c.voiceId || '', c.voiceGroup || '');
+      const dlgPresetMatch = !c.dialogueToneTag || TTS_TONE_TAG_PRESETS_CLIENT.some((t) => t.value.toLowerCase() === String(c.dialogueToneTag).toLowerCase());
+      const thVal = c.thoughtToneTag !== undefined ? c.thoughtToneTag : 'whispering';
+      const thPresetMatch = !thVal || TTS_TONE_TAG_PRESETS_CLIENT.some((t) => t.value.toLowerCase() === String(thVal).toLowerCase());
+      editorEl.innerHTML =
+        '<div class="tts-subbox" id="ttsGlobalEditorCard" style="margin-top:8px;">' +
+          '<div class="tts-subbox-title"><span>' + (ttsGlobalCastEditIdx >= 0 ? '✏️ 등장인물 보이스 편집' : '➕ 새 등장인물 보이스 추가') + '</span></div>' +
+          '<div class="grid-2">' +
+            '<div><label class="f-label" style="margin-top:2px;">등장인물 이름</label><input class="f-inp" id="ttscNameInp" value="' + esc(c.name || '') + '" placeholder="예: 주시은" /></div>' +
+            '<div><label class="f-label" style="margin-top:2px;">성별</label>' +
+              '<select class="f-inp" id="ttscGenderSel">' +
+                '<option value="female"' + (c.gender === 'female' ? ' selected' : '') + '>여성 (♀)</option>' +
+                '<option value="male"' + (c.gender === 'male' ? ' selected' : '') + '>남성 (♂)</option>' +
+                '<option value="neutral"' + (c.gender === 'neutral' ? ' selected' : '') + '>중성/기타</option>' +
+              '</select>' +
+            '</div>' +
+          '</div>' +
+          '<label class="f-label" style="margin-top:4px;">별칭 (쉼표 구분)</label>' +
+          '<input class="f-inp" id="ttscAliasesInp" value="' + esc(Array.isArray(c.aliases) ? c.aliases.join(', ') : '') + '" placeholder="예: 시은, Sieun, 그녀" />' +
+          '<label class="f-label" style="margin-top:6px;">전용 Voice / Reference ID (1단계: 영역 → 2단계: 보이스 ID)</label>' +
+          '<div class="tts-voice-tier">' +
+            '<select class="f-inp" id="ttscVoiceGroupSel" aria-label="캐릭터 보이스 영역">' + buildVoiceGroupOptionsHtml(curVoiceGroup) + '</select>' +
+            '<select class="f-inp" id="ttscVoiceRefSel" aria-label="캐릭터 보이스 레퍼런스">' + buildVoiceRefOptionsHtml(curVoiceGroup, c.voiceId || '', '-- 기본 성별 풀 사용 --') + '</select>' +
+          '</div>' +
+          '<div style="display:flex; gap:6px; align-items:center; margin-top:6px;">' +
+            '<input class="f-inp" id="ttscVoiceIdInp" list="ttsVoiceDatalist" value="' + esc(c.voiceId || '') + '" placeholder="Fish reference_id 또는 OpenAI/Qwen voice (직접 입력 가능)" style="flex:1; min-width:0;" />' +
+            '<button type="button" class="pill" id="ttscSaveVoiceProfileBtn" title="현재 영역 프로필로 저장" style="flex-shrink:0;">+ 프로필 저장</button>' +
+          '</div>' +
+          '<div class="grid-2">' +
+            '<div>' +
+              '<label class="f-label" style="margin-top:6px;">대화 톤 태그</label>' +
+              '<select class="f-inp" id="ttscDlgTagSel" aria-label="대화 톤 태그">' + buildToneTagOptionsHtml(c.dialogueToneTag || '', '-- 톤 태그 없음 (기본) --') + '</select>' +
+              '<input class="f-inp" id="ttscDlgTagInp" value="' + esc(c.dialogueToneTag || '') + '" placeholder="직접 입력 (예: soft)" style="margin-top:4px; display:' + (dlgPresetMatch ? 'none' : 'block') + ';" />' +
+            '</div>' +
+            '<div>' +
+              '<label class="f-label" style="margin-top:6px;">속마음 톤 태그</label>' +
+              '<select class="f-inp" id="ttscThTagSel" aria-label="속마음 톤 태그">' + buildToneTagOptionsHtml(thVal, '-- 톤 태그 없음 (기본) --') + '</select>' +
+              '<input class="f-inp" id="ttscThTagInp" value="' + esc(thVal) + '" placeholder="직접 입력 (예: whispering)" style="margin-top:4px; display:' + (thPresetMatch ? 'none' : 'block') + ';" />' +
+            '</div>' +
+          '</div>' +
+          '<div class="grid-2">' +
+            '<div><label class="f-label" style="margin-top:4px;">대화 속도</label><input class="f-inp" id="ttscSpeedInp" type="number" step="0.02" min="0.5" max="2.0" value="' + esc(String(c.speed || 1.0)) + '" /></div>' +
+            '<div><label class="f-label" style="margin-top:4px;">속마음 속도</label><input class="f-inp" id="ttscThSpeedInp" type="number" step="0.02" min="0.5" max="2.0" value="' + esc(String(c.thoughtSpeed || 0.94)) + '" /></div>' +
+          '</div>' +
+          '<div class="btn-row">' +
+            '<button type="button" class="btn" id="ttscApplyEditBtn">적용 및 저장</button>' +
+            '<button type="button" class="btn sec" id="ttscEditorPreviewBtn">▶ 미리듣기</button>' +
+            '<button type="button" class="btn sec" id="ttscCancelEditBtn">취소</button>' +
+          '</div>' +
+        '</div>';
+    }
+  }
+
   function collectTtsFormPayload() {
     const prov = document.getElementById('ttsProviderSel').value;
     const cur = (routerCfg && routerCfg.tts) || {};
@@ -13264,6 +13340,7 @@ function renderWebApp() {
         male: { ...(dv.male || {}), voiceId: document.getElementById('ttsMaleVoiceId').value.trim(), thoughtToneTag: document.getElementById('ttsMaleThoughtTag').value.trim(), thoughtSpeed: Number(document.getElementById('ttsDefThoughtSpeed').value) || 0.94 },
         neutral: { ...(dv.neutral || {}), voiceId: document.getElementById('ttsNeuVoiceId').value.trim(), thoughtSpeed: Number(document.getElementById('ttsDefThoughtSpeed').value) || 0.94 },
       },
+      characters: ttsGlobalCastDraft.slice(),
       effects: {
         ...fx,
         thoughtFxEnabled: document.getElementById('ttsFxEnabledChk').checked,
@@ -13333,6 +13410,9 @@ function renderWebApp() {
     syncToneTagControl(document.getElementById('ttsNarToneTagSel'), document.getElementById('ttsNarToneTag'), document.getElementById('ttsNarToneTag').value, '-- 톤 태그 없음 (기본) --');
     syncToneTagControl(document.getElementById('ttsFemThoughtTagSel'), document.getElementById('ttsFemThoughtTag'), document.getElementById('ttsFemThoughtTag').value, '-- 톤 태그 없음 (기본) --');
     syncToneTagControl(document.getElementById('ttsMaleThoughtTagSel'), document.getElementById('ttsMaleThoughtTag'), document.getElementById('ttsMaleThoughtTag').value, '-- 톤 태그 없음 (기본) --');
+    ttsGlobalCastDraft = Array.isArray(t.characters) ? JSON.parse(JSON.stringify(t.characters)) : [];
+    ttsGlobalCastEditIdx = null;
+    renderGlobalTtsCastBox();
     refreshAllTtsPickers();
     renderVoiceProfilesManager();
 
@@ -13648,8 +13728,198 @@ function renderWebApp() {
         }
       };
     }
+    async function previewTtsVoiceItem(opts) {
+      ensureTtsAudioCtx();
+      toast('음성 미리듣기 생성 중...');
+      const res = await fetch('/api/tts/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+        body: JSON.stringify({ ...opts, ttsOverride: collectTtsFormPayload() }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || ('HTTP ' + res.status));
+      }
+      const buf = await res.arrayBuffer();
+      await playTtsArrayBuffer(buf, { kind: opts.kind || 'dialogue' });
+    }
+
+    async function saveGlobalTtsCast(nextList) {
+      routerCfg = await api('/api/tts/chat-cast', {
+        method: 'POST',
+        body: JSON.stringify({ characters: Array.isArray(nextList) ? nextList : [] }),
+      });
+      ttsAnalyzeCache.clear();
+      ttsAudioBufferCache.clear();
+      const savedChars = (routerCfg && routerCfg.tts && Array.isArray(routerCfg.tts.characters)) ? routerCfg.tts.characters : [];
+      ttsGlobalCastDraft = JSON.parse(JSON.stringify(savedChars));
+      renderGlobalTtsCastBox();
+    }
+
+    const castBox = document.getElementById('ttsGlobalCastBox');
+    if (castBox) {
+      castBox.addEventListener('change', (e) => {
+        if (e.target && e.target.id === 'ttscVoiceGroupSel') {
+          const refSel = document.getElementById('ttscVoiceRefSel');
+          const idInp = document.getElementById('ttscVoiceIdInp');
+          if (refSel && idInp) refSel.innerHTML = buildVoiceRefOptionsHtml(e.target.value, idInp.value, '-- 기본 성별 풀 사용 --');
+        } else if (e.target && e.target.id === 'ttscVoiceRefSel') {
+          const idInp = document.getElementById('ttscVoiceIdInp');
+          if (!idInp) return;
+          if (e.target.value === '__custom__') idInp.focus();
+          else idInp.value = e.target.value;
+        } else if (e.target && (e.target.id === 'ttscDlgTagSel' || e.target.id === 'ttscThTagSel')) {
+          const inpId = e.target.id === 'ttscDlgTagSel' ? 'ttscDlgTagInp' : 'ttscThTagInp';
+          const inpEl = document.getElementById(inpId);
+          if (!inpEl) return;
+          if (e.target.value === '__custom__') {
+            inpEl.style.display = 'block';
+            inpEl.focus();
+          } else {
+            inpEl.value = e.target.value;
+            inpEl.style.display = 'none';
+          }
+        }
+      });
+      castBox.addEventListener('input', (e) => {
+        if (e.target && e.target.id === 'ttscVoiceIdInp') {
+          const gSel = document.getElementById('ttscVoiceGroupSel');
+          const rSel = document.getElementById('ttscVoiceRefSel');
+          if (gSel && rSel) rSel.innerHTML = buildVoiceRefOptionsHtml(gSel.value, e.target.value, '-- 기본 성별 풀 사용 --');
+        }
+      });
+      castBox.addEventListener('click', async (e) => {
+        if (e.target.closest('#ttscAddBtn')) {
+          ttsGlobalCastEditIdx = -1;
+          renderGlobalTtsCastBox();
+          return;
+        }
+        if (e.target.closest('#ttscCancelEditBtn')) {
+          ttsGlobalCastEditIdx = null;
+          renderGlobalTtsCastBox();
+          return;
+        }
+        if (e.target.closest('#ttscFetchFishBtn') || e.target.closest('#ttscFetchOaBtn')) {
+          const reqGroup = e.target.closest('#ttscFetchOaBtn') ? 'openai_qwen' : 'fish';
+          try {
+            const r = await api('/api/tts/models', { method: 'POST', body: JSON.stringify({ group: reqGroup }) });
+            storeLiveVoicesFromResponse(r, reqGroup);
+            const gSel = document.getElementById('ttscVoiceGroupSel');
+            const rSel = document.getElementById('ttscVoiceRefSel');
+            const idInp = document.getElementById('ttscVoiceIdInp');
+            if (gSel && rSel && idInp) {
+              gSel.innerHTML = buildVoiceGroupOptionsHtml(reqGroup);
+              rSel.innerHTML = buildVoiceRefOptionsHtml(reqGroup, idInp.value, '-- 기본 성별 풀 사용 --');
+            }
+            const cnt = Array.isArray(r.voices) ? r.voices.length : 0;
+            toast((reqGroup === 'fish' ? 'Fish' : 'OpenAI/Qwen') + ' 보이스 ' + cnt + '개를 불러왔습니다.');
+          } catch (err) { toast('보이스 조회 실패: ' + err.message); }
+          return;
+        }
+        if (e.target.closest('#ttscSaveVoiceProfileBtn')) {
+          const gSel = document.getElementById('ttscVoiceGroupSel');
+          const idInp = document.getElementById('ttscVoiceIdInp');
+          const nameInp = document.getElementById('ttscNameInp');
+          const genSel = document.getElementById('ttscGenderSel');
+          const grp = (gSel && gSel.value) || 'fish';
+          const voiceIdVal = (idInp && idInp.value.trim()) || '';
+          if (!voiceIdVal) { toast('저장할 Voice / Reference ID를 먼저 입력하거나 선택하세요.'); return; }
+          const labelVal = (nameInp && nameInp.value.trim()) || voiceIdVal;
+          const genderVal = (genSel && genSel.value) || 'female';
+          try {
+            routerCfg = await api('/api/tts/voice-profiles', {
+              method: 'POST',
+              body: JSON.stringify({ action: 'upsert', group: grp, item: { id: voiceIdVal, label: labelVal, gender: genderVal } }),
+            });
+            refreshAllTtsPickers();
+            renderVoiceProfilesManager();
+            const rSel = document.getElementById('ttscVoiceRefSel');
+            if (rSel) rSel.innerHTML = buildVoiceRefOptionsHtml(grp, voiceIdVal, '-- 기본 성별 풀 사용 --');
+            toast((grp === 'fish' ? 'Fish' : 'OpenAI/Qwen') + ' 프로필에 저장됨');
+          } catch (err) { toast('프로필 저장 실패: ' + err.message); }
+          return;
+        }
+        if (e.target.closest('#ttscApplyEditBtn')) {
+          const name = (document.getElementById('ttscNameInp') && document.getElementById('ttscNameInp').value.trim()) || '';
+          if (!name) { toast('등장인물 이름을 입력하세요.'); return; }
+          const item = {
+            id: (ttsGlobalCastEditIdx >= 0 && ttsGlobalCastDraft[ttsGlobalCastEditIdx]) ? ttsGlobalCastDraft[ttsGlobalCastEditIdx].id : ('tts-char-' + Date.now()),
+            name,
+            gender: (document.getElementById('ttscGenderSel') && document.getElementById('ttscGenderSel').value) || 'female',
+            aliases: ((document.getElementById('ttscAliasesInp') && document.getElementById('ttscAliasesInp').value) || '').split(',').map((s) => s.trim()).filter(Boolean),
+            voiceGroup: (document.getElementById('ttscVoiceGroupSel') && document.getElementById('ttscVoiceGroupSel').value) || '',
+            voiceId: (document.getElementById('ttscVoiceIdInp') && document.getElementById('ttscVoiceIdInp').value.trim()) || '',
+            dialogueToneTag: (document.getElementById('ttscDlgTagInp') && document.getElementById('ttscDlgTagInp').value.trim()) || '',
+            thoughtToneTag: (document.getElementById('ttscThTagInp') && document.getElementById('ttscThTagInp').value.trim()) || '',
+            speed: Number(document.getElementById('ttscSpeedInp') && document.getElementById('ttscSpeedInp').value) || 1.0,
+            thoughtSpeed: Number(document.getElementById('ttscThSpeedInp') && document.getElementById('ttscThSpeedInp').value) || 0.94,
+          };
+          const nextDraft = ttsGlobalCastDraft.slice();
+          if (ttsGlobalCastEditIdx >= 0) nextDraft[ttsGlobalCastEditIdx] = item;
+          else nextDraft.push(item);
+          try {
+            ttsGlobalCastEditIdx = null;
+            await saveGlobalTtsCast(nextDraft);
+            toast('등장인물 보이스 저장됨 (전역 적용)');
+          } catch (err) { toast('저장 실패: ' + err.message); }
+          return;
+        }
+        if (e.target.closest('#ttscEditorPreviewBtn')) {
+          try {
+            await previewTtsVoiceItem({
+              text: '안녕하세요. 이 목소리로 대사를 들려드릴게요.',
+              kind: 'dialogue',
+              speaker: (document.getElementById('ttscNameInp') && document.getElementById('ttscNameInp').value.trim()) || 'Tester',
+              gender: (document.getElementById('ttscGenderSel') && document.getElementById('ttscGenderSel').value) || 'female',
+              voiceId: (document.getElementById('ttscVoiceIdInp') && document.getElementById('ttscVoiceIdInp').value.trim()) || '',
+              toneTag: (document.getElementById('ttscDlgTagInp') && document.getElementById('ttscDlgTagInp').value.trim()) || '',
+            });
+          } catch (err) { toast('미리듣기 실패: ' + err.message); }
+          return;
+        }
+        const prevBtn = e.target.closest('[data-ttsc-preview]');
+        if (prevBtn) {
+          const idx = Number(prevBtn.getAttribute('data-ttsc-preview'));
+          const c = ttsGlobalCastDraft[idx];
+          if (!c) return;
+          try {
+            await previewTtsVoiceItem({
+              text: '안녕하세요. 이 목소리로 대사를 들려드릴게요.',
+              kind: 'dialogue',
+              speaker: c.name,
+              gender: c.gender,
+              voiceId: c.voiceId,
+              toneTag: c.dialogueToneTag,
+            });
+          } catch (err) { toast('미리듣기 실패: ' + err.message); }
+          return;
+        }
+        const editBtn = e.target.closest('[data-ttsc-edit]');
+        if (editBtn) {
+          ttsGlobalCastEditIdx = Number(editBtn.getAttribute('data-ttsc-edit'));
+          renderGlobalTtsCastBox();
+          return;
+        }
+        const delBtn = e.target.closest('[data-ttsc-del]');
+        if (delBtn) {
+          const idx = Number(delBtn.getAttribute('data-ttsc-del'));
+          if (idx >= 0 && idx < ttsGlobalCastDraft.length) {
+            const nextDraft = ttsGlobalCastDraft.slice();
+            nextDraft.splice(idx, 1);
+            if (ttsGlobalCastEditIdx === idx) ttsGlobalCastEditIdx = null;
+            else if (ttsGlobalCastEditIdx !== null && ttsGlobalCastEditIdx > idx) ttsGlobalCastEditIdx -= 1;
+            try {
+              await saveGlobalTtsCast(nextDraft);
+              toast('등장인물 보이스 삭제됨');
+            } catch (err) { toast('삭제 실패: ' + err.message); }
+          }
+        }
+      });
+    }
+
     refreshAllTtsPickers();
     renderVoiceProfilesManager();
+    renderGlobalTtsCastBox();
   })();
   document.getElementById('saveTrBtn').onclick = async () => {
     routerCfg.translator = {
@@ -15212,343 +15482,6 @@ function renderWebApp() {
     });
   }
 
-  // ---------- Per-Chat Character Voice Cast Modal (Chat Topbar 🎙️) ----------
-  let ttsModalChatKey = '';
-  let ttsModalDraft = [];
-  let ttsModalEditIdx = -1;
-  let ttsModalKeyHandler = null;
-
-  function closeTtsCastModal() {
-    if (ttsModalKeyHandler) {
-      document.removeEventListener('keydown', ttsModalKeyHandler);
-      ttsModalKeyHandler = null;
-    }
-    const modal = document.getElementById('ttsCastModal');
-    if (modal) {
-      modal.style.display = 'none';
-      modal.innerHTML = '';
-    }
-  }
-
-  function renderTtsCastModalBody() {
-    const modal = document.getElementById('ttsCastModal');
-    if (!modal) return;
-    const snap = (lastState && lastState.snapshot) || {};
-    const roomTitle = (displayBotName(snap.charName) || 'Character') + ' · ' + (snap.chatName || ('Chat ' + (Number(snap.chatIndex || 0) + 1)));
-
-    const listHtml = ttsModalDraft.length
-      ? ttsModalDraft.map((c, idx) => {
-          const gLabel = c.gender === 'female' ? '♀ 여성' : (c.gender === 'male' ? '♂ 남성' : '중성');
-          const vTxt = c.voiceId ? ('Voice: ' + c.voiceId) : '기본 성별 풀';
-          const aliasTxt = (c.aliases && c.aliases.length) ? (' (' + c.aliases.join(', ') + ')') : '';
-          const toneTxt = [c.dialogueToneTag ? ('대화:' + c.dialogueToneTag) : '', c.thoughtToneTag ? ('속마음:' + c.thoughtToneTag) : ''].filter(Boolean).join(' · ');
-          return '<div class="tts-cast-item">' +
-            '<div style="min-width:0;">' +
-              '<div style="font-size:13.5px; font-weight:700;">' + esc(c.name) + '<span style="font-weight:500; color:var(--sub); font-size:11.5px;">' + esc(aliasTxt) + '</span></div>' +
-              '<div style="font-size:11.5px; color:var(--sub);">' + esc(gLabel + ' · ' + vTxt + (toneTxt ? ' · ' + toneTxt : '')) + '</div>' +
-            '</div>' +
-            '<div style="display:flex; gap:5px; flex-shrink:0;">' +
-              '<button type="button" class="pill" data-ttsc-preview="' + idx + '" title="미리듣기">▶</button>' +
-              '<button type="button" class="pill" data-ttsc-edit="' + idx + '">편집</button>' +
-              '<button type="button" class="pill" data-ttsc-del="' + idx + '" style="color:var(--danger);">삭제</button>' +
-            '</div>' +
-          '</div>';
-        }).join('')
-      : '<div style="font-size:12.5px; color:var(--sub); padding:10px 2px;">이 채팅방에 등록된 캐릭터 보이스가 없습니다. <b>+ 캐릭터 추가</b>로 등록하거나 미등록 화자는 기본 성별 풀을 사용합니다.</div>';
-
-    let editorHtml = '';
-    if (ttsModalEditIdx !== null) {
-      const c = (ttsModalEditIdx >= 0 && ttsModalDraft[ttsModalEditIdx]) ? ttsModalDraft[ttsModalEditIdx] : {
-        id: 'tts-char-' + Date.now(), name: '', aliases: [], gender: 'female', voiceGroup: '', voiceId: '',
-        dialogueToneTag: '', thoughtToneTag: 'whispering', speed: 1.0, thoughtSpeed: 0.94,
-      };
-      const curVoiceGroup = inferClientVoiceGroup(c.voiceId || '', c.voiceGroup || '');
-      const dlgPresetMatch = !c.dialogueToneTag || TTS_TONE_TAG_PRESETS_CLIENT.some((t) => t.value.toLowerCase() === String(c.dialogueToneTag).toLowerCase());
-      const thVal = c.thoughtToneTag !== undefined ? c.thoughtToneTag : 'whispering';
-      const thPresetMatch = !thVal || TTS_TONE_TAG_PRESETS_CLIENT.some((t) => t.value.toLowerCase() === String(thVal).toLowerCase());
-      editorHtml =
-        '<div class="tts-subbox" id="ttsModalEditor" style="margin-top:4px;">' +
-          '<div class="tts-subbox-title"><span>' + (ttsModalEditIdx >= 0 ? '✏️ 캐릭터 보이스 편집' : '➕ 새 캐릭터 보이스 추가') + '</span></div>' +
-          '<div class="grid-2">' +
-            '<div><label class="f-label" style="margin-top:2px;">캐릭터 이름</label><input class="f-inp" id="ttscNameInp" value="' + esc(c.name || '') + '" placeholder="예: ' + esc(snap.charName || '엘레나') + '" /></div>' +
-            '<div><label class="f-label" style="margin-top:2px;">성별</label>' +
-              '<select class="f-inp" id="ttscGenderSel">' +
-                '<option value="female"' + (c.gender === 'female' ? ' selected' : '') + '>여성 (♀)</option>' +
-                '<option value="male"' + (c.gender === 'male' ? ' selected' : '') + '>남성 (♂)</option>' +
-                '<option value="neutral"' + (c.gender === 'neutral' ? ' selected' : '') + '>중성/기타</option>' +
-              '</select>' +
-            '</div>' +
-          '</div>' +
-          '<label class="f-label" style="margin-top:4px;">별칭 (쉼표 구분)</label>' +
-          '<input class="f-inp" id="ttscAliasesInp" value="' + esc(Array.isArray(c.aliases) ? c.aliases.join(', ') : '') + '" placeholder="예: Elena, 그녀, 아가씨" />' +
-          '<label class="f-label" style="margin-top:6px;">전용 Voice / Reference ID (1단계: 영역 → 2단계: 보이스 ID)</label>' +
-          '<div class="tts-voice-tier">' +
-            '<select class="f-inp" id="ttscVoiceGroupSel" aria-label="캐릭터 보이스 영역">' + buildVoiceGroupOptionsHtml(curVoiceGroup) + '</select>' +
-            '<select class="f-inp" id="ttscVoiceRefSel" aria-label="캐릭터 보이스 레퍼런스">' + buildVoiceRefOptionsHtml(curVoiceGroup, c.voiceId || '', '-- 기본 성별 풀 사용 --') + '</select>' +
-          '</div>' +
-          '<div style="display:flex; gap:6px; align-items:center; margin-top:6px;">' +
-            '<input class="f-inp" id="ttscVoiceIdInp" list="ttsVoiceDatalist" value="' + esc(c.voiceId || '') + '" placeholder="Fish reference_id 또는 OpenAI/Qwen voice (직접 입력 가능)" style="flex:1; min-width:0;" />' +
-            '<button type="button" class="pill" id="ttscSaveVoiceProfileBtn" title="현재 영역 프로필로 저장" style="flex-shrink:0;">+ 프로필 저장</button>' +
-          '</div>' +
-          '<div class="grid-2">' +
-            '<div>' +
-              '<label class="f-label" style="margin-top:6px;">대화 톤 태그</label>' +
-              '<select class="f-inp" id="ttscDlgTagSel" aria-label="대화 톤 태그">' + buildToneTagOptionsHtml(c.dialogueToneTag || '', '-- 톤 태그 없음 (기본) --') + '</select>' +
-              '<input class="f-inp" id="ttscDlgTagInp" value="' + esc(c.dialogueToneTag || '') + '" placeholder="직접 입력 (예: soft)" style="margin-top:4px; display:' + (dlgPresetMatch ? 'none' : 'block') + ';" />' +
-            '</div>' +
-            '<div>' +
-              '<label class="f-label" style="margin-top:6px;">속마음 톤 태그</label>' +
-              '<select class="f-inp" id="ttscThTagSel" aria-label="속마음 톤 태그">' + buildToneTagOptionsHtml(thVal, '-- 톤 태그 없음 (기본) --') + '</select>' +
-              '<input class="f-inp" id="ttscThTagInp" value="' + esc(thVal) + '" placeholder="직접 입력 (예: whispering)" style="margin-top:4px; display:' + (thPresetMatch ? 'none' : 'block') + ';" />' +
-            '</div>' +
-          '</div>' +
-          '<div class="grid-2">' +
-            '<div><label class="f-label" style="margin-top:4px;">대화 속도</label><input class="f-inp" id="ttscSpeedInp" type="number" step="0.02" min="0.5" max="2.0" value="' + esc(String(c.speed || 1.0)) + '" /></div>' +
-            '<div><label class="f-label" style="margin-top:4px;">속마음 속도</label><input class="f-inp" id="ttscThSpeedInp" type="number" step="0.02" min="0.5" max="2.0" value="' + esc(String(c.thoughtSpeed || 0.94)) + '" /></div>' +
-          '</div>' +
-          '<div class="btn-row">' +
-            '<button type="button" class="btn" id="ttscApplyEditBtn">목록에 반영</button>' +
-            '<button type="button" class="btn sec" id="ttscEditorPreviewBtn">▶ 미리듣기</button>' +
-            '<button type="button" class="btn sec" id="ttscCancelEditBtn">취소</button>' +
-          '</div>' +
-        '</div>';
-    }
-
-    modal.innerHTML =
-      '<div class="scene-ctrl-dialog">' +
-        '<div class="scene-ctrl-head">' +
-          '<div style="min-width:0;">' +
-            '<div style="font-size:15px; font-weight:800;">🎙️ 이 채팅방 캐릭터 보이스 설정</div>' +
-            '<div style="font-size:11.5px; color:var(--sub); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + esc(roomTitle) + '</div>' +
-          '</div>' +
-          '<button type="button" class="pill" data-ttsc-close="1">✕ 닫기</button>' +
-        '</div>' +
-        '<div class="scene-ctrl-body">' +
-          '<div class="hint" style="margin:0;">이 채팅방에서만 적용되는 캐릭터별 성별 · Voice ID · 대화/속마음 톤 설정입니다.</div>' +
-          '<div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">' +
-            '<button type="button" class="pill active" id="ttscAddBtn">+ 캐릭터 추가</button>' +
-            '<button type="button" class="pill" id="ttscFetchFishBtn">🐟 Fish 보이스 불러오기</button>' +
-            '<button type="button" class="pill" id="ttscFetchOaBtn">🎙️ OpenAI/Qwen 불러오기</button>' +
-          '</div>' +
-          '<div class="tts-cast-list" style="margin-top:0;">' + listHtml + '</div>' +
-          editorHtml +
-          '<div class="btn-row" style="margin-top:4px; padding-top:10px; border-top:1px solid var(--border);">' +
-            '<button type="button" class="btn" id="ttscSaveRoomBtn">💾 이 채팅방 보이스 저장</button>' +
-          '</div>' +
-        '</div>' +
-      '</div>';
-    modal.style.display = 'flex';
-  }
-
-  function openTtsCastModal() {
-    const modal = document.getElementById('ttsCastModal');
-    if (!modal) return;
-    const snap = (lastState && lastState.snapshot) || {};
-    const ck = getClientTtsChatKey(snap);
-    if (!ck) {
-      toast('먼저 채팅방을 열어 주세요.');
-      return;
-    }
-    const t = (routerCfg && routerCfg.tts && typeof routerCfg.tts === 'object') ? routerCfg.tts : {};
-    const cc = (t.chatCharacters && typeof t.chatCharacters === 'object') ? t.chatCharacters : {};
-    ttsModalChatKey = ck;
-    ttsModalDraft = Array.isArray(cc[ck]) ? JSON.parse(JSON.stringify(cc[ck])) : [];
-    ttsModalEditIdx = null;
-    if (ttsModalKeyHandler) document.removeEventListener('keydown', ttsModalKeyHandler);
-    ttsModalKeyHandler = (e) => { if (e.key === 'Escape') closeTtsCastModal(); };
-    document.addEventListener('keydown', ttsModalKeyHandler);
-    renderTtsCastModalBody();
-  }
-
-  async function previewTtsVoiceItem(opts) {
-    ensureTtsAudioCtx();
-    toast('음성 미리듣기 생성 중...');
-    const res = await fetch('/api/tts/test', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
-      body: JSON.stringify({ ...opts, chatKey: ttsModalChatKey }),
-    });
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      throw new Error(err.error || ('HTTP ' + res.status));
-    }
-    const buf = await res.arrayBuffer();
-    await playTtsArrayBuffer(buf, { kind: opts.kind || 'dialogue' });
-  }
-
-  const ttsCastQuickBtnEl = document.getElementById('ttsCastQuickBtn');
-  if (ttsCastQuickBtnEl) ttsCastQuickBtnEl.onclick = openTtsCastModal;
-
-  const ttsCastModalEl = document.getElementById('ttsCastModal');
-  if (ttsCastModalEl) {
-    ttsCastModalEl.addEventListener('change', (e) => {
-      if (e.target && e.target.id === 'ttscVoiceGroupSel') {
-        const refSel = document.getElementById('ttscVoiceRefSel');
-        const idInp = document.getElementById('ttscVoiceIdInp');
-        if (refSel && idInp) refSel.innerHTML = buildVoiceRefOptionsHtml(e.target.value, idInp.value, '-- 기본 성별 풀 사용 --');
-      } else if (e.target && e.target.id === 'ttscVoiceRefSel') {
-        const idInp = document.getElementById('ttscVoiceIdInp');
-        if (!idInp) return;
-        if (e.target.value === '__custom__') idInp.focus();
-        else idInp.value = e.target.value;
-      } else if (e.target && (e.target.id === 'ttscDlgTagSel' || e.target.id === 'ttscThTagSel')) {
-        const inpId = e.target.id === 'ttscDlgTagSel' ? 'ttscDlgTagInp' : 'ttscThTagInp';
-        const inpEl = document.getElementById(inpId);
-        if (!inpEl) return;
-        if (e.target.value === '__custom__') {
-          inpEl.style.display = 'block';
-          inpEl.focus();
-        } else {
-          inpEl.value = e.target.value;
-          inpEl.style.display = 'none';
-        }
-      }
-    });
-    ttsCastModalEl.addEventListener('input', (e) => {
-      if (e.target && e.target.id === 'ttscVoiceIdInp') {
-        const gSel = document.getElementById('ttscVoiceGroupSel');
-        const rSel = document.getElementById('ttscVoiceRefSel');
-        if (gSel && rSel) rSel.innerHTML = buildVoiceRefOptionsHtml(gSel.value, e.target.value, '-- 기본 성별 풀 사용 --');
-      }
-    });
-    ttsCastModalEl.addEventListener('click', async (e) => {
-      if (e.target === ttsCastModalEl || e.target.closest('[data-ttsc-close]')) {
-        closeTtsCastModal();
-        return;
-      }
-      if (e.target.closest('#ttscAddBtn')) {
-        ttsModalEditIdx = -1;
-        renderTtsCastModalBody();
-        return;
-      }
-      if (e.target.closest('#ttscCancelEditBtn')) {
-        ttsModalEditIdx = null;
-        renderTtsCastModalBody();
-        return;
-      }
-      if (e.target.closest('#ttscFetchFishBtn') || e.target.closest('#ttscFetchOaBtn')) {
-        const reqGroup = e.target.closest('#ttscFetchOaBtn') ? 'openai_qwen' : 'fish';
-        try {
-          const r = await api('/api/tts/models', { method: 'POST', body: JSON.stringify({ group: reqGroup }) });
-          storeLiveVoicesFromResponse(r, reqGroup);
-          const gSel = document.getElementById('ttscVoiceGroupSel');
-          const rSel = document.getElementById('ttscVoiceRefSel');
-          const idInp = document.getElementById('ttscVoiceIdInp');
-          if (gSel && rSel && idInp) {
-            gSel.innerHTML = buildVoiceGroupOptionsHtml(reqGroup);
-            rSel.innerHTML = buildVoiceRefOptionsHtml(reqGroup, idInp.value, '-- 기본 성별 풀 사용 --');
-          }
-          const cnt = Array.isArray(r.voices) ? r.voices.length : 0;
-          toast((reqGroup === 'fish' ? 'Fish' : 'OpenAI/Qwen') + ' 보이스 ' + cnt + '개를 불러왔습니다.');
-        } catch (err) { toast('보이스 조회 실패: ' + err.message); }
-        return;
-      }
-      if (e.target.closest('#ttscSaveVoiceProfileBtn')) {
-        const gSel = document.getElementById('ttscVoiceGroupSel');
-        const idInp = document.getElementById('ttscVoiceIdInp');
-        const nameInp = document.getElementById('ttscNameInp');
-        const genSel = document.getElementById('ttscGenderSel');
-        const grp = (gSel && gSel.value) || 'fish';
-        const voiceIdVal = (idInp && idInp.value.trim()) || '';
-        if (!voiceIdVal) { toast('저장할 Voice / Reference ID를 먼저 입력하거나 선택하세요.'); return; }
-        const labelVal = (nameInp && nameInp.value.trim()) || voiceIdVal;
-        const genderVal = (genSel && genSel.value) || 'female';
-        try {
-          routerCfg = await api('/api/tts/voice-profiles', {
-            method: 'POST',
-            body: JSON.stringify({ action: 'upsert', group: grp, item: { id: voiceIdVal, label: labelVal, gender: genderVal } }),
-          });
-          refreshAllTtsPickers();
-          renderVoiceProfilesManager();
-          const rSel = document.getElementById('ttscVoiceRefSel');
-          if (rSel) rSel.innerHTML = buildVoiceRefOptionsHtml(grp, voiceIdVal, '-- 기본 성별 풀 사용 --');
-          toast((grp === 'fish' ? 'Fish' : 'OpenAI/Qwen') + ' 프로필에 저장됨');
-        } catch (err) { toast('프로필 저장 실패: ' + err.message); }
-        return;
-      }
-      if (e.target.closest('#ttscApplyEditBtn')) {
-        const name = (document.getElementById('ttscNameInp') && document.getElementById('ttscNameInp').value.trim()) || '';
-        if (!name) { toast('캐릭터 이름을 입력하세요.'); return; }
-        const item = {
-          id: (ttsModalEditIdx >= 0 && ttsModalDraft[ttsModalEditIdx]) ? ttsModalDraft[ttsModalEditIdx].id : ('tts-char-' + Date.now()),
-          name,
-          gender: (document.getElementById('ttscGenderSel') && document.getElementById('ttscGenderSel').value) || 'female',
-          aliases: ((document.getElementById('ttscAliasesInp') && document.getElementById('ttscAliasesInp').value) || '').split(',').map((s) => s.trim()).filter(Boolean),
-          voiceGroup: (document.getElementById('ttscVoiceGroupSel') && document.getElementById('ttscVoiceGroupSel').value) || '',
-          voiceId: (document.getElementById('ttscVoiceIdInp') && document.getElementById('ttscVoiceIdInp').value.trim()) || '',
-          dialogueToneTag: (document.getElementById('ttscDlgTagInp') && document.getElementById('ttscDlgTagInp').value.trim()) || '',
-          thoughtToneTag: (document.getElementById('ttscThTagInp') && document.getElementById('ttscThTagInp').value.trim()) || '',
-          speed: Number(document.getElementById('ttscSpeedInp') && document.getElementById('ttscSpeedInp').value) || 1.0,
-          thoughtSpeed: Number(document.getElementById('ttscThSpeedInp') && document.getElementById('ttscThSpeedInp').value) || 0.94,
-        };
-        if (ttsModalEditIdx >= 0) ttsModalDraft[ttsModalEditIdx] = item;
-        else ttsModalDraft.push(item);
-        ttsModalEditIdx = null;
-        renderTtsCastModalBody();
-        toast('목록에 반영되었습니다. [💾 이 채팅방 보이스 저장]을 눌러 저장하세요.');
-        return;
-      }
-      if (e.target.closest('#ttscEditorPreviewBtn')) {
-        try {
-          await previewTtsVoiceItem({
-            text: '안녕하세요. 이 목소리로 대사를 들려드릴게요.',
-            kind: 'dialogue',
-            speaker: (document.getElementById('ttscNameInp') && document.getElementById('ttscNameInp').value.trim()) || 'Tester',
-            gender: (document.getElementById('ttscGenderSel') && document.getElementById('ttscGenderSel').value) || 'female',
-            voiceId: (document.getElementById('ttscVoiceIdInp') && document.getElementById('ttscVoiceIdInp').value.trim()) || '',
-            toneTag: (document.getElementById('ttscDlgTagInp') && document.getElementById('ttscDlgTagInp').value.trim()) || '',
-          });
-        } catch (err) { toast('미리듣기 실패: ' + err.message); }
-        return;
-      }
-      const prevBtn = e.target.closest('[data-ttsc-preview]');
-      if (prevBtn) {
-        const idx = Number(prevBtn.getAttribute('data-ttsc-preview'));
-        const c = ttsModalDraft[idx];
-        if (!c) return;
-        try {
-          await previewTtsVoiceItem({
-            text: '안녕하세요. 이 목소리로 대사를 들려드릴게요.',
-            kind: 'dialogue',
-            speaker: c.name,
-            gender: c.gender,
-            voiceId: c.voiceId,
-            toneTag: c.dialogueToneTag,
-          });
-        } catch (err) { toast('미리듣기 실패: ' + err.message); }
-        return;
-      }
-      const editBtn = e.target.closest('[data-ttsc-edit]');
-      if (editBtn) {
-        ttsModalEditIdx = Number(editBtn.getAttribute('data-ttsc-edit'));
-        renderTtsCastModalBody();
-        return;
-      }
-      const delBtn = e.target.closest('[data-ttsc-del]');
-      if (delBtn) {
-        const idx = Number(delBtn.getAttribute('data-ttsc-del'));
-        if (idx >= 0 && idx < ttsModalDraft.length) {
-          ttsModalDraft.splice(idx, 1);
-          if (ttsModalEditIdx === idx) ttsModalEditIdx = null;
-          renderTtsCastModalBody();
-        }
-        return;
-      }
-      if (e.target.closest('#ttscSaveRoomBtn')) {
-        try {
-          routerCfg = await api('/api/tts/chat-cast', {
-            method: 'POST',
-            body: JSON.stringify({ chatKey: ttsModalChatKey, characters: ttsModalDraft.slice() }),
-          });
-          ttsAnalyzeCache.clear();
-          ttsAudioBufferCache.clear();
-          renderTtsCastModalBody();
-          toast('이 채팅방 캐릭터 보이스 저장됨');
-        } catch (err) { toast('저장 실패: ' + err.message); }
-      }
-    });
-  }
-
   if (token) tryLogin(token);
 </script>
 </body>
@@ -16997,7 +16930,6 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             if (!requireAuth(req, res)) return;
             try {
                 const body = JSON.parse((await readBody(req)) || '{}');
-                const chatKey = String(body.chatKey || buildTtsChatKey(state.snapshot) || '').trim();
                 const effectiveTtsCfg = normalizeTtsConfig({
                     ...config.tts,
                     ...(body.parseMode ? { parseMode: body.parseMode } : {}),
@@ -17008,7 +16940,6 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     role: body.role || 'char',
                     charName: body.charName || ((state.snapshot && state.snapshot.charName) || 'Character'),
                     personaName: body.personaName || ((state.snapshot && state.snapshot.personaName) || '나'),
-                    chatKey,
                     ttsConfig: effectiveTtsCfg,
                     callLlm: async (messages) => {
                         const profile = resolveTtsLlmProfile();
@@ -17031,11 +16962,9 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             if (!requireAuth(req, res)) return;
             try {
                 const body = JSON.parse((await readBody(req)) || '{}');
-                const chatKey = String(body.chatKey || buildTtsChatKey(state.snapshot) || '').trim();
                 const result = await ttsProvider.synthesizeSegment(body.segment, config.tts, {
                     charName: body.charName || ((state.snapshot && state.snapshot.charName) || 'Character'),
                     overrideVoiceId: body.overrideVoiceId || '',
-                    chatKey,
                 });
                 res.writeHead(200, {
                     'Content-Type': result.mime || 'audio/mpeg',
@@ -17058,7 +16987,6 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             if (!requireAuth(req, res)) return;
             try {
                 const body = JSON.parse((await readBody(req)) || '{}');
-                const chatKey = String(body.chatKey || buildTtsChatKey(state.snapshot) || '').trim();
                 const ov = (body.ttsOverride && typeof body.ttsOverride === 'object') ? body.ttsOverride : {};
                 const mergedCfg = normalizeTtsConfig({
                     ...config.tts,
@@ -17073,7 +17001,6 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     gender: body.gender || 'female',
                     voiceId: body.voiceId || '',
                     toneTag: body.toneTag || '',
-                    chatKey,
                 });
                 const elapsedMs = Date.now() - t0;
                 res.writeHead(200, {
@@ -17192,21 +17119,14 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             }
         }
 
-        if (pathname === '/api/tts/chat-cast' && req.method === 'POST') {
+        if ((pathname === '/api/tts/chat-cast' || pathname === '/api/tts/characters') && req.method === 'POST') {
             if (!requireAuth(req, res)) return;
             try {
                 const body = JSON.parse((await readBody(req)) || '{}');
-                const scopeKey = String(body.chatKey || buildTtsChatKey(state.snapshot) || '').trim();
                 const chars = Array.isArray(body.characters) ? body.characters : [];
                 const curTts = normalizeTtsConfig(config.tts);
-                if (!scopeKey || scopeKey === '__global__') {
-                    curTts.characters = chars;
-                } else {
-                    const nextChatChars = { ...(curTts.chatCharacters || {}) };
-                    if (chars.length) nextChatChars[scopeKey] = chars;
-                    else delete nextChatChars[scopeKey];
-                    curTts.chatCharacters = nextChatChars;
-                }
+                curTts.characters = chars;
+                curTts.chatCharacters = {};
                 config.tts = normalizeTtsConfig(curTts);
                 ttsProvider.clearCache();
                 saveConfig();
@@ -17262,25 +17182,17 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     });
                 }
                 if (body.tts && typeof body.tts === 'object') {
-                    const existingChatChars = (config.tts && config.tts.chatCharacters && typeof config.tts.chatCharacters === 'object')
-                        ? config.tts.chatCharacters
-                        : {};
-                    const mergedChatChars = { ...existingChatChars };
-                    if (body.tts.chatCharacters && typeof body.tts.chatCharacters === 'object' && !Array.isArray(body.tts.chatCharacters)) {
-                        for (const [ck, cv] of Object.entries(body.tts.chatCharacters)) {
-                            const key = String(ck || '').trim();
-                            if (!key) continue;
-                            if (Array.isArray(cv) && cv.length) mergedChatChars[key] = cv;
-                            else delete mergedChatChars[key];
-                        }
-                    }
+                    const existingCharacters = (config.tts && Array.isArray(config.tts.characters))
+                        ? config.tts.characters
+                        : [];
                     const existingVoiceProfiles = (config.tts && config.tts.voiceProfiles && typeof config.tts.voiceProfiles === 'object')
                         ? config.tts.voiceProfiles
                         : { fish: [], openai_qwen: [] };
                     config.tts = normalizeTtsConfig({
                         ...config.tts,
                         ...body.tts,
-                        chatCharacters: mergedChatChars,
+                        characters: Array.isArray(body.tts.characters) ? body.tts.characters : existingCharacters,
+                        chatCharacters: {},
                         voiceProfiles: body.tts.voiceProfiles !== undefined ? body.tts.voiceProfiles : existingVoiceProfiles,
                         apiKey: body.tts.apiKey ? String(body.tts.apiKey) : (config.tts ? config.tts.apiKey : ''),
                     });
