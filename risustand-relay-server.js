@@ -18,6 +18,9 @@ const path = require('path');
 const crypto = require('crypto');
 const zlib = require('zlib');
 const { spawn } = require('child_process');
+const { parsePluginHeader, buildPluginGuiSrcdoc, createPluginAdapter } = require('./risustand-plugin-adapter.cjs');
+const { defaultImageGenConfig, normalizeImageGenConfig, sanitizeImageGenForClient, createImageProvider } = require('./risustand-image-provider.cjs');
+const { createModuleAdapter } = require('./risustand-module-adapter.cjs');
 
 // Kept in sync with VERSION by tools/release_version.cjs
 const RELAY_VERSION = '1.1.0';
@@ -25,6 +28,7 @@ const ROOT_DIR = __dirname;
 const TOKEN_PATH = path.join(ROOT_DIR, '.risustand-token');
 const CONFIG_PATH = path.join(ROOT_DIR, '.risustand-config.json');
 const PRESETS_PATH = path.join(ROOT_DIR, '.risustand-presets.json');
+const PLUGINS_PATH = path.join(ROOT_DIR, '.risustand-plugins.json');
 let configPersistDisabled = false;
 
 function loadSavedPort(rootDir = ROOT_DIR) {
@@ -71,11 +75,15 @@ let TOKEN = (process.env.RISU_REMOTE_TOKEN || '').trim();
 function defaultConfig() {
     return {
         activeProfileId: '',
+        auxProfileId: 'inherit',
         directPresetId: 'bundled:leave',
         remoteToggleValues: {},
         disabledLoreEntries: {},
         pinnedLoreEntries: {},
         presetToggles: [],
+        backendPlugins: {},
+        remoteDirectOnly: true,
+        imageGen: defaultImageGenConfig(),
         profiles: [
             {
                 id: 'preset-openrouter',
@@ -152,12 +160,16 @@ function loadConfig() {
             };
             return {
                 activeProfileId: typeof raw.activeProfileId === 'string' ? raw.activeProfileId : def.activeProfileId,
+                auxProfileId: typeof raw.auxProfileId === 'string' && raw.auxProfileId ? raw.auxProfileId : 'inherit',
                 directPresetId: typeof raw.directPresetId === 'string' ? raw.directPresetId : def.directPresetId,
                 remoteToggleValues,
                 disabledLoreEntries: normalizeStrArrayMap(raw.disabledLoreEntries),
                 pinnedLoreEntries: normalizeStrArrayMap(raw.pinnedLoreEntries),
                 profiles: Array.isArray(raw.profiles) ? raw.profiles : def.profiles,
                 presetToggles: Array.isArray(raw.presetToggles) ? raw.presetToggles : [],
+                backendPlugins: (raw.backendPlugins && typeof raw.backendPlugins === 'object' && !Array.isArray(raw.backendPlugins)) ? raw.backendPlugins : {},
+                remoteDirectOnly: raw.remoteDirectOnly !== undefined ? Boolean(raw.remoteDirectOnly) : true,
+                imageGen: normalizeImageGenConfig(raw.imageGen),
                 translator: { ...def.translator, ...(raw.translator || {}) },
             };
         }
@@ -725,6 +737,7 @@ const state = {
     lastTriggerEvent: null,
     catalogVersion: 0,
     snapshotVersion: 0,
+    baseSnapshot: null,
     catalog: {
         pcActiveCharIndex: -1,
         pcActiveChatIndex: -1,
@@ -819,6 +832,94 @@ function externalizeSnapshotAssets(snap) {
     };
 }
 
+async function replaceAsync(str, regex, asyncFn) {
+    const src = String(str || '');
+    const flags = regex.flags.includes('g') ? regex.flags : `${regex.flags}g`;
+    const rx = new RegExp(regex.source, flags);
+    let out = '';
+    let lastIndex = 0;
+    let match;
+    while ((match = rx.exec(src)) !== null) {
+        out += src.slice(lastIndex, match.index);
+        out += await asyncFn(...match);
+        lastIndex = match.index + match[0].length;
+        if (match[0].length === 0) rx.lastIndex += 1;
+    }
+    out += src.slice(lastIndex);
+    return out;
+}
+
+async function rebuildDisplayedSnapshot(baseSnap = state.baseSnapshot, adapter = activePluginAdapter) {
+    if (!baseSnap || typeof baseSnap !== 'object') {
+        state.snapshot = baseSnap;
+        return baseSnap;
+    }
+    if (!adapter || typeof adapter.hasEditDisplayHandlers !== 'function' || !adapter.hasEditDisplayHandlers() || !Array.isArray(baseSnap.messages) || !baseSnap.messages.length) {
+        state.snapshot = baseSnap;
+        return baseSnap;
+    }
+    const nextMessages = [];
+    for (const m of baseSnap.messages) {
+        if (!m || typeof m !== 'object') {
+            nextMessages.push(m);
+            continue;
+        }
+        const baseHtml = String(m.html || m.raw || '');
+        let nextHtml = await adapter.runEditDisplay(baseHtml);
+        if (typeof nextHtml !== 'string' || nextHtml === baseHtml) {
+            nextMessages.push(m);
+            continue;
+        }
+        nextHtml = nextHtml.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '');
+        const nextImages = Array.isArray(m.images) ? m.images.slice() : [];
+        if (typeof adapter.readInlay === 'function') {
+            nextHtml = await replaceAsync(nextHtml, /\{\{(?:inlay|inlayed)::([^}]+)\}\}/gi, async (_, rawId) => {
+                const inlay = await adapter.readInlay(String(rawId || '').trim());
+                if (inlay && inlay.data && String(inlay.data).startsWith('data:image/')) {
+                    const url = storeDataUriAsset(inlay.data);
+                    if (url && !nextImages.includes(url)) nextImages.push(url);
+                    return `<img class="msg-img" src="${url}" />`;
+                }
+                return '';
+            });
+        }
+        if (typeof adapter.readImage === 'function') {
+            nextHtml = await replaceAsync(nextHtml, /\{\{(?:raw|img|asset|image)::(assets\/[^}]+)\}\}/gi, async (_, rawPath) => {
+                const bytes = await adapter.readImage(String(rawPath || '').trim());
+                if (bytes && bytes.length) {
+                    const dataUri = `data:image/png;base64,${Buffer.from(bytes).toString('base64')}`;
+                    const url = storeDataUriAsset(dataUri);
+                    if (url && !nextImages.includes(url)) nextImages.push(url);
+                    return `<img class="msg-img" src="${url}" />`;
+                }
+                return '';
+            });
+        }
+        nextHtml = nextHtml.replace(/<img\b([^>]*?)\bsrc\s*=\s*(?:"(data:image\/[^"]+)"|'(data:image\/[^']+)'|(data:image\/[^\s>]+))([^>]*)>/gi, (_, bAttr, d1, d2, d3, aAttr) => {
+            const rawUri = d1 || d2 || d3 || '';
+            const url = storeDataUriAsset(rawUri);
+            if (url && !nextImages.includes(url)) nextImages.push(url);
+            return `<img${bAttr} src="${url}"${aAttr}>`;
+        });
+        const strippedText = nextHtml
+            .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '')
+            .replace(/<[^>]+>/g, '')
+            .trim();
+        const nextText = strippedText || (nextImages.length ? nextImages.map((_, idx) => `[[RSIMG:${idx}]]`).join('\n') : String(m.text || ''));
+        nextMessages.push({
+            ...m,
+            html: nextHtml,
+            text: nextText,
+            images: nextImages,
+        });
+    }
+    state.snapshot = {
+        ...baseSnap,
+        messages: nextMessages,
+    };
+    return state.snapshot;
+}
+
 function parseCookie(req, name) {
     const raw = String((req && req.headers && req.headers.cookie) || '');
     if (!raw) return '';
@@ -842,6 +943,17 @@ function maskKey(k) {
 function getActiveProfile() {
     if (!config.profiles.length) return null;
     return config.profiles.find((p) => p.id === config.activeProfileId) || null;
+}
+
+function getProfileForMode(mode = 'model') {
+    const m = String(mode || 'model').trim();
+    if (!m || m === 'model') return getActiveProfile();
+    const auxId = typeof config.auxProfileId === 'string' ? config.auxProfileId.trim() : 'inherit';
+    if (auxId && auxId !== 'inherit') {
+        const aux = config.profiles.find((p) => p && p.id === auxId);
+        if (aux) return aux;
+    }
+    return getActiveProfile();
 }
 
 function pruneCommandQueue(now = Date.now()) {
@@ -1301,13 +1413,16 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
 
         if (profile.providerType === 'anthropic') {
             const { sysParts, turns } = normalizeTurnMessages(messages, { assistantRole: 'assistant', ensureUserFirst: true });
-            const body = {
+            let body = {
                 model: profile.model,
                 max_tokens: maxTokVal || 4096,
                 messages: turns.map((t) => ({ role: t.role, content: t.text })),
             };
             if (sysParts.length) body.system = sysParts.join('\n\n');
             if (tempVal !== undefined) body.temperature = tempVal;
+            if (typeof extraOpts.interceptBody === 'function') {
+                body = (await extraOpts.interceptBody(body, 'anthropic')) || body;
+            }
 
             logEndpoint = profile.baseUrl || 'https://api.anthropic.com/v1/messages';
             logHeaders = {
@@ -1356,12 +1471,15 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
             const endpoint = `${base}/models/${encodeURIComponent(profile.model)}:generateContent`;
             const { sysParts, turns } = normalizeTurnMessages(messages, { assistantRole: 'model', ensureUserFirst: false });
             const contents = turns.map((t) => ({ role: t.role, parts: [{ text: t.text }] }));
-            const body = { contents };
+            let body = { contents };
             if (sysParts.length) body.systemInstruction = { parts: [{ text: sysParts.join('\n\n') }] };
             const genCfg = {};
             if (tempVal !== undefined) genCfg.temperature = tempVal;
             if (maxTokVal !== undefined) genCfg.maxOutputTokens = maxTokVal;
             if (Object.keys(genCfg).length) body.generationConfig = genCfg;
+            if (typeof extraOpts.interceptBody === 'function') {
+                body = (await extraOpts.interceptBody(body, 'gemini')) || body;
+            }
 
             logEndpoint = endpoint;
             logHeaders = {
@@ -1413,13 +1531,16 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
             headers['X-Title'] = 'RisuStand Remote';
         }
 
-        const body = {
+        let body = {
             model: profile.model,
-            messages,
+            messages: (Array.isArray(messages) ? messages : []).map(({ memo: _omitMemo, data: _omitData, ...rest }) => rest),
             stream: false,
         };
         if (tempVal !== undefined) body.temperature = tempVal;
         if (maxTokVal !== undefined) body.max_tokens = maxTokVal;
+        if (typeof extraOpts.interceptBody === 'function') {
+            body = (await extraOpts.interceptBody(body, 'openai')) || body;
+        }
 
         logEndpoint = endpoint;
         logHeaders = headers;
@@ -1802,6 +1923,7 @@ function parsePresetDefaultToggles(toggleSyntax = '', defaultVariablesText = '')
         const key = (parts[0] || '').trim();
         if (!key || key.startsWith('=')) continue;
         const kind = (parts[2] || '').trim().toLowerCase();
+        if (kind === 'caption' || kind === 'group' || kind === 'groupend' || kind === 'divider') continue;
         const defVal = (kind === 'text' || kind === 'textarea') ? '' : '0';
         assignToggle(key, defVal);
     }
@@ -1869,20 +1991,161 @@ function findMatchingCbsIfEnd(str, startIdx) {
         const closeIdx = findMatchingCbsClose(str, openIdx);
         if (closeIdx < 0) break;
         const tagInner = str.slice(openIdx + 2, closeIdx).trim();
-        if (/^#(?:if(?:_pure)?|when|each)(?:\s|$)/i.test(tagInner)) {
+        if (/^#(?:if(?:_pure)?|when|each|func|pure(?:_?display)?|escape)(?:[\s:]|$)/i.test(tagInner)) {
             blockDepth += 1;
-        } else if (/^\/(?:if|when|each)?$/i.test(tagInner)) {
+        } else if (/^\/(?:if(?:_pure)?|when|each|func|pure(?:_?display)?|escape)?\s*$/i.test(tagInner)) {
             if (blockDepth === 0) {
                 return { elseStart, elseEnd, endStart: openIdx, endClose: closeIdx };
             }
             blockDepth -= 1;
-        } else if (blockDepth === 0 && /^:else$/i.test(tagInner) && elseStart < 0) {
+        } else if (blockDepth === 0 && /^:else\s*$/i.test(tagInner) && elseStart < 0) {
             elseStart = openIdx;
             elseEnd = closeIdx + 2;
         }
         i = closeIdx + 2;
     }
     return null;
+}
+
+function findMatchingCbsBlockEnd(str, startIdx) {
+    let blockDepth = 0;
+    let i = startIdx;
+    while (i < str.length - 1) {
+        const openIdx = str.indexOf('{{', i);
+        if (openIdx < 0) break;
+        const closeIdx = findMatchingCbsClose(str, openIdx);
+        if (closeIdx < 0) break;
+        const tagInner = str.slice(openIdx + 2, closeIdx).trim();
+        if (/^#(?:if(?:_pure)?|when|each|func|pure(?:_?display)?|escape)(?:[\s:]|$)/i.test(tagInner)) {
+            blockDepth += 1;
+        } else if (/^\/(?:if(?:_pure)?|when|each|func|pure(?:_?display)?|escape)?\s*$/i.test(tagInner)) {
+            if (blockDepth === 0) {
+                return { endStart: openIdx, endClose: closeIdx };
+            }
+            blockDepth -= 1;
+        }
+        i = closeIdx + 2;
+    }
+    return null;
+}
+
+function evalSimpleCbsExpr(expr) {
+    const src = String(expr || '').trim();
+    if (!src) return '0';
+    let pos = 0;
+    const skipWs = () => { while (pos < src.length && /\s/.test(src[pos])) pos += 1; };
+    const peek = () => { skipWs(); return src.slice(pos); };
+    const isNum = (v) => typeof v === 'number' || (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v)));
+
+    function parsePrimary() {
+        skipWs();
+        if (src[pos] === '(') {
+            pos += 1;
+            const v = parseOr();
+            skipWs();
+            if (src[pos] === ')') pos += 1;
+            return v;
+        }
+        if (src[pos] === '"' || src[pos] === "'") {
+            const q = src[pos++];
+            let out = '';
+            while (pos < src.length && src[pos] !== q) {
+                if (src[pos] === '\\' && pos + 1 < src.length) pos += 1;
+                out += src[pos++];
+            }
+            if (src[pos] === q) pos += 1;
+            return out;
+        }
+        const mNum = src.slice(pos).match(/^-?\d+(?:\.\d+)?/);
+        if (mNum) {
+            pos += mNum[0].length;
+            return Number(mNum[0]);
+        }
+        const mId = src.slice(pos).match(/^[a-zA-Z_][a-zA-Z0-9_]*/);
+        if (mId) {
+            pos += mId[0].length;
+            if (mId[0] === 'true') return 1;
+            if (mId[0] === 'false') return 0;
+            if (mId[0] === 'null' || mId[0] === 'undefined') return '';
+            return mId[0];
+        }
+        return 0;
+    }
+    function parseUnary() {
+        const rest = peek();
+        if (rest.startsWith('!')) { pos += 1; return isCbsTruthy(parseUnary()) ? 0 : 1; }
+        if (rest.startsWith('-') && !/^-\d/.test(rest)) { pos += 1; return -Number(parseUnary() || 0); }
+        return parsePrimary();
+    }
+    function parseMul() {
+        let left = parseUnary();
+        while (true) {
+            const rest = peek();
+            const op = rest[0];
+            if (op !== '*' && op !== '/' && op !== '%') break;
+            pos += 1;
+            const right = Number(parseUnary() || 0);
+            const l = Number(left || 0);
+            left = op === '*' ? l * right : op === '/' ? (right === 0 ? 0 : l / right) : (right === 0 ? 0 : l % right);
+        }
+        return left;
+    }
+    function parseAdd() {
+        let left = parseMul();
+        while (true) {
+            const rest = peek();
+            const op = rest[0];
+            if (op !== '+' && op !== '-') break;
+            pos += 1;
+            const right = parseMul();
+            if (op === '+' && (typeof left === 'string' || typeof right === 'string')) left = String(left) + String(right);
+            else left = op === '+' ? Number(left || 0) + Number(right || 0) : Number(left || 0) - Number(right || 0);
+        }
+        return left;
+    }
+    function parseCmp() {
+        let left = parseAdd();
+        while (true) {
+            const rest = peek();
+            const m = rest.match(/^(===|!==|==|!=|>=|<=|>|<)/);
+            if (!m) break;
+            pos += m[1].length;
+            const right = parseAdd();
+            const op = m[1];
+            const bothNum = isNum(left) && isNum(right);
+            if (op === '==' || op === '===') left = (String(left) === String(right) || (bothNum && Number(left) === Number(right))) ? 1 : 0;
+            else if (op === '!=' || op === '!==') left = (String(left) !== String(right) && !(bothNum && Number(left) === Number(right))) ? 1 : 0;
+            else if (op === '>') left = Number(left) > Number(right) ? 1 : 0;
+            else if (op === '<') left = Number(left) < Number(right) ? 1 : 0;
+            else if (op === '>=') left = Number(left) >= Number(right) ? 1 : 0;
+            else if (op === '<=') left = Number(left) <= Number(right) ? 1 : 0;
+        }
+        return left;
+    }
+    function parseAnd() {
+        let left = parseCmp();
+        while (peek().startsWith('&&')) {
+            pos += 2;
+            const right = parseCmp();
+            left = isCbsTruthy(left) && isCbsTruthy(right) ? 1 : 0;
+        }
+        return left;
+    }
+    function parseOr() {
+        let left = parseAnd();
+        while (peek().startsWith('||')) {
+            pos += 2;
+            const right = parseAnd();
+            left = isCbsTruthy(left) || isCbsTruthy(right) ? 1 : 0;
+        }
+        return left;
+    }
+    try {
+        const res = parseOr();
+        return typeof res === 'number' && !Number.isFinite(res) ? '0' : String(res);
+    } catch (_) {
+        return '0';
+    }
 }
 
 function lookupCbsVar(name, ctx) {
@@ -1911,6 +2174,10 @@ function evalCbsWhenCondition(condExpr, ctx, depth) {
     }
 
     const tokens = splitCbsTopLevelArgs(raw);
+    while (tokens.length && /^(?:keep|legacy)$/i.test(tokens[0].trim())) {
+        tokens.shift();
+    }
+    if (!tokens.length) return false;
     const orGroups = [[]];
     for (const tok of tokens) {
         if (tok.trim().toLowerCase() === 'or') {
@@ -1945,27 +2212,44 @@ function evalCbsWhenCondition(condExpr, ctx, depth) {
                 res = isCbsTruthy(evalPresetCbs(rem.join('::'), ctx, depth + 1));
             }
         } else {
-            // Support either ['var', 'x', 'is', '1'] or ['A', 'is', 'B']
-            let opIdx = 1;
-            let lhs;
-            const headOp = rem[0].trim().toLowerCase();
-            if ((headOp === 'var' || headOp === 'toggle') && rem.length >= 4) {
-                lhs = lookupCbsVar(evalPresetCbs(rem[1], ctx, depth + 1).trim(), ctx);
-                opIdx = 2;
+            // Support ['var', 'x', 'is', '1'], ['A', 'vis'|'visnot'|'tis'|'tisnot', 'B'], or ['A', 'is', 'B']
+            const secondOp = (rem[1] || '').trim().toLowerCase();
+            if (secondOp === 'vis' || secondOp === 'visnot') {
+                const varKey = evalPresetCbs(rem[0], ctx, depth + 1).trim();
+                const cVars = (ctx && ctx.chatVars) || {};
+                const lhs = Object.prototype.hasOwnProperty.call(cVars, varKey) ? String(cVars[varKey] ?? '') : '';
+                const rhs = evalPresetCbs(rem.slice(2).join('::'), ctx, depth + 1).trim();
+                res = secondOp === 'vis' ? (lhs === rhs) : (lhs !== rhs);
+            } else if (secondOp === 'tis' || secondOp === 'tisnot') {
+                const togKey = evalPresetCbs(rem[0], ctx, depth + 1).trim();
+                const gVars = (ctx && ctx.globalVars) || {};
+                const lhs = Object.prototype.hasOwnProperty.call(gVars, `toggle_${togKey}`)
+                    ? String(gVars[`toggle_${togKey}`] ?? '')
+                    : (Object.prototype.hasOwnProperty.call(gVars, togKey) ? String(gVars[togKey] ?? '') : '');
+                const rhs = evalPresetCbs(rem.slice(2).join('::'), ctx, depth + 1).trim();
+                res = secondOp === 'tis' ? (lhs === rhs) : (lhs !== rhs);
             } else {
-                const rawLhs = rem[0];
-                const evalLhs = evalPresetCbs(rawLhs, ctx, depth + 1);
-                lhs = (!rawLhs.includes('{{') && lookupCbsVar(evalLhs, ctx) !== '') ? lookupCbsVar(evalLhs, ctx) : evalLhs;
+                let opIdx = 1;
+                let lhs;
+                const headOp = rem[0].trim().toLowerCase();
+                if ((headOp === 'var' || headOp === 'toggle') && rem.length >= 4) {
+                    lhs = lookupCbsVar(evalPresetCbs(rem[1], ctx, depth + 1).trim(), ctx);
+                    opIdx = 2;
+                } else {
+                    const rawLhs = rem[0];
+                    const evalLhs = evalPresetCbs(rawLhs, ctx, depth + 1);
+                    lhs = (!rawLhs.includes('{{') && lookupCbsVar(evalLhs, ctx) !== '') ? lookupCbsVar(evalLhs, ctx) : evalLhs;
+                }
+                const op = (rem[opIdx] || '').trim().toLowerCase();
+                const rhs = evalPresetCbs(rem.slice(opIdx + 1).join('::'), ctx, depth + 1);
+                if (op === 'is' || op === '==' || op === 'equal') res = String(lhs) === String(rhs);
+                else if (op === 'isnot' || op === '!=' || op === 'notequal') res = String(lhs) !== String(rhs);
+                else if (op === '>' || op === 'greater') res = Number(lhs) > Number(rhs);
+                else if (op === '<' || op === 'less') res = Number(lhs) < Number(rhs);
+                else if (op === '>=' || op === 'greater_equal' || op === 'greaterequal') res = Number(lhs) >= Number(rhs);
+                else if (op === '<=' || op === 'less_equal' || op === 'lessequal') res = Number(lhs) <= Number(rhs);
+                else res = isCbsTruthy(lhs);
             }
-            const op = (rem[opIdx] || '').trim().toLowerCase();
-            const rhs = evalPresetCbs(rem.slice(opIdx + 1).join('::'), ctx, depth + 1);
-            if (op === 'is' || op === '==' || op === 'equal') res = String(lhs) === String(rhs);
-            else if (op === 'isnot' || op === '!=' || op === 'notequal') res = String(lhs) !== String(rhs);
-            else if (op === '>') res = Number(lhs) > Number(rhs);
-            else if (op === '<') res = Number(lhs) < Number(rhs);
-            else if (op === '>=') res = Number(lhs) >= Number(rhs);
-            else if (op === '<=') res = Number(lhs) <= Number(rhs);
-            else res = isCbsTruthy(lhs);
         }
         return negate ? !res : res;
     };
@@ -1984,6 +2268,12 @@ function evalCbsWhenCondition(condExpr, ctx, depth) {
 function evalPresetCbs(input, ctx = {}, depth = 0) {
     const str = String(input ?? '');
     if (!str.includes('{{') || depth > 24) return str;
+    if (ctx && typeof ctx === 'object') {
+        if (!ctx.functions) ctx.functions = new Map();
+        if (!ctx.tempVars) ctx.tempVars = {};
+        if (!ctx.chatVars) ctx.chatVars = {};
+        if (!ctx.globalVars) ctx.globalVars = {};
+    }
     let out = '';
     let pos = 0;
     while (pos < str.length) {
@@ -2003,6 +2293,24 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
 
         if (trimmed.startsWith('//')) {
             pos = closeIdx + 2;
+            continue;
+        }
+
+        const funcMatch = trimmed.match(/^#func(?:(?:\s+|::)([\s\S]*))?$/i);
+        if (funcMatch) {
+            const bounds = findMatchingCbsBlockEnd(str, closeIdx + 2);
+            if (!bounds) {
+                out += str.slice(openIdx, closeIdx + 2);
+                pos = closeIdx + 2;
+                continue;
+            }
+            const headerTokens = String(funcMatch[1] || '').split(/(?:\s+|::)/).map((t) => t.trim()).filter(Boolean);
+            const funcName = headerTokens[0] || '';
+            if (funcName && ctx && ctx.functions) {
+                const rawBody = str.slice(closeIdx + 2, bounds.endStart).trim();
+                ctx.functions.set(funcName, { data: rawBody, params: headerTokens.slice(1) });
+            }
+            pos = bounds.endClose + 2;
             continue;
         }
 
@@ -2048,6 +2356,12 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
             continue;
         }
 
+        if (trimmed.startsWith('?')) {
+            out += evalSimpleCbsExpr(evalPresetCbs(trimmed.slice(1), ctx, depth + 1));
+            pos = closeIdx + 2;
+            continue;
+        }
+
         const parts = splitCbsTopLevelArgs(inner);
         const rawCmd = parts[0] || '';
         const cmd = (rawCmd.includes('{{') ? evalPresetCbs(rawCmd, ctx, depth + 1) : rawCmd).trim().toLowerCase();
@@ -2065,14 +2379,62 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
             } else {
                 replaced = '';
             }
-        } else if (cmd === 'getvar') {
+        } else if (cmd === 'getvar' || cmd === 'getchatvar') {
             const k = (args[0] || '').trim();
             if (Object.prototype.hasOwnProperty.call(cVars, k)) replaced = String(cVars[k] ?? '');
             else if (Object.prototype.hasOwnProperty.call(gVars, k)) replaced = String(gVars[k] ?? '');
             else replaced = '';
+        } else if (cmd === 'setvar') {
+            const k = (args[0] || '').trim();
+            if (k && ctx && ctx.chatVars) ctx.chatVars[k] = String(args.slice(1).join('::'));
+            replaced = '';
+        } else if (cmd === 'setdefaultvar') {
+            const k = (args[0] || '').trim();
+            if (k && ctx && ctx.chatVars && (!Object.prototype.hasOwnProperty.call(ctx.chatVars, k) || ctx.chatVars[k] === '' || ctx.chatVars[k] === 'null')) {
+                ctx.chatVars[k] = String(args.slice(1).join('::'));
+            }
+            replaced = '';
+        } else if (cmd === 'addvar') {
+            const k = (args[0] || '').trim();
+            if (k && ctx && ctx.chatVars) {
+                ctx.chatVars[k] = String((Number(ctx.chatVars[k]) || 0) + (Number(args[1]) || 0));
+            }
+            replaced = '';
+        } else if (cmd === 'tempvar' || cmd === 'gettempvar') {
+            const k = (args[0] || '').trim();
+            replaced = String((ctx && ctx.tempVars && Object.prototype.hasOwnProperty.call(ctx.tempVars, k)) ? ctx.tempVars[k] : '');
+        } else if (cmd === 'settempvar') {
+            const k = (args[0] || '').trim();
+            if (k && ctx && ctx.tempVars) ctx.tempVars[k] = String(args.slice(1).join('::'));
+            replaced = '';
+        } else if (cmd === 'calc') {
+            replaced = evalSimpleCbsExpr(args.join('::'));
+        } else if (cmd === 'call') {
+            if ((ctx.callStack || 0) <= 20) {
+                const funcName = String(args[0] || '').trim();
+                const fn = ctx && ctx.functions && ctx.functions.get(funcName);
+                if (fn) {
+                    let fnBody = fn.data;
+                    for (let ai = 0; ai < args.length; ai += 1) {
+                        fnBody = fnBody.split(`{{arg::${ai}}}`).join(String(args[ai] ?? ''));
+                    }
+                    replaced = evalPresetCbs(fnBody, { ...ctx, callArgs: args, callStack: (ctx.callStack || 0) + 1 }, depth + 1);
+                } else {
+                    replaced = '';
+                }
+            } else {
+                replaced = '';
+            }
+        } else if (cmd === 'arg') {
+            const idx = Number((args[0] || '').trim());
+            replaced = (Array.isArray(ctx.callArgs) && Number.isInteger(idx) && idx >= 0 && idx < ctx.callArgs.length)
+                ? String(ctx.callArgs[idx] ?? '')
+                : '';
+        } else if (cmd === 'return') {
+            replaced = String(args[0] ?? '');
         } else if (cmd === 'equal') {
             replaced = String(args[0] ?? '') === String(args[1] ?? '') ? '1' : '0';
-        } else if (cmd === 'notequal') {
+        } else if (cmd === 'notequal' || cmd === 'not_equal') {
             replaced = String(args[0] ?? '') !== String(args[1] ?? '') ? '1' : '0';
         } else if (cmd === 'any') {
             replaced = args.some(isCbsTruthy) ? '1' : '0';
@@ -2088,10 +2450,47 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
             replaced = Number(args[0]) > Number(args[1]) ? '1' : '0';
         } else if (cmd === 'less') {
             replaced = Number(args[0]) < Number(args[1]) ? '1' : '0';
-        } else if (cmd === 'greater_equal') {
+        } else if (cmd === 'greater_equal' || cmd === 'greaterequal') {
             replaced = Number(args[0]) >= Number(args[1]) ? '1' : '0';
-        } else if (cmd === 'less_equal') {
+        } else if (cmd === 'less_equal' || cmd === 'lessequal') {
             replaced = Number(args[0]) <= Number(args[1]) ? '1' : '0';
+        } else if (cmd === 'trim') {
+            replaced = String(args.join('::')).trim();
+        } else if (cmd === 'lower') {
+            replaced = String(args.join('::')).toLowerCase();
+        } else if (cmd === 'upper') {
+            replaced = String(args.join('::')).toUpperCase();
+        } else if (cmd === 'abs') {
+            replaced = String(Math.abs(Number(args[0]) || 0));
+        } else if (cmd === 'round') {
+            replaced = String(Math.round(Number(args[0]) || 0));
+        } else if (cmd === 'floor') {
+            replaced = String(Math.floor(Number(args[0]) || 0));
+        } else if (cmd === 'ceil') {
+            replaced = String(Math.ceil(Number(args[0]) || 0));
+        } else if (cmd === 'tonumber') {
+            const n = Number(String(args[0] || '').trim());
+            replaced = Number.isFinite(n) ? String(n) : '0';
+        } else if (cmd === 'min') {
+            const nums = args.map((x) => Number(x)).filter((n) => Number.isFinite(n));
+            replaced = nums.length ? String(Math.min(...nums)) : '0';
+        } else if (cmd === 'max') {
+            const nums = args.map((x) => Number(x)).filter((n) => Number.isFinite(n));
+            replaced = nums.length ? String(Math.max(...nums)) : '0';
+        } else if (cmd === 'sum') {
+            let sum = 0;
+            for (const x of args) sum += Number(x) || 0;
+            replaced = String(sum);
+        } else if (cmd === 'contains') {
+            replaced = String(args[0] ?? '').includes(String(args[1] ?? '')) ? '1' : '0';
+        } else if (cmd === 'startswith') {
+            replaced = String(args[0] ?? '').startsWith(String(args[1] ?? '')) ? '1' : '0';
+        } else if (cmd === 'endswith') {
+            replaced = String(args[0] ?? '').endsWith(String(args[1] ?? '')) ? '1' : '0';
+        } else if (cmd === 'replace') {
+            replaced = String(args[0] ?? '').split(String(args[1] ?? '')).join(String(args[2] ?? ''));
+        } else if (cmd === 'blank' || cmd === 'comment' || cmd === 'hiddenkey' || cmd === 'hidden_key') {
+            replaced = '';
         } else if (cmd === 'char') {
             replaced = String(ctx.charName || 'Character');
         } else if (cmd === 'user') {
@@ -2461,6 +2860,7 @@ function buildDirectPromptMessages({
     snap = null,
     historyMessages = [],
     userText = '',
+    stagedUserChatId = '',
     remoteToggleValues = null,
     disabledLoreUids = [],
     pinnedLoreUids = [],
@@ -2470,8 +2870,17 @@ function buildDirectPromptMessages({
         ? s.charContext
         : { name: s.charName || 'Character' };
 
-    const globalVars = parsePresetDefaultToggles(
+    const modToggleSyntax = (Array.isArray(s.customToggleBlocks) ? s.customToggleBlocks : [])
+        .map((b) => (b && b.syntax) || '')
+        .filter(Boolean)
+        .join('\n');
+    const combinedToggleSyntax = [
+        modToggleSyntax,
         (preset && (preset.toggleSyntax || preset.customPromptTemplateToggle)) || '',
+    ].filter(Boolean).join('\n');
+
+    const globalVars = parsePresetDefaultToggles(
+        combinedToggleSyntax,
         (preset && (preset.defaultVariables || preset.templateDefaultVariables)) || ''
     );
     normalizeToggleMapInto(globalVars, s.globalToggleValues);
@@ -2490,6 +2899,10 @@ function buildDirectPromptMessages({
     const baseCtx = {
         globalVars,
         chatVars,
+        tempVars: {},
+        functions: new Map(),
+        callArgs: null,
+        callStack: 0,
         charName: String(rawCtx.name || s.charName || 'Character'),
         personaName: String(rawCtx.personaName || 'User'),
         personaPrompt: '',
@@ -2519,9 +2932,14 @@ function buildDirectPromptMessages({
     const chatList = (Array.isArray(historyMessages) ? historyMessages : []).map((m) => ({
         role: m && m.role === 'user' ? 'user' : 'assistant',
         content: String((m && (m.raw || m.text)) || ''),
+        ...(m && m.chatId ? { memo: String(m.chatId) } : {}),
     }));
     if (userText) {
-        chatList.push({ role: 'user', content: String(userText) });
+        chatList.push({
+            role: 'user',
+            content: String(userText),
+            ...(stagedUserChatId ? { memo: String(stagedUserChatId) } : {}),
+        });
     }
 
     const loreBuckets = Array.isArray(rawCtx.loreEntries)
@@ -2699,7 +3117,13 @@ function buildDirectPromptMessages({
             sawChatBlock = true;
             const sliced = sliceChatRange(chatStream, item.rangeStart, item.rangeEnd);
             for (const cm of sliced) {
-                if (cm.content || cm.role === 'user') msgs.push({ role: cm.role, content: cm.content });
+                if (cm.content || cm.role === 'user') {
+                    msgs.push({
+                        role: cm.role,
+                        content: cm.content,
+                        ...(cm.memo ? { memo: cm.memo } : {}),
+                    });
+                }
             }
             continue;
         }
@@ -2745,41 +3169,169 @@ function getLoreCharKeyFromSnap(snap) {
     return String((snap && snap.charName) || 'default');
 }
 
+let activePluginAdapter = null;
+let activeModuleAdapter = null;
+let activeHostRpc = null;
+
+function syncSnapVarsFromChatObj(snap, chatObj) {
+    if (!snap || !chatObj || !chatObj.scriptstate || typeof chatObj.scriptstate !== 'object') return snap;
+    const nextVars = { ...(snap.chatVariables || {}) };
+    for (const [k, v] of Object.entries(chatObj.scriptstate)) {
+        const clean = k.startsWith('$') ? k.slice(1) : k;
+        if (clean) nextVars[clean] = String(v ?? '');
+    }
+    return { ...snap, chatVariables: nextVars };
+}
+
 // ================= Direct Remote Chat (for non-PC-active chars) =================
 async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = state.snapshot) {
     const profile = getActiveProfile();
     if (!profile) {
         throw new Error('PC에서 현재 열려있지 않은 봇과 대화하려면 [모델/번역] 탭에서 활성 모델 프로필을 먼저 설정해야 합니다.');
     }
-    const snap = snapView || state.snapshot;
+    let snap = snapView || state.snapshot;
     const preset = resolveDirectPreset(config.directPresetId);
     const history = Array.isArray(snap && snap.messages) ? snap.messages.slice(-30) : [];
     const loreKey = getLoreCharKeyFromSnap(snap);
-    const msgs = buildDirectPromptMessages({
-        preset,
-        snap,
-        historyMessages: history,
-        userText,
-        remoteToggleValues: config.remoteToggleValues,
-        disabledLoreUids: (config.disabledLoreEntries && config.disabledLoreEntries[loreKey]) || [],
-        pinnedLoreUids: (config.pinnedLoreEntries && config.pinnedLoreEntries[loreKey]) || [],
-    });
+    const adapter = activePluginAdapter && (activePluginAdapter.hasEnabledPlugins() || (activeHostRpc && activeHostRpc.isConnected()))
+        ? activePluginAdapter
+        : null;
+    const modAdapter = activeModuleAdapter;
 
-    const finalMsgs = applyPromptOverride(msgs, profile);
     state.directGenerating = true;
     try {
-        console.log(`[DirectChat] char#${charIndex} chat#${chatIndex} via ${profile.name} (${profile.model}) preset=${preset ? preset.name : 'off'}`);
-        const result = await callLLMNonStream(profile, finalMsgs, { source: 'direct_chat' });
+        let effectiveUserText = String(userText ?? '');
+        if (adapter) {
+            await adapter.prepareTurn(charIndex, chatIndex, snap);
+            const tCtx0 = adapter.getTurnContext();
+            if (modAdapter) {
+                await modAdapter.prepareTurn({
+                    charIndex,
+                    chatIndex,
+                    charObj: tCtx0.charObj,
+                    chatObj: tCtx0.chatObj,
+                    onSyncBack: (objs) => adapter.setTurnObjects(objs),
+                });
+            }
+            if (effectiveUserText) {
+                if (modAdapter) effectiveUserText = await modAdapter.runEditPhase('editInput', effectiveUserText);
+                effectiveUserText = await adapter.runEditInput(effectiveUserText);
+            }
+        } else if (modAdapter) {
+            await modAdapter.prepareTurn({ charIndex, chatIndex, charObj: null, chatObj: null });
+            if (effectiveUserText) {
+                effectiveUserText = await modAdapter.runEditPhase('editInput', effectiveUserText);
+            }
+        }
+
+        if (adapter && effectiveUserText) {
+            adapter.stageUserTurnMessage(effectiveUserText);
+        }
+
+        if (modAdapter) {
+            if (effectiveUserText) {
+                await modAdapter.runTriggerMode('input');
+            }
+            const startRes = await modAdapter.runTriggerMode('start');
+            if (startRes && startRes.stopSending) {
+                if (adapter) {
+                    const tCtxStop = adapter.getTurnContext();
+                    adapter.unstageUserTurnMessage();
+                    if (activeHostRpc && activeHostRpc.isConnected() && tCtxStop.chatObj) {
+                        await activeHostRpc.invoke('db.setChat', [Number(charIndex), Number(chatIndex), JSON.parse(JSON.stringify(tCtxStop.chatObj))]);
+                    }
+                }
+                return '';
+            }
+            if (adapter) {
+                snap = syncSnapVarsFromChatObj(snap, adapter.getTurnContext().chatObj);
+            }
+        }
+
+        const tCtx1 = adapter ? adapter.getTurnContext() : { stagedUserChatId: '' };
+        let msgs = buildDirectPromptMessages({
+            preset,
+            snap,
+            historyMessages: history,
+            userText: effectiveUserText,
+            stagedUserChatId: tCtx1.stagedUserChatId || '',
+            remoteToggleValues: config.remoteToggleValues,
+            disabledLoreUids: (config.disabledLoreEntries && config.disabledLoreEntries[loreKey]) || [],
+            pinnedLoreUids: (config.pinnedLoreEntries && config.pinnedLoreEntries[loreKey]) || [],
+        });
+
+        if (modAdapter) {
+            msgs = await modAdapter.runEditPhase('editRequest', msgs);
+        }
+        if (adapter) {
+            msgs = await adapter.runBeforeRequest(msgs, 'model');
+        }
+
+        const finalMsgs = applyPromptOverride(msgs, profile);
+        console.log(`[DirectChat] char#${charIndex} chat#${chatIndex} via ${profile.name} (${profile.model}) preset=${preset ? preset.name : 'off'}${adapter ? ' +plugins' : ''}`);
+        let result;
+        try {
+            result = await callLLMNonStream(profile, finalMsgs, {
+                source: 'direct_chat',
+                interceptBody: adapter ? (b, t) => adapter.runBodyIntercepters(b, t) : undefined,
+            });
+        } catch (err) {
+            if (adapter) adapter.unstageUserTurnMessage();
+            throw err;
+        }
+
+        let finalReply = result.text;
+        if (modAdapter) {
+            finalReply = await modAdapter.runEditPhase('editOutput', finalReply);
+        }
+        if (adapter) {
+            finalReply = await adapter.runAfterRequest(finalReply, 'model');
+        }
+
+        if (adapter) {
+            const tCtxPre = adapter.getTurnContext();
+            let messageIndex = -1;
+            if (tCtxPre.chatObj) {
+                if (!Array.isArray(tCtxPre.chatObj.message)) tCtxPre.chatObj.message = [];
+                tCtxPre.chatObj.message.push({
+                    role: 'char',
+                    data: String(finalReply ?? ''),
+                    chatId: crypto.randomUUID(),
+                    time: Date.now(),
+                });
+                messageIndex = tCtxPre.chatObj.message.length - 1;
+            }
+            if (modAdapter) {
+                await modAdapter.runTriggerMode('output');
+                if (tCtxPre.chatObj && messageIndex >= 0 && tCtxPre.chatObj.message[messageIndex]) {
+                    finalReply = String(tCtxPre.chatObj.message[messageIndex].data ?? finalReply);
+                }
+            }
+            const committed = (activeHostRpc && activeHostRpc.isConnected() && tCtxPre.chatObj)
+                ? (await activeHostRpc.invoke('db.setChat', [Number(charIndex), Number(chatIndex), JSON.parse(JSON.stringify(tCtxPre.chatObj))]), { committedViaRpc: true, messageIndex })
+                : { committedViaRpc: false, messageIndex };
+            if (!committed.committedViaRpc) {
+                const appended = [];
+                if (effectiveUserText) appended.push({ role: 'user', data: effectiveUserText, chatId: tCtx1.stagedUserChatId || '' });
+                appended.push({ role: 'char', data: finalReply });
+                queueCommand('append_messages', { charIndex, chatIndex, messages: appended });
+            }
+            await adapter.dispatchChatOutput({ charIndex, chatIndex, messageIndex: committed.messageIndex });
+            return finalReply;
+        }
+
         const appended = [];
-        if (userText) appended.push({ role: 'user', data: userText });
-        appended.push({ role: 'char', data: result.text });
+        if (effectiveUserText) appended.push({ role: 'user', data: effectiveUserText });
+        appended.push({ role: 'char', data: finalReply });
         queueCommand('append_messages', {
             charIndex,
             chatIndex,
             messages: appended,
         });
-        return result.text;
+        return finalReply;
     } finally {
+        if (modAdapter) modAdapter.endTurn();
+        if (adapter) adapter.endTurn();
         state.directGenerating = false;
     }
 }
@@ -2789,35 +3341,97 @@ async function runDirectRemoteReroll(charIndex, chatIndex, msgIndex, snapView = 
     if (!profile) {
         throw new Error('PC에서 현재 열려있지 않은 봇을 리롤하려면 [모델/번역] 탭에서 활성 모델 프로필을 먼저 설정해야 합니다.');
     }
-    const snap = snapView || state.snapshot;
+    let snap = snapView || state.snapshot;
     const preset = resolveDirectPreset(config.directPresetId);
     const prior = (Array.isArray(snap && snap.messages) ? snap.messages : [])
         .filter((m) => m.index < msgIndex)
         .slice(-30);
     const loreKey = getLoreCharKeyFromSnap(snap);
-    const msgs = buildDirectPromptMessages({
-        preset,
-        snap,
-        historyMessages: prior,
-        userText: '',
-        remoteToggleValues: config.remoteToggleValues,
-        disabledLoreUids: (config.disabledLoreEntries && config.disabledLoreEntries[loreKey]) || [],
-        pinnedLoreUids: (config.pinnedLoreEntries && config.pinnedLoreEntries[loreKey]) || [],
-    });
+    const adapter = activePluginAdapter && (activePluginAdapter.hasEnabledPlugins() || (activeHostRpc && activeHostRpc.isConnected()))
+        ? activePluginAdapter
+        : null;
+    const modAdapter = activeModuleAdapter;
 
-    const finalMsgs = applyPromptOverride(msgs, profile);
     state.directGenerating = true;
     try {
-        console.log(`[DirectReroll] char#${charIndex} chat#${chatIndex} msg#${msgIndex} via ${profile.name} (${profile.model}) preset=${preset ? preset.name : 'off'}`);
-        const result = await callLLMNonStream(profile, finalMsgs, { source: 'direct_reroll' });
+        if (adapter) {
+            await adapter.prepareTurn(charIndex, chatIndex, snap);
+            const tCtx0 = adapter.getTurnContext();
+            if (modAdapter) {
+                await modAdapter.prepareTurn({
+                    charIndex,
+                    chatIndex,
+                    charObj: tCtx0.charObj,
+                    chatObj: tCtx0.chatObj,
+                    onSyncBack: (objs) => adapter.setTurnObjects(objs),
+                });
+                snap = syncSnapVarsFromChatObj(snap, tCtx0.chatObj);
+            }
+        }
+        let msgs = buildDirectPromptMessages({
+            preset,
+            snap,
+            historyMessages: prior,
+            userText: '',
+            remoteToggleValues: config.remoteToggleValues,
+            disabledLoreUids: (config.disabledLoreEntries && config.disabledLoreEntries[loreKey]) || [],
+            pinnedLoreUids: (config.pinnedLoreEntries && config.pinnedLoreEntries[loreKey]) || [],
+        });
+        if (modAdapter) {
+            msgs = await modAdapter.runEditPhase('editRequest', msgs);
+        }
+        if (adapter) {
+            msgs = await adapter.runBeforeRequest(msgs, 'model');
+        }
+
+        const finalMsgs = applyPromptOverride(msgs, profile);
+        console.log(`[DirectReroll] char#${charIndex} chat#${chatIndex} msg#${msgIndex} via ${profile.name} (${profile.model}) preset=${preset ? preset.name : 'off'}${adapter ? ' +plugins' : ''}`);
+        const result = await callLLMNonStream(profile, finalMsgs, {
+            source: 'direct_reroll',
+            interceptBody: adapter ? (b, t) => adapter.runBodyIntercepters(b, t) : undefined,
+        });
+        let finalReply = result.text;
+        if (modAdapter) {
+            finalReply = await modAdapter.runEditPhase('editOutput', finalReply);
+        }
+        if (adapter) {
+            finalReply = await adapter.runAfterRequest(finalReply, 'model');
+        }
+
+        if (adapter) {
+            const tCtxPre = adapter.getTurnContext();
+            if (tCtxPre.chatObj && Array.isArray(tCtxPre.chatObj.message) && tCtxPre.chatObj.message[msgIndex]) {
+                tCtxPre.chatObj.message[msgIndex].data = String(finalReply ?? '');
+                if (!tCtxPre.chatObj.message[msgIndex].chatId) {
+                    tCtxPre.chatObj.message[msgIndex].chatId = crypto.randomUUID();
+                }
+            }
+            if (modAdapter) {
+                await modAdapter.runTriggerMode('output');
+                if (tCtxPre.chatObj && tCtxPre.chatObj.message[msgIndex]) {
+                    finalReply = String(tCtxPre.chatObj.message[msgIndex].data ?? finalReply);
+                }
+            }
+            const committedViaRpc = Boolean(activeHostRpc && activeHostRpc.isConnected() && tCtxPre.chatObj);
+            if (committedViaRpc) {
+                await activeHostRpc.invoke('db.setChat', [Number(charIndex), Number(chatIndex), JSON.parse(JSON.stringify(tCtxPre.chatObj))]);
+            } else {
+                queueCommand('replace_message_with_swipe', { charIndex, chatIndex, msgIndex, newData: finalReply });
+            }
+            await adapter.dispatchChatOutput({ charIndex, chatIndex, messageIndex: msgIndex });
+            return finalReply;
+        }
+
         queueCommand('replace_message_with_swipe', {
             charIndex,
             chatIndex,
             msgIndex,
-            newData: result.text,
+            newData: finalReply,
         });
-        return result.text;
+        return finalReply;
     } finally {
+        if (modAdapter) modAdapter.endTurn();
+        if (adapter) adapter.endTurn();
         state.directGenerating = false;
     }
 }
@@ -3243,6 +3857,15 @@ function renderWebApp() {
   }
   .leave-thought-box summary { cursor:pointer; font-weight:700; color:var(--text); }
   .leave-thought-body { margin-top:8px; white-space:pre-wrap; line-height:1.6; }
+  .leave-hud-card {
+    margin:12px 0 6px; padding:10px 14px; border-radius:12px;
+    background:rgba(15,23,42,0.82); border:1px solid rgba(148,163,184,0.28);
+    color:#e2e8f0; font-size:12.5px; line-height:1.65; break-inside:avoid;
+    font-family:system-ui,-apple-system,"Malgun Gothic",sans-serif;
+  }
+  .leave-hud-card summary { cursor:pointer; font-weight:700; color:#93c5fd; list-style:revert; }
+  .leave-hud-body { margin-top:8px; white-space:pre-line; color:#e2e8f0; }
+  body.hide-leave-hud .leave-hud-card { display:none !important; }
   body.asset-hide .rs-bot-html img, body.asset-hide .rs-bot-html .image-container { display:none !important; }
   body.asset-blur .rs-bot-html img:not(.revealed), body.asset-blur .rs-bot-html .image-container:not(.revealed) { filter:blur(22px) brightness(0.72); cursor:pointer; transition:filter 0.25s ease; }
   html body #bookBotOverlay {
@@ -3450,6 +4073,96 @@ function renderWebApp() {
     #msgEditModal { padding:8px; }
     .msg-edit-card { width:100%; height:92dvh; border-radius:16px; }
     .msg-edit-textarea { font-size:16px; padding:12px; }
+  }
+
+  /* ===== Backend Plugin Adapter & Native GUI Iframe Modal ===== */
+  .plg-list { display:flex; flex-direction:column; gap:8px; margin-top:10px; }
+  .plg-item {
+    border:1px solid var(--border); border-radius:12px; background:var(--bg);
+    padding:10px 12px; display:flex; flex-direction:column; gap:8px;
+  }
+  .plg-item.on { border-color:color-mix(in srgb, var(--accent) 45%, var(--border)); }
+  .plg-head { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+  .plg-title { font-size:13.5px; font-weight:700; display:flex; align-items:center; gap:6px; flex-wrap:wrap; min-width:0; }
+  .plg-meta { font-size:11.5px; color:var(--sub); line-height:1.5; }
+  .plg-err {
+    font-size:11.5px; color:var(--danger); background:color-mix(in srgb, var(--danger) 10%, transparent);
+    border:1px solid color-mix(in srgb, var(--danger) 30%, transparent); border-radius:8px; padding:6px 8px; word-break:break-word;
+  }
+  .plg-acts { display:flex; gap:6px; flex-wrap:wrap; align-items:center; }
+  .plg-args {
+    border-top:1px solid var(--border); padding-top:8px; display:flex; flex-direction:column; gap:7px;
+  }
+  #pluginGuiModal {
+    position:fixed; inset:0; z-index:170; background:rgba(0,0,0,0.72);
+    -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
+    display:flex; align-items:center; justify-content:center; padding:12px;
+  }
+  .plg-gui-dialog {
+    width:min(1120px, 96vw); height:min(90dvh, 880px); background:var(--elev); color:var(--text);
+    border:1px solid var(--border); border-radius:18px; box-shadow:var(--shadow);
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  .plg-gui-head {
+    display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
+    padding:10px 14px; border-bottom:1px solid var(--border); background:var(--surface); flex-shrink:0;
+  }
+  .plg-gui-tabs {
+    display:flex; gap:6px; flex-wrap:wrap; padding:8px 14px; border-bottom:1px solid var(--border);
+    background:var(--bg); flex-shrink:0;
+  }
+  #pluginGuiFrame {
+    flex:1; width:100%; min-height:0; border:none; background:#0f172a;
+  }
+  @media (max-width: 640px) {
+    #pluginGuiModal { padding:6px; }
+    .plg-gui-dialog { width:100%; height:94dvh; border-radius:14px; }
+  }
+
+  /* ===== Dedicated Bubble Plugin Controls & Scene Drawer ===== */
+  .rs-plugin-bubble-bar {
+    display:flex; align-items:center; flex-wrap:wrap; gap:6px;
+    margin-top:8px; padding:7px 10px;
+    border-radius:12px; border:1px solid var(--border);
+    background:color-mix(in srgb, var(--surface) 88%, var(--bg));
+  }
+  .rs-pbb-label {
+    font-size:11px; font-weight:700; color:var(--sub); margin-right:2px;
+  }
+  .rs-pbb-btn {
+    display:inline-flex; align-items:center; gap:4px;
+    min-height:30px; padding:0 10px; border-radius:999px;
+    border:1px solid var(--border); background:var(--elev); color:var(--text);
+    font-size:12px; font-weight:600; cursor:pointer;
+  }
+  .rs-pbb-btn:hover { border-color:var(--accent); color:var(--accent); }
+  #sceneCtrlModal {
+    position:fixed; inset:0; z-index:168; background:rgba(0,0,0,0.68);
+    -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
+    display:flex; align-items:center; justify-content:center; padding:12px;
+  }
+  .scene-ctrl-dialog {
+    width:min(760px, 96vw); max-height:min(88dvh, 780px);
+    background:var(--elev); color:var(--text);
+    border:1px solid var(--border); border-radius:18px; box-shadow:var(--shadow);
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  .scene-ctrl-head {
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+    padding:12px 16px; border-bottom:1px solid var(--border); background:var(--surface); flex-shrink:0;
+  }
+  .scene-ctrl-body {
+    flex:1; min-height:0; overflow-y:auto; padding:14px 16px;
+    display:flex; flex-direction:column; gap:12px;
+  }
+  .scene-slot-card {
+    border:1px solid var(--border); border-radius:12px; background:var(--bg);
+    padding:10px 12px; display:flex; flex-direction:column; gap:8px;
+  }
+  .scene-slot-thumbs { display:flex; gap:8px; flex-wrap:wrap; }
+  .scene-slot-thumb {
+    width:88px; height:88px; object-fit:cover; border-radius:10px;
+    border:1px solid var(--border); background:var(--surface);
   }
 
   /* ===== Composer (capsule) ===== */
@@ -3660,6 +4373,8 @@ function renderWebApp() {
 <div id="triggerModal" style="display:none;" role="dialog" aria-modal="true"></div>
 <div id="reqLogModal" style="display:none;" role="dialog" aria-modal="true" aria-label="리퀘스트 로그"></div>
 <div id="msgEditModal" style="display:none;" role="dialog" aria-modal="true" aria-label="메시지 수정"></div>
+<div id="pluginGuiModal" style="display:none;" role="dialog" aria-modal="true" aria-label="플러그인 GUI"></div>
+<div id="sceneCtrlModal" style="display:none;" role="dialog" aria-modal="true" aria-label="장면·삽화 제어함"></div>
 
 <div id="login">
   <div class="login-card">
@@ -3682,6 +4397,7 @@ function renderWebApp() {
       </div>
     </div>
     <div class="h-right">
+      <button class="pill icon-pill" id="sceneCtrlQuickBtn" title="장면·삽화 제어함" aria-label="장면·삽화 제어함">🎨</button>
       <button class="pill icon-pill" id="reqLogQuickBtn" title="리퀘스트 로그 보기" aria-label="리퀘스트 로그">📜</button>
       <button class="pill icon-pill" id="assetCycleBtn" title="에셋 표시 / 가리기 / 감추기" aria-label="에셋 표시 모드">🖼️</button>
       <button class="pill icon-pill" id="autoTrBtn" title="응답 자동 번역" aria-label="응답 자동 번역">🌐</button>
@@ -3752,7 +4468,7 @@ function renderWebApp() {
       <button class="btn sec" id="refreshAllBtn" style="flex-shrink:0;">새로고침</button>
     </div>
     <div class="hint" style="margin-top:0;">
-      PC RisuAI에 현재 열려 있는 봇만 <b>PC 활성</b>(<code>risuai.sendChat()</code> · 다른 RisuAI 플러그인 정상 작동)으로 동작합니다. PC가 홈 화면이거나 다른 봇을 열어 둔 상태에서는 <b>원격 라우팅</b>(DB 직접 반영)으로 동작하므로 <b>다른 RisuAI 플러그인은 동작하지 않습니다</b>. 대신 <b>[⚡ 모델/번역]</b>의 원격 프롬프트 프리셋과 <b>[🧩 모듈/설정]</b> 토글이 실시간 적용됩니다.
+      PC RisuAI에 현재 열려 있는 봇은 <b>PC 활성</b>(<code>risuai.sendChat()</code>)으로 동작합니다. PC가 홈 화면이거나 다른 봇을 열어 둔 상태에서는 <b>원격 라우팅</b>으로 동작하며, <b>[🧩 모듈/설정]</b>의 <b>백엔드 플러그인 어댑터</b>에서 켠 RisuAI v3 플러그인들이 RisuAI <code>pluginStorage</code>·<code>DB</code>에 직접 연결되어 동작합니다. (어댑터에 켜지 않은 다른 RisuAI 플러그인은 PC 활성 상태에서만 동작합니다.)
     </div>
     <div id="botList" style="display:flex; flex-direction:column; gap:8px;"></div>
   </section>
@@ -3822,6 +4538,31 @@ function renderWebApp() {
         <summary style="cursor:pointer; font-size:12.5px; font-weight:700; color:var(--text);">📋 반영 중인 캐릭터 설명 · 프롬프트 확인 <span id="charDescBadge" class="badge">0자</span></summary>
         <div id="charDescPreviewBody" style="margin-top:8px; display:flex; flex-direction:column; gap:8px; font-size:12px;"></div>
       </details>
+    </div>
+    <div class="card" id="backendPluginsCard">
+      <h3>
+        <span>🔌 백엔드 플러그인 어댑터</span>
+        <span class="badge" id="backendPluginCount">0 활성</span>
+      </h3>
+      <div class="hint" style="margin-top:0;">
+        <b>원격 라우팅</b>(<code>sendChat()</code> 미사용)에서도 RisuAI v3 플러그인을 백엔드 어댑터에서 직접 실행하고, PC RisuAI의 <code>pluginStorage</code>·<code>DB</code>에 직접 읽고 씁니다. 원격에서 쌓인 데이터는 PC 네이티브 실행 시에도 그대로 이어집니다.
+      </div>
+      <label style="display:flex; align-items:flex-start; gap:8px; margin-top:8px; padding:9px 11px; border-radius:10px; border:1px solid var(--border); background:var(--surface); cursor:pointer;">
+        <input type="checkbox" id="remoteDirectOnlyChk" checked style="margin-top:3px;" />
+        <span style="font-size:12.5px; line-height:1.45;">
+          <b>원격 전송 시 백엔드 단독 실행 (열려 있는 봇 포함 · PC 내부 플러그인 중지)</b><br/>
+          <span style="color:var(--sub); font-size:11.5px;">켜 두면 PC에 봇이 열려 있어도 <code>sendChat()</code>을 호출하지 않아 PC 내부 플러그인 작동이 멈추고, 백엔드에 켠 원격 플러그인만 단독 실행됩니다.</span>
+        </span>
+      </label>
+      <div class="btn-row" style="margin-top:8px;">
+        <button type="button" class="btn sec" id="syncPcPluginsBtn">🔄 PC 플러그인 동기화</button>
+        <button type="button" class="btn sec" id="uploadPluginBtn">+ .js 추가</button>
+        <button type="button" class="btn sec" id="reloadPcPluginsBtn">🔁 PC 플러그인 리로드</button>
+        <input type="file" id="pluginFileInp" accept=".js,.mjs,.cjs,text/javascript,application/javascript" style="display:none;" />
+      </div>
+      <div id="backendPluginList" class="plg-list">
+        <div style="color:var(--sub); font-size:12.5px;">등록된 플러그인이 없습니다. PC 연결 시 [PC 플러그인 동기화] 또는 [.js 추가]를 눌러 주세요.</div>
+      </div>
     </div>
     <div class="card" id="lorebookCard">
       <h3>
@@ -3896,6 +4637,11 @@ function renderWebApp() {
 
     <div class="card">
       <h3>⚡ AI 프리셋 · 모델 프로필 (릴레이 라우터)</h3>
+      <div style="margin-bottom:10px; padding:10px 12px; border-radius:10px; border:1px solid var(--border); background:var(--surface);">
+        <div class="f-label" style="margin:0 0 5px;">🧩 보조 모델 파이프라인 (<code>otherAx</code> · 모듈/플러그인 보조 LLM)</div>
+        <select class="f-inp" id="auxProfileSel" style="min-height:38px;"></select>
+        <div class="hint" style="margin-top:4px;">메인 채팅(<code>model</code>)은 아래 활성 프로필을, 모듈(<code>axLLM</code>)·플러그인 보조 호출(<code>otherAx</code>)은 위 보조 모델을 사용합니다.</div>
+      </div>
       <div id="profileList" style="display:flex; flex-direction:column; gap:6px; margin-bottom:10px;"></div>
       <div class="btn-row">
         <button class="btn sec" onclick="openNewProfile('ollama_cloud')">+ Ollama Cloud</button>
@@ -3954,13 +4700,61 @@ function renderWebApp() {
       <h3>📜 원격 직접 요청 프롬프트 프리셋</h3>
       <select class="f-inp" id="directPresetSel"></select>
       <div class="hint" id="directPresetHint" style="margin-top:6px;">
-        PC에서 <code>risuai.sendChat()</code>을 쓸 수 없는 상태(<code>원격 라우팅</code>)에서는 DB 직접 반영으로 동작하므로 <b>다른 RisuAI 플러그인은 동작하지 않습니다</b>. 대신 <b>원격 직접 요청(원격채팅 · 원격리롤)</b>에 이 프리셋의 프롬프트 구조와 <b>[🧩 모듈/설정]</b> 탭 토글을 실시간 CBS로 반영합니다. (다른 플러그인까지 쓰려면 PC RisuAI에서 해당 봇을 열어 <b>PC 활성</b> 상태로 사용해 주세요.)
+        PC에서 <code>risuai.sendChat()</code>을 쓸 수 없는 <code>원격 라우팅</code>에서는 이 프리셋과 <b>[🧩 모듈/설정]</b> 토글·로어북이 반영되며, <b>백엔드 플러그인 어댑터</b>에 켠 RisuAI v3 플러그인도 RisuAI <code>pluginStorage</code>·<code>DB</code>에 직접 연결되어 함께 동작합니다. (어댑터에 켜지 않은 다른 RisuAI 플러그인은 <b>PC 활성</b> 상태에서 동작합니다.)
       </div>
       <div class="btn-row">
         <button type="button" class="btn sec" id="directPresetUploadBtn">+ .risup / .json 업로드</button>
         <input type="file" id="directPresetFile" accept=".risup,.json" style="display:none;" />
         <button type="button" class="btn danger" id="directPresetDelBtn" style="display:none; margin-left:auto;">삭제</button>
       </div>
+    </div>
+
+    <div class="card" id="imageGenCard">
+      <h3>🎨 백엔드 삽화 프로바이더 (모듈 · <code>generateImage</code>)</h3>
+      <label class="f-label" style="margin-top:4px;">설정 연동 방식</label>
+      <select class="f-inp" id="imgGenSource">
+        <option value="pc_risu">PC RisuAI [기타 봇 - 이미지 생성] 설정 자동 연동 (추천)</option>
+        <option value="custom">RisuStand 원격 전용 커스텀 프로바이더 사용</option>
+      </select>
+      <div class="hint" style="margin-top:5px;">
+        모듈(예: 라이트보드 🌠 삽화)이 RisuAI 내부 <code>generateImage()</code> API를 호출하면 이 백엔드 프로바이더로 실행되어 Inlay로 저장됩니다. (에셋 메이드 등 자체 API를 쓰는 플러그인은 플러그인 내부 설정과 <code>runLLMModel</code>을 그대로 사용합니다.)
+      </div>
+      <div id="imgGenCustomBox" style="margin-top:8px;">
+        <label class="f-label">이미지 프로바이더</label>
+        <select class="f-inp" id="imgGenProvider">
+          <option value="novelai">NovelAI (v3 / v4 / v4.5 · ' | ' 다중 캐릭터 지원)</option>
+          <option value="comfyui">ComfyUI (로컬 127.0.0.1:8188 또는 원격 서버)</option>
+          <option value="webui">SD WebUI / Forge (/sdapi/v1/txt2img)</option>
+          <option value="openai">OpenAI Image (DALL-E 3 / GPT-Image)</option>
+        </select>
+        <label class="f-label">엔드포인트 URL (비우면 프로바이더 기본 주소 사용)</label>
+        <input class="f-inp" id="imgGenUrl" placeholder="NovelAI 기본 / ComfyUI: http://127.0.0.1:8188 / WebUI: http://127.0.0.1:7860" />
+        <label class="f-label">API 키 (PC 로컬 저장 · 비우면 유지)</label>
+        <input class="f-inp" id="imgGenKey" type="password" placeholder="NovelAI Token 또는 OpenAI API Key" />
+        <label class="f-label">모델 ID</label>
+        <input class="f-inp" id="imgGenModel" placeholder="nai-diffusion-4-5-full" />
+        <div class="grid-2">
+          <div><label class="f-label">너비 (Width)</label><input class="f-inp" id="imgGenWidth" type="number" /></div>
+          <div><label class="f-label">높이 (Height)</label><input class="f-inp" id="imgGenHeight" type="number" /></div>
+        </div>
+        <div class="grid-2">
+          <div><label class="f-label">Steps</label><input class="f-inp" id="imgGenSteps" type="number" /></div>
+          <div><label class="f-label">CFG Scale</label><input class="f-inp" id="imgGenScale" type="number" step="0.5" /></div>
+        </div>
+        <label class="f-label">Sampler</label>
+        <input class="f-inp" id="imgGenSampler" placeholder="k_euler_ancestral" />
+        <label class="f-label">기본 네거티브 프롬프트</label>
+        <textarea class="f-inp" id="imgGenNegBase" rows="2"></textarea>
+        <div id="imgGenComfyBox" style="display:none;">
+          <label class="f-label">ComfyUI API Workflow JSON (<code>{{risu_prompt}}</code> / <code>{{risu_neg}}</code> 지원)</label>
+          <textarea class="f-inp" id="imgGenComfyWorkflow" rows="4" placeholder="{ ... }"></textarea>
+          <div class="grid-2">
+            <div><label class="f-label">Positive Node ID (선택)</label><input class="f-inp" id="imgGenComfyPosId" placeholder="예: 6" /></div>
+            <div><label class="f-label">Negative Node ID (선택)</label><input class="f-inp" id="imgGenComfyNegId" placeholder="예: 7" /></div>
+          </div>
+        </div>
+      </div>
+      <div class="btn-row"><button type="button" class="btn" id="saveImgGenBtn">💾 삽화 설정 저장</button></div>
     </div>
 
     <div class="card">
@@ -4430,9 +5224,15 @@ function renderWebApp() {
       }
       if (ch.nodeType !== 1) continue;
       const tag = (ch.tagName || '').toLowerCase();
-      if (tag === 'script' || tag === 'iframe' || tag === 'object' || tag === 'embed' || tag === 'applet' || tag === 'base' || tag === 'meta' || tag === 'link' || tag === 'form') {
+      if (tag === 'script' || tag === 'iframe' || tag === 'object' || tag === 'embed' || tag === 'applet' || tag === 'base' || tag === 'meta' || tag === 'link' || (tag === 'form' && !ch.hasAttribute('risu-form'))) {
         node.removeChild(ch);
         continue;
+      }
+      if (tag === 'form') {
+        ch.removeAttribute('action');
+        ch.removeAttribute('method');
+        ch.removeAttribute('target');
+        ch.removeAttribute('enctype');
       }
       if (tag === 'style') {
         ch.textContent = scopeBotCss(sanitizeBotCss(ch.textContent || ''));
@@ -4816,9 +5616,22 @@ function renderWebApp() {
     };
   }
 
+  function syncLeaveHudVisibility(snapObj) {
+    const s = snapObj || (lastState && lastState.snapshot) || {};
+    const remoteGlobals = (routerCfg && routerCfg.remoteToggleValues && typeof routerCfg.remoteToggleValues === 'object') ? routerCfg.remoteToggleValues : {};
+    const useLocal = Boolean(s.useLocallySetGlobalVariables);
+    const localVals = s.localToggleValues || {};
+    const pcGlobals = s.globalToggleValues || {};
+    const effective = useLocal
+      ? (localVals.toggle_state_tracker ?? localVals.state_tracker ?? remoteGlobals.toggle_state_tracker ?? remoteGlobals.state_tracker ?? pcGlobals.toggle_state_tracker ?? pcGlobals.state_tracker ?? '0')
+      : (remoteGlobals.toggle_state_tracker ?? remoteGlobals.state_tracker ?? pcGlobals.toggle_state_tracker ?? pcGlobals.state_tracker ?? '0');
+    document.body.classList.toggle('hide-leave-hud', String(effective) === '2');
+  }
+
   function applyState(st) {
     lastState = st;
     const snap = st.snapshot || {};
+    syncLeaveHudVisibility(snap);
     document.getElementById('pcDot').className = 'dot' + (st.pcConnected ? ' on' : '');
     document.getElementById('hdrChar').textContent = displayBotName(snap.charName || 'PC 연결 대기');
     const modeTag = snap.isPcActive ? 'PC 활성' : '원격 라우팅';
@@ -4910,6 +5723,47 @@ function renderWebApp() {
     return '';
   }
 
+  function extractPluginBubbleControls(htmlStr) {
+    const raw = String(htmlStr || '');
+    if (!raw || !/data-am-|risu-form/i.test(raw)) return [];
+    const controls = [];
+    try {
+      const doc = new DOMParser().parseFromString('<div>' + raw + '</div>', 'text/html');
+      doc.querySelectorAll('[data-am-illustration-action], [data-am-chat-history-action], [data-am-chat-regenerate-action], [data-am-manual-generate-action]').forEach((el) => {
+        const ds = {};
+        for (const a of Array.from(el.attributes || [])) {
+          if (a.name.startsWith('data-')) ds[a.name] = a.value;
+        }
+        let label = (el.textContent || '').replace(/\\s+/g, ' ').trim();
+        if (!label) {
+          if (ds['data-am-illustration-action']) label = '✨ 삽화 생성';
+          else if (ds['data-am-chat-regenerate-action']) label = '↻ 삽화 재생성';
+          else if (ds['data-am-chat-history-action'] === 'previous') label = '◀ 이전 삽화';
+          else if (ds['data-am-chat-history-action'] === 'next') label = '다음 삽화 ▶';
+          else if (ds['data-am-manual-generate-action']) label = '🎨 수동 생성';
+          else label = '🎨 실행';
+        }
+        controls.push({
+          label: label.slice(0, 28),
+          outerHTML: el.outerHTML,
+          dataset: ds,
+        });
+      });
+    } catch (_) {}
+    return controls;
+  }
+
+  function renderPluginBubbleBarHtml(m) {
+    if (!m || !m.html) return '';
+    const ctrls = extractPluginBubbleControls(m.html);
+    if (!ctrls.length) return '';
+    const btns = ctrls.map((c) => {
+      const payload = esc(JSON.stringify({ msgIndex: m.index, actionHtml: c.outerHTML, dataset: c.dataset }));
+      return '<button type="button" class="rs-pbb-btn" data-am-proxy="' + payload + '">' + esc(c.label) + '</button>';
+    }).join('');
+    return '<div class="rs-plugin-bubble-bar"><span class="rs-pbb-label">🎨 플러그인</span>' + btns + '</div>';
+  }
+
   function renderMsgActionBarHtml(m, snap, key, showTr, isLatestChar, isBook) {
     let acts = '';
     if (m.isFirstMessage) {
@@ -4936,7 +5790,7 @@ function renderWebApp() {
       acts += '<button class="act-btn" data-edit-msg="' + m.index + '">✏️ 수정</button>';
       acts += '<button class="act-btn" data-del-msg="' + m.index + '">🗑️ 삭제</button>';
     }
-    return acts ? '<div class="msg-actions" style="flex-wrap:wrap; align-items:center;">' + acts + '</div>' : '';
+    return renderPluginBubbleBarHtml(m) + (acts ? '<div class="msg-actions" style="flex-wrap:wrap; align-items:center;">' + acts + '</div>' : '');
   }
 
   function renderBookContent(msgs, snap) {
@@ -5614,9 +6468,82 @@ function renderWebApp() {
     if (botMenuExpanded) scheduleBotMenuAutoHide();
   });
 
+  async function dispatchPluginSurfaceAction(msgIndex, actionHtml, dataset) {
+    const snap = lastState && lastState.snapshot;
+    if (!snap || snap.charIndex < 0) return;
+    toast('플러그인 액션 실행 중...');
+    try {
+      await api('/api/plugins/surface-action', {
+        method: 'POST',
+        body: JSON.stringify({
+          charIndex: snap.charIndex,
+          chatIndex: snap.chatIndex,
+          msgIndex: Number(msgIndex ?? -1),
+          actionHtml: String(actionHtml || ''),
+          dataset: dataset || {},
+        }),
+      });
+      setTimeout(pollState, 300);
+      setTimeout(pollState, 1200);
+    } catch (err) {
+      toast('액션 오류: ' + (err && err.message ? err.message : '실패'));
+    }
+  }
+
+  async function handleRisuFormSubmit(e) {
+    const form = e.target && e.target.closest ? e.target.closest('form[risu-form]') : null;
+    if (!form) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const snap = lastState && lastState.snapshot;
+    if (!snap || snap.charIndex < 0) return;
+    const key = form.getAttribute('risu-form') || '';
+    const fd = new FormData(form);
+    const formValues = {};
+    fd.forEach((v, k) => { formValues[k] = typeof v === 'string' ? v : String(v || ''); });
+    toast('모듈 폼 전송 중...');
+    try {
+      await api('/api/modules/interaction', {
+        method: 'POST',
+        body: JSON.stringify({
+          charIndex: snap.charIndex,
+          chatIndex: snap.chatIndex,
+          kind: 'form',
+          key,
+          formValues,
+        }),
+      });
+      setTimeout(pollState, 350);
+      setTimeout(pollState, 1200);
+    } catch (err) {
+      toast('모듈 폼 오류: ' + (err && err.message ? err.message : '실패'));
+    }
+  }
+
   async function handleBotWidgetClick(e) {
     if (document.getElementById('bookBotOverlay').contains(e.target) && botMenuExpanded) {
       scheduleBotMenuAutoHide();
+    }
+    const proxyBtn = e.target.closest('[data-am-proxy]');
+    if (proxyBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      try {
+        const info = JSON.parse(proxyBtn.getAttribute('data-am-proxy') || '{}');
+        await dispatchPluginSurfaceAction(info.msgIndex, info.actionHtml, info.dataset);
+      } catch (_) {}
+      return true;
+    }
+    const amEl = e.target.closest('[data-am-illustration-action], [data-am-chat-history-action], [data-am-chat-regenerate-action], [data-am-manual-generate-action]');
+    if (amEl) {
+      e.preventDefault();
+      e.stopPropagation();
+      const ds = {};
+      for (const a of Array.from(amEl.attributes || [])) {
+        if (a.name.startsWith('data-')) ds[a.name] = a.value;
+      }
+      await dispatchPluginSurfaceAction(-1, amEl.outerHTML, ds);
+      return true;
     }
     const trigEl = e.target.closest('[risu-trigger]');
     if (trigEl) {
@@ -5647,6 +6574,18 @@ function renderWebApp() {
       const snap = lastState && lastState.snapshot;
       const txt = (btnEl.getAttribute('risu-btn') || btnEl.textContent || '').trim();
       if (!snap || snap.charIndex < 0 || !txt) return true;
+      try {
+        const modRes = await api('/api/modules/interaction', {
+          method: 'POST',
+          body: JSON.stringify({ charIndex: snap.charIndex, chatIndex: snap.chatIndex, kind: 'button', code: txt }),
+        });
+        if (modRes && modRes.handled) {
+          toast('모듈 버튼 실행됨');
+          setTimeout(pollState, 300);
+          setTimeout(pollState, 1000);
+          return true;
+        }
+      } catch (_) {}
       markLocalRequestPending(true);
       armPendingReplyFollow(snap);
       try {
@@ -5673,6 +6612,9 @@ function renderWebApp() {
 
   document.getElementById('bookBotOverlay').addEventListener('click', handleBotWidgetClick);
   document.getElementById('botBgHost').addEventListener('click', handleBotWidgetClick);
+  document.getElementById('tab-chat').addEventListener('submit', handleRisuFormSubmit);
+  document.getElementById('bookBotOverlay').addEventListener('submit', handleRisuFormSubmit);
+  document.getElementById('botBgHost').addEventListener('submit', handleRisuFormSubmit);
 
   document.getElementById('tab-chat').addEventListener('click', async (e) => {
     if (await handleBotWidgetClick(e)) return;
@@ -6259,6 +7201,7 @@ function renderWebApp() {
       ? { ...(snap.globalToggleValues || {}), ...remoteGlobals, ...(snap.localToggleValues || {}) }
       : { ...(snap.globalToggleValues || {}), ...remoteGlobals };
     const vals = { ...baseVals, ...(now < optimisticUntil ? optimisticVars : {}) };
+    syncLeaveHudVisibility({ ...snap, useLocallySetGlobalVariables: useLocal, localToggleValues: { ...(snap.localToggleValues || {}), ...(now < optimisticUntil ? optimisticVars : {}) } });
     const sig = JSON.stringify([snap.charIndex, snap.chatIndex, useLocal, vals, blocks.map((b) => (b.id || '') + ':' + b.source + ':' + b.syntax.length), Array.from(openToggleGroups)]);
     if (!force && sig === lastToggleRenderSig) return;
 
@@ -6664,6 +7607,7 @@ function renderWebApp() {
     renderChatVariables(force);
     renderAuthorNoteAndCharContext(force);
     loadLorebookList(false);
+    loadBackendPlugins(false);
     const cat = (lastState && lastState.catalog) || {};
     const snap = (lastState && lastState.snapshot) || {};
     const chatModSet = new Set(Array.isArray(snap.chatModules) ? snap.chatModules.map(String) : []);
@@ -6812,7 +7756,37 @@ function renderWebApp() {
 
   function renderRouterUI() {
     if (!routerCfg) return;
-    document.getElementById('profileList').innerHTML = (routerCfg.profiles || []).map((p) => {
+    const profs = routerCfg.profiles || [];
+    const auxSel = document.getElementById('auxProfileSel');
+    if (auxSel) {
+      const curAux = typeof routerCfg.auxProfileId === 'string' && routerCfg.auxProfileId ? routerCfg.auxProfileId : 'inherit';
+      auxSel.innerHTML = '<option value="inherit">메인 모델과 동일 (기본 · inherit)</option>' +
+        profs.map((p) => '<option value="' + esc(p.id) + '">' + esc(p.name + ' (' + (p.model || p.providerType) + ')') + '</option>').join('');
+      auxSel.value = (curAux !== 'inherit' && profs.some((p) => p && p.id === curAux)) ? curAux : 'inherit';
+    }
+    const imgCfg = (routerCfg.imageGen && typeof routerCfg.imageGen === 'object') ? routerCfg.imageGen : {};
+    if (document.getElementById('imgGenSource')) {
+      const srcVal = imgCfg.source === 'custom' ? 'custom' : 'pc_risu';
+      const provVal = imgCfg.provider || 'novelai';
+      document.getElementById('imgGenSource').value = srcVal;
+      document.getElementById('imgGenProvider').value = provVal;
+      document.getElementById('imgGenUrl').value = imgCfg.apiUrl || '';
+      document.getElementById('imgGenKey').value = '';
+      document.getElementById('imgGenKey').placeholder = imgCfg.hasKey ? ('저장됨: ' + imgCfg.keyPreview + ' (비우면 유지)') : 'NovelAI Token 또는 OpenAI API Key';
+      document.getElementById('imgGenModel').value = imgCfg.model || 'nai-diffusion-4-5-full';
+      document.getElementById('imgGenWidth').value = imgCfg.width || 1024;
+      document.getElementById('imgGenHeight').value = imgCfg.height || 1024;
+      document.getElementById('imgGenSteps').value = imgCfg.steps || 28;
+      document.getElementById('imgGenScale').value = imgCfg.scale !== undefined ? imgCfg.scale : 5;
+      document.getElementById('imgGenSampler').value = imgCfg.sampler || 'k_euler_ancestral';
+      document.getElementById('imgGenNegBase').value = imgCfg.negativeBase || '';
+      document.getElementById('imgGenComfyWorkflow').value = imgCfg.comfyWorkflowJson || '';
+      document.getElementById('imgGenComfyPosId').value = imgCfg.comfyPosNodeId || '';
+      document.getElementById('imgGenComfyNegId').value = imgCfg.comfyNegNodeId || '';
+      document.getElementById('imgGenCustomBox').style.display = srcVal === 'custom' ? 'block' : 'none';
+      document.getElementById('imgGenComfyBox').style.display = provVal === 'comfyui' ? 'block' : 'none';
+    }
+    document.getElementById('profileList').innerHTML = profs.map((p) => {
       const active = p.id === routerCfg.activeProfileId;
       const pMeta = getProviderMeta(inferClientProviderId(p.provider, p.providerType, p.baseUrl));
       return '<div class="row" style="padding:8px 10px; border:1px solid ' + (active ? 'var(--accent)' : 'var(--border)') + '; border-radius:10px; background:var(--bg);">' +
@@ -7106,11 +8080,57 @@ function renderWebApp() {
     const id = document.getElementById('edId').value;
     routerCfg.profiles = routerCfg.profiles.filter((x) => x.id !== id);
     if (routerCfg.activeProfileId === id) routerCfg.activeProfileId = '';
+    if (routerCfg.auxProfileId === id) routerCfg.auxProfileId = 'inherit';
     routerCfg = await api('/api/router/config', { method: 'POST', body: JSON.stringify(routerCfg) });
     document.getElementById('profileEditor').style.display = 'none';
     renderRouterUI();
     toast('프로필 삭제됨');
   };
+  const auxProfileSelEl = document.getElementById('auxProfileSel');
+  if (auxProfileSelEl) {
+    auxProfileSelEl.onchange = async () => {
+      routerCfg.auxProfileId = auxProfileSelEl.value || 'inherit';
+      routerCfg = await api('/api/router/config', { method: 'POST', body: JSON.stringify({ auxProfileId: routerCfg.auxProfileId }) });
+      renderRouterUI();
+      toast('보조 모델(otherAx) 변경됨');
+    };
+  }
+  const imgGenSourceEl = document.getElementById('imgGenSource');
+  const imgGenProvEl = document.getElementById('imgGenProvider');
+  if (imgGenSourceEl) {
+    imgGenSourceEl.onchange = () => {
+      document.getElementById('imgGenCustomBox').style.display = imgGenSourceEl.value === 'custom' ? 'block' : 'none';
+    };
+  }
+  if (imgGenProvEl) {
+    imgGenProvEl.onchange = () => {
+      document.getElementById('imgGenComfyBox').style.display = imgGenProvEl.value === 'comfyui' ? 'block' : 'none';
+    };
+  }
+  const saveImgGenBtnEl = document.getElementById('saveImgGenBtn');
+  if (saveImgGenBtnEl) {
+    saveImgGenBtnEl.onclick = async () => {
+      const payload = {
+        source: document.getElementById('imgGenSource').value,
+        provider: document.getElementById('imgGenProvider').value,
+        apiUrl: document.getElementById('imgGenUrl').value.trim(),
+        apiKey: document.getElementById('imgGenKey').value.trim(),
+        model: document.getElementById('imgGenModel').value.trim(),
+        width: Number(document.getElementById('imgGenWidth').value) || 1024,
+        height: Number(document.getElementById('imgGenHeight').value) || 1024,
+        steps: Number(document.getElementById('imgGenSteps').value) || 28,
+        scale: Number(document.getElementById('imgGenScale').value) || 5,
+        sampler: document.getElementById('imgGenSampler').value.trim(),
+        negativeBase: document.getElementById('imgGenNegBase').value,
+        comfyWorkflowJson: document.getElementById('imgGenComfyWorkflow').value,
+        comfyPosNodeId: document.getElementById('imgGenComfyPosId').value.trim(),
+        comfyNegNodeId: document.getElementById('imgGenComfyNegId').value.trim(),
+      };
+      routerCfg = await api('/api/router/config', { method: 'POST', body: JSON.stringify({ imageGen: payload }) });
+      renderRouterUI();
+      toast('삽화 프로바이더 설정 저장됨');
+    };
+  }
   document.getElementById('saveTrBtn').onclick = async () => {
     routerCfg.translator = {
       ...routerCfg.translator,
@@ -7625,6 +8645,442 @@ function renderWebApp() {
     if (row) openRequestLogDetail(row.getAttribute('data-log-id'));
   });
 
+  // ===== Backend Plugin Adapter UI & Native Sandboxed Iframe GUI Modal =====
+  let backendPluginsCache = [];
+  let backendPluginsLoadedAt = 0;
+  let backendPluginsLoading = false;
+  const openPluginArgsSet = new Set();
+  const pluginGuiState = {
+    open: false,
+    pluginName: '',
+    displayName: '',
+    entryId: '',
+    uiItems: [],
+  };
+
+  function renderBackendPluginsList() {
+    const listEl = document.getElementById('backendPluginList');
+    const cntEl = document.getElementById('backendPluginCount');
+    if (!listEl) return;
+    const list = Array.isArray(backendPluginsCache) ? backendPluginsCache : [];
+    const activeCnt = list.filter((p) => p && p.enabled).length;
+    if (cntEl) cntEl.textContent = activeCnt + ' / ' + list.length + ' 활성';
+    if (!list.length) {
+      listEl.innerHTML = '<div style="color:var(--sub); font-size:12.5px;">등록된 플러그인이 없습니다. PC 연결 시 [PC 플러그인 동기화] 또는 [.js 추가]를 눌러 주세요.</div>';
+      return;
+    }
+    listEl.innerHTML = list.map((p) => {
+      const hookTags = [];
+      if (p.hooks && Array.isArray(p.hooks.replacers)) p.hooks.replacers.forEach((r) => hookTags.push(r));
+      if (p.hooks && Array.isArray(p.hooks.chatListeners)) p.hooks.chatListeners.forEach((c) => hookTags.push('chat:' + c));
+      if (p.hooks && Array.isArray(p.hooks.scriptHandlers)) p.hooks.scriptHandlers.forEach((s) => hookTags.push('script:' + s));
+      if (p.hasBodyIntercepter) hookTags.push('body');
+      const argsOpen = openPluginArgsSet.has(p.name);
+      const argsSchema = Array.isArray(p.argsSchema) ? p.argsSchema : [];
+      const argVals = (p.argValues && typeof p.argValues === 'object') ? p.argValues : {};
+      let argsHtml = '';
+      if (argsOpen && argsSchema.length) {
+        argsHtml = '<div class="plg-args">' +
+          argsSchema.map((a) => {
+            const val = argVals[a.key] !== undefined ? String(argVals[a.key]) : '';
+            return '<div>' +
+              '<div class="f-label" style="margin:2px 0 3px;">' + esc(a.key) + ' <span style="opacity:0.7;">(' + esc(a.type) + (a.description ? ' · ' + esc(a.description) : '') + ')</span></div>' +
+              '<input class="f-inp" type="' + (a.type === 'int' ? 'number' : 'text') + '" data-plg-arg-name="' + esc(p.name) + '" data-plg-arg-key="' + esc(a.key) + '" value="' + esc(val) + '" placeholder="' + esc(a.placeholder || '') + '" style="min-height:34px; padding:6px 10px; font-size:13px;" />' +
+            '</div>';
+          }).join('') +
+          '<div class="btn-row" style="margin-top:4px;"><button type="button" class="btn" data-plg-args-save="' + esc(p.name) + '">💾 인자 저장</button></div>' +
+        '</div>';
+      }
+      return '<div class="plg-item' + (p.enabled ? ' on' : '') + '">' +
+        '<div class="plg-head">' +
+          '<div class="plg-title">' +
+            '<span>' + esc(p.displayName || p.name) + '</span>' +
+            '<span class="badge">' + esc(p.source === 'custom' ? '업로드' : 'PC 연동') + '</span>' +
+            (p.version ? '<span class="badge">v' + esc(p.version) + '</span>' : '') +
+            (p.loaded ? '<span class="badge pc">실행 중</span>' : '') +
+          '</div>' +
+          '<input type="checkbox" data-plg-toggle="' + esc(p.name) + '" ' + (p.enabled ? 'checked' : '') + ' title="백엔드 어댑터 활성화" />' +
+        '</div>' +
+        '<div class="plg-meta">' +
+          'ID: <code>' + esc(p.name) + '</code>' +
+          (hookTags.length ? ' · 훅: ' + esc(hookTags.join(', ')) : '') +
+          (p.uiItems && p.uiItems.length ? ' · GUI 메뉴 ' + p.uiItems.length + '개' : '') +
+        '</div>' +
+        (p.lastError ? '<div class="plg-err">⚠️ ' + esc(p.lastError) + '</div>' : '') +
+        '<div class="plg-acts">' +
+          '<button type="button" class="pill" data-plg-gui="' + esc(p.name) + '">🖥️ GUI 보기</button>' +
+          (argsSchema.length ? '<button type="button" class="pill" data-plg-args-btn="' + esc(p.name) + '">⚙️ 설정 (' + argsSchema.length + ')</button>' : '') +
+          (p.source === 'custom' ? '<button type="button" class="pill" data-plg-del="' + esc(p.name) + '" style="color:var(--danger);">🗑️ 삭제</button>' : '') +
+        '</div>' +
+        argsHtml +
+      '</div>';
+    }).join('');
+  }
+
+  async function loadBackendPlugins(force = false) {
+    if (backendPluginsLoading) return;
+    if (!force && backendPluginsLoadedAt && (Date.now() - backendPluginsLoadedAt < 5000)) return;
+    backendPluginsLoading = true;
+    try {
+      const res = await api('/api/plugins');
+      backendPluginsCache = Array.isArray(res && res.plugins) ? res.plugins : [];
+      backendPluginsLoadedAt = Date.now();
+      const chk = document.getElementById('remoteDirectOnlyChk');
+      if (chk && res) chk.checked = res.remoteDirectOnly !== false;
+      renderBackendPluginsList();
+    } catch (_) {
+    } finally {
+      backendPluginsLoading = false;
+    }
+  }
+
+  function renderPluginGuiModalHeader() {
+    const tabsEl = document.getElementById('pluginGuiTabs');
+    if (!tabsEl) return;
+    const items = Array.isArray(pluginGuiState.uiItems) ? pluginGuiState.uiItems : [];
+    if (!items.length) {
+      tabsEl.style.display = 'none';
+      tabsEl.innerHTML = '';
+      return;
+    }
+    tabsEl.style.display = 'flex';
+    tabsEl.innerHTML = items.map((u) => {
+      const active = pluginGuiState.entryId ? (u.id === pluginGuiState.entryId) : (u === items[0]);
+      return '<button type="button" class="pill' + (active ? ' active' : '') + '" data-plg-gui-entry="' + esc(u.id) + '">' + esc(u.name) + '</button>';
+    }).join('');
+  }
+
+  function closePluginGuiModal() {
+    pluginGuiState.open = false;
+    pluginGuiState.pluginName = '';
+    pluginGuiState.uiItems = [];
+    const modal = document.getElementById('pluginGuiModal');
+    if (modal) {
+      modal.style.display = 'none';
+      modal.innerHTML = '';
+    }
+  }
+
+  async function openPluginGuiModal(pluginName, entryId = '') {
+    const modal = document.getElementById('pluginGuiModal');
+    if (!modal || !pluginName) return;
+    const plg = backendPluginsCache.find((p) => p && p.name === pluginName);
+    pluginGuiState.open = true;
+    pluginGuiState.pluginName = pluginName;
+    pluginGuiState.displayName = (plg && plg.displayName) || pluginName;
+    pluginGuiState.entryId = entryId || '';
+    pluginGuiState.uiItems = (plg && Array.isArray(plg.uiItems)) ? plg.uiItems : [];
+
+    modal.innerHTML =
+      '<div class="plg-gui-dialog">' +
+        '<div class="plg-gui-head">' +
+          '<div style="font-size:14.5px; font-weight:800; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🖥️ ' + esc(pluginGuiState.displayName) + '</div>' +
+          '<div style="display:flex; gap:6px; align-items:center;">' +
+            '<button type="button" class="pill" data-plg-gui-reload="1">↻ 새로고침</button>' +
+            '<button type="button" class="pill" data-plg-gui-close="1">✕ 닫기</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="plg-gui-tabs" id="pluginGuiTabs" style="display:none;"></div>' +
+        '<iframe id="pluginGuiFrame" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads"></iframe>' +
+      '</div>';
+    renderPluginGuiModalHeader();
+    modal.style.display = 'flex';
+
+    try {
+      const isNight = /night|midnight|dark|claude/i.test(uiPref.theme || '');
+      const res = await api('/api/plugins/gui-srcdoc?name=' + encodeURIComponent(pluginName) + '&entryId=' + encodeURIComponent(entryId || '') + '&theme=' + (isNight ? 'dark' : 'light'));
+      const frame = document.getElementById('pluginGuiFrame');
+      if (frame && res && res.srcdoc) {
+        frame.srcdoc = res.srcdoc;
+      }
+    } catch (e) {
+      toast('플러그인 GUI 열기 실패: ' + (e && e.message ? e.message : '오류'));
+    }
+  }
+
+  window.addEventListener('message', async (ev) => {
+    const frame = document.getElementById('pluginGuiFrame');
+    if (!frame || !frame.contentWindow || ev.source !== frame.contentWindow) return;
+    const d = ev.data;
+    if (!d || typeof d !== 'object') return;
+    if (d.__rsGuiClose === 1) {
+      closePluginGuiModal();
+      return;
+    }
+    if (d.__rsGuiItems === 1 && Array.isArray(d.items)) {
+      pluginGuiState.uiItems = d.items;
+      renderPluginGuiModalHeader();
+      return;
+    }
+    if (d.__rsGuiRpc === 1 && d.reqId) {
+      try {
+        const res = await api('/api/plugins/gui-rpc', {
+          method: 'POST',
+          body: JSON.stringify({ pluginName: d.pluginName || pluginGuiState.pluginName, method: d.method, args: d.args || [] }),
+        });
+        frame.contentWindow.postMessage({ __rsGuiRpcRes: 1, reqId: d.reqId, ok: true, value: res ? res.value : undefined }, '*');
+      } catch (err) {
+        frame.contentWindow.postMessage({ __rsGuiRpcRes: 1, reqId: d.reqId, ok: false, error: (err && err.message) ? err.message : 'RPC error' }, '*');
+      }
+    }
+  });
+
+  const pluginGuiModalEl = document.getElementById('pluginGuiModal');
+  if (pluginGuiModalEl) {
+    pluginGuiModalEl.addEventListener('click', (e) => {
+      if (e.target === pluginGuiModalEl || e.target.closest('[data-plg-gui-close]')) {
+        closePluginGuiModal();
+        return;
+      }
+      if (e.target.closest('[data-plg-gui-reload]')) {
+        openPluginGuiModal(pluginGuiState.pluginName, pluginGuiState.entryId);
+        return;
+      }
+      const entryBtn = e.target.closest('[data-plg-gui-entry]');
+      if (entryBtn) {
+        const eid = entryBtn.getAttribute('data-plg-gui-entry') || '';
+        pluginGuiState.entryId = eid;
+        renderPluginGuiModalHeader();
+        const frame = document.getElementById('pluginGuiFrame');
+        if (frame && frame.contentWindow) {
+          frame.contentWindow.postMessage({ __rsGuiInvokeEntry: 1, entryId: eid }, '*');
+        }
+      }
+    });
+  }
+
+  const remoteDirectOnlyChk = document.getElementById('remoteDirectOnlyChk');
+  if (remoteDirectOnlyChk) {
+    remoteDirectOnlyChk.onchange = async () => {
+      const want = Boolean(remoteDirectOnlyChk.checked);
+      try {
+        const res = await api('/api/plugins/settings', {
+          method: 'POST',
+          body: JSON.stringify({ remoteDirectOnly: want }),
+        });
+        remoteDirectOnlyChk.checked = res.remoteDirectOnly !== false;
+        toast(remoteDirectOnlyChk.checked ? '백엔드 단독 실행 켜짐 (PC 내부 플러그인 중지)' : 'PC 활성 봇 네이티브 실행 허용됨');
+      } catch (e) {
+        remoteDirectOnlyChk.checked = !want;
+        toast('설정 저장 실패: ' + (e && e.message ? e.message : '오류'));
+      }
+    };
+  }
+  const syncPcPluginsBtn = document.getElementById('syncPcPluginsBtn');
+  if (syncPcPluginsBtn) {
+    syncPcPluginsBtn.onclick = async () => {
+      try {
+        const res = await api('/api/plugins/sync-pc', { method: 'POST', body: '{}' });
+        backendPluginsCache = Array.isArray(res && res.plugins) ? res.plugins : [];
+        backendPluginsLoadedAt = Date.now();
+        renderBackendPluginsList();
+        toast('PC 플러그인 동기화 완료 (' + backendPluginsCache.length + '개)');
+      } catch (e) {
+        toast('동기화 오류: ' + (e && e.message ? e.message : '실패'));
+      }
+    };
+  }
+  const reloadPcPluginsBtn = document.getElementById('reloadPcPluginsBtn');
+  if (reloadPcPluginsBtn) {
+    reloadPcPluginsBtn.onclick = async () => {
+      try {
+        await api('/api/plugins/reload-pc', { method: 'POST', body: '{}' });
+        toast('PC RisuAI 플러그인 리로드 요청됨');
+      } catch (e) {
+        toast('리로드 오류: ' + (e && e.message ? e.message : '실패'));
+      }
+    };
+  }
+  const uploadPluginBtn = document.getElementById('uploadPluginBtn');
+  const pluginFileInp = document.getElementById('pluginFileInp');
+  if (uploadPluginBtn && pluginFileInp) {
+    uploadPluginBtn.onclick = () => pluginFileInp.click();
+    pluginFileInp.onchange = async () => {
+      const f = pluginFileInp.files && pluginFileInp.files[0];
+      pluginFileInp.value = '';
+      if (!f) return;
+      try {
+        const script = await f.text();
+        const res = await api('/api/plugins/upload', {
+          method: 'POST',
+          body: JSON.stringify({ filename: f.name, script, enabled: true }),
+        });
+        backendPluginsCache = Array.isArray(res && res.plugins) ? res.plugins : [];
+        backendPluginsLoadedAt = Date.now();
+        renderBackendPluginsList();
+        toast('플러그인 추가 및 활성화됨: ' + f.name);
+      } catch (e) {
+        toast('업로드 실패: ' + (e && e.message ? e.message : '오류'));
+      }
+    };
+  }
+  const backendPluginListEl = document.getElementById('backendPluginList');
+  if (backendPluginListEl) {
+    backendPluginListEl.addEventListener('change', async (e) => {
+      const chk = e.target.closest('[data-plg-toggle]');
+      if (!chk) return;
+      const name = chk.getAttribute('data-plg-toggle');
+      const enabled = Boolean(chk.checked);
+      try {
+        const res = await api('/api/plugins/toggle', {
+          method: 'POST',
+          body: JSON.stringify({ name, enabled }),
+        });
+        backendPluginsCache = Array.isArray(res && res.plugins) ? res.plugins : [];
+        backendPluginsLoadedAt = Date.now();
+        renderBackendPluginsList();
+        toast(name + (enabled ? ' 켜짐' : ' 꺼짐'));
+      } catch (err) {
+        chk.checked = !enabled;
+        toast('전환 실패: ' + (err && err.message ? err.message : '오류'));
+      }
+    });
+    backendPluginListEl.addEventListener('click', async (e) => {
+      const guiBtn = e.target.closest('[data-plg-gui]');
+      if (guiBtn) {
+        openPluginGuiModal(guiBtn.getAttribute('data-plg-gui'));
+        return;
+      }
+      const argsBtn = e.target.closest('[data-plg-args-btn]');
+      if (argsBtn) {
+        const n = argsBtn.getAttribute('data-plg-args-btn');
+        if (openPluginArgsSet.has(n)) openPluginArgsSet.delete(n);
+        else openPluginArgsSet.add(n);
+        renderBackendPluginsList();
+        return;
+      }
+      const saveArgsBtn = e.target.closest('[data-plg-args-save]');
+      if (saveArgsBtn) {
+        const n = saveArgsBtn.getAttribute('data-plg-args-save');
+        const nextArgs = {};
+        backendPluginListEl.querySelectorAll('[data-plg-arg-name]').forEach((inp) => {
+          if (inp.getAttribute('data-plg-arg-name') === n) {
+            nextArgs[inp.getAttribute('data-plg-arg-key')] = inp.value;
+          }
+        });
+        const res = await api('/api/plugins/args', {
+          method: 'POST',
+          body: JSON.stringify({ name: n, args: nextArgs }),
+        });
+        backendPluginsCache = Array.isArray(res && res.plugins) ? res.plugins : [];
+        renderBackendPluginsList();
+        toast('플러그인 인자 저장됨');
+        return;
+      }
+      const delBtn = e.target.closest('[data-plg-del]');
+      if (delBtn) {
+        const n = delBtn.getAttribute('data-plg-del');
+        if (!confirm('백엔드에서 "' + n + '" 플러그인을 삭제할까요?')) return;
+        const res = await api('/api/plugins/' + encodeURIComponent(n), { method: 'DELETE' });
+        backendPluginsCache = Array.isArray(res && res.plugins) ? res.plugins : [];
+        renderBackendPluginsList();
+        toast('플러그인 삭제됨');
+      }
+    });
+  }
+
+  function closeSceneCtrlModal() {
+    const modal = document.getElementById('sceneCtrlModal');
+    if (modal) {
+      modal.style.display = 'none';
+      modal.innerHTML = '';
+    }
+  }
+
+  async function openSceneCtrlModal() {
+    const modal = document.getElementById('sceneCtrlModal');
+    if (!modal) return;
+    if (!backendPluginsCache.length) {
+      await loadBackendPlugins(true).catch(() => {});
+    }
+    const snap = (lastState && lastState.snapshot) || {};
+    const msgs = Array.isArray(snap.messages) ? snap.messages : [];
+    const cards = [];
+    for (const m of msgs) {
+      if (!m || m.role === 'user') continue;
+      const ctrls = extractPluginBubbleControls(m.html || '');
+      const imgs = Array.isArray(m.images) ? m.images : [];
+      const hasLb = Boolean(m.html && /risu-form|lb-interaction/i.test(m.html));
+      if (!ctrls.length && !imgs.length && !hasLb) continue;
+      const thumbsHtml = imgs.map((im) => {
+        const src = String(im).startsWith('[[RSASSET:') ? resolveAssetTokens(im, snap.assetMap) : safeImgSrc(im);
+        return src ? '<img class="scene-slot-thumb" src="' + esc(src) + '" />' : '';
+      }).join('');
+      const amBtnsHtml = ctrls.map((c) => {
+        const payload = esc(JSON.stringify({ msgIndex: m.index, actionHtml: c.outerHTML, dataset: c.dataset }));
+        return '<button type="button" class="rs-pbb-btn" data-scene-am="' + payload + '">' + esc(c.label) + '</button>';
+      }).join('');
+      const lbBtnHtml = hasLb
+        ? '<button type="button" class="rs-pbb-btn" data-scene-lb-reroll="' + m.index + '">🔦 라이트보드 재생성</button>'
+        : '';
+      cards.push(
+        '<div class="scene-slot-card">' +
+          '<div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">' +
+            '<b style="font-size:13px;">#' + (m.index >= 0 ? m.index + 1 : '인사말') + ' · ' + esc(displayBotName(snap.charName)) + '</b>' +
+            '<span class="badge">삽화 ' + imgs.length + ' · 컨트롤 ' + (ctrls.length + (hasLb ? 1 : 0)) + '</span>' +
+          '</div>' +
+          (thumbsHtml ? '<div class="scene-slot-thumbs">' + thumbsHtml + '</div>' : '') +
+          '<div class="plg-acts">' + amBtnsHtml + lbBtnHtml + '</div>' +
+        '</div>'
+      );
+    }
+    const activeGuiPlugins = (backendPluginsCache || []).filter((p) => p && p.enabled);
+    const guiLinksHtml = activeGuiPlugins.length
+      ? '<div class="plg-acts" style="margin-bottom:4px;">' +
+          activeGuiPlugins.map((p) => '<button type="button" class="pill" data-scene-open-gui="' + esc(p.name) + '">🖥️ ' + esc(p.displayName || p.name) + ' GUI</button>').join('') +
+        '</div>'
+      : '';
+    modal.innerHTML =
+      '<div class="scene-ctrl-dialog">' +
+        '<div class="scene-ctrl-head">' +
+          '<div style="font-size:15px; font-weight:800;">🖼️ 장면 · 삽화 · 플러그인 제어함</div>' +
+          '<button type="button" class="pill" data-scene-close="1">✕ 닫기</button>' +
+        '</div>' +
+        '<div class="scene-ctrl-body">' +
+          guiLinksHtml +
+          (cards.length ? cards.join('') : '<div style="font-size:13px; color:var(--sub); padding:16px 4px;">이 채팅방에 삽화나 플러그인/모듈 제어 슬롯이 아직 없습니다.</div>') +
+        '</div>' +
+      '</div>';
+    modal.style.display = 'flex';
+  }
+
+  const sceneQuickBtnEl = document.getElementById('sceneCtrlQuickBtn');
+  if (sceneQuickBtnEl) sceneQuickBtnEl.onclick = openSceneCtrlModal;
+  const sceneModalEl = document.getElementById('sceneCtrlModal');
+  if (sceneModalEl) {
+    sceneModalEl.addEventListener('click', async (e) => {
+      if (e.target === sceneModalEl || e.target.closest('[data-scene-close]')) {
+        closeSceneCtrlModal();
+        return;
+      }
+      const guiBtn = e.target.closest('[data-scene-open-gui]');
+      if (guiBtn) {
+        closeSceneCtrlModal();
+        openPluginGuiModal(guiBtn.getAttribute('data-scene-open-gui'));
+        return;
+      }
+      const amBtn = e.target.closest('[data-scene-am]');
+      if (amBtn) {
+        try {
+          const info = JSON.parse(amBtn.getAttribute('data-scene-am') || '{}');
+          await dispatchPluginSurfaceAction(info.msgIndex, info.actionHtml, info.dataset);
+        } catch (_) {}
+        return;
+      }
+      const lbBtn = e.target.closest('[data-scene-lb-reroll]');
+      if (lbBtn) {
+        const snap = lastState && lastState.snapshot;
+        if (!snap || snap.charIndex < 0) return;
+        toast('라이트보드 인터랙션 요청 중...');
+        await api('/api/modules/interaction', {
+          method: 'POST',
+          body: JSON.stringify({ charIndex: snap.charIndex, chatIndex: snap.chatIndex, kind: 'form', key: 'lb-interaction__xnai', formValues: {} }),
+        }).catch(() => {});
+        setTimeout(pollState, 350);
+      }
+    });
+  }
+
   if (token) tryLogin(token);
 </script>
 </body>
@@ -7640,12 +9096,16 @@ function sanitizeConfigForClient() {
         : {};
     return {
         activeProfileId: config.activeProfileId,
+        auxProfileId: typeof config.auxProfileId === 'string' && config.auxProfileId ? config.auxProfileId : 'inherit',
         directPresetId: typeof config.directPresetId === 'string' ? config.directPresetId : 'bundled:leave',
         directPresets: listDirectPresets(),
         remoteToggleValues,
         disabledLoreEntries: (config.disabledLoreEntries && typeof config.disabledLoreEntries === 'object') ? config.disabledLoreEntries : {},
         pinnedLoreEntries: (config.pinnedLoreEntries && typeof config.pinnedLoreEntries === 'object') ? config.pinnedLoreEntries : {},
         presetToggles: Array.isArray(config.presetToggles) ? config.presetToggles : [],
+        backendPlugins: (config.backendPlugins && typeof config.backendPlugins === 'object') ? config.backendPlugins : {},
+        remoteDirectOnly: config.remoteDirectOnly !== false,
+        imageGen: sanitizeImageGenForClient(config.imageGen),
         profiles: config.profiles.map((p) => ({
             id: p.id,
             name: p.name,
@@ -7824,6 +9284,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         config = {
             ...defaultConfig(),
             ...configOverride,
+            auxProfileId: typeof configOverride.auxProfileId === 'string' && configOverride.auxProfileId ? configOverride.auxProfileId : 'inherit',
             remoteToggleValues: (configOverride.remoteToggleValues && typeof configOverride.remoteToggleValues === 'object')
                 ? { ...configOverride.remoteToggleValues }
                 : {},
@@ -7833,10 +9294,160 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             pinnedLoreEntries: (configOverride.pinnedLoreEntries && typeof configOverride.pinnedLoreEntries === 'object')
                 ? { ...configOverride.pinnedLoreEntries }
                 : {},
+            backendPlugins: (configOverride.backendPlugins && typeof configOverride.backendPlugins === 'object')
+                ? cloneJsonSafe(configOverride.backendPlugins)
+                : {},
+            imageGen: normalizeImageGenConfig(configOverride.imageGen),
+            remoteDirectOnly: configOverride.remoteDirectOnly !== undefined ? Boolean(configOverride.remoteDirectOnly) : true,
         };
         configPersistDisabled = true;
         customPresetsCache = [];
     }
+
+    function cloneJsonSafe(v) {
+        try { return JSON.parse(JSON.stringify(v)); } catch (_) { return {}; }
+    }
+
+    // ---- Direct PC Host RPC Coordinator (zero separate durable store) ----
+    const rpcState = {
+        seq: 0,
+        rpcClientActive: false,
+        pcSyncedOnce: false,
+        queue: [],
+        waiters: [],
+        pending: new Map(), // id -> { resolve, reject, timer }
+    };
+
+    function flushRpcWaiters() {
+        while (rpcState.waiters.length && rpcState.queue.length) {
+            const w = rpcState.waiters.shift();
+            if (!w || w.done) continue;
+            w.done = true;
+            clearTimeout(w.timer);
+            const batch = rpcState.queue.splice(0, 25);
+            try { w.respond(batch); } catch (_) {}
+        }
+    }
+
+    const hostRpc = {
+        isConnected: () => Boolean(
+            rpcState.rpcClientActive &&
+            state.pcConnected &&
+            (Date.now() - state.pcLastSeen < 15000)
+        ),
+        invoke: (op, args = [], timeoutMs = 15000) => new Promise((resolve, reject) => {
+            if (!hostRpc.isConnected()) {
+                return reject(new Error('PC RisuAI 브릿지 RPC가 연결되어 있지 않습니다.'));
+            }
+            const id = `rpc_${++rpcState.seq}_${Date.now()}`;
+            const timer = setTimeout(() => {
+                if (!rpcState.pending.has(id)) return;
+                rpcState.pending.delete(id);
+                const qIdx = rpcState.queue.findIndex((x) => x.id === id);
+                if (qIdx >= 0) rpcState.queue.splice(qIdx, 1);
+                reject(new Error(`Host RPC timeout: ${op}`));
+            }, timeoutMs);
+            rpcState.pending.set(id, { resolve, reject, timer });
+            rpcState.queue.push({ id, op, args: Array.isArray(args) ? args : [] });
+            flushRpcWaiters();
+        }),
+    };
+
+    const prevPluginAdapter = activePluginAdapter;
+    const prevModuleAdapter = activeModuleAdapter;
+    const prevHostRpc = activeHostRpc;
+    activeHostRpc = hostRpc;
+
+    let llmHookDepth = 0;
+    async function runUnifiedBackendLLM(req, callerLabel = 'plugin', customProviders = null) {
+        const mode = String((req && req.mode) || 'model');
+        let msgs = Array.isArray(req && req.messages) ? req.messages.map((m) => ({ ...m })) : [];
+
+        if (req && req.allowPlugins && customProviders && customProviders.size > 0) {
+            const explicitProv = String(req.provider || req.staticModel || '').trim();
+            const chosen = (explicitProv && customProviders.get(explicitProv))
+                || (!getProfileForMode(mode) ? Array.from(customProviders.values())[0] : null);
+            if (chosen && typeof chosen.fn === 'function') {
+                const provRes = await chosen.fn({ ...req, messages: msgs, mode });
+                if (provRes && (provRes.success || provRes.type === 'success')) {
+                    const txt = String(provRes.content ?? provRes.result ?? '');
+                    return { type: 'success', result: txt, content: txt, model: chosen.name, finishReason: 'stop' };
+                }
+                if (provRes && provRes.type === 'fail') {
+                    return provRes;
+                }
+            }
+        }
+
+        const profile = getProfileForMode(mode);
+        if (!profile) {
+            return { type: 'fail', result: '활성화된 모델 프로필이 없습니다.' };
+        }
+
+        const runAllowPluginHooks = Boolean(req && req.allowPlugins && llmHookDepth === 0 && pluginAdapter && pluginAdapter.hasEnabledPlugins());
+        if (runAllowPluginHooks) {
+            llmHookDepth += 1;
+            try {
+                msgs = await pluginAdapter.runBeforeRequest(msgs, mode);
+                const finalMsgs = applyPromptOverride(msgs, profile);
+                const res = await callLLMNonStream(profile, finalMsgs, {
+                    source: `${callerLabel}:${mode}`,
+                    interceptBody: (b, t) => pluginAdapter.runBodyIntercepters(b, t),
+                });
+                const finalOut = await pluginAdapter.runAfterRequest(res.text, mode);
+                return {
+                    type: 'success',
+                    result: finalOut,
+                    content: finalOut,
+                    model: res.model,
+                    usage: res.usage,
+                    finishReason: 'stop',
+                };
+            } finally {
+                llmHookDepth -= 1;
+            }
+        }
+
+        const finalMsgs = applyPromptOverride(msgs, profile);
+        const res = await callLLMNonStream(profile, finalMsgs, { source: `${callerLabel}:${mode}` });
+        return {
+            type: 'success',
+            result: res.text,
+            content: res.text,
+            model: res.model,
+            usage: res.usage,
+            finishReason: 'stop',
+        };
+    }
+
+    const pluginAdapter = createPluginAdapter({
+        pluginsPath: PLUGINS_PATH,
+        persistDisabled: configPersistDisabled,
+        getBackendConfig: () => config,
+        saveBackendConfig: () => saveConfig(),
+        hostRpc,
+        getFallbackSnapshot: () => state.snapshot,
+        runLLM: (req, pluginName, customProviders) => runUnifiedBackendLLM(req, `plugin:${pluginName}`, customProviders),
+    });
+    activePluginAdapter = pluginAdapter;
+
+    const imageProvider = createImageProvider({
+        getBackendConfig: () => config,
+        hostRpc,
+        createInlay: (data, opts) => pluginAdapter.createInlay(data, opts),
+    });
+
+    const moduleAdapter = createModuleAdapter({
+        hostRpc,
+        getBackendConfig: () => config,
+        runLLM: (req, srcLabel) => runUnifiedBackendLLM(req, srcLabel || 'module', pluginAdapter.getRegisteredProviders()),
+        imageProvider,
+        evalCbs: evalPresetCbs,
+        onTriggerNotice: (ev) => {
+            state.lastTriggerEvent = { id: crypto.randomUUID(), at: Date.now(), ...ev };
+        },
+    });
+    activeModuleAdapter = moduleAdapter;
 
     const server = http.createServer(async (req, res) => {
         const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -7914,13 +9525,17 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     state.catalogVersion += 1;
                 }
                 if (body.snapshot) {
-                    state.snapshot = externalizeSnapshotAssets(body.snapshot);
+                    state.baseSnapshot = externalizeSnapshotAssets(body.snapshot);
+                    await rebuildDisplayedSnapshot(state.baseSnapshot, pluginAdapter);
                     state.snapshotVersion += 1;
                 }
                 if (body.triggerEvent) state.lastTriggerEvent = body.triggerEvent;
                 const needFullSync = !state.catalog || !Array.isArray(state.catalog.characters) || state.catalog.characters.length === 0 || !state.snapshot || typeof state.snapshot.charIndex !== 'number' || state.snapshot.charIndex < 0;
 
                 pruneCommandQueue();
+                const inlineRpcCalls = (!rpcState.waiters.length && rpcState.queue.length)
+                    ? rpcState.queue.splice(0, 25)
+                    : [];
                 if (body.supportsBatchCommands === true) {
                     const commands = [];
                     while (state.commandQueue.length && commands.length < 10) {
@@ -7932,14 +9547,78 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                             break;
                         }
                     }
-                    return sendJson(res, 200, { ok: true, command: commands[0] || null, commands, needFullSync, relayVersion: RELAY_VERSION }, req);
+                    return sendJson(res, 200, { ok: true, command: commands[0] || null, commands, rpcCalls: inlineRpcCalls, supportsHostRpc: true, needFullSync, relayVersion: RELAY_VERSION }, req);
                 }
                 const nextCmd = state.commandQueue.shift() || null;
                 if (nextCmd && (nextCmd.type === 'send_chat' || nextCmd.type === 'reroll_message')) {
                     state.nativeRequestDispatched = true;
                     if (!state.nativeRequestPendingSince) state.nativeRequestPendingSince = Date.now();
                 }
-                return sendJson(res, 200, { ok: true, command: nextCmd, needFullSync, relayVersion: RELAY_VERSION }, req);
+                return sendJson(res, 200, { ok: true, command: nextCmd, rpcCalls: inlineRpcCalls, supportsHostRpc: true, needFullSync, relayVersion: RELAY_VERSION }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e.message }, req);
+            }
+        }
+
+        // 3b) Fast PC Host RPC Wait / Result Channels (for direct pluginStorage & DB access)
+        if (pathname === '/api/pc/rpc-wait' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                state.pcConnected = true;
+                state.pcLastSeen = Date.now();
+                rpcState.rpcClientActive = true;
+                if (!rpcState.pcSyncedOnce) {
+                    rpcState.pcSyncedOnce = true;
+                    setTimeout(() => { void pluginAdapter.syncPcPlugins().catch(() => {}); }, 20);
+                }
+                if (rpcState.queue.length) {
+                    return sendJson(res, 200, { ok: true, calls: rpcState.queue.splice(0, 25) }, req);
+                }
+                const timeoutMs = Math.max(500, Math.min(15000, Number(body.timeoutMs) || 12000));
+                const waiter = {
+                    done: false,
+                    timer: null,
+                    respond: (calls) => sendJson(res, 200, { ok: true, calls: calls || [] }, req),
+                };
+                waiter.timer = setTimeout(() => {
+                    if (waiter.done) return;
+                    waiter.done = true;
+                    const idx = rpcState.waiters.indexOf(waiter);
+                    if (idx >= 0) rpcState.waiters.splice(idx, 1);
+                    try { waiter.respond([]); } catch (_) {}
+                }, timeoutMs);
+                req.on('close', () => {
+                    if (waiter.done) return;
+                    waiter.done = true;
+                    clearTimeout(waiter.timer);
+                    const idx = rpcState.waiters.indexOf(waiter);
+                    if (idx >= 0) rpcState.waiters.splice(idx, 1);
+                });
+                rpcState.waiters.push(waiter);
+                return;
+            } catch (e) {
+                return sendJson(res, 400, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/pc/rpc-result' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                rpcState.rpcClientActive = true;
+                state.pcConnected = true;
+                state.pcLastSeen = Date.now();
+                const results = Array.isArray(body.results) ? body.results : [];
+                for (const item of results) {
+                    if (!item || !item.id || !rpcState.pending.has(item.id)) continue;
+                    const p = rpcState.pending.get(item.id);
+                    rpcState.pending.delete(item.id);
+                    clearTimeout(p.timer);
+                    if (item.ok) p.resolve(item.value);
+                    else p.reject(new Error(item.error || 'PC Host RPC error'));
+                }
+                return sendJson(res, 200, { ok: true }, req);
             } catch (e) {
                 return sendJson(res, 400, { error: e.message }, req);
             }
@@ -8037,32 +9716,42 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 }
                 if (body.type === 'set_author_note' && body.payload && typeof body.payload === 'object') {
                     const p = body.payload;
-                    if (state.snapshot && Number(p.charIndex) === state.snapshot.charIndex && Number(p.chatIndex) === state.snapshot.chatIndex) {
-                        if (!state.snapshot.charContext || typeof state.snapshot.charContext !== 'object') {
-                            state.snapshot.charContext = { name: state.snapshot.charName || 'Character' };
+                    for (const targetSnap of [state.snapshot, state.baseSnapshot]) {
+                        if (targetSnap && Number(p.charIndex) === targetSnap.charIndex && Number(p.chatIndex) === targetSnap.chatIndex) {
+                            if (!targetSnap.charContext || typeof targetSnap.charContext !== 'object') {
+                                targetSnap.charContext = { name: targetSnap.charName || 'Character' };
+                            }
+                            targetSnap.charContext.note = String(p.note ?? '');
                         }
-                        state.snapshot.charContext.note = String(p.note ?? '');
+                    }
+                    if (state.snapshot && Number(p.charIndex) === state.snapshot.charIndex && Number(p.chatIndex) === state.snapshot.chatIndex) {
                         state.snapshotVersion += 1;
                     }
                 }
                 if (body.type === 'set_char_global_note' && body.payload && typeof body.payload === 'object') {
                     const p = body.payload;
-                    if (state.snapshot && Number(p.charIndex) === state.snapshot.charIndex) {
-                        if (!state.snapshot.charContext || typeof state.snapshot.charContext !== 'object') {
-                            state.snapshot.charContext = { name: state.snapshot.charName || 'Character' };
+                    for (const targetSnap of [state.snapshot, state.baseSnapshot]) {
+                        if (targetSnap && Number(p.charIndex) === targetSnap.charIndex) {
+                            if (!targetSnap.charContext || typeof targetSnap.charContext !== 'object') {
+                                targetSnap.charContext = { name: targetSnap.charName || 'Character' };
+                            }
+                            targetSnap.charContext.replaceGlobalNote = String(p.replaceGlobalNote ?? '');
                         }
-                        state.snapshot.charContext.replaceGlobalNote = String(p.replaceGlobalNote ?? '');
+                    }
+                    if (state.snapshot && Number(p.charIndex) === state.snapshot.charIndex) {
                         state.snapshotVersion += 1;
                     }
                 }
                 if (body.type === 'edit_message' && body.payload && typeof body.payload === 'object') {
                     const p = body.payload;
-                    if (state.snapshot && Number(p.charIndex) === state.snapshot.charIndex && Number(p.chatIndex) === state.snapshot.chatIndex && Array.isArray(state.snapshot.messages)) {
-                        const hit = state.snapshot.messages.find((m) => m && m.index === Number(p.msgIndex));
-                        if (hit) {
-                            hit.raw = String(p.text ?? '');
-                            state.snapshotVersion += 1;
+                    for (const targetSnap of [state.snapshot, state.baseSnapshot]) {
+                        if (targetSnap && Number(p.charIndex) === targetSnap.charIndex && Number(p.chatIndex) === targetSnap.chatIndex && Array.isArray(targetSnap.messages)) {
+                            const hit = targetSnap.messages.find((m) => m && m.index === Number(p.msgIndex));
+                            if (hit) hit.raw = String(p.text ?? '');
                         }
+                    }
+                    if (state.snapshot && Number(p.charIndex) === state.snapshot.charIndex && Number(p.chatIndex) === state.snapshot.chatIndex) {
+                        state.snapshotVersion += 1;
                     }
                 }
                 queueCommand(body.type, body.payload || {});
@@ -8081,7 +9770,11 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 const charIndex = Number(body.charIndex);
                 const chatIndex = Number(body.chatIndex);
 
-                if (state.snapshot && state.snapshot.isPcActive && charIndex === state.snapshot.charIndex) {
+                const hasRelayProfile = Boolean(getActiveProfile());
+                const hasBackendPlugins = Boolean(pluginAdapter && pluginAdapter.hasEnabledPlugins());
+                const forceDirectRouter = (config.remoteDirectOnly !== false && hasRelayProfile) || hasBackendPlugins;
+
+                if (!forceDirectRouter && state.snapshot && state.snapshot.isPcActive && charIndex === state.snapshot.charIndex) {
                     state.nativeRequestPendingSince = Date.now();
                     state.nativeRequestDispatched = false;
                     queueCommand('send_chat', { charIndex, chatIndex, text });
@@ -8094,8 +9787,8 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 if (state.directGenerating) {
                     return sendJson(res, 409, { error: '이미 응답을 생성 중입니다.' }, req);
                 }
-                if (!getActiveProfile()) {
-                    return sendJson(res, 400, { error: 'PC에서 현재 열려있지 않은 봇과 대화하려면 [모델/번역] 탭에서 활성 모델 프로필을 먼저 설정해야 합니다.' }, req);
+                if (!hasRelayProfile) {
+                    return sendJson(res, 400, { error: '원격 직접 라우팅(백엔드 플러그인 모드)을 사용하려면 [모델/번역] 탭에서 활성 모델 프로필을 먼저 설정해야 합니다.' }, req);
                 }
                 if (!state.snapshot || state.snapshot.charIndex !== charIndex || state.snapshot.chatIndex !== chatIndex) {
                     return sendJson(res, 409, { error: '채팅방 동기화가 완료되지 않았습니다. 잠시 후 다시 시도해 주세요.' }, req);
@@ -8103,9 +9796,13 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
 
                 state.lastDirectError = null;
                 const snapView = {
+                    charIndex: state.snapshot.charIndex,
                     charName: state.snapshot.charName,
+                    fmIndex: state.snapshot.fmIndex,
+                    totalMessages: state.snapshot.totalMessages,
                     charContext: state.snapshot.charContext ? { ...state.snapshot.charContext } : null,
                     messages: Array.isArray(state.snapshot.messages) ? state.snapshot.messages.slice() : [],
+                    customToggleBlocks: Array.isArray(state.snapshot.customToggleBlocks) ? state.snapshot.customToggleBlocks.slice() : [],
                     useLocallySetGlobalVariables: Boolean(state.snapshot.useLocallySetGlobalVariables),
                     globalToggleValues: state.snapshot.globalToggleValues ? { ...state.snapshot.globalToggleValues } : {},
                     localToggleValues: state.snapshot.localToggleValues ? { ...state.snapshot.localToggleValues } : {},
@@ -8135,7 +9832,11 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     return sendJson(res, 400, { error: 'Invalid reroll parameters' }, req);
                 }
 
-                if (state.snapshot && state.snapshot.isPcActive && charIndex === state.snapshot.charIndex) {
+                const hasRelayProfile = Boolean(getActiveProfile());
+                const hasBackendPlugins = Boolean(pluginAdapter && pluginAdapter.hasEnabledPlugins());
+                const forceDirectRouter = (config.remoteDirectOnly !== false && hasRelayProfile) || hasBackendPlugins;
+
+                if (!forceDirectRouter && state.snapshot && state.snapshot.isPcActive && charIndex === state.snapshot.charIndex) {
                     state.nativeRequestPendingSince = Date.now();
                     state.nativeRequestDispatched = false;
                     queueCommand('reroll_message', { charIndex, chatIndex, msgIndex });
@@ -8145,8 +9846,8 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 if (state.directGenerating) {
                     return sendJson(res, 409, { error: '이미 응답을 생성 중입니다.' }, req);
                 }
-                if (!getActiveProfile()) {
-                    return sendJson(res, 400, { error: 'PC에서 현재 열려있지 않은 봇을 리롤하려면 [모델/번역] 탭에서 활성 모델 프로필을 먼저 설정해야 합니다.' }, req);
+                if (!hasRelayProfile) {
+                    return sendJson(res, 400, { error: '원격 직접 라우팅(백엔드 플러그인 모드)을 사용하려면 [모델/번역] 탭에서 활성 모델 프로필을 먼저 설정해야 합니다.' }, req);
                 }
                 if (!state.snapshot || state.snapshot.charIndex !== charIndex || state.snapshot.chatIndex !== chatIndex) {
                     return sendJson(res, 409, { error: '채팅방 동기화가 완료되지 않았습니다. 잠시 후 다시 시도해 주세요.' }, req);
@@ -8154,9 +9855,13 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
 
                 state.lastDirectError = null;
                 const snapView = {
+                    charIndex: state.snapshot.charIndex,
                     charName: state.snapshot.charName,
+                    fmIndex: state.snapshot.fmIndex,
+                    totalMessages: state.snapshot.totalMessages,
                     charContext: state.snapshot.charContext ? { ...state.snapshot.charContext } : null,
                     messages: Array.isArray(state.snapshot.messages) ? state.snapshot.messages.slice() : [],
+                    customToggleBlocks: Array.isArray(state.snapshot.customToggleBlocks) ? state.snapshot.customToggleBlocks.slice() : [],
                     useLocallySetGlobalVariables: Boolean(state.snapshot.useLocallySetGlobalVariables),
                     globalToggleValues: state.snapshot.globalToggleValues ? { ...state.snapshot.globalToggleValues } : {},
                     localToggleValues: state.snapshot.localToggleValues ? { ...state.snapshot.localToggleValues } : {},
@@ -8216,6 +9921,19 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 }
                 if (typeof body.activeProfileId === 'string') {
                     config.activeProfileId = body.activeProfileId;
+                }
+                if (typeof body.auxProfileId === 'string') {
+                    config.auxProfileId = body.auxProfileId || 'inherit';
+                }
+                if (config.auxProfileId && config.auxProfileId !== 'inherit' && !config.profiles.some((p) => p && p.id === config.auxProfileId)) {
+                    config.auxProfileId = 'inherit';
+                }
+                if (body.imageGen && typeof body.imageGen === 'object') {
+                    config.imageGen = normalizeImageGenConfig({
+                        ...config.imageGen,
+                        ...body.imageGen,
+                        apiKey: body.imageGen.apiKey ? String(body.imageGen.apiKey) : (config.imageGen ? config.imageGen.apiKey : ''),
+                    });
                 }
                 if (typeof body.directPresetId === 'string') {
                     config.directPresetId = body.directPresetId;
@@ -8527,7 +10245,222 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             }
         }
 
+        // 8d) Backend Plugin Adapter & Native GUI Iframe APIs
+        const refreshDisplaySnapshot = async () => {
+            if (state.baseSnapshot) {
+                await rebuildDisplayedSnapshot(state.baseSnapshot, pluginAdapter);
+                state.snapshotVersion += 1;
+            }
+        };
+
+        if (pathname === '/api/plugins' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            return sendJson(res, 200, {
+                ok: true,
+                pcConnected: Boolean(state.pcConnected && (Date.now() - state.pcLastSeen < 12000)),
+                rpcConnected: hostRpc.isConnected(),
+                remoteDirectOnly: config.remoteDirectOnly !== false,
+                plugins: pluginAdapter.listPlugins(),
+            }, req);
+        }
+
+        if (pathname === '/api/plugins/settings' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                if (typeof body.remoteDirectOnly === 'boolean') {
+                    config.remoteDirectOnly = body.remoteDirectOnly;
+                    saveConfig();
+                }
+                return sendJson(res, 200, {
+                    ok: true,
+                    remoteDirectOnly: config.remoteDirectOnly !== false,
+                    plugins: pluginAdapter.listPlugins(),
+                }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/plugins/sync-pc' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const plugins = await pluginAdapter.syncPcPlugins();
+                await refreshDisplaySnapshot();
+                return sendJson(res, 200, { ok: true, plugins }, req);
+            } catch (e) {
+                return sendJson(res, 502, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/plugins/reload-pc' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                await hostRpc.invoke('db.reloadPcPlugins', []);
+                return sendJson(res, 200, { ok: true }, req);
+            } catch (e) {
+                return sendJson(res, 502, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/plugins/upload' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const plugins = await pluginAdapter.addCustomPlugin({
+                    filename: body.filename,
+                    script: body.script,
+                    enabled: body.enabled !== false,
+                });
+                await refreshDisplaySnapshot();
+                return sendJson(res, 200, { ok: true, plugins }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/plugins/toggle' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const plugins = await pluginAdapter.togglePlugin(body.name, Boolean(body.enabled));
+                await refreshDisplaySnapshot();
+                return sendJson(res, 200, { ok: true, plugins }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/plugins/args' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const plugins = await pluginAdapter.updatePluginArgs(body.name, body.args || {});
+                await refreshDisplaySnapshot();
+                return sendJson(res, 200, { ok: true, plugins }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/plugins/gui-srcdoc' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            const pName = urlObj.searchParams.get('name') || '';
+            const entryId = urlObj.searchParams.get('entryId') || '';
+            const theme = urlObj.searchParams.get('theme') || 'dark';
+            const out = pluginAdapter.getGuiSrcdoc(pName, entryId, theme);
+            if (!out) return sendJson(res, 404, { error: '플러그인을 찾을 수 없습니다.' }, req);
+            return sendJson(res, 200, { ok: true, ...out }, req);
+        }
+
+        if (pathname === '/api/plugins/gui-rpc' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const value = await pluginAdapter.handleGuiRpc({
+                    pluginName: body.pluginName,
+                    method: body.method,
+                    args: body.args || [],
+                });
+                return sendJson(res, 200, { ok: true, value }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
+            }
+        }
+
+        if (pathname === '/api/plugins/surface-action' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const snapNow = state.snapshot || {};
+                const charIndex = Number.isFinite(Number(body.charIndex)) ? Number(body.charIndex) : snapNow.charIndex;
+                const chatIndex = Number.isFinite(Number(body.chatIndex)) ? Number(body.chatIndex) : snapNow.chatIndex;
+                const out = await pluginAdapter.dispatchSurfaceAction({
+                    charIndex,
+                    chatIndex,
+                    msgIndex: Number(body.msgIndex ?? -1),
+                    actionHtml: String(body.actionHtml || ''),
+                    dataset: (body.dataset && typeof body.dataset === 'object') ? body.dataset : {},
+                });
+                await refreshDisplaySnapshot();
+                return sendJson(res, 200, { ok: true, ...out }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
+            }
+        }
+
+        if (pathname === '/api/modules/interaction' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const snapNow = state.snapshot || {};
+                const charIndex = Number.isFinite(Number(body.charIndex)) ? Number(body.charIndex) : snapNow.charIndex;
+                const chatIndex = Number.isFinite(Number(body.chatIndex)) ? Number(body.chatIndex) : snapNow.chatIndex;
+                await pluginAdapter.prepareTurn(charIndex, chatIndex, state.snapshot);
+                try {
+                    const tCtx = pluginAdapter.getTurnContext();
+                    const resInt = await moduleAdapter.runInteraction({
+                        charIndex,
+                        chatIndex,
+                        charObj: tCtx.charObj,
+                        chatObj: tCtx.chatObj,
+                        kind: body.kind === 'form' ? 'form' : 'button',
+                        code: String(body.code || ''),
+                        key: String(body.key || ''),
+                        formValues: (body.formValues && typeof body.formValues === 'object') ? body.formValues : {},
+                    });
+                    if (resInt && resInt.chatObj && hostRpc.isConnected()) {
+                        await hostRpc.invoke('db.setChat', [Number(charIndex), Number(chatIndex), cloneJsonSafe(resInt.chatObj)]);
+                    }
+                    await refreshDisplaySnapshot();
+                    return sendJson(res, 200, { ok: true, handled: Boolean(resInt && resInt.handled) }, req);
+                } finally {
+                    moduleAdapter.endTurn();
+                    pluginAdapter.endTurn();
+                }
+            } catch (e) {
+                return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
+            }
+        }
+
+        const pluginDelMatch = pathname.match(/^\/api\/plugins\/([^/]+)$/);
+        if (pluginDelMatch && req.method === 'DELETE') {
+            if (!requireAuth(req, res)) return;
+            let pName = pluginDelMatch[1];
+            try { pName = decodeURIComponent(pName); } catch (_) {}
+            const plugins = await pluginAdapter.removePlugin(pName);
+            await refreshDisplaySnapshot();
+            return sendJson(res, 200, { ok: true, plugins }, req);
+        }
+
         sendJson(res, 404, { error: 'Not found' }, req);
+    });
+    function closeRpcState() {
+        for (const w of rpcState.waiters.splice(0)) {
+            if (!w.done) {
+                w.done = true;
+                clearTimeout(w.timer);
+                try { w.respond([]); } catch (_) {}
+            }
+        }
+        for (const [id, p] of rpcState.pending.entries()) {
+            clearTimeout(p.timer);
+            p.reject(new Error('Relay server closed'));
+        }
+        rpcState.pending.clear();
+    }
+    const origServerClose = server.close.bind(server);
+    server.close = function (...args) {
+        closeRpcState();
+        return origServerClose(...args);
+    };
+    server.once('close', () => {
+        closeRpcState();
+        moduleAdapter.dispose();
+        void pluginAdapter.dispose();
+        if (activePluginAdapter === pluginAdapter) activePluginAdapter = prevPluginAdapter;
+        if (activeModuleAdapter === moduleAdapter) activeModuleAdapter = prevModuleAdapter;
+        if (activeHostRpc === hostRpc) activeHostRpc = prevHostRpc;
     });
     if (prevConfig !== null) {
         server.once('close', () => {

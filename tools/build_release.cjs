@@ -115,7 +115,11 @@ function assertNoSecrets(root, payload) {
     } catch (_) {}
     try {
         const cfg = JSON.parse(fs.readFileSync(path.join(root, '.risustand-config.json'), 'utf8'));
-        const keys = [...(cfg.profiles || []).map((p) => p && p.apiKey), cfg.translator && cfg.translator.apiKey];
+        const keys = [
+            ...(cfg.profiles || []).map((p) => p && p.apiKey),
+            cfg.translator && cfg.translator.apiKey,
+            cfg.imageGen && cfg.imageGen.apiKey,
+        ];
         for (const k of keys) if (typeof k === 'string' && k.trim().length >= 8) localSecrets.push(k.trim());
     } catch (_) {}
     for (const p of payload) {

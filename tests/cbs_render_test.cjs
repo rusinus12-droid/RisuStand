@@ -829,7 +829,10 @@ test('Lua trigger require("json") and isolated module script execution', async (
 test('Relay server includes book page jump UI and valid client script', async () => {
     const http = require('node:http');
     const relay = require(path.join(REPO, 'risustand-relay-server.js'));
-    const server = relay.createRelayServer({ token: 'test-jump-token' });
+    const server = relay.createRelayServer({
+        token: 'test-jump-token',
+        configOverride: { activeProfileId: '', remoteDirectOnly: false },
+    });
     await new Promise((r) => server.listen(0, '127.0.0.1', r));
     const { port } = server.address();
     try {
@@ -936,9 +939,15 @@ test('empty send_chat command triggers risuai.sendChat("") retry in plugin', asy
     }
 });
 
-test('Leave preset display compat renders <ooc>, hides text-only <statusdata>, and respects toggle_thought_display', async () => {
+test('Leave preset display compat renders <statusdata> HUD card, <ooc>, and respects toggle_state_tracker & toggle_thought_display', async () => {
     const db = {
-        enabledModules: [],
+        enabledModules: [{
+            id: 'mod-hud-tog',
+            name: 'HudModule',
+            customModuleToggle: 'hud_mode=상태창=select=켜짐,꺼짐',
+            regex: [],
+            lorebook: [],
+        }],
         modules: [],
         personas: [{ name: 'User', personaPrompt: '' }],
         selectedPersona: 0,
@@ -946,6 +955,10 @@ test('Leave preset display compat renders <ooc>, hides text-only <statusdata>, a
         globalChatVariables: { toggle_thought_display: '0' },
         characters: [],
     };
+    db.modules = db.enabledModules;
+    db.enabledModules = ['mod-hud-tog'];
+    const bigScriptState = {};
+    for (let i = 0; i < 55; i += 1) bigScriptState[`$var_${i}`] = `val_${i}`;
     const characters = [{
         chaId: 'leave-compat-char',
         name: 'LeaveBot',
@@ -956,35 +969,44 @@ test('Leave preset display compat renders <ooc>, hides text-only <statusdata>, a
             id: 'c-leave',
             name: 'Chat 1',
             fmIndex: -1,
-            scriptstate: {},
+            scriptstate: bigScriptState,
             message: [
                 {
                     role: 'char',
-                    data: '<thinking>숨길 생각</thinking>\n<statusdata>HP: 100</statusdata>\n<statusdata><details><summary>HUD</summary>상태창</details></statusdata>\n<ooc>사서 리브 응답</ooc>\n본문 서사입니다.',
+                    data: '<thinking>숨길 생각</thinking>\n<statusdata>\n📖 Leave HUD · 2025.03.03 PM 06:37 · 음악실\n• 현장: 강다인\n</statusdata>\n<statusdata>HP: 100</statusdata>\n<statusdata><details><summary>HUD</summary>상태창</details></statusdata>\n<ooc>사서 리브 응답</ooc>\n{{#when::hud_mode::tis::0}}HUD_TOG_DEFAULT{{/when}}\n본문 서사입니다.',
                 },
             ],
         }],
     }];
     const harness = await bootPluginWithMockRisu({ db, characters });
     try {
-        // Case 1: toggle_thought_display = '0' -> thinking hidden, text-only statusdata hidden, HUD & OOC visible
+        // Case 1: default state_tracker ('0') -> Leave HUD cards rendered cleanly, text-only cleanProse excludes HUD
         let snap = [...harness.polls].reverse().find((p) => p.snapshot)?.snapshot;
         let msg = snap.messages.find((m) => m.index === 0);
         assert.ok(msg.html.includes('leave-ooc-card'));
         assert.ok(msg.html.includes('사서 리브 응답'));
-        assert.ok(!msg.html.includes('HP: 100'));
+        assert.ok(msg.html.includes('<details class="leave-hud-card"><summary>📖 Leave HUD · 2025.03.03 PM 06:37 · 음악실</summary><div class="leave-hud-body">• 현장: 강다인</div></details>'));
+        assert.ok(msg.html.includes('<details class="leave-hud-card"><summary>📖 Leave HUD</summary><div class="leave-hud-body">HP: 100</div></details>'));
         assert.ok(msg.html.includes('<details><summary>HUD</summary>상태창</details>'));
         assert.ok(!msg.html.includes('숨길 생각'));
         assert.ok(!msg.html.includes('leave-thought-box'));
+        assert.ok(msg.html.includes('HUD_TOG_DEFAULT'), 'Untouched module toggle defaults to 0 in evalCBS');
+        assert.ok(!msg.text.includes('현장: 강다인'), 'cleanProse should strip leave-hud-card from plain text');
+        assert.ok(!msg.text.includes('HP: 100'));
+        assert.ok(Object.keys(snap.chatVariables).length >= 55 && snap.chatVariables.var_54 === 'val_54', 'All >40 chatVariables must be preserved');
 
-        // Case 2: toggle_thought_display = '1' -> <thinking> rendered inside leave-thought-box, cleanProse text still hides it
+        // Case 2: toggle_thought_display = '1' & toggle_state_tracker = '2' -> thoughts shown, text-only <statusdata> hidden
         db.globalChatVariables.toggle_thought_display = '1';
+        db.globalChatVariables.toggle_state_tracker = '2';
         await harness.triggerNextPoll({ type: 'sync_chat', payload: {} });
         await harness.triggerNextPoll();
         snap = [...harness.polls].reverse().find((p) => p.snapshot)?.snapshot;
         msg = snap.messages.find((m) => m.index === 0);
         assert.ok(msg.html.includes('<details class="leave-thought-box">'));
         assert.ok(msg.html.includes('숨길 생각'));
+        assert.ok(!msg.html.includes('leave-hud-card'));
+        assert.ok(!msg.html.includes('HP: 100'));
+        assert.ok(msg.html.includes('<details><summary>HUD</summary>상태창</details>'));
         assert.ok(!msg.text.includes('숨길 생각'));
         assert.ok(msg.text.includes('본문 서사입니다.'));
     } finally {

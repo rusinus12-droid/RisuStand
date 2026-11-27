@@ -48,6 +48,9 @@ const MAX_ENTRIES = 200;
 // Replaced in place on update.
 const PROGRAM_FILES = Object.freeze([
     'risustand-relay-server.js',
+    'risustand-plugin-adapter.cjs',
+    'risustand-image-provider.cjs',
+    'risustand-module-adapter.cjs',
     'risustand-admin.cjs',
     'risustand-updater.cjs',
     'risustand.js',
@@ -57,6 +60,10 @@ const PROGRAM_FILES = Object.freeze([
     'release-policy.json',
     'prompt/Leave_RisuAI_Preset.risup',
     'prompt/Leave_RisuAI_Preset.html',
+    'vendor/wasmoon/index.cjs',
+    'vendor/wasmoon/glue.wasm',
+    'vendor/wasmoon/json.lua',
+    'vendor/wasmoon/LICENSE',
 ]);
 // May be running while we update: staged as "<name>.new" when changed.
 const LAUNCHER_FILES = Object.freeze([

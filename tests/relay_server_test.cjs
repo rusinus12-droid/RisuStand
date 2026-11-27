@@ -1130,7 +1130,7 @@ test('direct remote chat applies Leave preset + remote toggles & supports custom
         // 5) Web UI renders preset selector + upload controls and compiles cleanly
         const html = await requestHttp(port, { path: '/' });
         assert.equal(html.status, 200);
-        for (const marker of ['directPresetCard', 'directPresetSel', 'directPresetUploadBtn', 'directPresetDelBtn', '다른 RisuAI 플러그인은 동작하지 않습니다']) {
+        for (const marker of ['directPresetCard', 'directPresetSel', 'directPresetUploadBtn', 'directPresetDelBtn', 'backendPluginsCard', 'pluginGuiModal', '백엔드 플러그인 어댑터']) {
             assert.ok(html.body.includes(marker), `Expected UI marker: ${marker}`);
         }
         const scriptMatch = html.body.match(/<script>([\s\S]*?)<\/script>/);
@@ -1193,7 +1193,20 @@ test('Cheongwon High School regression: large lorebooks (>6k), character sheet s
             { key: '', comment: 'LBDATA', alwaysActive: true, insertorder: 200, content: 'X'.repeat(2800) },
             { key: '', comment: '기본 정보', alwaysActive: true, insertorder: 190, content: 'Y'.repeat(2800) },
             { key: '', comment: 'Asset Prompt', alwaysActive: true, insertorder: 150, content: '@@depth 00\n<img src={name}_{outfit}_{keyword}>' },
-            { key: '', comment: 'Bot Status Bar', alwaysActive: true, insertorder: 50, content: '@@depth 0\nAlways emit status line: [☀️][7°C][YYYY.MM.DD][AM/PM HH:MM][Location][Action]{{#when::nsfw_mode::is::1}}\nNSFW_ACTIVE{{/when}}' },
+            { key: '', comment: 'Bot Status Bar', alwaysActive: true, insertorder: 50, content: '@@depth 0\nAlways emit status line: [☀️][7°C][YYYY.MM.DD][AM/PM HH:MM][Location][Action]{{#when::nsfw_mode::is::1}}\nNSFW_ACTIVE{{/when}}{{#when::hud_bar::tis::0}}\nHUD_DEFAULT_ON{{/when}}' },
+            {
+                key: '',
+                comment: '♥️ 호감도 (Love Guages)',
+                alwaysActive: true,
+                insertorder: 60,
+                content: '@@depth 0\n{{#func getAffectionBehavior}}' +
+                    '{{#if {{calc:: ({{arg::1}} < 0) && ({{arg::1}} >= -100) }}}}(Stage -1: 경계/불신){{/if}}' +
+                    '{{#if {{calc:: ({{arg::1}} >= 0) && ({{arg::1}} < 100) }}}}(Stage 0: 중립){{/if}}' +
+                    '{{#if {{calc:: {{arg::1}} >= 100 }}}}(Stage 1: 호의){{/if}}' +
+                    '{{/func}}' +
+                    '강다인: {{getvar::dain_c}}/500 | {{call::getAffectionBehavior::{{getvar::dain_c}}}}\n' +
+                    '서민지: {{getvar::minji_c}}/500 | {{call::getAffectionBehavior::{{getvar::minji_c}}}}',
+            },
             { key: '다인,강다인', comment: '강다인', alwaysActive: false, insertorder: 120, content: 'Character Sheet: 강다인 (음악실 자주 방문).' },
             { key: '음악실', comment: '음악실', alwaysActive: false, insertorder: 110, content: 'Location Detail: 신관 음악실.' },
         ];
@@ -1205,13 +1218,18 @@ test('Cheongwon High School regression: large lorebooks (>6k), character sheet s
             { index: 3, role: 'char', raw: '그녀가 고개를 끄덕였다.' },
         ];
 
+        const manyChatVars = { nsfw_mode: '1', dain_c: '-30' };
+        for (let vi = 0; vi < 45; vi += 1) manyChatVars[`pad_var_${vi}`] = String(vi);
+        manyChatVars.minji_c = '0';
+
         const snap = {
             charIndex: 0,
             chatIndex: 0,
             charName: 'Cheongwon High School',
             chatName: 'Chat 1',
             isPcActive: false,
-            chatVariables: { nsfw_mode: '1' },
+            chatVariables: manyChatVars,
+            customToggleBlocks: [{ source: 'CWModule', syntax: 'hud_bar=상태창=select=켜짐,꺼짐' }],
             useLocallySetGlobalVariables: false,
             globalToggleValues: {},
             localToggleValues: {},
@@ -1243,6 +1261,11 @@ test('Cheongwon High School regression: large lorebooks (>6k), character sheet s
         assert.ok(!/@@depth\b/i.test(fullText), 'Raw @@depth decorator must be stripped before LLM payload');
         assert.ok(fullText.includes('Always emit status line: [☀️][7°C]'), 'Status bar prompt must not be truncated');
         assert.ok(fullText.includes('NSFW_ACTIVE'), '{{#when::nsfw_mode::is::1}} must evaluate inside lorebook');
+        assert.ok(fullText.includes('HUD_DEFAULT_ON'), 'Untouched module toggle defaults to 0 for #when::hud_bar::tis::0');
+        assert.ok(!/\{\{#func|\{\{call::|\{\{arg::|\{\{calc::/.test(fullText), 'All #func/call/arg/calc macros must resolve');
+        assert.ok(fullText.includes('강다인: -30/500 | (Stage -1: 경계/불신)'));
+        assert.ok(fullText.includes('서민지: 0/500 | (Stage 0: 중립)'));
+        assert.ok(!fullText.includes('(Stage 1: 호의)'), 'Non-matching affection stages must not be emitted');
         assert.ok(fullText.includes('Character Sheet: 강다인'), 'Character lorebook must activate from prior turns');
         assert.ok(fullText.includes('Location Detail: 신관 음악실'), 'Location lorebook must activate');
         assert.ok(fullText.includes('CARD_STATUS_LOCK_REMINDER'), 'replaceGlobalNote must populate globalNote slot');

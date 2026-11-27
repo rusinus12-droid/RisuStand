@@ -2418,6 +2418,28 @@
                     margin: 12px 0;
                     font-family: system-ui, -apple-system, "Malgun Gothic", sans-serif;
                 }
+                .leave-hud-card {
+                    margin: 12px 0 6px;
+                    padding: 10px 14px;
+                    border-radius: 12px;
+                    background: rgba(15, 23, 42, 0.82);
+                    border: 1px solid rgba(148, 163, 184, 0.28);
+                    color: #e2e8f0;
+                    font-size: 12.5px;
+                    line-height: 1.65;
+                    break-inside: avoid;
+                    font-family: system-ui, -apple-system, "Malgun Gothic", sans-serif;
+                }
+                .leave-hud-card summary {
+                    cursor: pointer;
+                    font-weight: 700;
+                    color: #93c5fd;
+                }
+                .leave-hud-body {
+                    margin-top: 8px;
+                    white-space: pre-line;
+                    color: #e2e8f0;
+                }
                 .epub-columns img {
                     max-width: 100% !important;
                     max-height: 42vh !important;
@@ -3908,6 +3930,25 @@
             }
         }
 
+        function applyDefaultToggleSyntax(syntax, target) {
+            if (!syntax || typeof syntax !== 'string' || !target) return;
+            for (const rawLine of syntax.split(/\r?\n/)) {
+                const line = rawLine.trim();
+                if (!line || line.startsWith('//') || line.startsWith('#') || line.startsWith('=group') || line.startsWith('=divider')) continue;
+                const parts = line.split('=');
+                if (parts.length < 2) continue;
+                const key = (parts[0] || '').trim();
+                if (!key || key.startsWith('=')) continue;
+                const kind = (parts[2] || '').trim().toLowerCase();
+                if (kind === 'caption' || kind === 'group' || kind === 'groupend' || kind === 'divider') continue;
+                const defVal = (kind === 'text' || kind === 'textarea') ? '' : '0';
+                const fullKey = key.startsWith('toggle_') ? key : ('toggle_' + key);
+                if (!Object.prototype.hasOwnProperty.call(target, fullKey)) {
+                    target[fullKey] = defVal;
+                }
+            }
+        }
+
         function findMatchingClose(str, openIdx) {
             let depth = 0;
             let i = openIdx;
@@ -4043,8 +4084,10 @@
                     pos += m[1].length;
                     const right = parseAdd();
                     const op = m[1];
-                    if (op === '==' || op === '===') left = String(left) === String(right) || Number(left) === Number(right) ? 1 : 0;
-                    else if (op === '!=' || op === '!==') left = String(left) !== String(right) && Number(left) !== Number(right) ? 1 : 0;
+                    const bothNum = (typeof left === 'number' || (typeof left === 'string' && left.trim() !== '' && Number.isFinite(Number(left))))
+                        && (typeof right === 'number' || (typeof right === 'string' && right.trim() !== '' && Number.isFinite(Number(right))));
+                    if (op === '==' || op === '===') left = (String(left) === String(right) || (bothNum && Number(left) === Number(right))) ? 1 : 0;
+                    else if (op === '!=' || op === '!==') left = (String(left) !== String(right) && !(bothNum && Number(left) === Number(right))) ? 1 : 0;
                     else if (op === '>') left = Number(left) > Number(right) ? 1 : 0;
                     else if (op === '<') left = Number(left) < Number(right) ? 1 : 0;
                     else if (op === '>=') left = Number(left) >= Number(right) ? 1 : 0;
@@ -4095,16 +4138,28 @@
                 }
                 const rem = arr.slice(idx);
                 let result = false;
-                if (rem.length >= 3 && (rem[1] === 'is' || rem[1] === 'isnot' || rem[1] === '>' || rem[1] === 'greater' || rem[1] === '<' || rem[1] === 'less' || rem[1] === '>=' || rem[1] === 'greater_equal' || rem[1] === '<=' || rem[1] === 'less_equal')) {
-                    const left = evalCBS(rem[0], ctx, depth + 1).trim();
-                    const right = evalCBS(rem[2], ctx, depth + 1).trim();
+                if (rem.length >= 3 && (rem[1] === 'is' || rem[1] === 'isnot' || rem[1] === 'vis' || rem[1] === 'visnot' || rem[1] === 'tis' || rem[1] === 'tisnot' || rem[1] === '>' || rem[1] === 'greater' || rem[1] === '<' || rem[1] === 'less' || rem[1] === '>=' || rem[1] === 'greater_equal' || rem[1] === 'greaterequal' || rem[1] === '<=' || rem[1] === 'less_equal' || rem[1] === 'lessequal')) {
                     const op = rem[1];
-                    if (op === 'is') result = left === right;
-                    else if (op === 'isnot') result = left !== right;
-                    else if (op === '>' || op === 'greater') result = Number(left) > Number(right);
-                    else if (op === '<' || op === 'less') result = Number(left) < Number(right);
-                    else if (op === '>=' || op === 'greater_equal') result = Number(left) >= Number(right);
-                    else if (op === '<=' || op === 'less_equal') result = Number(left) <= Number(right);
+                    const right = evalCBS(rem.slice(2).join('::'), ctx, depth + 1).trim();
+                    if (op === 'vis' || op === 'visnot') {
+                        const varKey = evalCBS(rem[0], ctx, depth + 1).trim();
+                        const val = Object.prototype.hasOwnProperty.call(ctx.vars, varKey) ? String(ctx.vars[varKey] ?? '') : '';
+                        result = op === 'vis' ? (val === right) : (val !== right);
+                    } else if (op === 'tis' || op === 'tisnot') {
+                        const togKey = evalCBS(rem[0], ctx, depth + 1).trim();
+                        const val = Object.prototype.hasOwnProperty.call(ctx.globalVars, 'toggle_' + togKey)
+                            ? String(ctx.globalVars['toggle_' + togKey] ?? '')
+                            : (Object.prototype.hasOwnProperty.call(ctx.globalVars, togKey) ? String(ctx.globalVars[togKey] ?? '') : '');
+                        result = op === 'tis' ? (val === right) : (val !== right);
+                    } else {
+                        const left = evalCBS(rem[0], ctx, depth + 1).trim();
+                        if (op === 'is') result = left === right;
+                        else if (op === 'isnot') result = left !== right;
+                        else if (op === '>' || op === 'greater') result = Number(left) > Number(right);
+                        else if (op === '<' || op === 'less') result = Number(left) < Number(right);
+                        else if (op === '>=' || op === 'greater_equal' || op === 'greaterequal') result = Number(left) >= Number(right);
+                        else if (op === '<=' || op === 'less_equal' || op === 'lessequal') result = Number(left) <= Number(right);
+                    }
                 } else if (rem.length >= 2 && rem[0] === 'var') {
                     const k = evalCBS(rem[1], ctx, depth + 1).trim();
                     const val = Object.prototype.hasOwnProperty.call(ctx.vars, k) ? ctx.vars[k] : 'null';
@@ -4159,7 +4214,7 @@
             return false;
         }
 
-        function findBlockBranches(str, startAfterOpen) {
+        function findBlockBranches(str, startAfterOpen, ignoreElse = false) {
             const branches = [];
             let blockDepth = 1;
             let segStart = startAfterOpen;
@@ -4181,7 +4236,7 @@
                         branches.push({ cond: curCond, body: str.slice(segStart, openAt) });
                         return { branches, endPos: closeAt + 2 };
                     }
-                } else if (blockDepth === 1 && /^:(?:else|elif|elseif|else\s+if)(?:[\s:]|$)/i.test(trimmed)) {
+                } else if (!ignoreElse && blockDepth === 1 && /^:(?:else|elif|elseif|else\s+if)(?:[\s:]|$)/i.test(trimmed)) {
                     branches.push({ cond: curCond, body: str.slice(segStart, openAt) });
                     if (/^:else\s*$/i.test(trimmed)) {
                         curCond = '__ELSE__';
@@ -4361,10 +4416,20 @@
                     }
                 }
 
-                // Unsupported block tags like {{#func ...}}...{{/func}} -> skip cleanly
-                if (/^#func(?:[\s:]|$)/i.test(trimmed)) {
-                    const parsed = findBlockBranches(str, closeAt + 2);
+                // Define inline CBS function {{#func name [args...]}}...{{/func}}
+                const funcMatch = trimmed.match(/^#func(?:(?:::|\s+)([\s\S]*))?$/i);
+                if (funcMatch) {
+                    const parsed = findBlockBranches(str, closeAt + 2, true);
                     if (parsed) {
+                        const headerTokens = String(funcMatch[1] || '').split(/(?:\s+|::)/).map((t) => t.trim()).filter(Boolean);
+                        const funcName = headerTokens[0] || '';
+                        if (funcName) {
+                            if (!ctx.functions) ctx.functions = new Map();
+                            ctx.functions.set(funcName, {
+                                data: (parsed.branches[0] ? parsed.branches[0].body : '').trim(),
+                                params: headerTokens.slice(1),
+                            });
+                        }
                         pos = parsed.endPos;
                         continue;
                     }
@@ -4498,6 +4563,24 @@
                     out += evalCBS(parts.slice(1).join('::'), ctx, depth + 1).toLowerCase();
                 } else if (cmd === 'upper') {
                     out += evalCBS(parts.slice(1).join('::'), ctx, depth + 1).toUpperCase();
+                } else if (cmd === 'call') {
+                    if ((ctx.callStack || 0) <= 20) {
+                        const argData = parts.slice(1).map((p) => evalCBS(p, ctx, depth + 1));
+                        const funcName = String(argData[0] || '').trim();
+                        const fn = ctx.functions && ctx.functions.get(funcName);
+                        if (fn) {
+                            let fnBody = fn.data;
+                            for (let ai = 0; ai < argData.length; ai += 1) {
+                                fnBody = fnBody.split(`{{arg::${ai}}}`).join(String(argData[ai] ?? ''));
+                            }
+                            out += evalCBS(fnBody, { ...ctx, callArgs: argData, callStack: (ctx.callStack || 0) + 1 }, depth + 1);
+                        }
+                    }
+                } else if (cmd === 'arg') {
+                    const idx = Number(evalCBS(parts[1] || '', ctx, depth + 1).trim());
+                    if (Array.isArray(ctx.callArgs) && Number.isInteger(idx) && idx >= 0 && idx < ctx.callArgs.length) {
+                        out += String(ctx.callArgs[idx] ?? '');
+                    }
                 } else {
                     out += str.slice(openAt, closeAt + 2);
                 }
@@ -4558,6 +4641,10 @@
             }
 
             const globalVars = Object.create(null);
+            for (const m of enabledModules || []) {
+                if (m && m.customModuleToggle) applyDefaultToggleSyntax(m.customModuleToggle, globalVars);
+            }
+            if (charObj && charObj.customModuleToggle) applyDefaultToggleSyntax(charObj.customModuleToggle, globalVars);
             if (db && db.globalChatVariables && typeof db.globalChatVariables === 'object') {
                 Object.assign(globalVars, db.globalChatVariables);
             }
@@ -4583,6 +4670,9 @@
                 globalVars,
                 tempVars: Object.create(null),
                 slots: Object.create(null),
+                functions: new Map(),
+                callArgs: null,
+                callStack: 0,
                 enabledModules: Array.isArray(enabledModules) ? enabledModules : [],
                 displayScripts,
                 charName: (charObj && charObj.name) || 'Character',
@@ -4626,8 +4716,27 @@
 
         function applyLeavePresetDisplayCompat(str, ctx) {
             let out = String(str || '');
-            // Leave regex #2: hide text-only <statusdata> blocks (keep HUD cards that contain <details>)
-            out = out.replace(/<statusdata>(?:(?!<details\b|<\/statusdata>)[\s\S])*?<\/statusdata>\s*/gi, '');
+            // Leave regex #2: convert text-only <statusdata> blocks into collapsible Leave HUD cards (unless state_tracker === '2')
+            const rawTracker = ctx && ctx.globalVars
+                ? (ctx.globalVars.toggle_state_tracker !== undefined ? ctx.globalVars.toggle_state_tracker : ctx.globalVars.state_tracker)
+                : '';
+            if (String(rawTracker ?? '') === '2') {
+                out = out.replace(/<statusdata>(?:(?!<details\b|<\/statusdata>)[\s\S])*?<\/statusdata>\s*/gi, '');
+            } else {
+                out = out.replace(
+                    /<statusdata>\s*(?:📖\s*)?([^\r\n<]+)\r?\n((?:(?!<details\b|<\/statusdata>)[\s\S])+?)\s*<\/statusdata>\s*/gi,
+                    (_, title, body) => `<details class="leave-hud-card"><summary>📖 ${escapeHtml(String(title || '').trim())}</summary><div class="leave-hud-body">${escapeHtml(String(body || '').trim())}</div></details>`
+                );
+                out = out.replace(
+                    /<statusdata>((?:(?!<details\b|<\/statusdata>)[\s\S])*?)<\/statusdata>\s*/gi,
+                    (_, body) => {
+                        const trimmed = String(body || '').trim();
+                        return trimmed
+                            ? `<details class="leave-hud-card"><summary>📖 Leave HUD</summary><div class="leave-hud-body">${escapeHtml(trimmed)}</div></details>`
+                            : '';
+                    }
+                );
+            }
             // Leave regex #3: render <ooc> blocks as styled cards
             out = out.replace(/<ooc>([\s\S]*?)<\/ooc>\s*/gi, '<div class="leave-ooc-card"><div class="leave-ooc-badge">🍃 OOC</div><div>$1</div></div>');
             // Leave regex #1: show collapsible thought block when toggle_thought_display === '1'
@@ -4650,7 +4759,7 @@
             return String(raw)
                 .replace(/<!--\s*HAYAKU[\s\S]*?-->/gi, '')
                 .replace(/<!--[\s\S]*?-->/gi, '')
-                .replace(/<details\b[^>]*class="[^"]*\bleave-thought-box\b[^"]*"[^>]*>[\s\S]*?<\/details>/gi, '')
+                .replace(/<details\b[^>]*class="[^"]*\b(?:leave-thought-box|leave-hud-card)\b[^"]*"[^>]*>[\s\S]*?<\/details>/gi, '')
                 .replace(/<Thoughts>[\s\S]*?<\/Thoughts>/gi, '')
                 .replace(/<think>[\s\S]*?<\/think>/gi, '')
                 .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
@@ -4784,6 +4893,7 @@
                 if (!allowImages || !cfg.includeImages || !name) return null;
                 if (kind === 'inlay') return await readInlayDataUrl(name);
                 if (/^(?:data:image\/|https?:\/\/)/i.test(name)) return name;
+                if (/^assets\/[^/\\]+$/i.test(name)) return await readAssetDataUrl(name);
                 const p = findPath(name, seasonSuffix);
                 return p ? await readAssetDataUrl(p) : null;
             };
@@ -5380,6 +5490,7 @@
                 outMsgs.push({
                     index: startOffset + i,
                     role: msg.role,
+                    chatId: String(msg.chatId || ''),
                     text: parsed.text,
                     html: parsed.html,
                     raw: String(msg.data || ''),
@@ -5405,9 +5516,9 @@
                 chatVariables[k] = String(v);
             }
             for (const [k, v] of Object.entries(renderCtx.vars)) {
-                if (Object.keys(chatVariables).length >= 40) break;
+                if (Object.keys(chatVariables).length >= 400) break;
                 const val = String(v ?? '');
-                if (k === 'timetable_html_output' || k.endsWith('_html_output') || val.length > 200) continue;
+                if (k === 'timetable_html_output' || k.endsWith('_html_output') || val.length > 600) continue;
                 chatVariables[k] = val;
             }
 
@@ -5424,6 +5535,7 @@
                     charName: charObj.name || 'Character',
                     charIndex: viewCharIndex,
                     chatIndex: viewChatIndex,
+                    chatUuid: String(chatObj.id || ''),
                     chatName: chatObj.name || `Chat ${viewChatIndex + 1}`,
                     isPcActive,
                     totalMessages: allMsgs.length,
@@ -7283,10 +7395,12 @@
                 const chatObj = await risuai.getChatFromIndex(cIdx, chIdx);
                 if (!chatObj) return;
                 if (!Array.isArray(chatObj.message)) chatObj.message = [];
+                if (!chatObj.id) chatObj.id = makeUuid();
                 for (const m of list) {
                     chatObj.message.push({
                         role: m.role === 'user' ? 'user' : 'char',
                         data: String(m.data || ''),
+                        chatId: String(m.chatId || makeUuid()),
                         time: Date.now(),
                     });
                 }
@@ -7306,6 +7420,26 @@
                 lastSnapSig = '';
                 lastCatalogSig = '';
                 setTimeout(() => pollOnce(true), 150);
+                return;
+            }
+
+            if (type === 'run_output_trigger') {
+                const cIdx = Number(p.charIndex);
+                const chIdx = Number(p.chatIndex);
+                if (!Number.isNaN(cIdx) && !Number.isNaN(chIdx)) {
+                    try {
+                        const ev = await runBotTrigger(cIdx, chIdx, 'onOutput', [], {
+                            skipNativeLayer1: true,
+                            runAllGroups: true,
+                            quietMissing: true,
+                        });
+                        if (ev && (ev.kind === 'notice' || ev.kind === 'alert_error') && ev.message) {
+                            pendingTriggerEvent = { id: makeUuid(), at: Date.now(), ...ev, source: 'lua_output' };
+                        }
+                    } catch (_) {}
+                    lastSnapSig = '';
+                    setTimeout(() => pollOnce(true), 120);
+                }
                 return;
             }
 
@@ -7733,6 +7867,354 @@
             }
         }
     
+        let cachedLocalPluginStore = null;
+        let hostRpcSupported = false;
+        let rpcLoopRunning = false;
+        let rpcLoopNonce = 0;
+
+        async function getSharedLocalPluginStore() {
+            if (!cachedLocalPluginStore && typeof risuai.getLocalPluginStorage === 'function') {
+                try {
+                    cachedLocalPluginStore = await risuai.getLocalPluginStorage();
+                } catch (_) {
+                    cachedLocalPluginStore = null;
+                }
+            }
+            return cachedLocalPluginStore;
+        }
+
+        async function executeHostRpcCall(op, args) {
+            const a = Array.isArray(args) ? args : [];
+            const kindOp = String(op || '');
+
+            // 1) Shared RisuAI pluginStorage singleton
+            if (kindOp === 'pluginStorage.getItem') {
+                return risuai.pluginStorage && risuai.pluginStorage.getItem ? await risuai.pluginStorage.getItem(String(a[0] ?? '')) : null;
+            }
+            if (kindOp === 'pluginStorage.getMany') {
+                const out = {};
+                const ks = Array.isArray(a[0]) ? a[0] : [];
+                if (risuai.pluginStorage && risuai.pluginStorage.getItem) {
+                    for (const k of ks) out[String(k)] = await risuai.pluginStorage.getItem(String(k));
+                }
+                return out;
+            }
+            if (kindOp === 'pluginStorage.setItem') {
+                if (risuai.pluginStorage && risuai.pluginStorage.setItem) await risuai.pluginStorage.setItem(String(a[0] ?? ''), a[1]);
+                return true;
+            }
+            if (kindOp === 'pluginStorage.setMany') {
+                const pairs = Array.isArray(a[0]) ? a[0] : [];
+                if (risuai.pluginStorage && risuai.pluginStorage.setItem) {
+                    for (const pair of pairs) {
+                        if (Array.isArray(pair)) await risuai.pluginStorage.setItem(String(pair[0] ?? ''), pair[1]);
+                    }
+                }
+                return true;
+            }
+            if (kindOp === 'pluginStorage.removeItem') {
+                if (risuai.pluginStorage && risuai.pluginStorage.removeItem) await risuai.pluginStorage.removeItem(String(a[0] ?? ''));
+                return true;
+            }
+            if (kindOp === 'pluginStorage.clear') {
+                if (risuai.pluginStorage && risuai.pluginStorage.clear) await risuai.pluginStorage.clear();
+                return true;
+            }
+            if (kindOp === 'pluginStorage.keys') {
+                return risuai.pluginStorage && risuai.pluginStorage.keys ? await risuai.pluginStorage.keys() : [];
+            }
+            if (kindOp === 'pluginStorage.key') {
+                return risuai.pluginStorage && risuai.pluginStorage.key ? await risuai.pluginStorage.key(Number(a[0] || 0)) : null;
+            }
+            if (kindOp === 'pluginStorage.length') {
+                return risuai.pluginStorage && risuai.pluginStorage.length ? await risuai.pluginStorage.length() : 0;
+            }
+
+            // 2) Shared safeLocalStorage
+            if (kindOp.startsWith('safeLocalStorage.')) {
+                const m = kindOp.slice(17);
+                const sl = risuai.safeLocalStorage;
+                if (sl && typeof sl[m] === 'function') {
+                    return m === 'setItem' ? (await sl.setItem(String(a[0] ?? ''), String(a[1] ?? '')), true) : await sl[m](...a);
+                }
+                if (m === 'keys') return [];
+                if (m === 'length') return 0;
+                return null;
+            }
+
+            // 3) Shared getLocalPluginStorage()
+            if (kindOp.startsWith('localPluginStorage.')) {
+                const m = kindOp.slice(19);
+                const lps = await getSharedLocalPluginStore();
+                if (lps && typeof lps[m] === 'function') {
+                    if (m === 'setItem') { await lps.setItem(String(a[0] ?? ''), a[1]); return true; }
+                    if (m === 'removeItem' || m === 'clear') { await lps[m](...a); return true; }
+                    return await lps[m](...a);
+                }
+                if (m === 'keys') return [];
+                return null;
+            }
+
+            // 4) Direct RisuAI DB Read / Write (dbWrite permission)
+            if (kindOp === 'db.getCurrentIndices') {
+                const charIndex = await risuai.getCurrentCharacterIndex();
+                const chatIndex = charIndex >= 0 ? await risuai.getCurrentChatIndex() : -1;
+                return { charIndex, chatIndex, viewCharIndex, viewChatIndex };
+            }
+            if (kindOp === 'db.getCharacter') {
+                return await risuai.getCharacterFromIndex(Number(a[0]));
+            }
+            if (kindOp === 'db.setCharacter') {
+                await risuai.setCharacterToIndex(Number(a[0]), a[1]);
+                cachedSnapDb = null;
+                lastSnapSig = '';
+                lastCatalogSig = '';
+                setTimeout(() => pollOnce(true), 80);
+                return true;
+            }
+            if (kindOp === 'db.getChat') {
+                return await risuai.getChatFromIndex(Number(a[0]), Number(a[1]));
+            }
+            if (kindOp === 'db.setChat') {
+                await risuai.setChatToIndex(Number(a[0]), Number(a[1]), a[2]);
+                cachedSnapDb = null;
+                lastSnapSig = '';
+                lastCatalogSig = '';
+                setTimeout(() => pollOnce(true), 80);
+                return true;
+            }
+            if (kindOp === 'db.getDatabase') {
+                return await risuai.getDatabase(a[0] === undefined ? 'all' : a[0]);
+            }
+            if (kindOp === 'db.setDatabaseLite') {
+                await risuai.setDatabaseLite(a[0] || {});
+                cachedSnapDb = null;
+                lastSnapSig = '';
+                lastCatalogSig = '';
+                setTimeout(() => pollOnce(true), 80);
+                return true;
+            }
+            if (kindOp === 'db.setDatabase') {
+                if (typeof risuai.setDatabase === 'function') await risuai.setDatabase(a[0] || {});
+                else await risuai.setDatabaseLite(a[0] || {});
+                cachedSnapDb = null;
+                lastSnapSig = '';
+                lastCatalogSig = '';
+                setTimeout(() => pollOnce(true), 80);
+                return true;
+            }
+            if (kindOp === 'db.getPlugins') {
+                const db = await risuai.getDatabase(['plugins']);
+                const raw = (db && Array.isArray(db.plugins)) ? db.plugins : [];
+                return raw
+                    .filter((p) => p && p.name && p.name !== 'risustand' && typeof p.script === 'string')
+                    .map((p) => ({
+                        name: String(p.name),
+                        displayName: String(p.displayName || p.name),
+                        version: String(p.version || '3.0'),
+                        versionOfPlugin: String(p.versionOfPlugin || ''),
+                        script: String(p.script),
+                        realArg: (p.realArg && typeof p.realArg === 'object') ? p.realArg : {},
+                        enabled: p.enabled !== false,
+                        allowedIPC: Array.isArray(p.allowedIPC) ? p.allowedIPC : [],
+                    }));
+            }
+            if (kindOp === 'db.reloadPcPlugins') {
+                if (typeof risuai.loadPlugins === 'function') await risuai.loadPlugins();
+                return true;
+            }
+            if (kindOp === 'db.getActiveModules') {
+                const cIdx = Number(a[0]);
+                const chIdx = Number(a[1]);
+                const charObj = cIdx >= 0 ? await risuai.getCharacterFromIndex(cIdx) : null;
+                const chatObj = (cIdx >= 0 && chIdx >= 0) ? await risuai.getChatFromIndex(cIdx, chIdx) : null;
+                const db = await risuai.getDatabase([
+                    'modules',
+                    'enabledModules',
+                    'globalChatVariables',
+                    'templateDefaultVariables',
+                ]);
+                const enSet = new Set([
+                    ...(db && Array.isArray(db.enabledModules) ? db.enabledModules.map(String) : []),
+                    ...(chatObj && Array.isArray(chatObj.modules) ? chatObj.modules.map(String) : []),
+                ]);
+                const rawMods = (db && Array.isArray(db.modules)) ? db.modules : [];
+                const modules = [];
+                const seenIds = new Set();
+                for (const m of rawMods) {
+                    if (!m || !enSet.has(String(m.id))) continue;
+                    const mid = String(m.id);
+                    if (seenIds.has(mid)) continue;
+                    seenIds.add(mid);
+                    modules.push({
+                        id: mid,
+                        name: String(m.name || mid),
+                        namespace: String(m.namespace || ''),
+                        lowLevelAccess: Boolean(m.lowLevelAccess),
+                        trigger: Array.isArray(m.trigger) ? m.trigger : [],
+                        regex: Array.isArray(m.regex) ? m.regex : [],
+                        lorebook: Array.isArray(m.lorebook) ? m.lorebook : [],
+                        customModuleToggle: String(m.customModuleToggle || ''),
+                        backgroundEmbedding: String(m.backgroundEmbedding || ''),
+                    });
+                }
+                return {
+                    modules,
+                    globalChatVariables: (db && db.globalChatVariables && typeof db.globalChatVariables === 'object') ? db.globalChatVariables : {},
+                    templateDefaultVariables: String((db && db.templateDefaultVariables) || ''),
+                    charLowLevelAccess: Boolean(charObj && charObj.lowLevelAccess),
+                };
+            }
+            if (kindOp === 'db.getImageGenConfig') {
+                const db = await risuai.getDatabase([
+                    'sdProvider',
+                    'NAIImgUrl',
+                    'NAIApiKey',
+                    'NAIImgModel',
+                    'NAIImgConfig',
+                    'NAII2I',
+                    'comfyUiUrl',
+                    'comfyConfig',
+                    'webUiUrl',
+                    'sdSteps',
+                    'sdCFG',
+                    'sdConfig',
+                    'openAIKey',
+                    'dallEQuality',
+                ]);
+                return {
+                    sdProvider: String((db && db.sdProvider) || ''),
+                    NAIImgUrl: String((db && db.NAIImgUrl) || ''),
+                    NAIApiKey: String((db && db.NAIApiKey) || ''),
+                    NAIImgModel: String((db && db.NAIImgModel) || ''),
+                    NAIImgConfig: (db && db.NAIImgConfig && typeof db.NAIImgConfig === 'object') ? db.NAIImgConfig : {},
+                    NAII2I: Boolean(db && db.NAII2I),
+                    comfyUiUrl: String((db && db.comfyUiUrl) || ''),
+                    comfyConfig: (db && db.comfyConfig && typeof db.comfyConfig === 'object') ? db.comfyConfig : {},
+                    webUiUrl: String((db && db.webUiUrl) || ''),
+                    sdSteps: Number((db && db.sdSteps) || 25),
+                    sdCFG: Number((db && db.sdCFG) || 7),
+                    sdConfig: (db && db.sdConfig && typeof db.sdConfig === 'object') ? db.sdConfig : {},
+                    openAIKey: String((db && db.openAIKey) || ''),
+                    dallEQuality: String((db && db.dallEQuality) || 'standard'),
+                };
+            }
+            if (kindOp === 'asset.readImage') {
+                const targetPath = String(a[0] || '');
+                if (!targetPath || typeof risuai.readImage !== 'function') return null;
+                const raw = await risuai.readImage(targetPath);
+                if (!raw) return null;
+                const bytes = raw instanceof Uint8Array
+                    ? raw
+                    : ArrayBuffer.isView(raw)
+                    ? new Uint8Array(raw.buffer, raw.byteOffset, raw.byteLength)
+                    : raw instanceof ArrayBuffer
+                    ? new Uint8Array(raw)
+                    : new Uint8Array(Object.values(raw));
+                if (!bytes.length) return null;
+                return { __b64: uint8ToBase64(bytes), mime: detectImageMime(bytes, targetPath) };
+            }
+            if (kindOp === 'asset.saveAsset') {
+                const payload = (a[0] && typeof a[0] === 'object') ? a[0] : {};
+                if (!payload.__b64 || typeof risuai.saveAsset !== 'function') return '';
+                const bytes = base64ToUint8(payload.__b64);
+                const savedPath = await risuai.saveAsset(bytes);
+                lastSnapSig = '';
+                return String(savedPath || '');
+            }
+            if (kindOp === 'asset.readInlay') {
+                const inlayId = String(a[0] || '');
+                if (!inlayId || typeof risuai.readInlay !== 'function') return null;
+                return (await risuai.readInlay(inlayId)) || null;
+            }
+            if (kindOp === 'asset.createInlay') {
+                const payload = (a[0] && typeof a[0] === 'object') ? a[0] : {};
+                if (typeof risuai.createInlay !== 'function') return null;
+                const dataArg = payload.kind === 'dataUri' ? String(payload.dataUri || '') : base64ToUint8(payload.__b64 || '');
+                const opts = payload.name ? { name: String(payload.name) } : undefined;
+                const inlayId = await risuai.createInlay(dataArg, opts);
+                if (inlayId) {
+                    assetDataCache.delete('inlay:' + inlayId);
+                    iframeInlayDataCache.delete(String(inlayId));
+                    lastSnapSig = '';
+                }
+                return inlayId ? String(inlayId) : null;
+            }
+
+            throw new Error(`Unsupported host RPC op: ${kindOp}`);
+        }
+
+        function base64ToUint8(b64) {
+            const clean = String(b64 || '').replace(/\s+/g, '');
+            if (!clean) return new Uint8Array(0);
+            if (typeof atob === 'function') {
+                const bin = atob(clean);
+                const out = new Uint8Array(bin.length);
+                for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+                return out;
+            }
+            return new Uint8Array(Buffer.from(clean, 'base64'));
+        }
+
+        async function runHostRpcBatch(calls) {
+            if (!Array.isArray(calls) || !calls.length || !cfg.enabled || !cfg.relayUrl || !cfg.token) return;
+            const results = await Promise.all(calls.map(async (c) => {
+                try {
+                    const value = await executeHostRpcCall(c.op, c.args);
+                    return { id: c.id, ok: true, value };
+                } catch (err) {
+                    return { id: c.id, ok: false, error: err && err.message ? err.message : String(err) };
+                }
+            }));
+            try {
+                const resEndpoint = cfg.relayUrl.replace(/\/+$/, '') + '/api/pc/rpc-result';
+                await risuai.nativeFetch(resEndpoint, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-RisuStand-Token': cfg.token,
+                    },
+                    body: JSON.stringify({ results }),
+                });
+            } catch (_) {}
+        }
+
+        function startHostRpcLoop() {
+            if (rpcLoopRunning || !cfg.enabled || !cfg.relayUrl || !cfg.token || !hostRpcSupported) return;
+            rpcLoopRunning = true;
+            const myNonce = ++rpcLoopNonce;
+            void (async () => {
+                try {
+                    while (rpcLoopNonce === myNonce && cfg.enabled && cfg.relayUrl && cfg.token && hostRpcSupported) {
+                        try {
+                            const waitEndpoint = cfg.relayUrl.replace(/\/+$/, '') + '/api/pc/rpc-wait';
+                            const resp = await risuai.nativeFetch(waitEndpoint, {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'X-RisuStand-Token': cfg.token,
+                                },
+                                body: JSON.stringify({ timeoutMs: 12000 }),
+                            });
+                            if (!resp || !resp.ok) {
+                                await new Promise((r) => setTimeout(r, 1500));
+                                continue;
+                            }
+                            const payload = await resp.json();
+                            if (Array.isArray(payload && payload.calls) && payload.calls.length) {
+                                await runHostRpcBatch(payload.calls);
+                            }
+                        } catch (_) {
+                            if (rpcLoopNonce !== myNonce || !cfg.enabled) break;
+                            await new Promise((r) => setTimeout(r, 1500));
+                        }
+                    }
+                } finally {
+                    if (rpcLoopNonce === myNonce) rpcLoopRunning = false;
+                }
+            })();
+        }
+
         async function pollOnce(forceFull = false) {
             if (!cfg.enabled || !cfg.relayUrl || !cfg.token || isPolling) return;
             isPolling = true;
@@ -7782,6 +8264,13 @@
                     lastSnapSig = '';
                     setTimeout(() => pollOnce(true), 120);
                 }
+                if (Array.isArray(data && data.rpcCalls) && data.rpcCalls.length) {
+                    void runHostRpcBatch(data.rpcCalls);
+                }
+                if (data && data.supportsHostRpc) {
+                    hostRpcSupported = true;
+                    startHostRpcLoop();
+                }
     
                 const cmds = Array.isArray(data && data.commands)
                     ? data.commands
@@ -7802,6 +8291,8 @@
                 pollTimer = null;
             }
             if (!cfg.enabled) {
+                hostRpcSupported = false;
+                rpcLoopNonce += 1;
                 lastStatus = '꺼짐';
                 return;
             }
@@ -7875,7 +8366,7 @@
                     <div class="tip">
                         <b>릴레이 모델 라우터 &amp; 원격 라우팅 안내</b><br>
                         • PC RisuAI 모델 설정(Reverse Proxy / OpenAI 호환)의 URL을 <code>http://127.0.0.1:8787/v1/chat/completions</code>, API 키에 위 <b>보안 접속 토큰</b>, 모델 이름에 <code>risustand-router</code>를 지정하면 휴대폰에서 모델·프롬프트·번역을 실시간 제어할 수 있습니다. (PC 로컬 접속은 기존 키도 동작하지만 원격 프록시 호출에는 토큰이 필요합니다.)<br>
-                        • <b>PC 활성 vs 원격 라우팅</b>: PC RisuAI에 현재 열려 있는 봇(<code>PC 활성</code>)만 <code>risuai.sendChat()</code>을 통해 다른 RisuAI 플러그인들이 정상 작동합니다. PC가 홈 화면이거나 다른 봇을 열어 둔 상태(<code>원격 라우팅</code>)에서는 DB 직접 반영 방식으로 동작하므로 <b>다른 RisuAI 플러그인(메모리·로어북·외부 플러그인 등)은 동작하지 않으며</b>, 대신 모바일 <b>[모델/번역]</b>의 원격 프롬프트 프리셋과 <b>[모듈/설정]</b> 토글이 적용됩니다.
+                        • <b>PC 활성 vs 원격 라우팅</b>: PC RisuAI에 현재 열려 있는 봇(<code>PC 활성</code>)은 <code>risuai.sendChat()</code>을 통해 동작합니다. PC가 홈 화면이거나 다른 봇을 열어 둔 상태(<code>원격 라우팅</code>)에서는 모바일 <b>[모듈/설정]</b>의 <b>백엔드 플러그인 어댑터</b>에서 켠 RisuAI v3 플러그인들이 RisuAI <code>pluginStorage</code>·<code>DB</code>에 직접 연결되어 동일하게 작동합니다.
                     </div>
                 </div>
             `;
@@ -7950,6 +8441,8 @@
         }
     
         return async () => {
+            hostRpcSupported = false;
+            rpcLoopNonce += 1;
             if (pollTimer) {
                 clearInterval(pollTimer);
                 pollTimer = null;
