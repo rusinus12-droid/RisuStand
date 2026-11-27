@@ -1148,7 +1148,10 @@ function isLikelyJsonOrHtmlError(buf, contentType = '') {
 
 function createAbortSignal(timeoutMs, externalSignal) {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(new Error(`TTS 요청 시간 초과 (${Math.round(timeoutMs / 1000)}초)`)), timeoutMs);
+    const ms = Number(timeoutMs);
+    const timer = (Number.isFinite(ms) && ms > 0)
+        ? setTimeout(() => ctrl.abort(new Error(`TTS 요청 시간 초과 (${Math.round(ms / 1000)}초)`)), ms)
+        : null;
     let onAbort = null;
     if (externalSignal) {
         if (externalSignal.aborted) ctrl.abort(externalSignal.reason);
@@ -1160,7 +1163,7 @@ function createAbortSignal(timeoutMs, externalSignal) {
     return {
         signal: ctrl.signal,
         cleanup: () => {
-            clearTimeout(timer);
+            if (timer) clearTimeout(timer);
             if (externalSignal && onAbort) {
                 externalSignal.removeEventListener('abort', onAbort);
             }
@@ -1303,7 +1306,9 @@ function createTtsProvider({ fetchImpl = fetch, maxCacheEntries = 120, maxCacheB
             };
         }
 
-        const { signal, cleanup } = createAbortSignal(cfg.timeoutMs, opts.signal);
+        // Keep playback synthesis alive until completion or explicit user cancellation (X button)
+        const effectiveTimeoutMs = opts.timeoutMs !== undefined ? opts.timeoutMs : 0;
+        const { signal, cleanup } = createAbortSignal(effectiveTimeoutMs, opts.signal);
         try {
             const { bytes, mime } = await callUpstreamTts(cfg, resolved, text, signal);
             const entry = {
@@ -1338,6 +1343,7 @@ function createTtsProvider({ fetchImpl = fetch, maxCacheEntries = 120, maxCacheB
             overrideVoiceId: opts.voiceId ? String(opts.voiceId).trim() : '',
             chatKey: opts.chatKey || '',
             signal: opts.signal,
+            timeoutMs: cfg.timeoutMs,
         });
     }
 
