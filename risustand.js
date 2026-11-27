@@ -2425,7 +2425,7 @@
                     min-width: 48px;
                     max-width: 110px;
                     z-index: 4;
-                    cursor: pointer;
+                    pointer-events: none;
                     background: transparent !important;
                     user-select: none;
                 }
@@ -3053,10 +3053,51 @@
             };
             document.getElementById('epub-prev').onclick = () => turnPage(-1);
             document.getElementById('epub-next').onclick = () => turnPage(1);
-            const tapPrev = document.getElementById('epub-tap-prev');
-            const tapNext = document.getElementById('epub-tap-next');
-            if (tapPrev) tapPrev.onclick = () => turnPage(-1);
-            if (tapNext) tapNext.onclick = () => turnPage(1);
+            const epubFrame = vp ? vp.closest('.epub-book-frame') : null;
+            const isInteractiveEpubTarget = (target, rootEl) => {
+                if (!target || target.nodeType !== 1) return false;
+                if (target.closest('button, a, summary, input, select, textarea, label, [role="button"], [onclick], [risu-btn], [risu-trigger], [x-risu-btn], img, .epub-nav')) {
+                    return true;
+                }
+                let cur = target;
+                let hops = 0;
+                while (cur && cur !== rootEl && hops < 12) {
+                    if (cur.nodeType === 1 && typeof window.getComputedStyle === 'function') {
+                        try {
+                            if (window.getComputedStyle(cur).cursor === 'pointer') return true;
+                        } catch (_) {}
+                    }
+                    cur = cur.parentElement;
+                    hops += 1;
+                }
+                return false;
+            };
+            if (epubFrame) {
+                if (window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches) {
+                    epubFrame.addEventListener('mousemove', (e) => {
+                        const rect = epubFrame.getBoundingClientRect();
+                        const zoneW = Math.max(48, Math.min(110, rect.width * 0.12));
+                        const relX = e.clientX - rect.left;
+                        const inPrev = relX <= zoneW && spreadIdx > 0;
+                        const inNext = relX >= rect.width - zoneW && spreadIdx < totalSpreads - 1;
+                        epubFrame.style.cursor = ((inPrev || inNext) && !isInteractiveEpubTarget(e.target, epubFrame)) ? 'pointer' : '';
+                    });
+                    epubFrame.addEventListener('mouseleave', () => {
+                        epubFrame.style.cursor = '';
+                    });
+                }
+                epubFrame.addEventListener('click', (e) => {
+                    if (e.defaultPrevented || (e.button && e.button !== 0)) return;
+                    const selTxt = window.getSelection ? String(window.getSelection()).trim() : '';
+                    if (selTxt) return;
+                    if (isInteractiveEpubTarget(e.target, epubFrame)) return;
+                    const rect = epubFrame.getBoundingClientRect();
+                    const zoneW = Math.max(48, Math.min(110, rect.width * 0.12));
+                    const relX = e.clientX - rect.left;
+                    if (relX <= zoneW) turnPage(-1);
+                    else if (relX >= rect.width - zoneW) turnPage(1);
+                });
+            }
             document.onkeydown = (e) => {
                 if (document.activeElement && document.activeElement.tagName === 'TEXTAREA') return;
                 if (e.key === 'ArrowRight') turnPage(1);
@@ -5280,15 +5321,23 @@
                 if (isTrashedEntry(c)) continue;
                 const rawChats = Array.isArray(c && c.chats) ? c.chats : [];
                 const chats = [];
+                let charLastDate = 0;
                 for (let cIdx = 0; cIdx < rawChats.length; cIdx++) {
                     const ch = rawChats[cIdx];
                     if (isTrashedEntry(ch)) continue;
+                    const msgsArr = Array.isArray(ch && ch.message) ? ch.message : [];
+                    const lastMsg = msgsArr.length ? msgsArr[msgsArr.length - 1] : null;
+                    const rawLastDate = (ch && typeof ch.lastDate === 'number' && Number.isFinite(ch.lastDate)) ? ch.lastDate : 0;
+                    const msgTime = (lastMsg && typeof lastMsg.time === 'number' && Number.isFinite(lastMsg.time)) ? lastMsg.time : 0;
+                    const chatLastDate = Math.max(rawLastDate, msgTime);
+                    if (chatLastDate > charLastDate) charLastDate = chatLastDate;
                     chats.push({
                         index: cIdx,
                         id: (ch && ch.id) || String(cIdx),
                         name: (ch && ch.name) || `Chat ${cIdx + 1}`,
-                        msgCount: Array.isArray(ch && ch.message) ? ch.message.length : 0,
+                        msgCount: msgsArr.length,
                         turnCount: computeUATurnStats(ch && ch.message).completedTurns,
+                        lastDate: chatLastDate,
                     });
                 }
                 characters.push({
@@ -5296,6 +5345,8 @@
                     chaId: (c && c.chaId) || String(idx),
                     name: (c && c.name) || `Character ${idx + 1}`,
                     type: (c && c.type) || 'character',
+                    image: (c && typeof c.image === 'string') ? c.image : '',
+                    lastDate: charLastDate,
                     chatPage: typeof (c && c.chatPage) === 'number' ? c.chatPage : 0,
                     isPcActive: idx === pcActiveCharIndex,
                     chats,
@@ -5346,9 +5397,11 @@
                     x.index,
                     x.chaId,
                     x.name,
+                    x.image,
                     x.chatPage,
                     x.chats.map((ch) => [ch.index, ch.id, ch.name, ch.msgCount]),
                     x.chats.map((ch) => ch.turnCount),
+                    x.chats.map((ch) => ch.lastDate),
                 ]),
                 m: modules.map((x) => [x.id, x.enabled, x.assetCount]),
                 pe: personas.map((x) => x.name),
@@ -8330,6 +8383,43 @@
                     sdConfig: (db && db.sdConfig && typeof db.sdConfig === 'object') ? db.sdConfig : {},
                     openAIKey: String((db && db.openAIKey) || ''),
                     dallEQuality: String((db && db.dallEQuality) || 'standard'),
+                };
+            }
+            if (kindOp === 'db.getCharacterImageAssets') {
+                const cIdx = Number(a[0]);
+                const ch = await risuai.getCharacterFromIndex(cIdx);
+                if (!ch || typeof ch !== 'object') return null;
+                const assets = [];
+                const seenPaths = new Set();
+                const mediaRx = /(?:^|\.)(?:mp3|wav|ogg|mp4|webm|m4a|flac)$/i;
+                const pushAsset = (rawName, rawPath, kind, rawExt = '') => {
+                    if (assets.length >= 300) return;
+                    const p = String(rawPath || '').trim();
+                    if (!p || seenPaths.has(p)) return;
+                    const nm = String(rawName || '').trim();
+                    const ex = String(rawExt || '').trim();
+                    if (kind === 'additional' && (mediaRx.test(ex) || mediaRx.test(nm) || mediaRx.test(p))) return;
+                    seenPaths.add(p);
+                    assets.push({ name: nm || p, path: p, kind });
+                };
+                if (typeof ch.image === 'string' && ch.image.trim()) {
+                    pushAsset('기본 아이콘', ch.image, 'main');
+                }
+                if (Array.isArray(ch.emotionImages)) {
+                    for (const e of ch.emotionImages) {
+                        if (Array.isArray(e)) pushAsset(e[0], e[1], 'emotion', e[2]);
+                    }
+                }
+                if (Array.isArray(ch.additionalAssets)) {
+                    for (const item of ch.additionalAssets) {
+                        if (Array.isArray(item)) pushAsset(item[0], item[1], 'additional', item[2]);
+                    }
+                }
+                return {
+                    chaId: String(ch.chaId || cIdx),
+                    name: String(ch.name || ''),
+                    image: typeof ch.image === 'string' ? ch.image : '',
+                    assets,
                 };
             }
             if (kindOp === 'asset.readImage') {

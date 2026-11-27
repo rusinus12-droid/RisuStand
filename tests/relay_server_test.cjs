@@ -2346,6 +2346,7 @@ test('CBS negative-number comparisons, keywords, and Leave Preset r1.1 AIDE/enco
     assert.ok(leave.defaultVariables.includes('toggle_sub_body_state=1'));
     assert.ok(leave.defaultVariables.includes('toggle_sub_relationship_sim=1'));
     assert.ok(leave.defaultVariables.includes('toggle_sub_world_dynamics=1'));
+    assert.ok(leave.toggleSyntax.includes('sub_body_state=상태 AIDE (부상 · 피로 · 신체 상태 · 수면)'));
 
     const msgsWithBiancaConflict = relay.buildDirectPromptMessages({
         preset: leave,
@@ -2365,6 +2366,11 @@ test('CBS negative-number comparisons, keywords, and Leave Preset r1.1 AIDE/enco
     assert.ok(!combinedBianca.includes('[LEAVE PROSE TONE — LIVELY LIGHT-NOVEL'), 'BIANCA active must suppress contradictory prose_tone=4');
     assert.ok(/DeepSeek/i.test(combinedBianca), 'Auto model_adapter must inject DeepSeek adapter when modelName contains deepseek');
     assert.ok(combinedBianca.includes('STRICT ORDER: Prose -> Step 2'));
+    assert.ok(combinedBianca.includes('[SUB-AIDE: Status (Physical & Sleep)]'));
+    assert.ok(combinedBianca.includes('No Fabricated Readings'));
+    assert.ok(combinedBianca.includes('• 상태:'));
+    assert.ok(!combinedBianca.includes('• 몸·수면:'));
+    assert.ok(!combinedBianca.includes('수면 0-100'));
     assert.ok(msgsWithBiancaConflict.some((m) => m._cachePoint === true), 'Leave cache template entries must tag _cachePoint');
     assert.ok(!/\{\{#if|\{\{getglobalvar|\{\{\/if\}\}/.test(combinedBianca));
 
@@ -2377,11 +2383,15 @@ test('CBS negative-number comparisons, keywords, and Leave Preset r1.1 AIDE/enco
         remoteToggleValues: { toggle_output_lang: '1' },
     });
     const bodyEn = msgsEn.slice(0, -1).map((m) => m.content).join('\n');
+    const combinedEn = msgsEn.map((m) => m.content).join('\n');
     assert.ok(!/[가-힣]/.test(bodyEn), 'English Leave AIDE blocks must not leak Korean Hangul');
     assert.ok(bodyEn.includes('FAIL (impersonation): "When the guard handed over the folder'));
     assert.ok(bodyEn.includes('FAIL (echo-loop): User: "Still don\'t feel it?"'));
     assert.ok(bodyEn.includes('FAIL (crutch chop): "She very slowly looked up.'));
-    assert.ok(!/\{\{#if|\{\{getglobalvar|\{\{\/if\}\}/.test(msgsEn.map((m) => m.content).join('\n')));
+    assert.ok(combinedEn.includes('• Status:'));
+    assert.ok(!combinedEn.includes('• Body & Sleep:'));
+    assert.ok(!combinedEn.includes('wakefulness 0-100'));
+    assert.ok(!/\{\{#if|\{\{getglobalvar|\{\{\/if\}\}/.test(combinedEn));
 
     const msgsJp = relay.buildDirectPromptMessages({
         preset: leave,
@@ -2391,11 +2401,27 @@ test('CBS negative-number comparisons, keywords, and Leave Preset r1.1 AIDE/enco
         remoteToggleValues: { toggle_output_lang: '2' },
     });
     const bodyJp = msgsJp.slice(0, -1).map((m) => m.content).join('\n');
+    const combinedJp = msgsJp.map((m) => m.content).join('\n');
     assert.ok(!/[가-힣]/.test(bodyJp), 'Japanese Leave AIDE blocks must not leak Korean Hangul');
     assert.ok(bodyJp.includes('FAIL (impersonation): 「警備員が書類を差し出すと'));
     assert.ok(bodyJp.includes('FAIL (echo-loop): User: 「まだ実感わかない？」'));
     assert.ok(bodyJp.includes('FAIL (crutch chop): 「彼女はとてもゆっくり顔を上げた。'));
-    assert.ok(!/\{\{#if|\{\{getglobalvar|\{\{\/if\}\}/.test(msgsJp.map((m) => m.content).join('\n')));
+    assert.ok(combinedJp.includes('• 状態:'));
+    assert.ok(!combinedJp.includes('• 身体・睡眠:'));
+    assert.ok(!combinedJp.includes('覚醒 0-100'));
+    assert.ok(!/\{\{#if|\{\{getglobalvar|\{\{\/if\}\}/.test(combinedJp));
+
+    const msgsTextTracker = relay.buildDirectPromptMessages({
+        preset: leave,
+        snap: { charName: 'Alice', charContext: { name: 'Alice', desc: 'Room.' } },
+        historyMessages: [{ index: 0, role: 'user', raw: 'Hi' }],
+        userText: 'Go',
+        remoteToggleValues: { toggle_state_tracker: '2' },
+    });
+    const combinedTextTracker = msgsTextTracker.map((m) => m.content).join('\n');
+    assert.ok(combinedTextTracker.includes('- Status:'));
+    assert.ok(!combinedTextTracker.includes('- Body & Sleep:'));
+    assert.ok(!combinedTextTracker.includes('wakefulness 0-100'));
 });
 
 test('selectCacheFriendlyHistory preserves prefix across 5 turns & reconcileLeaveHayakuFooterContract fixes </statusdata>', () => {
@@ -2804,5 +2830,88 @@ test('Anthropic cache_control + preset sampling fallback, deterministic guards, 
         if (typeof oaiUpstream.closeAllConnections === 'function') oaiUpstream.closeAllConnections();
         await new Promise((r) => anthropicUpstream.close(r));
         await new Promise((r) => oaiUpstream.close(r));
+    }
+});
+
+test('home tab UI and bot thumbnail endpoints (custom upload, default reset, auth, uncached asset rejection)', async () => {
+    const tok = 'home-thumb-test-token';
+    const server = relay.createRelayServer({ token: tok, configOverride: {} });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    const requestBinary = (reqPath, headers = {}) => new Promise((resolve, reject) => {
+        const req = http.request({ host: '127.0.0.1', port, method: 'GET', path: reqPath, headers }, (res) => {
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => resolve({
+                status: res.statusCode,
+                headers: res.headers,
+                buf: Buffer.concat(chunks),
+            }));
+        });
+        req.on('error', reject);
+        req.end();
+    });
+    try {
+        const htmlRes = await requestHttp(port, { path: '/' });
+        assert.equal(htmlRes.status, 200);
+        assert.ok(htmlRes.body.includes('id="tab-home"'));
+        assert.ok(htmlRes.body.includes('data-tab="home"'));
+        assert.ok(htmlRes.body.includes('id="thumbPickerModal"'));
+        assert.ok(htmlRes.body.includes('tab-chat-active'));
+        assert.ok(!htmlRes.body.includes('data-tab="bots"'));
+
+        const unauthThumb = await requestBinary('/api/asset/bot-thumb/c1');
+        assert.equal(unauthThumb.status, 401);
+
+        // Tiny valid 1x1 transparent PNG
+        const pngB64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+        const expectedPng = Buffer.from(pngB64, 'base64');
+        const hdrs = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+
+        const postCustom = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/bot-thumb',
+            headers: hdrs,
+            body: JSON.stringify({
+                chaId: 'c1',
+                source: 'custom',
+                dataUri: 'data:image/png;base64,' + pngB64,
+            }),
+        });
+        assert.equal(postCustom.status, 200);
+        const postCustomJson = JSON.parse(postCustom.body);
+        assert.equal(postCustomJson.ok, true);
+        assert.equal(postCustomJson.botThumbs.c1.source, 'custom');
+
+        const getCustom = await requestBinary('/api/asset/bot-thumb/c1', { 'X-RisuStand-Token': tok });
+        assert.equal(getCustom.status, 200);
+        assert.equal(getCustom.headers['content-type'], 'image/png');
+        assert.deepEqual(getCustom.buf, expectedPng);
+
+        const stateRes = await requestHttp(port, { path: '/api/state', headers: { 'X-RisuStand-Token': tok } });
+        assert.equal(stateRes.status, 200);
+        const stateJson = JSON.parse(stateRes.body);
+        assert.equal(stateJson.botThumbs.c1.source, 'custom');
+
+        const postDefault = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/bot-thumb',
+            headers: hdrs,
+            body: JSON.stringify({ chaId: 'c1', source: 'default' }),
+        });
+        assert.equal(postDefault.status, 200);
+
+        const afterReset = await requestBinary('/api/asset/bot-thumb/c1', { 'X-RisuStand-Token': tok });
+        assert.equal(afterReset.status, 404);
+
+        const uncachedAsset = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/bot-thumb',
+            headers: hdrs,
+            body: JSON.stringify({ chaId: 'c1', charIndex: 0, source: 'asset', assetIndex: 0 }),
+        });
+        assert.equal(uncachedAsset.status, 400);
+    } finally {
+        await new Promise((r) => server.close(r));
     }
 });

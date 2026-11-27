@@ -119,6 +119,7 @@ function assertNoSecrets(root, payload) {
             ...(cfg.profiles || []).map((p) => p && p.apiKey),
             cfg.translator && cfg.translator.apiKey,
             cfg.imageGen && cfg.imageGen.apiKey,
+            cfg.tts && cfg.tts.apiKey,
         ];
         for (const k of keys) if (typeof k === 'string' && k.trim().length >= 8) localSecrets.push(k.trim());
     } catch (_) {}

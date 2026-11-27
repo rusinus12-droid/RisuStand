@@ -50,6 +50,7 @@ const PROGRAM_FILES = Object.freeze([
     'risustand-relay-server.js',
     'risustand-plugin-adapter.cjs',
     'risustand-image-provider.cjs',
+    'risustand-tts-provider.cjs',
     'risustand-module-adapter.cjs',
     'risustand-admin.cjs',
     'risustand-updater.cjs',

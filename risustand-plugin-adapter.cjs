@@ -263,10 +263,24 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
     let childMutationFlushScheduled = false;
     let surfaceMutationFlushScheduled = false;
 
+    function markChatRowBodyMutated(targetNode) {
+        if (suppressSurfaceMutationNotify) return;
+        let cur = unwrapEl(targetNode);
+        while (cur && cur !== chatScreen && cur !== body && cur !== documentElement) {
+            if (cur.classList && cur.classList.contains('x-risu-am-illustration-footer')) return;
+            if (cur.classList && cur.classList.contains('risu-chat')) {
+                cur._rsBodyMutated = true;
+                return;
+            }
+            cur = cur.parentNode;
+        }
+    }
+
     function scheduleSurfaceMutationNotify(targetNode) {
         if (suppressSurfaceMutationNotify || typeof onChatSurfaceMutated !== 'function') return;
         const raw = unwrapEl(targetNode);
         if (!raw || !chatScreen || (raw !== chatScreen && !chatScreen.contains(raw))) return;
+        markChatRowBodyMutated(raw);
         if (surfaceMutationFlushScheduled) return;
         surfaceMutationFlushScheduled = true;
         queueMicrotask(() => {
@@ -278,6 +292,7 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
     function notifyChildListMutation(targetNode) {
         const raw = unwrapEl(targetNode);
         if (!raw) return;
+        markChatRowBodyMutated(raw);
         if (mutationObservers.size > 0) {
             pendingChildMutationTargets.add(raw);
             if (!childMutationFlushScheduled) {
@@ -860,9 +875,11 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                 parts.push(`${cssProp}:${v}`);
             }
             const next = parts.join('; ');
+            const prevStyle = this._styleRaw;
             this._styleRaw = next;
             if (next) this.attributes.set('style', next);
             else this.attributes.delete('style');
+            if (prevStyle !== next) scheduleSurfaceMutationNotify(this);
         }
         _clearChildNodes() {
             const target = (this.tagName === 'TEMPLATE' && this.content) ? this.content : this;
@@ -1028,7 +1045,7 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             if (key === 'value') this.value = val;
             if (key === 'style') void this.setStyleAttribute(val);
             if (key.startsWith('data-')) this.dataset[attrNameToDatasetKey(key)] = val;
-            if (prev !== val && (key.startsWith('x-am-') || key.startsWith('data-am-') || key === 'class')) {
+            if (prev !== val && (key.startsWith('x-') || key.startsWith('data-') || key === 'class' || key === 'src' || key === 'style' || key === 'hidden' || key === 'disabled' || key === 'aria-disabled' || key === 'aria-label')) {
                 scheduleSurfaceMutationNotify(this);
             }
         }
@@ -1043,7 +1060,7 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             if (key === 'checked') this.checked = false;
             if (key === 'style') void this.setStyleAttribute('');
             if (key.startsWith('data-')) delete this.dataset[attrNameToDatasetKey(key)];
-            if (had && (key.startsWith('x-am-') || key.startsWith('data-am-') || key === 'class')) {
+            if (had && (key.startsWith('x-') || key.startsWith('data-') || key === 'class' || key === 'src' || key === 'style' || key === 'hidden' || key === 'disabled' || key === 'aria-disabled' || key === 'aria-label')) {
                 scheduleSurfaceMutationNotify(this);
             }
         }
@@ -1249,6 +1266,8 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         if (!Number.isFinite(clickX)) clickX = 24;
         if (!Number.isFinite(clickY)) clickY = 24;
 
+        const wrappedTarget = wrapSafeElement(rawTarget) || rawTarget;
+        const wrappedDoc = wrapSafeElement(documentElement) || documentElement;
         const makeEv = (type) => {
             const ev = {
                 type,
@@ -1258,8 +1277,8 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                 pageY: clickY,
                 button: 0,
                 buttons: type === 'mousedown' ? 1 : 0,
-                target: rawTarget,
-                currentTarget: documentElement,
+                target: wrappedTarget,
+                currentTarget: wrappedDoc,
                 defaultPrevented: false,
                 propagationStopped: false,
                 preventDefault() { this.defaultPrevented = true; },
@@ -1283,12 +1302,11 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         hoverEl = rawTarget || null;
         focusedEl = rawTarget || null;
         try {
-            const downEv = makeEv('mousedown');
-            await dispatchDocListeners('mousedown', downEv);
-            await dispatchBubble(downEv);
-            const clickEv = makeEv('click');
-            await dispatchDocListeners('click', clickEv);
-            await dispatchBubble(clickEv);
+            for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                const ev = makeEv(type);
+                await dispatchDocListeners(type, ev);
+                await dispatchBubble(ev);
+            }
             await new Promise((r) => setTimeout(r, 12));
             return true;
         } finally {
@@ -1297,7 +1315,68 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         }
     }
 
-    function matchElementByAttrs(roots, { selector = '', countNode = '', actionHtml = '', dataset = {} } = {}) {
+    async function dispatchElementInput(targetEl, { value, checked, eventType = 'input' } = {}) {
+        const rawTarget = unwrapEl(targetEl);
+        if (!rawTarget || rawTarget.nodeType !== 1) return false;
+        focusedEl = rawTarget;
+        if (value !== undefined) {
+            rawTarget.value = String(value);
+            if (rawTarget.tagName === 'TEXTAREA') {
+                rawTarget.textContent = String(value);
+            } else if (rawTarget.tagName === 'INPUT') {
+                rawTarget.attributes.set('value', String(value));
+            }
+        }
+        if (typeof checked === 'boolean') {
+            rawTarget.checked = checked;
+            if (checked) rawTarget.attributes.set('checked', '');
+            else rawTarget.attributes.delete('checked');
+        }
+        const evName = eventType === 'change' ? 'change' : 'input';
+        const wrappedTarget = wrapSafeElement(rawTarget) || rawTarget;
+        const wrappedDoc = wrapSafeElement(documentElement) || documentElement;
+        const makeEv = (type) => ({
+            type,
+            target: wrappedTarget,
+            currentTarget: wrappedDoc,
+            defaultPrevented: false,
+            propagationStopped: false,
+            preventDefault() { this.defaultPrevented = true; },
+            stopPropagation() { this.propagationStopped = true; },
+            stopImmediatePropagation() { this.propagationStopped = true; },
+        });
+        const dispatchBubble = async (ev) => {
+            let cur = rawTarget;
+            while (cur && cur.nodeType === 1 && !ev.propagationStopped) {
+                if (typeof cur.dispatchEvent === 'function') {
+                    await cur.dispatchEvent(ev);
+                }
+                cur = cur.parentElement;
+            }
+        };
+        const ev1 = makeEv(evName);
+        await dispatchDocListeners(evName, ev1);
+        await dispatchBubble(ev1);
+        if (evName === 'change') {
+            const evIn = makeEv('input');
+            await dispatchDocListeners('input', evIn);
+            await dispatchBubble(evIn);
+        }
+        await new Promise((r) => setTimeout(r, 10));
+        return true;
+    }
+
+    function matchElementByAttrs(roots, {
+        selector = '',
+        countNode = '',
+        actionHtml = '',
+        dataset = {},
+        textContent = '',
+        ariaLabel = '',
+        title = '',
+        className = '',
+        siblingIndex = -1,
+    } = {}) {
         if (countNode) {
             const escVal = String(countNode).replace(/"/g, '\\"');
             for (const r of roots) {
@@ -1317,7 +1396,7 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         const matchAttrs = new Map(parsed.attrs.entries());
         if (dataset && typeof dataset === 'object') {
             for (const [k, v] of Object.entries(dataset)) {
-                const attrName = k.startsWith('data-')
+                const attrName = (k.startsWith('data-') || k.startsWith('x-'))
                     ? k
                     : `data-${k.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`)}`;
                 if (!matchAttrs.has(attrName)) matchAttrs.set(attrName, String(v ?? ''));
@@ -1333,14 +1412,19 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                 }
             }
         }
+        const wantText = String(textContent || '').replace(/\s+/g, ' ').trim();
+        const wantAria = String(ariaLabel || matchAttrs.get('aria-label') || '').trim();
+        const wantTitle = String(title || matchAttrs.get('title') || '').trim();
+        const wantClassTokens = String(className || matchAttrs.get('class') || '').split(/\s+/).filter(Boolean);
+        const wantSrc = String(matchAttrs.get('src') || '').trim();
+        const wantSibIdx = Number(siblingIndex);
+
         const significantKeys = [];
         for (const [k, v] of matchAttrs.entries()) {
-            if (k === 'class' || k === 'style' || k === 'type' || k === 'aria-labelledby' || k === 'aria-label' || k === 'title' || k === 'x-am-busy') continue;
+            if (k === 'class' || k === 'style' || k === 'type' || k === 'src' || k === 'loading' || k === 'decoding' || k === 'aria-labelledby' || k === 'aria-label' || k === 'title' || k === 'x-am-busy') continue;
             significantKeys.push([k, v]);
         }
-        if (!significantKeys.length) return null;
-        let bestEl = null;
-        let bestScore = 0;
+
         const allNodes = [];
         for (const r of roots) {
             allNodes.push(r);
@@ -1352,17 +1436,63 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             };
             walk(r);
         }
-        for (const el of allNodes) {
-            let score = 0;
-            let mismatch = false;
-            for (const [k, v] of significantKeys) {
-                if (!el.hasAttribute(k)) { mismatch = true; break; }
-                if (String(el.getAttribute(k) ?? '') !== String(v ?? '')) { mismatch = true; break; }
-                score += k.startsWith('data-am-') ? 4 : 2;
+
+        const scoreExtras = (el) => {
+            let bonus = 0;
+            if (parsed.tagName && el.tagName === parsed.tagName.toUpperCase()) bonus += 2;
+            const elText = String(el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (wantText && elText === wantText) bonus += 4;
+            const elAria = String(el.getAttribute('aria-label') || '').trim();
+            if (wantAria && elAria === wantAria) bonus += 3;
+            const elTitle = String(el.getAttribute('title') || '').trim();
+            if (wantTitle && elTitle === wantTitle) bonus += 2;
+            if (wantClassTokens.length && el.classList) {
+                for (const cls of wantClassTokens) {
+                    if (el.classList.contains(cls)) bonus += 1;
+                }
             }
-            if (!mismatch && score > bestScore) {
-                if (parsed.tagName && el.tagName === parsed.tagName.toUpperCase()) score += 1;
-                bestScore = score;
+            if (wantSrc && String(el.getAttribute('src') || '').trim() === wantSrc) bonus += 2;
+            if (Number.isInteger(wantSibIdx) && wantSibIdx >= 0 && el.parentElement) {
+                const sameTagSibs = (el.parentElement.children || []).filter((s) => s.tagName === el.tagName);
+                if (sameTagSibs[wantSibIdx] === el) bonus += 2;
+            }
+            return bonus;
+        };
+
+        let bestEl = null;
+        let bestScore = 0;
+        if (significantKeys.length) {
+            for (const el of allNodes) {
+                let score = 0;
+                let mismatch = false;
+                for (const [k, v] of significantKeys) {
+                    if (!el.hasAttribute(k)) { mismatch = true; break; }
+                    if (String(el.getAttribute(k) ?? '') !== String(v ?? '')) { mismatch = true; break; }
+                    score += (k.startsWith('data-am-') || k.startsWith('x-am-')) ? 4 : 2;
+                }
+                if (!mismatch) {
+                    score += scoreExtras(el);
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestEl = el;
+                    }
+                }
+            }
+            if (bestEl) return bestEl;
+        }
+
+        // Fallback matching when element lacks unique data-* attributes (e.g. bare <img> or <button><</button>)
+        for (const el of allNodes) {
+            if (parsed.tagName && el.tagName !== parsed.tagName.toUpperCase()) continue;
+            const bonus = scoreExtras(el);
+            const hasStrongCue = Boolean(
+                (wantAria && String(el.getAttribute('aria-label') || '').trim() === wantAria)
+                || (wantTitle && String(el.getAttribute('title') || '').trim() === wantTitle)
+                || (wantText && String(el.textContent || '').replace(/\s+/g, ' ').trim() === wantText)
+                || (wantClassTokens.length && el.classList && wantClassTokens.some((c) => el.classList.contains(c)))
+            );
+            if (hasStrongCue && bonus > bestScore) {
+                bestScore = bonus;
                 bestEl = el;
             }
         }
@@ -1374,7 +1504,8 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         return matchElementByAttrs(roots, opts);
     }
 
-    function findChatSurfaceInteractiveElement({ msgIndex = -1, chatId = '', actionHtml = '', dataset = {} } = {}) {
+    function findChatSurfaceInteractiveElement(opts = {}) {
+        const { msgIndex = -1, chatId = '' } = opts || {};
         const cid = String(chatId || '').trim();
         const mIdx = Number(msgIndex);
         let scopeRoots = [];
@@ -1384,10 +1515,11 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         if (!scopeRoots.length && Number.isInteger(mIdx) && mIdx >= 0) {
             scopeRoots = chatScreen.children.filter((ch) => ch.getAttribute('data-chat-index') === String(mIdx));
         }
-        if (!scopeRoots.length) {
-            scopeRoots = [chatScreen];
+        if (scopeRoots.length) {
+            const scopedHit = matchElementByAttrs(scopeRoots, opts);
+            if (scopedHit) return scopedHit;
         }
-        return matchElementByAttrs(scopeRoots, { actionHtml, dataset });
+        return matchElementByAttrs([chatScreen], opts);
     }
 
     function mountSurfaceActionElement(actionHtml, dataset = {}, { msgIndex = -1, chatId = '' } = {}) {
@@ -1398,14 +1530,19 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         }
         if (dataset && typeof dataset === 'object') {
             for (const [k, v] of Object.entries(dataset)) {
-                const attrName = k.startsWith('data-')
+                const attrName = (k.startsWith('data-') || k.startsWith('x-'))
                     ? k
                     : `data-${k.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`)}`;
                 el.setAttribute(attrName, String(v ?? ''));
             }
         }
         el._rect = { top: 14000, left: 400, right: 448, bottom: 14048, width: 48, height: 48 };
-        if (el.hasAttribute('data-am-illustration-action')) {
+        if (
+            el.hasAttribute('data-am-illustration-action')
+            || el.hasAttribute('data-am-illustration-revision-action')
+            || el.hasAttribute('data-am-revision-action')
+            || el.hasAttribute('data-am-chat-history-action')
+        ) {
             const row = new MockElement('div');
             row.className = 'risu-chat';
             if (chatId) row.setAttribute('data-chat-id', String(chatId));
@@ -1414,7 +1551,10 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             textEl.className = 'chattext';
             const footer = new MockElement('div');
             footer.className = 'x-risu-am-illustration-footer';
-            footer.appendChild(el);
+            const revCtrl = new MockElement('div');
+            revCtrl.className = 'x-risu-am-illustration-revision-controls';
+            revCtrl.appendChild(el);
+            footer.appendChild(revCtrl);
             textEl.appendChild(footer);
             row.appendChild(textEl);
             el._rsTempWrapper = row;
@@ -1466,6 +1606,7 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                 row.setAttribute('data-chat-index', String(mIdx));
                 row.setAttribute('data-role', role);
                 row._rsSourceSig = sig;
+                row._rsBodyMutated = false;
                 row._rect = rowRect;
                 let textEl = row.querySelector('.chattext');
                 if (!textEl) {
@@ -1519,11 +1660,17 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             }
             if (textEl && cid) {
                 const hasInjected = Boolean(
-                    textEl.querySelector('.x-risu-am-illustration-slot')
+                    row._rsBodyMutated
+                    || textEl.querySelector('.x-risu-am-illustration-slot')
                     || textEl.querySelector('.am-illustration-projection')
                     || textEl.querySelector('.x-risu-am-illustration-projection')
+                    || textEl.querySelector('.x-risu-am-image')
+                    || textEl.querySelector('.am-image')
+                    || textEl.querySelector('.x-risu-am-generated-image')
+                    || textEl.querySelector('.am-generated-image')
                     || textEl.querySelector('.am-chat-regenerate-action')
                     || textEl.querySelector('.am-chat-history-edge-controls')
+                    || textEl.querySelector('.x-risu-am-chat-history-edge-controls')
                 );
                 if (hasInjected) {
                     const parts = [];
@@ -1551,6 +1698,18 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             get tagName() { return rawEl.tagName; },
             get id() { return rawEl.id; },
             get className() { return rawEl.className; },
+            get classList() { return rawEl.classList; },
+            get dataset() { return rawEl.dataset; },
+            get value() { return rawEl.value; },
+            set value(v) { rawEl.value = String(v ?? ''); },
+            get checked() { return Boolean(rawEl.checked); },
+            set checked(v) { rawEl.checked = Boolean(v); },
+            get disabled() { return Boolean(rawEl.disabled); },
+            set disabled(v) { rawEl.disabled = Boolean(v); },
+            getValue: async () => rawEl.value,
+            setValue: async (v) => { rawEl.value = String(v ?? ''); },
+            getChecked: async () => Boolean(rawEl.checked),
+            setChecked: async (v) => { rawEl.checked = Boolean(v); },
             getAttribute: async (k) => rawEl.getAttribute(k),
             setAttribute: async (k, v) => { rawEl.setAttribute(k, v); },
             removeAttribute: async (k) => { rawEl.removeAttribute(k); },
@@ -1682,6 +1841,7 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         MockElement,
         chatScreen,
         dispatchSurfaceClick,
+        dispatchElementInput,
         findRootInteractiveElement,
         findChatSurfaceInteractiveElement,
         mountSurfaceActionElement,
@@ -1938,6 +2098,8 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
     getCurrentChatIndex: () => rpcCall('db.getCurrentChatIndex', []),
     getChat: () => rpcCall('db.getChatActive', []),
     getCurrentChat: () => rpcCall('db.getChatActive', []),
+    setChat: (chat) => rpcCall('db.setChatActive', [chat]),
+    setCurrentChat: (chat) => rpcCall('db.setChatActive', [chat]),
     getChatFromIndex: (cIdx, chIdx) => rpcCall('db.getChat', [Number(cIdx), Number(chIdx)]),
     setChatToIndex: (cIdx, chIdx, chat) => rpcCall('db.setChat', [Number(cIdx), Number(chIdx), chat]),
     loadPlugins: async () => {
@@ -2163,6 +2325,7 @@ function createPluginAdapter({
     const guiIpcOutbox = []; // [{ seq, targetPlugin, channel, message, sender, at }]
     let guiIpcSeq = 0;
     let activeHookFrame = null; // { stage, step, total, pluginName, explicit, handle }
+    let activeActionTracker = null; // { dbMutated, surfaceMutated, openedContainerPlugin }
 
     function getPluginDisplayName(pluginName) {
         const custom = customPlugins.find((p) => p && p.name === pluginName);
@@ -2595,6 +2758,7 @@ function createPluginAdapter({
                     ensureStableChatAndMessageIds(ch, cIdx, ch.chats[ci], ci);
                 }
             }
+            if (ch) fallbackCharCache.set(cIdx, cloneJson(ch));
             return ch;
         }
         const fb = getOrSeedFallbackChar(cIdx);
@@ -2617,6 +2781,7 @@ function createPluginAdapter({
             }
         }
         fallbackCharCache.set(cIdx, cloneJson(copy));
+        if (activeActionTracker) activeActionTracker.dbMutated = true;
         if (isRpcConnected()) {
             await hostRpc.invoke('db.setCharacter', [cIdx, copy]);
         }
@@ -2659,6 +2824,7 @@ function createPluginAdapter({
         if (!Array.isArray(fb.chats)) fb.chats = [];
         fb.chats[chi] = cloneJson(copy);
         fallbackCharCache.set(ci, fb);
+        if (activeActionTracker) activeActionTracker.dbMutated = true;
         if (isRpcConnected()) {
             await hostRpc.invoke('db.setChat', [ci, chi, copy]);
         }
@@ -3184,6 +3350,14 @@ function createPluginAdapter({
                 const idx = await dbGetCurrentIndices();
                 return dbGetChatFromIndex(idx.charIndex, idx.chatIndex);
             },
+            setChat: async (chat) => {
+                const idx = await dbGetCurrentIndices();
+                return dbSetChatToIndex(idx.charIndex, idx.chatIndex, chat);
+            },
+            setCurrentChat: async (chat) => {
+                const idx = await dbGetCurrentIndices();
+                return dbSetChatToIndex(idx.charIndex, idx.chatIndex, chat);
+            },
             getChatFromIndex: (cIdx, chIdx) => dbGetChatFromIndex(cIdx, chIdx),
             setChatToIndex: (cIdx, chIdx, chat) => dbSetChatToIndex(cIdx, chIdx, chat),
             getDatabase: (keys) => dbGetDatabase(keys),
@@ -3222,7 +3396,11 @@ function createPluginAdapter({
             getRootContainer: async () => asyncDoc.body,
             getPluginRoot: async () => asyncDoc.body,
             createMutationObserver: async (cb) => sharedMockDom.createMutationObserver(cb),
-            showContainer: async () => {},
+            showContainer: async () => {
+                if (activeActionTracker && !activeActionTracker.openedContainerPlugin) {
+                    activeActionTracker.openedContainerPlugin = pluginName;
+                }
+            },
             hideContainer: async () => {},
             getRuntimeInfo: async () => ({ apiVersion: '3.0', platform: 'risustand-backend', saveMethod: 'local' }),
             requestPluginPermission: async () => true,
@@ -3307,6 +3485,7 @@ function createPluginAdapter({
         const sharedMockDom = createHeadlessMockDom({
             onToastText: (txt) => updateHookTaskDetail(name, txt, true),
             onChatSurfaceMutated: () => {
+                if (activeActionTracker) activeActionTracker.surfaceMutated = true;
                 if (typeof onSurfaceMutated === 'function') {
                     try { onSurfaceMutated({ pluginName: name }); } catch (_) {}
                 }
@@ -3934,7 +4113,113 @@ function createPluginAdapter({
         return { committedViaRpc: false, messageIndex };
     }
 
-    async function dispatchSurfaceAction({ charIndex, chatIndex, msgIndex = -1, chatId = '', actionHtml = '', dataset = {} } = {}) {
+    function collectMockDomStyles(mockDom) {
+        const styles = [];
+        if (!mockDom) return styles;
+        const head = mockDom.head;
+        const body = mockDom.body;
+        for (const st of [...(head ? head.children : []), ...(body ? body.children : [])]) {
+            if (st && st.tagName === 'STYLE') {
+                const txt = st.textContent || st.innerHTML || '';
+                if (txt) styles.push(txt);
+            }
+        }
+        return styles;
+    }
+
+    function isNodeVisiblyHidden(el) {
+        if (!el || el.nodeType !== 1) return true;
+        if (el.hasAttribute('hidden')) return true;
+        const stAttr = (el.attributes && el.attributes.get('style')) || '';
+        if (/display\s*:\s*none|visibility\s*:\s*hidden/i.test(stAttr)) return true;
+        return false;
+    }
+
+    function hasVisibleContent(el) {
+        if (!el || el.nodeType !== 1) return false;
+        const inner = el.innerHTML || el.textContent || '';
+        return Boolean(inner.trim() || (el.children && el.children.length));
+    }
+
+    function isPersistentToastOrBadge(el) {
+        if (!el || el.nodeType !== 1) return false;
+        if (el.hasAttribute('data-am-toast-region') || el.hasAttribute('data-am-count-region')) return true;
+        if (el.classList && (el.classList.contains('x-risu-am-generation-count') || el.classList.contains('x-risu-am-runtime-toast-stack'))) {
+            return true;
+        }
+        return false;
+    }
+
+    function extractOverlayBlocks(mockDom) {
+        const out = [];
+        if (!mockDom || !mockDom.body) return out;
+        const collectFromNode = (el) => {
+            if (!el || el === mockDom.chatScreen || el.tagName === 'STYLE' || el.tagName === 'SCRIPT') return;
+            if (isNodeVisiblyHidden(el)) return;
+            if (typeof el.hasAttribute === 'function' && el.hasAttribute('data-plugin-chat-panel')) return;
+            if (typeof el.hasAttribute === 'function' && (el.hasAttribute('data-am-floating-viewport') || el.hasAttribute('x-am-root-host'))) {
+                for (const sub of el.children || []) {
+                    collectFromNode(sub);
+                }
+                return;
+            }
+            if (isPersistentToastOrBadge(el)) {
+                // If an element wraps both count/toast regions and a modal, recurse; otherwise skip
+                for (const sub of el.children || []) {
+                    if (!isPersistentToastOrBadge(sub)) collectFromNode(sub);
+                }
+                return;
+            }
+            const countReg = typeof el.querySelector === 'function' ? el.querySelector('[data-am-count-region]') : null;
+            const toastReg = typeof el.querySelector === 'function' ? el.querySelector('[data-am-toast-region]') : null;
+            if (countReg || toastReg) {
+                for (const sub of el.children || []) {
+                    collectFromNode(sub);
+                }
+                return;
+            }
+            if (!hasVisibleContent(el)) return;
+            out.push(el.outerHTML);
+        };
+        for (const ch of mockDom.body.children || []) {
+            collectFromNode(ch);
+        }
+        if (mockDom.documentElement) {
+            for (const ch of mockDom.documentElement.children || []) {
+                if (ch === mockDom.head || ch === mockDom.body) continue;
+                collectFromNode(ch);
+            }
+        }
+        return out;
+    }
+
+    function getPluginOverlaySnapshot(pluginName) {
+        const mockDom = pluginDoms.get(pluginName);
+        if (!mockDom || !activeHosts.has(pluginName)) return null;
+        const blocks = extractOverlayBlocks(mockDom);
+        if (!blocks.length) return null;
+        return {
+            pluginName,
+            displayName: getPluginDisplayName(pluginName),
+            styles: collectMockDomStyles(mockDom),
+            html: blocks.join('\n'),
+        };
+    }
+
+    async function dispatchSurfaceAction({
+        charIndex,
+        chatIndex,
+        msgIndex = -1,
+        chatId = '',
+        actionHtml = '',
+        dataset = {},
+        selector = '',
+        textContent = '',
+        ariaLabel = '',
+        title = '',
+        className = '',
+        siblingIndex = -1,
+    } = {}) {
         const cIdx = Number(charIndex);
         const chIdx = Number(chatIndex);
         if (!Number.isNaN(cIdx) && !Number.isNaN(chIdx) && cIdx >= 0 && chIdx >= 0) {
@@ -3949,35 +4234,95 @@ function createPluginAdapter({
             : [];
         const resolvedCid = String(chatId || '').trim()
             || ((syncedMsgs.find((m) => m && Number(m.index) === Number(msgIndex)) || {}).chatId || '');
-        let dispatchedCount = 0;
-        let matchedLive = false;
+
+        const beforeOverlayHtmlByPlugin = new Map();
         for (const [pName, mockDom] of pluginDoms.entries()) {
             if (!activeHosts.has(pName)) continue;
-            if (syncedMsgs.length && typeof mockDom.syncChatMessages === 'function') {
-                mockDom.syncChatMessages(syncedMsgs);
-            }
-            const liveEl = typeof mockDom.findChatSurfaceInteractiveElement === 'function'
-                ? mockDom.findChatSurfaceInteractiveElement({ msgIndex, chatId: resolvedCid, actionHtml, dataset })
-                : null;
-            if (liveEl) {
-                matchedLive = true;
-                await mockDom.dispatchSurfaceClick(liveEl, 24, 24);
-                dispatchedCount += 1;
-            } else {
-                const el = mockDom.mountSurfaceActionElement(actionHtml, dataset, { msgIndex, chatId: resolvedCid });
-                try {
-                    await mockDom.dispatchSurfaceClick(el, 24, 24);
+            beforeOverlayHtmlByPlugin.set(pName, extractOverlayBlocks(mockDom).join('\n'));
+        }
+
+        const prevTracker = activeActionTracker;
+        const tracker = { dbMutated: false, surfaceMutated: false, openedContainerPlugin: '' };
+        activeActionTracker = tracker;
+        let dispatchedCount = 0;
+        let matchedLive = false;
+        let openedOverlay = null;
+        let openPluginGui = null;
+
+        try {
+            const matchOpts = { msgIndex, chatId: resolvedCid, selector, actionHtml, dataset, textContent, ariaLabel, title, className, siblingIndex };
+            for (const [pName, mockDom] of pluginDoms.entries()) {
+                if (!activeHosts.has(pName)) continue;
+                if (syncedMsgs.length && typeof mockDom.syncChatMessages === 'function') {
+                    mockDom.syncChatMessages(syncedMsgs);
+                }
+                const liveEl = typeof mockDom.findChatSurfaceInteractiveElement === 'function'
+                    ? mockDom.findChatSurfaceInteractiveElement(matchOpts)
+                    : null;
+                if (liveEl) {
+                    matchedLive = true;
+                    await mockDom.dispatchSurfaceClick(liveEl, 24, 24);
                     dispatchedCount += 1;
-                } finally {
-                    if (el && el._rsTempWrapper) el._rsTempWrapper.remove();
-                    else if (el) el.remove();
+                } else {
+                    const el = mockDom.mountSurfaceActionElement(actionHtml, dataset, { msgIndex, chatId: resolvedCid });
+                    try {
+                        await mockDom.dispatchSurfaceClick(el, 24, 24);
+                        dispatchedCount += 1;
+                    } finally {
+                        if (el && el._rsTempWrapper) el._rsTempWrapper.remove();
+                        else if (el) el.remove();
+                    }
                 }
             }
+
+            if (dispatchedCount > 0) {
+                await new Promise((r) => setTimeout(r, 40));
+                const checkOverlays = () => {
+                    for (const [pName, mockDom] of pluginDoms.entries()) {
+                        if (!activeHosts.has(pName)) continue;
+                        const afterHtml = extractOverlayBlocks(mockDom).join('\n');
+                        if (afterHtml && afterHtml !== (beforeOverlayHtmlByPlugin.get(pName) || '')) {
+                            return {
+                                pluginName: pName,
+                                displayName: getPluginDisplayName(pName),
+                                styles: collectMockDomStyles(mockDom),
+                                html: afterHtml,
+                            };
+                        }
+                    }
+                    return null;
+                };
+                openedOverlay = checkOverlays();
+                for (let step = 0; step < 4 && !openedOverlay && !tracker.openedContainerPlugin && !tracker.dbMutated && !tracker.surfaceMutated; step += 1) {
+                    await new Promise((r) => setTimeout(r, 35));
+                    openedOverlay = checkOverlays();
+                }
+                if (tracker.dbMutated || tracker.surfaceMutated || openedOverlay) {
+                    await new Promise((r) => setTimeout(r, 25));
+                    const settledOverlay = checkOverlays();
+                    if (settledOverlay) openedOverlay = settledOverlay;
+                }
+            }
+
+            if (tracker.openedContainerPlugin) {
+                openPluginGui = {
+                    pluginName: tracker.openedContainerPlugin,
+                    displayName: getPluginDisplayName(tracker.openedContainerPlugin),
+                };
+            }
+            return {
+                ok: true,
+                dispatchedCount,
+                matchedLive,
+                dbMutated: tracker.dbMutated,
+                surfaceMutated: tracker.surfaceMutated,
+                openedOverlay,
+                openPluginGui,
+                pluginFloatingUi: getFloatingUiState(),
+            };
+        } finally {
+            activeActionTracker = prevTracker;
         }
-        if (dispatchedCount > 0) {
-            await new Promise((r) => setTimeout(r, 40));
-        }
-        return { ok: true, dispatchedCount, matchedLive };
     }
 
     async function syncAndProjectChatSurface(baseSnap) {
@@ -4054,34 +4399,75 @@ function createPluginAdapter({
         };
     }
 
-    async function dispatchRootWidgetClick({ pluginName, charIndex, chatIndex, selector = '', countNode = '', actionHtml = '', dataset = {}, x = 24, y = 24 } = {}) {
+    async function dispatchRootWidgetClick({
+        pluginName,
+        charIndex,
+        chatIndex,
+        selector = '',
+        countNode = '',
+        actionHtml = '',
+        dataset = {},
+        textContent = '',
+        ariaLabel = '',
+        title = '',
+        className = '',
+        siblingIndex = -1,
+        eventType = 'click',
+        value,
+        checked,
+        x = 24,
+        y = 24,
+    } = {}) {
         const pName = String(pluginName || '');
         const mockDom = pluginDoms.get(pName);
-        if (!mockDom || !activeHosts.has(pName)) return { ok: false, dispatchedCount: 0 };
+        if (!mockDom || !activeHosts.has(pName)) return { ok: false, dispatchedCount: 0, activeOverlay: null };
         const cIdx = Number(charIndex);
         const chIdx = Number(chatIndex);
         const needTempTurn = !turnCache.active && !Number.isNaN(cIdx) && !Number.isNaN(chIdx) && cIdx >= 0 && chIdx >= 0;
         if (needTempTurn) {
             await prepareTurn(cIdx, chIdx, getFallbackSnapshot());
         }
+        const prevTracker = activeActionTracker;
+        const tracker = { dbMutated: false, surfaceMutated: false, openedContainerPlugin: '' };
+        activeActionTracker = tracker;
         try {
+            const matchOpts = { selector, countNode, actionHtml, dataset, textContent, ariaLabel, title, className, siblingIndex };
             const liveEl = typeof mockDom.findRootInteractiveElement === 'function'
-                ? mockDom.findRootInteractiveElement({ selector, countNode, actionHtml, dataset })
+                ? mockDom.findRootInteractiveElement(matchOpts)
                 : null;
             if (liveEl) {
-                await mockDom.dispatchSurfaceClick(liveEl, Number(x) || 24, Number(y) || 24);
+                if ((eventType === 'input' || eventType === 'change') && typeof mockDom.dispatchElementInput === 'function') {
+                    await mockDom.dispatchElementInput(liveEl, { value, checked, eventType });
+                } else {
+                    await mockDom.dispatchSurfaceClick(liveEl, Number(x) || 24, Number(y) || 24);
+                }
                 await new Promise((r) => setTimeout(r, 35));
-                return { ok: true, dispatchedCount: 1, matchedLive: true };
+                return {
+                    ok: true,
+                    dispatchedCount: 1,
+                    matchedLive: true,
+                    dbMutated: tracker.dbMutated,
+                    surfaceMutated: tracker.surfaceMutated,
+                    activeOverlay: getPluginOverlaySnapshot(pName),
+                };
             }
             const el = mockDom.mountSurfaceActionElement(actionHtml, dataset);
             try {
                 await mockDom.dispatchSurfaceClick(el, Number(x) || 24, Number(y) || 24);
                 await new Promise((r) => setTimeout(r, 25));
-                return { ok: true, dispatchedCount: 1, matchedLive: false };
+                return {
+                    ok: true,
+                    dispatchedCount: 1,
+                    matchedLive: false,
+                    dbMutated: tracker.dbMutated,
+                    surfaceMutated: tracker.surfaceMutated,
+                    activeOverlay: getPluginOverlaySnapshot(pName),
+                };
             } finally {
                 el.remove();
             }
         } finally {
+            activeActionTracker = prevTracker;
             if (needTempTurn) endTurn();
         }
     }
@@ -4139,28 +4525,28 @@ function createPluginAdapter({
 
             const mockDom = pluginDoms.get(entry.name);
             if (mockDom && mockDom.body) {
-                const body = mockDom.body;
-                const head = mockDom.head;
-                const styles = [];
-                for (const st of [...(head ? head.children : []), ...(body ? body.children : [])]) {
-                    if (st && st.tagName === 'STYLE') {
-                        const txt = st.textContent || st.innerHTML || '';
-                        if (txt) styles.push(txt);
-                    }
-                }
+                const styles = collectMockDomStyles(mockDom);
                 const blocks = [];
-                for (const ch of (body ? body.children : [])) {
+                for (const ch of (mockDom.body ? mockDom.body.children : [])) {
                     if (!ch || ch === mockDom.chatScreen || ch.tagName === 'STYLE' || ch.tagName === 'SCRIPT') continue;
-                    const stAttr = (ch.attributes && ch.attributes.get('style')) || '';
-                    if (/display\s*:\s*none/i.test(stAttr)) continue;
-                    if (typeof ch.hasAttribute === 'function' && (ch.hasAttribute('data-am-floating-viewport') || ch.hasAttribute('data-plugin-chat-panel'))) continue;
+                    if (isNodeVisiblyHidden(ch)) continue;
+                    if (typeof ch.hasAttribute === 'function' && ch.hasAttribute('data-plugin-chat-panel')) continue;
+                    if (typeof ch.hasAttribute === 'function' && ch.hasAttribute('data-am-floating-viewport')) {
+                        const subBlocks = [];
+                        for (const sub of ch.children || []) {
+                            if (!sub || sub.tagName === 'STYLE' || sub.tagName === 'SCRIPT' || isNodeVisiblyHidden(sub)) continue;
+                            if (!hasVisibleContent(sub)) continue;
+                            subBlocks.push(sub.outerHTML);
+                        }
+                        if (subBlocks.length) blocks.push(...subBlocks);
+                        continue;
+                    }
                     const countReg = typeof ch.querySelector === 'function' ? ch.querySelector('[data-am-count-region]') : null;
                     if (countReg && countReg.getAttribute('x-am-count-visible') === 'false') {
                         const toastReg = typeof ch.querySelector === 'function' ? ch.querySelector('[data-am-toast-region]') : null;
                         if (!toastReg || !(toastReg.innerHTML || '').trim()) continue;
                     }
-                    const inner = ch.innerHTML || ch.textContent || '';
-                    if (!inner.trim() && !ch.children.length) continue;
+                    if (!hasVisibleContent(ch)) continue;
                     blocks.push(ch.outerHTML);
                 }
                 if (blocks.length) {
@@ -4244,6 +4630,10 @@ function createPluginAdapter({
         if (method === 'db.getChatActive') {
             const idx = await dbGetCurrentIndices();
             return dbGetChatFromIndex(idx.charIndex, idx.chatIndex);
+        }
+        if (method === 'db.setChatActive') {
+            const idx = await dbGetCurrentIndices();
+            return dbSetChatToIndex(idx.charIndex, idx.chatIndex, a[0]);
         }
         if (method === 'db.getChat') return dbGetChatFromIndex(a[0], a[1]);
         if (method === 'db.setChat') return dbSetChatToIndex(a[0], a[1], a[2]);

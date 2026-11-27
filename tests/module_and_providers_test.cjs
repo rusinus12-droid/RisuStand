@@ -1654,3 +1654,334 @@ test('Soakma-style preset without internal toggles reacts cleanly to module cust
         try { fs.rmSync(tmpCfgPath, { force: true }); } catch (_) {}
     }
 });
+
+test('Asset Maid image click opens dedicated GUI overlay, showContainer triggers GUI, and revision < / > switches images', async () => {
+    const tmpCfgPath = path.join(os.tmpdir(), `rs-am-rev-cfg-${Date.now()}.json`);
+    const tmpPluginsPath = path.join(os.tmpdir(), `rs-am-rev-plugins-${Date.now()}.json`);
+    const rev1Png = Buffer.concat([ONE_BY_ONE_PNG, Buffer.from('REV1')]);
+    const rev2Png = Buffer.concat([ONE_BY_ONE_PNG, Buffer.from('REV2')]);
+
+    const charObj = {
+        chaId: 'char-am-rev-1',
+        name: 'Sieun',
+        desc: 'Campus story',
+        personality: '',
+        scenario: '',
+        systemPrompt: '',
+        replaceGlobalNote: '',
+        lowLevelAccess: false,
+        triggerscript: [],
+        customscript: [],
+        globalLore: [],
+        additionalAssets: [
+            ['rev1_asset', 'assets/rev1.png', 'png'],
+            ['rev2_asset', 'assets/rev2.png', 'png'],
+        ],
+        chatPage: 0,
+        chats: [],
+    };
+    const chatObj = {
+        id: 'chat-am-rev-1',
+        name: 'Chat 1',
+        note: '',
+        modules: [],
+        localLore: [],
+        scriptstate: {},
+        message: [
+            { role: 'user', data: '안녕', chatId: 'cid-rev-0' },
+            { role: 'char', data: '장면 본문\n<div class="x-risu-am-illustration-projection"><span class="x-risu-am-image"><img class="x-risu-am-image__media" src="{{raw::rev2_asset}}" /></span></div>', chatId: 'cid-rev-1' },
+        ],
+    };
+    charObj.chats = [chatObj];
+
+    const bridge = createFakeHostBridge({ charObj, chatObj });
+    const relay = createRelayServer({
+        token: 'test-am-rev-token',
+        configPath: tmpCfgPath,
+        pluginsPath: tmpPluginsPath,
+        configOverride: { activeProfileId: '' },
+    });
+    const baseUrl = await listenServer(relay);
+    const headers = { 'Content-Type': 'application/json', 'X-RisuStand-Token': 'test-am-rev-token' };
+
+    try {
+        bridge.startRpcLoop(baseUrl, 'test-am-rev-token');
+        const assetMap = {
+            'assets/rev1.png': `data:image/png;base64,${rev1Png.toString('base64')}`,
+            'assets/rev2.png': `data:image/png;base64,${rev2Png.toString('base64')}`,
+            rev1_asset: `data:image/png;base64,${rev1Png.toString('base64')}`,
+            rev2_asset: `data:image/png;base64,${rev2Png.toString('base64')}`,
+        };
+        await fetch(`${baseUrl}/api/pc/poll`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                bridgeVersion: '2.0.0',
+                pluginVersion: '1.1.0',
+                generating: false,
+                catalog: {
+                    pcActiveCharIndex: 0,
+                    pcActiveChatIndex: 0,
+                    selectedPersona: 0,
+                    params: { temperature: 80, maxContext: 8000, maxResponse: 1000 },
+                    characters: [{ index: 0, name: 'Sieun', activeChatIndex: 0, chats: [{ index: 0, name: 'Chat 1' }] }],
+                    modules: [],
+                    personas: [{ index: 0, name: 'User' }],
+                },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: 'Sieun',
+                    chatName: 'Chat 1',
+                    chatUuid: 'chat-am-rev-1',
+                    isPcActive: true,
+                    totalMessages: 2,
+                    chatModules: [],
+                    chatVariables: {},
+                    assetMap,
+                    messages: [
+                        { index: 0, role: 'user', raw: chatObj.message[0].data, html: chatObj.message[0].data, text: '안녕', images: [], chatId: 'cid-rev-0' },
+                        { index: 1, role: 'char', raw: chatObj.message[1].data, html: chatObj.message[1].data, text: '장면 본문', images: [], chatId: 'cid-rev-1' },
+                    ],
+                    charContext: { charId: 'char-am-rev-1', name: 'Sieun', personaName: 'User' },
+                },
+            }),
+        });
+
+        const amInteractivePlugin = `
+        //@name AssetMaidInteractiveTest
+        //@display-name Asset Maid Interactive
+        //@api 3.0
+        (async () => {
+            const doc = await risuai.getRootDocument();
+            let revIdx = 2;
+            let lastPromptEdit = '';
+
+            async function renderFooter(row) {
+                const bodyEl = await row.querySelector('.chattext');
+                if (!bodyEl) return;
+                let footer = await bodyEl.querySelector('.x-risu-am-illustration-footer');
+                if (!footer) {
+                    footer = await doc.createElement('div');
+                    await footer.addClass('x-risu-am-illustration-footer');
+                    await bodyEl.appendChild(footer);
+                }
+                const prevRev = await footer.getAttribute('x-am-rev').catch(() => '');
+                if (prevRev === String(revIdx)) return;
+                await footer.setAttribute('x-am-rev', String(revIdx));
+                await footer.setInnerHTML(
+                    '<button type="button" class="x-risu-am-illustration-footer__generate" title="재생성">↻</button>' +
+                    '<div class="x-risu-am-illustration-revision-controls">' +
+                      '<button type="button" title="이전 이미지">&lt;</button>' +
+                      '<span class="x-risu-am-illustration-revision-count">' + revIdx + '/2</span>' +
+                      '<button type="button" title="다음 이미지">&gt;</button>' +
+                    '</div>'
+                );
+            }
+
+            async function reconcileAll() {
+                const screen = await doc.querySelector('.default-chat-screen');
+                if (!screen) return;
+                const rows = await screen.querySelectorAll('.risu-chat[data-role="char"]');
+                const count = await rows.length();
+                for (let i = 0; i < count; i += 1) {
+                    await renderFooter(await rows.at(i));
+                }
+            }
+
+            async function openInspectorOverlay() {
+                let vp = await doc.querySelector('[data-am-floating-viewport]');
+                if (!vp) {
+                    vp = await doc.createElement('div');
+                    await vp.setAttribute('data-am-floating-viewport', 'true');
+                    await doc.body.appendChild(vp);
+                }
+                const assetName = revIdx === 1 ? 'rev1_asset' : 'rev2_asset';
+                await vp.setInnerHTML(
+                    '<div class="am-inspector-modal">' +
+                      '<img class="am-inspector-img" src="{{raw::' + assetName + '}}" />' +
+                      '<input id="amPromptEditInp" type="text" value="custom prompt" />' +
+                      '<button type="button" id="amCloseInspectorBtn">닫기</button>' +
+                    '</div>'
+                );
+            }
+
+            await doc.addEventListener('click', async (ev) => {
+                const target = ev.target;
+                if (!target) return;
+                const id = target.id || (await target.getAttribute('id').catch(() => ''));
+                const title = await target.getAttribute('title').catch(() => '');
+                const cls = await target.getClassName().catch(() => '');
+
+                if (id === 'amCloseInspectorBtn') {
+                    const vp = await doc.querySelector('[data-am-floating-viewport]');
+                    if (vp) await vp.setInnerHTML('');
+                    return;
+                }
+                if (title === '이전 이미지' || title === '다음 이미지') {
+                    revIdx = title === '이전 이미지' ? Math.max(1, revIdx - 1) : Math.min(2, revIdx + 1);
+                    const chat = await risuai.getChat();
+                    const msg = chat.message.find((m) => m.chatId === 'cid-rev-1');
+                    if (msg) {
+                        const tok = revIdx === 1 ? 'rev1_asset' : 'rev2_asset';
+                        msg.data = '장면 본문\\n<div class="x-risu-am-illustration-projection"><span class="x-risu-am-image"><img class="x-risu-am-image__media" src="{{raw::' + tok + '}}" /></span></div>';
+                        await risuai.setChat(chat);
+                    }
+                    await reconcileAll();
+                    return;
+                }
+                if (cls.includes('x-risu-am-image__media') || cls.includes('x-risu-am-image')) {
+                    await openInspectorOverlay();
+                }
+            });
+
+            await doc.addEventListener('input', async (ev) => {
+                if (ev.target && ev.target.id === 'amPromptEditInp') {
+                    lastPromptEdit = String(ev.target.value || '');
+                    await risuai.setArg('last_prompt_edit', lastPromptEdit);
+                }
+            });
+
+            const body = await doc.querySelector('body');
+            const obs = await risuai.createMutationObserver(() => { void reconcileAll(); });
+            await obs.observe(body, { childList: true, subtree: true });
+            await reconcileAll();
+        })();
+        `;
+
+        await fetch(`${baseUrl}/api/plugins/upload`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ filename: 'AssetMaidInteractiveTest.js', script: amInteractivePlugin, enabled: true }),
+        }).then((r) => assert.equal(r.status, 200));
+
+        // Initial state shows rev2/2 asset URL
+        const st0 = await fetch(`${baseUrl}/api/state`, { headers }).then((r) => r.json());
+        const m0 = st0.snapshot.messages.find((m) => m.chatId === 'cid-rev-1');
+        assert.ok(m0 && m0.pluginFooterHtml.includes('2/2'));
+        const rev2Match = m0.html.match(/src="(\/api\/asset\/[^"]+)"/);
+        assert.ok(rev2Match && rev2Match[1], 'Initial message should resolve rev2 asset URL');
+        const rev2Url = rev2Match[1];
+
+        // 1) Click '<' (이전 이미지) button with NO data-* attributes -> must match exact button, call setChat(), switch image to rev1 and update counter to 1/2
+        const revClickRes = await fetch(`${baseUrl}/api/plugins/surface-action`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                charIndex: 0,
+                chatIndex: 0,
+                msgIndex: 1,
+                chatId: 'cid-rev-1',
+                actionHtml: '<button type="button" title="이전 이미지">&lt;</button>',
+                textContent: '<',
+                title: '이전 이미지',
+                siblingIndex: 0,
+            }),
+        }).then((r) => r.json());
+        assert.equal(revClickRes.ok, true, `Unexpected revClickRes: ${JSON.stringify(revClickRes)}`);
+        assert.equal(revClickRes.matchedLive, true);
+        assert.equal(revClickRes.openedOverlay, null, 'Revision switch must not pop up an overlay modal');
+
+        const updatedMsg = revClickRes.snapshot.messages.find((m) => m.chatId === 'cid-rev-1');
+        assert.ok(updatedMsg && updatedMsg.pluginFooterHtml.includes('1/2'), 'Footer counter must switch to 1/2');
+        const rev1Match = updatedMsg.html.match(/src="(\/api\/asset\/[^"]+)"/);
+        assert.ok(rev1Match && rev1Match[1] && rev1Match[1] !== rev2Url, 'Image URL must switch to rev1 after clicking <');
+        assert.ok(bridge.dbState.chat.message[1].data.includes('{{raw::rev1_asset}}'), 'setChat() must persist rev1 to host bridge');
+
+        // 2) Click generated image -> plugin mounts dedicated inspector overlay inside [data-am-floating-viewport]
+        const imgClickRes = await fetch(`${baseUrl}/api/plugins/surface-action`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                charIndex: 0,
+                chatIndex: 0,
+                msgIndex: 1,
+                chatId: 'cid-rev-1',
+                actionHtml: `<img class="x-risu-am-image__media" src="${rev1Match[1]}">`,
+                className: 'x-risu-am-image__media',
+            }),
+        }).then((r) => r.json());
+        assert.equal(imgClickRes.ok, true);
+        assert.equal(imgClickRes.matchedLive, true);
+        assert.ok(imgClickRes.openedOverlay && imgClickRes.openedOverlay.pluginName === 'AssetMaidInteractiveTest', 'Clicking image must open dedicated plugin overlay');
+        assert.ok(imgClickRes.openedOverlay.html.includes('am-inspector-modal'));
+        assert.ok(imgClickRes.openedOverlay.html.includes(rev1Match[1]), 'Overlay image token {{raw::rev1_asset}} must resolve to /api/asset/... URL');
+
+        // 3) Interact with input inside dedicated overlay GUI + close it via root-click
+        const inputRes = await fetch(`${baseUrl}/api/plugins/root-click`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                pluginName: 'AssetMaidInteractiveTest',
+                charIndex: 0,
+                chatIndex: 0,
+                selector: '#amPromptEditInp',
+                eventType: 'input',
+                value: 'edited prompt text',
+            }),
+        }).then((r) => r.json());
+        assert.equal(inputRes.ok, true);
+        assert.equal(inputRes.matchedLive, true);
+
+        const closeOverlayRes = await fetch(`${baseUrl}/api/plugins/root-click`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                pluginName: 'AssetMaidInteractiveTest',
+                charIndex: 0,
+                chatIndex: 0,
+                selector: '#amCloseInspectorBtn',
+                eventType: 'click',
+            }),
+        }).then((r) => r.json());
+        assert.equal(closeOverlayRes.ok, true);
+        assert.equal(closeOverlayRes.activeOverlay, null, 'Closing dedicated overlay must clear activeOverlay');
+
+        // 4) Plugin calling risuai.showContainer() opens full plugin GUI modal
+        const showContainerPlugin = `
+        //@name ShowContainerTest
+        //@display-name Show Container Plugin
+        //@api 3.0
+        (async () => {
+            const doc = await risuai.getRootDocument();
+            await doc.addEventListener('click', async (ev) => {
+                if (ev.target && ev.target.classList && ev.target.classList.contains('open-container-img')) {
+                    await risuai.showContainer();
+                }
+            });
+        })();
+        `;
+        await fetch(`${baseUrl}/api/plugins/upload`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ filename: 'ShowContainerTest.js', script: showContainerPlugin, enabled: true }),
+        }).then((r) => assert.equal(r.status, 200));
+
+        const showRes = await fetch(`${baseUrl}/api/plugins/surface-action`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                charIndex: 0,
+                chatIndex: 0,
+                actionHtml: '<img class="open-container-img" data-am-image-action="open" />',
+                dataset: { 'data-am-image-action': 'open' },
+                className: 'open-container-img',
+            }),
+        }).then((r) => r.json());
+        assert.ok(showRes.openPluginGui && showRes.openPluginGui.pluginName === 'ShowContainerTest', 'showContainer() must instruct UI to open plugin GUI modal');
+
+        // 5) Embedded client JS compiles cleanly and keeps data-pfm-open-gui omitted
+        const html = await fetch(`${baseUrl}/`).then((r) => r.text());
+        assert.ok(!html.includes('data-pfm-open-gui'));
+        assert.ok(html.includes('openPluginActionOverlayModal'));
+        const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
+        assert.ok(scriptMatch && scriptMatch[1]);
+        assert.doesNotThrow(() => new Function(scriptMatch[1]));
+    } finally {
+        await bridge.stop();
+        if (typeof relay.closeAllConnections === 'function') relay.closeAllConnections();
+        await closeServer(relay);
+        try { fs.rmSync(tmpCfgPath, { force: true }); } catch (_) {}
+        try { fs.rmSync(tmpPluginsPath, { force: true }); } catch (_) {}
+    }
+});

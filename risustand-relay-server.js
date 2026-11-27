@@ -20,6 +20,27 @@ const zlib = require('zlib');
 const { spawn } = require('child_process');
 const { parsePluginHeader, buildPluginGuiSrcdoc, createPluginAdapter } = require('./risustand-plugin-adapter.cjs');
 const { defaultImageGenConfig, normalizeImageGenConfig, sanitizeImageGenForClient, createImageProvider } = require('./risustand-image-provider.cjs');
+const {
+    TTS_PROVIDER_DEFAULTS,
+    TTS_ENDPOINT_PRESETS,
+    TTS_VOICE_GROUPS,
+    TTS_BUILTIN_VOICE_REFERENCES,
+    TTS_TONE_TAG_PRESETS,
+    normalizeVoiceGroup,
+    normalizeVoiceProfiles,
+    inferTtsVoiceGroup,
+    normalizeTtsEndpointUrl,
+    buildTtsChatKey,
+    getEffectiveTtsCharacters,
+    defaultTtsConfig,
+    normalizeTtsConfig,
+    sanitizeTtsForClient,
+    analyzeTtsSegments,
+    resolveSegmentVoice,
+    listTtsModels,
+    scanLocalTtsServers,
+    createTtsProvider,
+} = require('./risustand-tts-provider.cjs');
 const { createModuleAdapter } = require('./risustand-module-adapter.cjs');
 
 // Kept in sync with VERSION by tools/release_version.cjs
@@ -29,6 +50,7 @@ const TOKEN_PATH = path.join(ROOT_DIR, '.risustand-token');
 const CONFIG_PATH = path.join(ROOT_DIR, '.risustand-config.json');
 const PRESETS_PATH = path.join(ROOT_DIR, '.risustand-presets.json');
 const PLUGINS_PATH = path.join(ROOT_DIR, '.risustand-plugins.json');
+const THUMBS_DIR = process.env.RISUSTAND_THUMBS_DIR || path.join(ROOT_DIR, '.risustand-thumbs');
 let configPersistDisabled = false;
 
 function loadSavedPort(rootDir = ROOT_DIR) {
@@ -86,7 +108,9 @@ function defaultConfig() {
         presetToggles: [],
         backendPlugins: {},
         remoteDirectOnly: true,
+        botThumbs: {},
         imageGen: defaultImageGenConfig(),
+        tts: defaultTtsConfig(),
         profiles: [
             {
                 id: 'preset-openrouter',
@@ -141,6 +165,22 @@ function defaultConfig() {
     };
 }
 
+function normalizeBotThumbs(src) {
+    const out = {};
+    if (!src || typeof src !== 'object' || Array.isArray(src)) return out;
+    const fileRx = /^[a-f0-9]{24}\.(png|jpg|webp|gif)$/;
+    for (const [k, v] of Object.entries(src)) {
+        if (!k || k.length > 200 || !v || typeof v !== 'object' || Array.isArray(v)) continue;
+        const updatedAt = (typeof v.updatedAt === 'number' && Number.isFinite(v.updatedAt)) ? v.updatedAt : Date.now();
+        if (v.source === 'asset' && typeof v.path === 'string' && v.path && v.path.length <= 500) {
+            out[k] = { source: 'asset', path: v.path, updatedAt };
+        } else if (v.source === 'custom' && typeof v.file === 'string' && fileRx.test(v.file)) {
+            out[k] = { source: 'custom', file: v.file, updatedAt };
+        }
+    }
+    return out;
+}
+
 function loadConfig() {
     try {
         if (fs.existsSync(CONFIG_PATH)) {
@@ -175,7 +215,9 @@ function loadConfig() {
                 presetToggles: Array.isArray(raw.presetToggles) ? raw.presetToggles : [],
                 backendPlugins: (raw.backendPlugins && typeof raw.backendPlugins === 'object' && !Array.isArray(raw.backendPlugins)) ? raw.backendPlugins : {},
                 remoteDirectOnly: raw.remoteDirectOnly !== undefined ? Boolean(raw.remoteDirectOnly) : true,
+                botThumbs: normalizeBotThumbs(raw.botThumbs),
                 imageGen: normalizeImageGenConfig(raw.imageGen),
+                tts: normalizeTtsConfig(raw.tts),
                 translator: { ...def.translator, ...(raw.translator || {}) },
             };
         }
@@ -1223,6 +1265,105 @@ async function rebuildDisplayedSnapshot(baseSnap = state.baseSnapshot, adapter =
         messages: nextMessages,
     };
     return state.snapshot;
+}
+
+async function resolvePluginHtmlAssets(rawHtml, adapter = activePluginAdapter, baseSnap = state.baseSnapshot) {
+    let nextHtml = String(rawHtml || '');
+    if (!nextHtml) return '';
+    nextHtml = nextHtml.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '');
+    const assetPathsByName = {};
+    try {
+        if (adapter && typeof adapter.getTurnContext === 'function') {
+            const tCtx = adapter.getTurnContext();
+            const cAssets = tCtx && tCtx.charObj && Array.isArray(tCtx.charObj.additionalAssets) ? tCtx.charObj.additionalAssets : [];
+            for (const entry of cAssets) {
+                if (Array.isArray(entry) && entry[0] && entry[1]) assetPathsByName[String(entry[0])] = String(entry[1]);
+                else if (entry && typeof entry === 'object' && entry.name && (entry.key || entry.path)) assetPathsByName[String(entry.name)] = String(entry.key || entry.path);
+            }
+        }
+    } catch (_) {}
+
+    const resolveTokenUrl = async (rawToken) => {
+        const tok = String(rawToken || '').trim();
+        if (!tok) return '';
+        const mappedPath = assetPathsByName[tok] || '';
+        const tryPaths = /^assets\//i.test(tok) ? [tok] : (mappedPath ? [mappedPath, tok] : [tok]);
+        if (adapter && typeof adapter.readImage === 'function') {
+            for (const p of tryPaths) {
+                const bytes = await adapter.readImage(p);
+                if (bytes && bytes.length) {
+                    const dataUri = `data:image/png;base64,${Buffer.from(bytes).toString('base64')}`;
+                    return storeDataUriAsset(dataUri);
+                }
+            }
+        }
+        if (baseSnap && baseSnap.assetMap && typeof baseSnap.assetMap[tok] === 'string') {
+            return baseSnap.assetMap[tok];
+        }
+        return '';
+    };
+
+    const resolveInlayUrl = async (rawId) => {
+        if (!adapter || typeof adapter.readInlay !== 'function') return '';
+        const inlay = await adapter.readInlay(String(rawId || '').trim());
+        if (inlay && inlay.data && String(inlay.data).startsWith('data:image/')) {
+            return storeDataUriAsset(inlay.data);
+        }
+        return '';
+    };
+
+    if (/\{\{(?:inlay|inlayed|raw|img|asset|image)::/i.test(nextHtml)) {
+        nextHtml = await replaceAsync(
+            nextHtml,
+            /(\bsrc\s*=\s*)(?:"\{\{(?:inlay|inlayed)::([^}]+)\}\}"|'\{\{(?:inlay|inlayed)::([^}]+)\}\}'|\{\{(?:inlay|inlayed)::([^}]+)\}\})/gi,
+            async (_, prefix, d1, d2, d3) => {
+                const url = await resolveInlayUrl(d1 || d2 || d3);
+                return url ? `${prefix}"${url}"` : `${prefix}""`;
+            }
+        );
+        nextHtml = await replaceAsync(nextHtml, /\{\{(?:inlay|inlayed)::([^}]+)\}\}/gi, async (_, rawId) => {
+            const url = await resolveInlayUrl(rawId);
+            return url ? `<img class="msg-img" src="${url}" />` : '';
+        });
+        nextHtml = await replaceAsync(
+            nextHtml,
+            /(\bsrc\s*=\s*)(?:"\{\{(?:raw|img|asset|image)::([^}]+)\}\}"|'\{\{(?:raw|img|asset|image)::([^}]+)\}\}'|\{\{(?:raw|img|asset|image)::([^}]+)\}\})/gi,
+            async (_, prefix, d1, d2, d3) => {
+                const url = await resolveTokenUrl(d1 || d2 || d3);
+                return url ? `${prefix}"${url}"` : `${prefix}""`;
+            }
+        );
+        nextHtml = await replaceAsync(nextHtml, /\{\{raw::([^}]+)\}\}/gi, async (_, rawTok) => await resolveTokenUrl(rawTok));
+        nextHtml = await replaceAsync(nextHtml, /\{\{(?:img|asset|image)::([^}]+)\}\}/gi, async (_, rawTok) => {
+            const url = await resolveTokenUrl(rawTok);
+            return url ? `<img class="msg-img" src="${url}" />` : '';
+        });
+    }
+    nextHtml = nextHtml.replace(/<img\b([^>]*?)\bsrc\s*=\s*(?:"(data:image\/[^"]+)"|'(data:image\/[^']+)'|(data:image\/[^\s>]+))([^>]*)>/gi, (_, bAttr, d1, d2, d3, aAttr) => {
+        const rawUri = d1 || d2 || d3 || '';
+        const url = storeDataUriAsset(rawUri);
+        return `<img${bAttr} src="${url}"${aAttr}>`;
+    });
+    return nextHtml;
+}
+
+async function resolvePluginUiAssets(uiObj, adapter = activePluginAdapter, baseSnap = state.baseSnapshot) {
+    if (!uiObj || typeof uiObj !== 'object') return uiObj;
+    if (typeof uiObj.html === 'string') {
+        return {
+            ...uiObj,
+            html: await resolvePluginHtmlAssets(uiObj.html, adapter, baseSnap),
+        };
+    }
+    if (Array.isArray(uiObj.rootWidgets)) {
+        const nextWidgets = await Promise.all(uiObj.rootWidgets.map(async (w) => (
+            w && typeof w.html === 'string'
+                ? { ...w, html: await resolvePluginHtmlAssets(w.html, adapter, baseSnap) }
+                : w
+        )));
+        return { ...uiObj, rootWidgets: nextWidgets };
+    }
+    return uiObj;
 }
 
 function parseCookie(req, name) {
@@ -6185,7 +6326,7 @@ function renderWebApp() {
   }
   .book-tap-zone {
     position:absolute; top:0; bottom:0; width:12%; min-width:44px; max-width:100px;
-    z-index:6; cursor:pointer; background:transparent; user-select:none;
+    z-index:6; pointer-events:none; background:transparent; user-select:none;
   }
   .book-tap-left { left:0; }
   .book-tap-right { right:0; }
@@ -6198,7 +6339,19 @@ function renderWebApp() {
   .book-frame.single-page .book-columns { text-align:left; }
   .book-columns .msg-img-wrap { break-inside:avoid; max-width:100%; margin:10px auto; }
   .book-columns .msg-img { max-height:38vh; max-width:100%; width:auto; height:auto; }
-  .book-turn-tag { font-family: var(--ui-font); font-size:11px; color:var(--accent); margin-bottom:6px; font-weight:700; letter-spacing:0.04em; break-after:avoid; }
+  .book-turn-tag { font-family: var(--ui-font); font-size:11px; color:var(--accent); margin-bottom:6px; font-weight:700; letter-spacing:0.04em; break-after:avoid; display:inline-flex; align-items:center; gap:6px; position:relative; z-index:8; }
+  .turn-tts-btn {
+    display:inline-flex; align-items:center; justify-content:center;
+    width:20px; height:20px; padding:0; border:none; border-radius:999px;
+    background:transparent; color:var(--sub); cursor:pointer;
+    position:relative; z-index:8; flex-shrink:0; pointer-events:auto;
+    transition: background 0.15s ease, color 0.15s ease, transform 0.12s ease;
+  }
+  .turn-tts-btn:hover { background: var(--accent-soft); color: var(--accent); }
+  .turn-tts-btn:active { transform: scale(0.92); }
+  .turn-tts-btn.is-loading { color: var(--accent); background: var(--accent-soft); animation: rsTtsPulse 1s ease-in-out infinite; }
+  .turn-tts-btn.is-playing { color: var(--on-accent); background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  @keyframes rsTtsPulse { 0%, 100% { opacity: 0.45; } 50% { opacity: 1; } }
   .book-user-block { background:var(--user-bg); color:var(--user-text); padding:10px 14px; border-radius:8px; border-left:3px solid var(--accent); margin:10px 0 16px; text-align:left; break-inside:avoid; }
   .book-char-block { margin:6px 0 18px; }
   .book-char-block .msg-actions { opacity:1; flex-wrap:wrap; align-items:center; }
@@ -6628,11 +6781,12 @@ function renderWebApp() {
     font-size:12px; font-weight:600; cursor:pointer;
   }
   .rs-pbb-btn:hover { border-color:var(--accent); color:var(--accent); }
-  #sceneCtrlModal {
+  #sceneCtrlModal, #ttsCastModal {
     position:fixed; inset:0; z-index:168; background:rgba(0,0,0,0.68);
     -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
     display:flex; align-items:center; justify-content:center; padding:12px;
   }
+  #ttsCastModal { z-index:169; }
   .scene-ctrl-dialog {
     width:min(760px, 96vw); max-height:min(88dvh, 780px);
     background:var(--elev); color:var(--text);
@@ -6735,8 +6889,9 @@ function renderWebApp() {
   .rs-pfm-stage button, .rs-pfm-stage [role="button"], .rs-pfm-stage [data-am-runtime-generation-count-action] {
     pointer-events:auto !important; cursor:pointer;
   }
-  body.asset-hide #pluginFloatingModal img { display:none !important; }
-  body.asset-blur #pluginFloatingModal img { filter:blur(14px); }
+  body.asset-hide #pluginFloatingModal:not(.is-action-overlay) img { display:none !important; }
+  body.asset-blur #pluginFloatingModal:not(.is-action-overlay) img { filter:blur(14px); }
+  #pluginFloatingModal.is-action-overlay img { max-width:100%; height:auto; }
 
   /* ===== Asset Maid Per-Message Manual Illustration Footer & Chat Projections ===== */
   @keyframes x-risu-am-spin { to { transform: rotate(360deg); } }
@@ -6944,9 +7099,91 @@ function renderWebApp() {
 
   .bot-item { background:var(--elev); border:1px solid var(--border); border-radius:var(--radius); overflow:hidden; box-shadow: var(--shadow-sm); transition: border-color 0.15s ease; }
   .bot-item:hover { border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
-  .bot-head { padding:13px 14px; min-height:54px; display:flex; align-items:center; justify-content:space-between; gap:10px; cursor:pointer; }
-  .bot-head > div:first-child { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .bot-head { padding:11px 14px; min-height:66px; display:flex; align-items:center; justify-content:space-between; gap:10px; cursor:pointer; }
+  .bot-head-main { display:flex; align-items:center; gap:12px; min-width:0; flex:1; }
+  .bot-head-meta { min-width:0; flex:1; }
+  .bot-head-title { font-weight:700; font-size:14.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .bot-head-sub { font-size:11.5px; color:var(--sub); margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   .bot-head > div:last-child { flex-shrink:0; }
+  .bot-thumb {
+    position:relative; width:52px; height:52px; border-radius:12px; overflow:hidden; flex-shrink:0;
+    display:flex; align-items:center; justify-content:center;
+    border:1px solid var(--border); background:var(--surface2);
+  }
+  .bot-thumb.xs { width:28px; height:28px; border-radius:8px; }
+  .bot-thumb.sm { width:40px; height:40px; border-radius:10px; }
+  .bot-thumb.lg { width:62px; height:62px; border-radius:14px; }
+  .bot-thumb-ph {
+    width:100%; height:100%; display:flex; align-items:center; justify-content:center;
+    font-weight:800; font-size:18px; color:#fff; text-shadow:0 1px 2px rgba(0,0,0,0.28); user-select:none;
+  }
+  .bot-thumb.xs .bot-thumb-ph { font-size:12px; }
+  .bot-thumb.sm .bot-thumb-ph { font-size:15px; }
+  .bot-thumb.lg .bot-thumb-ph { font-size:22px; }
+  .bot-thumb-img {
+    position:absolute; inset:0; width:100%; height:100%;
+    object-fit:cover; object-position:center top; display:block;
+    transition:filter 0.18s ease, transform 0.18s ease;
+  }
+  .hdr-avatar-wrap { flex-shrink:0; }
+  #hdrHomeTitle { display:none; }
+  body.tab-home-active #hdrHomeTitle { display:block; }
+  body.tab-home-active #hdrAvatar,
+  body.tab-home-active #hdrChar,
+  body.tab-home-active .h-sub-row { display:none !important; }
+  body.tab-home-active #sceneCtrlQuickBtn,
+  body.tab-home-active #reqLogQuickBtn,
+  body.tab-home-active #assetCycleBtn,
+  body.tab-home-active #autoTrBtn,
+  body.tab-home-active #zenModeBtn { display:none !important; }
+  body:not(.tab-chat-active) #ttsCastQuickBtn { display:none !important; }
+  .home-status-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:8px; }
+  .home-stat-pill { background:var(--bg); border:1px solid var(--border); border-radius:12px; padding:9px 11px; min-width:0; }
+  .home-stat-pill .k { font-size:11px; font-weight:700; color:var(--sub); margin-bottom:3px; }
+  .home-stat-pill .v { font-size:13px; font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .home-resume-card {
+    display:flex; align-items:center; gap:14px; cursor:pointer;
+    border:1px solid color-mix(in srgb, var(--accent) 36%, var(--border));
+    background:linear-gradient(135deg, var(--accent-soft), var(--elev));
+  }
+  .home-resume-card:hover { border-color:var(--accent); }
+  .home-recent-list { display:flex; flex-direction:column; gap:7px; }
+  .home-recent-row {
+    display:flex; align-items:center; gap:11px; padding:9px 11px; border-radius:12px;
+    border:1px solid var(--border); background:var(--bg); cursor:pointer;
+    transition:border-color 0.15s ease, background 0.15s ease;
+  }
+  .home-recent-row:hover { border-color:var(--accent); background:var(--surface); }
+  .home-shortcuts { display:flex; flex-wrap:wrap; gap:8px; }
+  .home-hint-details {
+    margin:0; padding:10px 12px; border-radius:12px; border:1px solid var(--border);
+    background:var(--surface); font-size:12px; color:var(--sub); line-height:1.55;
+  }
+  .home-hint-details summary { cursor:pointer; font-weight:700; color:var(--text); }
+  #thumbPickerModal {
+    position:fixed; inset:0; z-index:172; background:rgba(0,0,0,0.68);
+    -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
+    display:flex; align-items:center; justify-content:center; padding:12px;
+  }
+  .thumb-picker-dialog {
+    width:min(760px, 96vw); max-height:min(88dvh, 780px);
+    background:var(--elev); color:var(--text);
+    border:1px solid var(--border); border-radius:18px; box-shadow:var(--shadow);
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  .thumb-picker-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(104px, 1fr)); gap:10px; }
+  .thumb-asset-tile {
+    display:flex; flex-direction:column; gap:5px; padding:6px; border-radius:12px;
+    border:1px solid var(--border); background:var(--bg); cursor:pointer; text-align:left; color:var(--text);
+    transition:border-color 0.15s ease;
+  }
+  .thumb-asset-tile:hover { border-color:var(--accent); }
+  .thumb-asset-tile img {
+    width:100%; aspect-ratio:1/1; object-fit:cover; object-position:center top;
+    border-radius:8px; background:var(--surface); display:block;
+  }
+  .thumb-asset-name { font-size:11.5px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .thumb-asset-kind { font-size:10px; color:var(--sub); }
   .badge { display:inline-flex; align-items:center; font-size:11px; padding:3px 8px; border-radius:999px; background:var(--surface2); color:var(--sub); font-weight:700; white-space:nowrap; }
   .badge.pc { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
   .chat-list { border-top:1px solid var(--border); background:var(--surface); padding:8px; display:flex; flex-direction:column; gap:6px; }
@@ -7063,16 +7300,85 @@ function renderWebApp() {
     }
     #tab-modules .panel-title, #tab-router .panel-title { grid-column: 1 / -1; }
     #reqLogCard { grid-column: 1 / -1; }
-    #tab-bots { --content-w: 760px; }
+    #tab-home { --content-w: 760px; }
     .composer { margin-bottom: 16px; }
   }
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
   }
+
+  /* ===== Floating TTS Mini Player & Cast List ===== */
+  #ttsPlayerBar {
+    position:fixed; left:50%; bottom:calc(126px + env(safe-area-inset-bottom)); transform:translateX(-50%);
+    z-index:45; width:min(580px, calc(100vw - 20px));
+    background:var(--elev); border:1px solid var(--border); border-radius:18px;
+    box-shadow:var(--shadow); padding:8px 12px; display:none; flex-direction:column; gap:6px;
+    -webkit-backdrop-filter: saturate(160%) blur(14px); backdrop-filter: saturate(160%) blur(14px);
+  }
+  #ttsPlayerBar.show { display:flex; animation: rsFade 0.18s ease; }
+  @media (min-width: 900px) {
+    #ttsPlayerBar { left:calc(50% + 46px); bottom:calc(82px + env(safe-area-inset-bottom)); }
+  }
+  .tts-bar-top { display:flex; align-items:center; justify-content:space-between; gap:8px; min-width:0; }
+  .tts-bar-meta { display:flex; align-items:center; gap:6px; min-width:0; flex:1; }
+  .tts-kind-badge {
+    font-size:11px; font-weight:700; padding:2px 7px; border-radius:999px; flex-shrink:0;
+    background:var(--accent-soft); color:var(--accent);
+  }
+  .tts-kind-badge.thought { background: color-mix(in srgb, var(--sub) 18%, transparent); color:var(--text); }
+  .tts-kind-badge.narration { background: var(--surface); color:var(--sub); border:1px solid var(--border); }
+  .tts-bar-speaker { font-size:12px; font-weight:700; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .tts-bar-tone { font-size:11px; color:var(--sub); white-space:nowrap; }
+  .tts-bar-preview {
+    font-size:12px; color:var(--sub); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+    line-height:1.35;
+  }
+  .tts-bar-ctrls { display:flex; align-items:center; gap:4px; flex-shrink:0; }
+  .tts-bar-btn {
+    min-width:28px; height:28px; padding:0 8px; border-radius:999px;
+    border:1px solid var(--border); background:var(--surface); color:var(--text);
+    font-size:12px; font-weight:600; cursor:pointer; display:inline-flex; align-items:center; justify-content:center;
+  }
+  .tts-bar-btn:hover { border-color:var(--accent); color:var(--accent); }
+  .tts-bar-btn.primary { background:var(--accent); color:var(--on-accent); border-color:transparent; }
+  .tts-cast-list { display:flex; flex-direction:column; gap:6px; margin-top:8px; }
+  .tts-cast-item {
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+    padding:8px 10px; border:1px solid var(--border); border-radius:10px; background:var(--bg);
+  }
+  .tts-subbox {
+    margin-top:10px; padding:10px 12px; border:1px solid var(--border); border-radius:12px;
+    background: color-mix(in srgb, var(--surface) 55%, transparent);
+  }
+  .tts-subbox-title { font-size:12.5px; font-weight:800; color:var(--text); margin-bottom:6px; display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+  .tts-voice-tier { display:grid; grid-template-columns:minmax(122px, 0.92fr) minmax(0, 1.48fr); gap:6px; }
+  .tts-vp-tabs { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:8px; }
+  .tts-vp-chips { display:flex; gap:5px; flex-wrap:wrap; margin-top:6px; }
+  @media (max-width: 520px) {
+    .tts-voice-tier { grid-template-columns:1fr; }
+  }
 </style>
 </head>
-<body class="tab-chat-active">
+<body class="tab-home-active">
 <div id="toast" role="status" aria-live="polite"></div>
+<div id="ttsPlayerBar" role="region" aria-label="TTS 재생기">
+  <div class="tts-bar-top">
+    <div class="tts-bar-meta">
+      <span class="tts-kind-badge" id="ttsBarKind">💬 대화</span>
+      <span class="tts-bar-speaker" id="ttsBarSpeaker">준비 중</span>
+      <span class="tts-bar-tone" id="ttsBarTone"></span>
+    </div>
+    <div class="tts-bar-ctrls">
+      <button type="button" class="tts-bar-btn" id="ttsPrevSegBtn" title="이전 구간">⏮</button>
+      <button type="button" class="tts-bar-btn primary" id="ttsPauseBtn" title="일시정지/재개">⏸</button>
+      <button type="button" class="tts-bar-btn" id="ttsNextSegBtn" title="다음 구간">⏭</button>
+      <button type="button" class="tts-bar-btn" id="ttsRateBtn" title="재생 속도">1.0x</button>
+      <button type="button" class="tts-bar-btn" id="ttsCfgJumpBtn" title="TTS 설정">⚙️</button>
+      <button type="button" class="tts-bar-btn" id="ttsStopBtn" title="정지">✕</button>
+    </div>
+  </div>
+  <div class="tts-bar-preview" id="ttsBarPreview">...</div>
+</div>
 <div id="botBgHost" class="rs-bg-host rs-bot-html"></div>
 <div id="bookBotOverlay" class="bot-menu-collapsed"></div>
 <div id="rsMiniBar" class="minimized" style="display:none;" aria-label="리스스탠드 플로팅 미니바"></div>
@@ -7083,6 +7389,8 @@ function renderWebApp() {
 <div id="pluginGuiModal" style="display:none;" role="dialog" aria-modal="true" aria-label="플러그인 GUI"></div>
 <div id="pluginFloatingModal" style="display:none;" role="dialog" aria-modal="true" aria-label="플러그인 플로팅 컨트롤"></div>
 <div id="sceneCtrlModal" style="display:none;" role="dialog" aria-modal="true" aria-label="장면·삽화 제어함"></div>
+<div id="ttsCastModal" style="display:none;" role="dialog" aria-modal="true" aria-label="이 채팅방 캐릭터 보이스 설정"></div>
+<div id="thumbPickerModal" style="display:none;" role="dialog" aria-modal="true" aria-label="봇 썸네일 변경"></div>
 
 <div id="login">
   <div class="login-card">
@@ -7097,9 +7405,11 @@ function renderWebApp() {
 
 <div id="app" style="display:none;">
   <header>
-    <div class="h-left" onclick="switchTab('bots')" style="cursor:pointer;" title="봇/채팅방 목록">
+    <div class="h-left" onclick="switchTab('home')" style="cursor:pointer;" title="홈으로">
       <span class="dot" id="pcDot"></span>
+      <div id="hdrAvatar" class="hdr-avatar-wrap" style="display:none;"></div>
       <div style="min-width:0; flex:1;">
+        <div class="h-title" id="hdrHomeTitle">RisuStand</div>
         <div class="h-title" id="hdrChar">연결 중...</div>
         <div class="h-sub-row">
           <div class="h-sub" id="hdrSub">-</div>
@@ -7108,6 +7418,7 @@ function renderWebApp() {
       </div>
     </div>
     <div class="h-right">
+      <button class="pill icon-pill" id="ttsCastQuickBtn" title="이 채팅방 캐릭터 보이스 설정" aria-label="캐릭터 보이스 설정">🎙️</button>
       <button class="pill icon-pill" id="sceneCtrlQuickBtn" title="장면·삽화 제어함" aria-label="장면·삽화 제어함">🎨</button>
       <button class="pill icon-pill" id="reqLogQuickBtn" title="리퀘스트 로그 보기" aria-label="리퀘스트 로그">📜</button>
       <button class="pill icon-pill" id="assetCycleBtn" title="에셋 표시 / 가리기 / 감추기" aria-label="에셋 표시 모드">🖼️</button>
@@ -7169,23 +7480,27 @@ function renderWebApp() {
   </div>
 
   <!-- TAB 1: CHAT / EPUB READER -->
-  <section class="panel active" id="tab-chat"></section>
-  <div class="composer" id="composerBar">
+  <section class="panel" id="tab-chat"></section>
+  <div class="composer" id="composerBar" style="display:none;">
     <button class="pill" id="inTrBtn" title="입력 한→영 자동 번역">한→영</button>
     <textarea id="msgInput" rows="1" placeholder="메시지를 입력하세요..."></textarea>
     <button class="send-btn" id="sendBtn">전송</button>
   </div>
 
-  <!-- TAB 2: BOTS & CHATS -->
-  <section class="panel" id="tab-bots">
-    <div class="panel-title">봇 · 채팅방</div>
+  <!-- TAB 2: HOME (DASHBOARD & BOT LIBRARY) -->
+  <section class="panel active" id="tab-home">
+    <div id="homeTopArea" style="display:flex; flex-direction:column; gap:12px;"></div>
+    <div class="panel-title" style="margin-top:4px;">봇 서재</div>
     <div style="display:flex; gap:8px;">
       <input class="search-inp" id="botSearch" placeholder="봇 이름 검색..." />
       <button class="btn sec" id="refreshAllBtn" style="flex-shrink:0;">새로고침</button>
     </div>
-    <div class="hint" style="margin-top:0;">
-      PC RisuAI에 현재 열려 있는 봇은 <b>PC 활성</b>(<code>risuai.sendChat()</code>)으로 동작합니다. PC가 홈 화면이거나 다른 봇을 열어 둔 상태에서는 <b>원격 라우팅</b>으로 동작하며, <b>[🧩 모듈/설정]</b>의 <b>백엔드 플러그인 어댑터</b>에서 켠 RisuAI v3 플러그인들이 RisuAI <code>pluginStorage</code>·<code>DB</code>에 직접 연결되어 동작합니다. (어댑터에 켜지 않은 다른 RisuAI 플러그인은 PC 활성 상태에서만 동작합니다.)
-    </div>
+    <details class="home-hint-details">
+      <summary>ℹ️ 동작 방식 안내</summary>
+      <div style="margin-top:6px;">
+        PC RisuAI에 현재 열려 있는 봇은 <b>PC 활성</b>(<code>risuai.sendChat()</code>)으로 동작합니다. PC가 홈 화면이거나 다른 봇을 열어 둔 상태에서는 <b>원격 라우팅</b>으로 동작하며, <b>[🧩 모듈/설정]</b>의 <b>백엔드 플러그인 어댑터</b>에서 켠 RisuAI v3 플러그인들이 RisuAI <code>pluginStorage</code>·<code>DB</code>에 직접 연결되어 동작합니다. (어댑터에 켜지 않은 다른 RisuAI 플러그인은 PC 활성 상태에서만 동작합니다.)
+      </div>
+    </details>
     <div id="botList" style="display:flex; flex-direction:column; gap:8px;"></div>
   </section>
 
@@ -7509,6 +7824,245 @@ function renderWebApp() {
       <div class="btn-row"><button type="button" class="btn" id="saveImgGenBtn">💾 삽화 설정 저장</button></div>
     </div>
 
+    <div class="card" id="ttsConfigCard">
+      <h3>
+        <span>🔊 멀티 캐릭터 · 톤 TTS 설정</span>
+        <label class="chk-row" style="margin:0; padding:0; border:none; font-size:12px; gap:6px;">
+          <span>아이콘 표시</span>
+          <input type="checkbox" id="ttsEnabledChk" checked />
+        </label>
+      </h3>
+      <label class="f-label" style="margin-top:4px;">간편 엔드포인트 프리셋 · 로컬 서버 탐색</label>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <select class="f-inp" id="ttsEndpointPresetSel" style="flex:1; min-width:0;">
+          <option value="">-- 빠른 프리셋 선택 --</option>
+          <option value="fish_local_8081">Fish Speech S2-Pro 로컬 (127.0.0.1:8081)</option>
+          <option value="fish_local_8080">Fish Speech 로컬 기본 (127.0.0.1:8080)</option>
+          <option value="localai_8080">LocalAI 로컬 허브 (127.0.0.1:8080)</option>
+          <option value="qwen3_8881">Qwen3-TTS FastAPI 로컬 (127.0.0.1:8881)</option>
+          <option value="vllm_8000">vLLM-Omni / TTS-WebUI 로컬 (127.0.0.1:8000)</option>
+          <option value="fish_cloud">Fish Audio Cloud (상용 · api.fish.audio)</option>
+          <option value="openai_cloud">OpenAI TTS (상용 · gpt-4o-mini-tts)</option>
+        </select>
+        <button type="button" class="btn sec" id="ttsDiscoverBtn" style="flex-shrink:0;">🔍 로컬 자동 탐색</button>
+      </div>
+      <select class="f-inp" id="ttsDiscoveredPick" style="display:none; margin-top:6px;"></select>
+      <div class="hint" id="ttsDiscoverStatus" style="margin-top:4px;"></div>
+
+      <label class="f-label" style="margin-top:6px;">TTS 엔진 프로바이더</label>
+      <select class="f-inp" id="ttsProviderSel">
+        <option value="fish_local">Fish Speech 로컬 (기본 · /v1/tts · Pinokio / api_server)</option>
+        <option value="openai_compat_local">OpenAI 호환 로컬 허브 (/v1/audio/speech · LocalAI / TTS-WebUI / vLLM-Omni / Qwen3-TTS)</option>
+        <option value="fish_cloud">Fish Audio Cloud (상용 · api.fish.audio)</option>
+        <option value="openai_compat_cloud">OpenAI TTS / 호환 상용 API (gpt-4o-mini-tts)</option>
+      </select>
+      <div class="hint" id="ttsProviderHint" style="margin-top:5px;">
+        Windows에서는 <b>Pinokio</b>(Fish Speech 원클릭 설치)나 <b>LocalAI / TTS-WebUI</b>를 켜고 아래 로컬 주소에 연결하면 Ollama처럼 모델을 서빙할 수 있습니다.
+      </div>
+      <label class="f-label">엔드포인트 URL (<code>127.0.0.1:8081</code>처럼 주소:포트만 입력해도 경로 자동 완성)</label>
+      <input class="f-inp" id="ttsApiUrl" placeholder="http://127.0.0.1:8081/v1/tts" />
+      <label class="f-label">API 키 (로컬 서버는 비워도 됨 · 비우면 기존 키 유지)</label>
+      <input class="f-inp" id="ttsApiKey" type="password" placeholder="Fish Audio / OpenAI API Key" />
+      <label class="f-label">모델 ID</label>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <input class="f-inp" id="ttsModel" placeholder="s2-pro" style="flex:1; min-width:0;" />
+        <button type="button" class="btn sec" id="ttsLoadModelsBtn" style="flex-shrink:0;">🔄 모델 불러오기</button>
+      </div>
+      <select class="f-inp" id="ttsModelPick" style="display:none; margin-top:6px;"></select>
+      <div class="hint" id="ttsModelStatus" style="margin-top:4px;"></div>
+      <label class="f-label">오디오 포맷</label>
+      <select class="f-inp" id="ttsFormat">
+        <option value="mp3">MP3 (기본 · 가벼움)</option>
+        <option value="wav">WAV (무손실)</option>
+        <option value="opus">Opus</option>
+      </select>
+      <datalist id="ttsVoiceDatalist"></datalist>
+      <div class="grid-2">
+        <div>
+          <label class="f-label">화자·속마음·지문 분리 방식</label>
+          <select class="f-inp" id="ttsParseMode">
+            <option value="hybrid">하이브리드 (LLM 대본분석 + 규칙 폴백)</option>
+            <option value="llm">LLM 대본 분석 전용 (다중 화자·성별 정확도)</option>
+            <option value="rule">규칙 기반 즉시 파싱 (0초 · 무비용)</option>
+          </select>
+        </div>
+        <div>
+          <label class="f-label">대본 분석용 LLM</label>
+          <select class="f-inp" id="ttsLlmSource">
+            <option value="translator">번역기 모델 공용 (추천 · 저비용)</option>
+            <option value="active">메인 활성 프로필 사용</option>
+            <option value="aux">보조(Aux) 프로필 사용</option>
+          </select>
+        </div>
+      </div>
+      <div id="ttsFishTagRow">
+        <label class="f-label">Fish 감정/톤 태그 문법</label>
+        <select class="f-inp" id="ttsFishTagStyle">
+          <option value="brackets">대괄호 [whispering] (Fish S2 권장)</option>
+          <option value="parens">소괄호 (whispering) (Fish S1 구버전)</option>
+          <option value="none">태그 삽입 안 함</option>
+        </select>
+      </div>
+
+      <div class="tts-subbox" id="ttsVoiceProfilesBox">
+        <div class="tts-subbox-title">
+          <span>📚 보이스 레퍼런스 프로필 관리 (Fish / OpenAI·Qwen)</span>
+          <button type="button" class="pill" id="ttsVpFetchBtn">🔄 이 영역 서버에서 불러오기</button>
+        </div>
+        <div class="tts-vp-tabs">
+          <button type="button" class="pill active" data-vp-tab="fish">🐟 Fish 레퍼런스</button>
+          <button type="button" class="pill" data-vp-tab="openai_qwen">🎙️ OpenAI / Qwen 레퍼런스</button>
+        </div>
+        <div id="ttsVpList" class="tts-cast-list" style="margin-top:0;"></div>
+        <div id="ttsVpLiveBox" style="display:none; margin-top:6px;">
+          <div class="hint" id="ttsVpLiveTitle" style="margin-top:0;">서버에서 불러온 보이스 (클릭해 프로필에 저장)</div>
+          <div class="tts-vp-chips" id="ttsVpLiveChips"></div>
+        </div>
+        <div class="grid-2" style="margin-top:8px;">
+          <div><label class="f-label" style="margin-top:0;">프로필 이름 (라벨)</label><input class="f-inp" id="ttsVpLabelInp" placeholder="예: 시은 / 차분한 여성" /></div>
+          <div>
+            <label class="f-label" style="margin-top:0;">기본 성별</label>
+            <select class="f-inp" id="ttsVpGenderSel">
+              <option value="female">👩 여성 (♀)</option>
+              <option value="male">👨 남성 (♂)</option>
+              <option value="neutral">중성/기타</option>
+            </select>
+          </div>
+        </div>
+        <label class="f-label" style="margin-top:6px;">Voice / Reference ID</label>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <input class="f-inp" id="ttsVpIdInp" list="ttsVoiceDatalist" placeholder="Fish reference_id 또는 OpenAI/Qwen voice" style="flex:1; min-width:0;" />
+          <button type="button" class="btn sec" id="ttsVpAddBtn" style="flex-shrink:0;">+ 프로필 저장</button>
+        </div>
+        <div class="hint" id="ttsVpStatus" style="margin-top:5px;">Fish 영역과 OpenAI/Qwen 영역을 나눠 레퍼런스 ID를 미리 저장하면 2단계 드롭다운에서 바로 선택할 수 있습니다.</div>
+      </div>
+
+      <div class="tts-subbox">
+        <div class="tts-subbox-title"><span>📖 나레이션 (일반 지문) 보이스 · 톤</span></div>
+        <label class="f-label" style="margin-top:2px;">Voice / Reference ID (1단계: 엔진 영역 → 2단계: 보이스 ID)</label>
+        <div class="tts-voice-tier">
+          <select class="f-inp" id="ttsNarVoiceGroupSel" aria-label="나레이션 보이스 영역"></select>
+          <select class="f-inp" id="ttsNarVoiceRefSel" aria-label="나레이션 보이스 레퍼런스"></select>
+        </div>
+        <input class="f-inp" id="ttsNarVoiceId" list="ttsVoiceDatalist" placeholder="비우면 서버 기본 음성 (직접 입력 가능)" style="margin-top:6px;" />
+        <div class="grid-2">
+          <div>
+            <label class="f-label" style="margin-top:4px;">기본 톤 태그</label>
+            <select class="f-inp" id="ttsNarToneTagSel" aria-label="나레이션 기본 톤 태그"></select>
+            <input class="f-inp" id="ttsNarToneTag" placeholder="직접 톤 태그 입력 (예: calm)" style="margin-top:4px; display:none;" />
+          </div>
+          <div><label class="f-label" style="margin-top:4px;">속도 (0.5~2.0)</label><input class="f-inp" id="ttsNarSpeed" type="number" step="0.02" min="0.5" max="2.0" /></div>
+        </div>
+        <label class="f-label" style="margin-top:4px;">톤 지시어 (OpenAI/Qwen3용)</label>
+        <input class="f-inp" id="ttsNarInstr" placeholder="차분한 나레이터 톤" />
+      </div>
+
+      <div class="tts-subbox">
+        <div class="tts-subbox-title"><span>👥 기본 성별 보이스 풀 (미등록 캐릭터 자동 배정)</span></div>
+        <label class="f-label" style="margin-top:2px;">👩 여성 기본 Voice ID (영역 → 레퍼런스)</label>
+        <div class="tts-voice-tier">
+          <select class="f-inp" id="ttsFemVoiceGroupSel" aria-label="여성 보이스 영역"></select>
+          <select class="f-inp" id="ttsFemVoiceRefSel" aria-label="여성 보이스 레퍼런스"></select>
+        </div>
+        <input class="f-inp" id="ttsFemVoiceId" list="ttsVoiceDatalist" placeholder="Reference ID / Voice (직접 입력 가능)" style="margin-top:6px;" />
+
+        <label class="f-label" style="margin-top:8px;">👨 남성 기본 Voice ID (영역 → 레퍼런스)</label>
+        <div class="tts-voice-tier">
+          <select class="f-inp" id="ttsMaleVoiceGroupSel" aria-label="남성 보이스 영역"></select>
+          <select class="f-inp" id="ttsMaleVoiceRefSel" aria-label="남성 보이스 레퍼런스"></select>
+        </div>
+        <input class="f-inp" id="ttsMaleVoiceId" list="ttsVoiceDatalist" placeholder="Reference ID / Voice (직접 입력 가능)" style="margin-top:6px;" />
+
+        <label class="f-label" style="margin-top:8px;">중성/기타 기본 Voice ID (영역 → 레퍼런스)</label>
+        <div class="tts-voice-tier">
+          <select class="f-inp" id="ttsNeuVoiceGroupSel" aria-label="중성 보이스 영역"></select>
+          <select class="f-inp" id="ttsNeuVoiceRefSel" aria-label="중성 보이스 레퍼런스"></select>
+        </div>
+        <input class="f-inp" id="ttsNeuVoiceId" list="ttsVoiceDatalist" placeholder="Reference ID / Voice (직접 입력 가능)" style="margin-top:6px;" />
+
+        <div class="grid-2">
+          <div>
+            <label class="f-label" style="margin-top:6px;">여성 속마음 톤 태그</label>
+            <select class="f-inp" id="ttsFemThoughtTagSel" aria-label="여성 속마음 톤 태그"></select>
+            <input class="f-inp" id="ttsFemThoughtTag" placeholder="whispering" style="margin-top:4px; display:none;" />
+          </div>
+          <div>
+            <label class="f-label" style="margin-top:6px;">남성 속마음 톤 태그</label>
+            <select class="f-inp" id="ttsMaleThoughtTagSel" aria-label="남성 속마음 톤 태그"></select>
+            <input class="f-inp" id="ttsMaleThoughtTag" placeholder="whispering" style="margin-top:4px; display:none;" />
+          </div>
+        </div>
+        <label class="f-label" style="margin-top:6px;">기본 속마음 속도</label>
+        <input class="f-inp" id="ttsDefThoughtSpeed" type="number" step="0.02" min="0.5" max="2.0" />
+      </div>
+
+      <div class="hint" style="margin-top:8px;">
+        🎭 <b>개별 캐릭터 보이스 설정</b>은 채팅방 화면 상단바의 <b>🎙️</b> 버튼을 눌러 채팅방별로 설정합니다.
+      </div>
+
+      <div class="tts-subbox">
+        <div class="tts-subbox-title"><span>🎧 속마음 · 나레이션 Web Audio 음향 구분</span></div>
+        <label class="chk-row" style="margin-top:2px;">
+          <span>속마음 전용 음향 효과 (내면 잔향 + 저역통과 필터)</span>
+          <input type="checkbox" id="ttsFxEnabledChk" checked />
+        </label>
+        <div class="grid-2">
+          <div><label class="f-label" style="margin-top:4px;">속마음 잔향 강도 (0~1)</label><input class="f-inp" id="ttsFxReverbInp" type="number" step="0.05" min="0" max="1" /></div>
+          <div><label class="f-label" style="margin-top:4px;">속마음 필터 Hz (600~12000)</label><input class="f-inp" id="ttsFxFilterInp" type="number" step="100" min="600" max="12000" /></div>
+        </div>
+        <div class="grid-2">
+          <div><label class="f-label" style="margin-top:4px;">속마음 재생 배속</label><input class="f-inp" id="ttsFxThRateInp" type="number" step="0.02" min="0.6" max="1.4" /></div>
+          <div><label class="f-label" style="margin-top:4px;">나레이션 재생 배속</label><input class="f-inp" id="ttsFxNarRateInp" type="number" step="0.02" min="0.6" max="1.4" /></div>
+        </div>
+      </div>
+
+      <div class="tts-subbox" id="ttsTestBox">
+        <div class="tts-subbox-title">
+          <span>🧪 TTS 연결 · 음성 테스트</span>
+          <div style="display:flex; gap:4px; flex-wrap:wrap;">
+            <button type="button" class="pill" data-tts-sample="dialogue">💬 대화</button>
+            <button type="button" class="pill" data-tts-sample="thought">💭 속마음</button>
+            <button type="button" class="pill" data-tts-sample="narration">📖 나레이션</button>
+          </div>
+        </div>
+        <label class="f-label" style="margin-top:2px;">예시 텍스트 (직접 수정 가능)</label>
+        <textarea class="f-inp" id="ttsTestTextInp" rows="2">안녕하세요. 지금 들리는 목소리와 톤이 자연스러운가요?</textarea>
+        <div class="grid-2">
+          <div>
+            <label class="f-label" style="margin-top:4px;">발화 유형</label>
+            <select class="f-inp" id="ttsTestKindSel">
+              <option value="dialogue">💬 대화 (Dialogue)</option>
+              <option value="thought">💭 속마음 (Inner Thought)</option>
+              <option value="narration">📖 나레이션 (Narration)</option>
+            </select>
+          </div>
+          <div>
+            <label class="f-label" style="margin-top:4px;">테스트 성별</label>
+            <select class="f-inp" id="ttsTestGenderSel">
+              <option value="female">👩 여성 (♀)</option>
+              <option value="male">👨 남성 (♂)</option>
+              <option value="neutral">중성/기타</option>
+            </select>
+          </div>
+        </div>
+        <label class="f-label" style="margin-top:4px;">테스트 Voice / Reference ID (선택 · 1단계 영역 → 2단계 ID)</label>
+        <div class="tts-voice-tier">
+          <select class="f-inp" id="ttsTestVoiceGroupSel" aria-label="테스트 보이스 영역"></select>
+          <select class="f-inp" id="ttsTestVoiceRefSel" aria-label="테스트 보이스 레퍼런스"></select>
+        </div>
+        <input class="f-inp" id="ttsTestVoiceInp" list="ttsVoiceDatalist" placeholder="비우면 위 기본 성별/나레이션 보이스 사용 (직접 입력 가능)" style="margin-top:6px;" />
+        <div class="btn-row" style="margin-top:8px;">
+          <button type="button" class="btn sec" id="testTtsBtn">🔊 연결 테스트 실행</button>
+        </div>
+        <div class="hint" id="ttsTestStatus" style="margin-top:6px;">예시 텍스트를 입력하고 버튼을 누르면 현재 설정(저장 전 포함)으로 바로 음성을 생성해 재생합니다.</div>
+        <audio id="ttsTestAudio" controls style="display:none; width:100%; margin-top:6px; height:36px;"></audio>
+      </div>
+
+      <div class="btn-row">
+        <button type="button" class="btn" id="saveTtsBtn">💾 TTS 설정 저장</button>
+      </div>
+    </div>
+
     <div class="card">
       <h3>🌐 자체 번역기 설정</h3>
       <label class="chk-row"><span>활성 모델 프로필을 번역에도 공용 사용</span><input type="checkbox" id="trUseActive" /></label>
@@ -7566,8 +8120,8 @@ function renderWebApp() {
   </section>
 
   <nav class="tabbar">
-    <button class="tab-btn active" data-tab="chat" onclick="switchTab('chat')"><span class="ic">📖</span>독서/채팅</button>
-    <button class="tab-btn" data-tab="bots" onclick="switchTab('bots')"><span class="ic">📚</span>봇/방</button>
+    <button class="tab-btn active" data-tab="home" onclick="switchTab('home')"><span class="ic">🏠</span>홈</button>
+    <button class="tab-btn" data-tab="chat" onclick="switchTab('chat')"><span class="ic">📖</span>독서/채팅</button>
     <button class="tab-btn" data-tab="modules" onclick="switchTab('modules')"><span class="ic">🧩<span class="nd"></span></span>모듈/설정</button>
     <button class="tab-btn" data-tab="router" onclick="switchTab('router')"><span class="ic">⚡</span>모델/번역</button>
   </nav>
@@ -7576,11 +8130,13 @@ function renderWebApp() {
 <script>
   const AI_PROVIDERS = ${JSON.stringify(Object.values(AI_PROVIDER_PRESETS)).replace(/<\//g, '<\\/')};
   let token = localStorage.getItem('rs_token') || '';
-  let currentTab = 'chat';
+  let currentTab = 'home';
   let lastState = null;
   let routerCfg = null;
   let expandedBotIdx = -1;
   let lastChatRenderSig = '';
+  let lastHomeRenderSig = '';
+  let lastHdrAvatarSig = '';
   let lastBotsRenderSig = '';
   let lastBotsSyncAt = 0;
   let lastModulesRenderSig = '';
@@ -7775,6 +8331,7 @@ function renderWebApp() {
       setReadBar(false);
       closeBookImgPreview(true);
       if (typeof closeReqLogModal === 'function') closeReqLogModal();
+      if (typeof closeThumbPickerModal === 'function') closeThumbPickerModal();
       const jBar = document.getElementById('bookJumpBar');
       if (jBar) jBar.style.display = 'none';
     }
@@ -8019,7 +8576,7 @@ function renderWebApp() {
     return out;
   }
 
-  function sanitizeBotNode(node, scopeSel = '.rs-bot-html') {
+  function sanitizeBotNode(node, scopeSel = '.rs-bot-html', allowForms = false) {
     const kids = Array.from(node.childNodes || []);
     for (const ch of kids) {
       if (ch.nodeType === 8) {
@@ -8028,7 +8585,7 @@ function renderWebApp() {
       }
       if (ch.nodeType !== 1) continue;
       const tag = (ch.tagName || '').toLowerCase();
-      if (tag === 'script' || tag === 'iframe' || tag === 'object' || tag === 'embed' || tag === 'applet' || tag === 'base' || tag === 'meta' || tag === 'link' || (tag === 'form' && !ch.hasAttribute('risu-form'))) {
+      if (tag === 'script' || tag === 'iframe' || tag === 'object' || tag === 'embed' || tag === 'applet' || tag === 'base' || tag === 'meta' || tag === 'link' || (tag === 'form' && !allowForms && !ch.hasAttribute('risu-form'))) {
         node.removeChild(ch);
         continue;
       }
@@ -8066,7 +8623,7 @@ function renderWebApp() {
         if (!ch.getAttribute('loading')) ch.setAttribute('loading', 'lazy');
         if (!ch.getAttribute('decoding')) ch.setAttribute('decoding', 'async');
       }
-      sanitizeBotNode(ch, scopeSel);
+      sanitizeBotNode(ch, scopeSel, allowForms);
     }
   }
 
@@ -8078,7 +8635,7 @@ function renderWebApp() {
       const doc = parser.parseFromString('<div id="__rs_root">' + withAssets + '</div>', 'text/html');
       const root = doc.getElementById('__rs_root');
       if (!root) return esc(withAssets);
-      sanitizeBotNode(root, scopeSel);
+      sanitizeBotNode(root, scopeSel, true);
       return root.innerHTML;
     } catch (_) {
       return esc(withAssets);
@@ -8357,6 +8914,8 @@ function renderWebApp() {
   }
 
   function logoutToLogin(reason) {
+    if (typeof stopTtsPlayback === 'function') stopTtsPlayback();
+    if (typeof closeTtsCastModal === 'function') closeTtsCastModal();
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     if (updPolling) { clearInterval(updPolling); updPolling = null; }
     if (typeof disconnectActivityStream === 'function') disconnectActivityStream();
@@ -8374,19 +8933,108 @@ function renderWebApp() {
 
   document.getElementById('logoutBtn').onclick = () => logoutToLogin('로그아웃되었습니다.');
 
-  function switchTab(tab) {
+  function loadRecentOpens() {
+    try { return JSON.parse(localStorage.getItem('rs_recent_opens') || '{}') || {}; } catch (_) { return {}; }
+  }
+  function saveRecentOpens(map) {
+    try {
+      const entries = Object.entries(map || {}).sort((a, b) => Number(b[1] || 0) - Number(a[1] || 0)).slice(0, 100);
+      localStorage.setItem('rs_recent_opens', JSON.stringify(Object.fromEntries(entries)));
+    } catch (_) {}
+  }
+  function recordRecentOpen(charIndex, chatIndex) {
+    const chars = (lastState && lastState.catalog && lastState.catalog.characters) || [];
+    const c = chars.find((x) => x && x.index === charIndex) || chars[charIndex];
+    if (!c) return;
+    const ch = (c.chats || []).find((x) => x && x.index === chatIndex);
+    const key = String(c.chaId || c.index) + '|' + String((ch && ch.id) || chatIndex);
+    const map = loadRecentOpens();
+    map[key] = Date.now();
+    saveRecentOpens(map);
+  }
+  function getEffectiveChatDate(c, ch, recentMap) {
+    const pcDate = Number((ch && ch.lastDate) || 0);
+    const key = String((c && (c.chaId || c.index)) ?? '') + '|' + String((ch && (ch.id || ch.index)) ?? '');
+    const localDate = Number((recentMap && recentMap[key]) || 0);
+    return Math.max(Number.isFinite(pcDate) ? pcDate : 0, Number.isFinite(localDate) ? localDate : 0);
+  }
+  function getEffectiveCharDate(c, recentMap) {
+    let best = Number((c && c.lastDate) || 0);
+    if (!Number.isFinite(best)) best = 0;
+    for (const ch of (c && c.chats) || []) {
+      const d = getEffectiveChatDate(c, ch, recentMap);
+      if (d > best) best = d;
+    }
+    return best;
+  }
+  function formatRelTime(ts) {
+    const n = Number(ts || 0);
+    if (!n || !Number.isFinite(n)) return '';
+    const diff = Date.now() - n;
+    if (diff < 60000) return '방금 전';
+    if (diff < 3600000) return Math.floor(diff / 60000) + '분 전';
+    if (diff < 86400000) return Math.floor(diff / 3600000) + '시간 전';
+    const d = new Date(n);
+    const now = new Date();
+    const yest = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+    if (d.getFullYear() === yest.getFullYear() && d.getMonth() === yest.getMonth() && d.getDate() === yest.getDate()) return '어제';
+    const days = Math.floor(diff / 86400000);
+    if (days < 7) return days + '일 전';
+    return (d.getMonth() + 1) + '월 ' + d.getDate() + '일';
+  }
+  function botThumbHtml(charObj, sizeClass = '') {
+    const rawName = String((charObj && charObj.name) || '?');
+    const initial = esc((rawName.trim().slice(0, 1) || '?').toUpperCase());
+    let hue = 0;
+    for (let i = 0; i < rawName.length; i++) hue = (hue * 31 + rawName.charCodeAt(i)) % 360;
+    const chaId = charObj ? String(charObj.chaId || (charObj.index !== undefined ? charObj.index : '')) : '';
+    const thumbs = (lastState && lastState.botThumbs) || {};
+    const ov = chaId ? thumbs[chaId] : null;
+    const ver = (ov && ov.v) ? String(ov.v) : ((charObj && charObj.image) ? String(charObj.image) : '0');
+    const src = chaId
+      ? ('/api/asset/bot-thumb/' + encodeURIComponent(chaId) + '?v=' + encodeURIComponent(ver))
+      : '';
+    const cls = 'bot-thumb' + (sizeClass ? (' ' + sizeClass) : '');
+    return '<div class="' + cls + '">' +
+      '<div class="bot-thumb-ph" style="background:hsl(' + hue + ',46%,38%);">' + initial + '</div>' +
+      (src ? '<img class="bot-thumb-img" loading="lazy" decoding="async" src="' + esc(src) + '" alt="" />' : '') +
+    '</div>';
+  }
+  document.addEventListener('error', (e) => {
+    const t = e && e.target;
+    if (t && t.tagName === 'IMG' && t.classList && t.classList.contains('bot-thumb-img')) {
+      t.style.display = 'none';
+    }
+  }, true);
+
+  function switchTab(tab, opts = {}) {
+    if (tab === 'bots') tab = 'home';
+    const prevTab = currentTab;
     currentTab = tab;
     document.body.classList.toggle('tab-chat-active', tab === 'chat');
+    document.body.classList.toggle('tab-home-active', tab === 'home');
     document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
     document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
-    document.getElementById('tab-' + tab).classList.add('active');
-    document.querySelector('.tab-btn[data-tab="' + tab + '"]').classList.add('active');
+    const panelEl = document.getElementById('tab-' + tab);
+    if (panelEl) panelEl.classList.add('active');
+    const btnEl = document.querySelector('.tab-btn[data-tab="' + tab + '"]');
+    if (btnEl) btnEl.classList.add('active');
     document.getElementById('composerBar').style.display = tab === 'chat' ? 'flex' : 'none';
-    if (tab === 'chat' && isBookMode()) setTimeout(() => layoutBookSpreads(false), 30);
+    if (!opts.fromPopstate && typeof history !== 'undefined' && history.pushState) {
+      try {
+        if (prevTab === 'home' && tab === 'chat') history.pushState(null, '', '#chat');
+        else history.replaceState(null, '', '#' + tab);
+      } catch (_) {}
+    }
+    if (tab === 'chat') {
+      if (lastState) syncChatRender(lastState);
+      if (isBookMode()) setTimeout(() => layoutBookSpreads(false), 30);
+    }
     syncBotMenuVisibility();
     if (typeof renderRsMiniBar === 'function') renderRsMiniBar(false);
     if (tab === 'router') { loadRouterConfig(); if (typeof loadRequestLogs === 'function') loadRequestLogs(); }
-    if (tab === 'bots') {
+    if (tab === 'home') {
+      if (typeof renderHome === 'function') renderHome();
       renderBots();
       if (Date.now() - lastBotsSyncAt > 4000) {
         lastBotsSyncAt = Date.now();
@@ -8395,6 +9043,11 @@ function renderWebApp() {
     }
     if (tab === 'modules') { renderModules(); refreshUpdateStatus(); }
   }
+  window.addEventListener('popstate', () => {
+    if (currentTab === 'chat' && location.hash !== '#chat') {
+      switchTab('home', { fromPopstate: true });
+    }
+  });
 
   let activityAbortCtrl = null;
   let activityRetryTimer = null;
@@ -8498,6 +9151,8 @@ function renderWebApp() {
       document.getElementById('app').style.display = 'grid';
       await loadRouterConfig();
       applyState(st);
+      switchTab('home', { fromPopstate: true });
+      try { if (typeof history !== 'undefined' && history.replaceState) history.replaceState(null, '', '#home'); } catch (_) {}
       connectActivityStream();
       if (pollTimer) clearInterval(pollTimer);
       pollTimer = setInterval(pollState, 2000);
@@ -8594,6 +9249,18 @@ function renderWebApp() {
     document.body.classList.toggle('hide-leave-hud', String(effective) === '2');
   }
 
+  function syncChatRender(st) {
+    const snap = (st && st.snapshot) || {};
+    const msgs = snap.messages || [];
+    const msgDigest = hashStr(msgs.map((m) => m.index + ':' + (m.text || '') + ':' + (m.html || '') + ':' + (m.pluginFooterHtml || '') + ':' + (m.swipeCount || 1) + ':' + (m.swipeIndex || 0) + ':' + (m.images ? m.images.length : 0)).join('\\x01'));
+    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, snap.fmIndex, snap.firstMessageCount, snap.greetingControls || [], snap.backgroundHtml || '', hashStr(snap.botWidgetHtml || ''), Object.keys(snap.assetMap || {}).length, msgs.length, msgDigest, uiPref.theme, uiPref.assetMode, uiPref.richHtml]);
+    if (sig !== lastChatRenderSig) {
+      lastChatRenderSig = sig;
+      try { renderChat(); }
+      catch (err) { console.error('[RisuStand UI] chat render failed:', err); }
+    }
+  }
+
   function applyState(st) {
     lastState = st;
     if (st.runtimeActivity) renderHdrActivity(st.runtimeActivity);
@@ -8607,6 +9274,27 @@ function renderWebApp() {
     const snap = st.snapshot || {};
     syncLeaveHudVisibility(snap);
     document.getElementById('pcDot').className = 'dot' + (st.pcConnected ? ' on' : '');
+    const hdrAvEl = document.getElementById('hdrAvatar');
+    if (hdrAvEl) {
+      const chars = (st.catalog && Array.isArray(st.catalog.characters)) ? st.catalog.characters : [];
+      const curCharObj = (typeof snap.charIndex === 'number' && snap.charIndex >= 0)
+        ? (chars.find((c) => c && c.index === snap.charIndex) || chars[snap.charIndex] || null)
+        : null;
+      if (curCharObj && uiPref.assetMode !== 'hide') {
+        const chaId = String(curCharObj.chaId || curCharObj.index);
+        const ov = st.botThumbs && st.botThumbs[chaId];
+        const avSig = chaId + ':' + (ov ? ov.v : (curCharObj.image || '0')) + ':' + uiPref.assetMode + ':' + displayBotName(curCharObj.name);
+        if (avSig !== lastHdrAvatarSig) {
+          lastHdrAvatarSig = avSig;
+          hdrAvEl.innerHTML = botThumbHtml(curCharObj, 'xs');
+        }
+        hdrAvEl.style.display = 'block';
+      } else {
+        lastHdrAvatarSig = '';
+        hdrAvEl.innerHTML = '';
+        hdrAvEl.style.display = 'none';
+      }
+    }
     document.getElementById('hdrChar').textContent = displayBotName(snap.charName || 'PC 연결 대기');
     const modeTag = snap.isPcActive ? 'PC 활성' : '원격 라우팅';
     const isBusy = Boolean(st.generating || st.directGenerating);
@@ -8660,14 +9348,13 @@ function renderWebApp() {
         }
       }
     }
-    const msgDigest = hashStr(msgs.map((m) => m.index + ':' + (m.text || '') + ':' + (m.html || '') + ':' + (m.pluginFooterHtml || '') + ':' + (m.swipeCount || 1) + ':' + (m.swipeIndex || 0) + ':' + (m.images ? m.images.length : 0)).join('\\x01'));
-    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, snap.fmIndex, snap.firstMessageCount, snap.greetingControls || [], snap.backgroundHtml || '', hashStr(snap.botWidgetHtml || ''), Object.keys(snap.assetMap || {}).length, msgs.length, msgDigest, uiPref.theme, uiPref.assetMode, uiPref.richHtml]);
-    if (sig !== lastChatRenderSig) {
-      lastChatRenderSig = sig;
-      try { renderChat(); }
-      catch (err) { console.error('[RisuStand UI] chat render failed:', err); }
+    if (currentTab === 'chat') {
+      syncChatRender(st);
     }
-    if (currentTab === 'bots') renderBots();
+    if (currentTab === 'home') {
+      if (typeof renderHome === 'function') renderHome();
+      renderBots();
+    }
     if (currentTab === 'modules') renderModules();
   }
 
@@ -8736,10 +9423,24 @@ function renderWebApp() {
     const ctrls = extractPluginBubbleControls(m.html);
     if (!ctrls.length) return '';
     const btns = ctrls.map((c) => {
-      const payload = esc(JSON.stringify({ msgIndex: m.index, actionHtml: c.outerHTML, dataset: c.dataset }));
+      const payload = esc(JSON.stringify({ msgIndex: m.index, chatId: m.chatId || '', actionHtml: c.outerHTML, dataset: c.dataset }));
       return '<button type="button" class="rs-pbb-btn" data-am-proxy="' + payload + '">' + esc(c.label) + '</button>';
     }).join('');
     return '<div class="rs-plugin-bubble-bar"><span class="rs-pbb-label">🎨 플러그인</span>' + btns + '</div>';
+  }
+
+  function renderTurnTtsBtnHtml(m, key) {
+    if (!m) return '';
+    const ttsCfg = (routerCfg && routerCfg.tts && typeof routerCfg.tts === 'object') ? routerCfg.tts : null;
+    if (ttsCfg && ttsCfg.enabled === false) return '';
+    const hasTxt = Boolean((m.text && stripImgTokens(m.text).trim()) || m.html);
+    if (!hasTxt) return '';
+    const isThis = typeof ttsPlayerState !== 'undefined' && ttsPlayerState.activeKey === key;
+    const cls = isThis
+      ? (ttsPlayerState.loading ? ' is-loading' : (ttsPlayerState.playing ? ' is-playing' : ''))
+      : '';
+    const svg = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>';
+    return '<button type="button" class="turn-tts-btn' + cls + '" data-tts-msg="' + m.index + '" data-tts-key="' + esc(key) + '" title="이 메시지 음성 재생 (TTS)" aria-label="이 메시지 음성 재생">' + svg + '</button>';
   }
 
   function renderMsgActionBarHtml(m, snap, key, showTr, isLatestChar, isBook) {
@@ -8839,7 +9540,7 @@ function renderWebApp() {
         ? ('나' + (turnNum > 0 ? ' · Turn ' + turnNum : ''))
         : (displayBotName(snap.charName) + (turnNum > 0 ? ' · Turn ' + turnNum : ' · 프롤로그'));
       out += '<div class="' + (isUser ? 'book-user-block' : 'book-char-block') + '" data-msg-idx="' + m.index + '" data-turn-num="' + turnNum + '" data-chat-id="' + esc(m.chatId || '') + '">';
-      out += '<div class="book-turn-tag">' + esc(turnTagLabel) + '</div>';
+      out += '<div class="book-turn-tag"><span>' + esc(turnTagLabel) + '</span>' + renderTurnTtsBtnHtml(m, key) + '</div>';
       out += '<div>' + bodyHtml + '</div>';
       out += renderPluginFooterHostHtml(m, snap.assetMap);
       out += renderMsgActionBarHtml(m, snap, key, showTr, isLatestChar, true);
@@ -9292,11 +9993,34 @@ function renderWebApp() {
     syncBotMenuVisibility();
   }
 
+  function isInteractiveBookTarget(target, rootEl) {
+    if (!target || target.nodeType !== 1) return false;
+    const sel = 'button, a, summary, input, select, textarea, label, audio, video, [role="button"], [role="link"], [onclick], [tabindex]:not([tabindex="-1"]), .msg-actions, .rs-am-footer-host, .rs-plugin-bubble-bar, .x-risu-am-illustration-footer, .x-risu-am-illustration-revision-controls, .x-risu-am-chat-history-edge-controls, .x-risu-am-image, .am-image, .x-risu-am-generated-image, .am-generated-image, .x-risu-am-illustration-projection, .am-illustration-projection, .x-risu-am-illustration-slot, .turn-tts-btn, .msg-img-wrap, .image-container, #bookImgPreview, [risu-btn], [risu-trigger], [x-risu-btn], [data-am-proxy], [data-am-illustration-action], [data-am-illustration-revision-action], [data-am-revision-action], [data-am-chat-history-action], [data-am-image-action], [data-am-viewer-action], [data-tts-msg], [data-reroll-msg], [data-tr-key], [data-edit-msg], [data-del-msg], [data-swipe-msg], [data-img-reveal], [data-fm-swipe], [data-chat-var-key]';
+    if (target.closest(sel)) return true;
+    let cur = target;
+    let hops = 0;
+    while (cur && cur !== rootEl && hops < 12) {
+      if (cur.nodeType === 1 && typeof window.getComputedStyle === 'function') {
+        try {
+          if (window.getComputedStyle(cur).cursor === 'pointer') return true;
+        } catch (_) {}
+      }
+      cur = cur.parentElement;
+      hops += 1;
+    }
+    return false;
+  }
+
   function renderChat() {
     const box = document.getElementById('tab-chat');
     const snap = (lastState && lastState.snapshot) || {};
     const msgs = snap.messages || [];
     const checkedBotIds = captureCheckedBotIds();
+
+    if (typeof snap.charIndex !== 'number' || snap.charIndex < 0) {
+      box.innerHTML = '<div class="empty-hint"><span class="big">🏠</span>열려 있는 채팅방이 없습니다.<br>홈에서 봇과 채팅방을 골라 주세요.<div style="margin-top:14px;"><button type="button" class="btn" onclick="switchTab(&#39;home&#39;)">🏠 홈으로 가기</button></div></div>';
+      return;
+    }
 
     if (isBookMode()) {
       const singleInit = window.innerWidth < 700;
@@ -9340,8 +10064,6 @@ function renderWebApp() {
 
       document.getElementById('bookPrevBtn').onclick = () => flipBook(-1);
       document.getElementById('bookNextBtn').onclick = () => flipBook(1);
-      document.getElementById('bookTapPrev').onclick = () => flipBook(-1);
-      document.getElementById('bookTapNext').onclick = () => flipBook(1);
       document.getElementById('bookTurnRuler').onclick = (e) => {
         const tick = e.target.closest('[data-book-spread]');
         if (tick) goToBookSpread(Number(tick.getAttribute('data-book-spread')), true);
@@ -9399,6 +10121,14 @@ function renderWebApp() {
           const ic = e.target.closest('.book-columns .rs-bot-html .image-container');
           if (ic) openBookImgPreview(ic, false);
         });
+        frame.addEventListener('mousemove', (e) => {
+          const rect = frame.getBoundingClientRect();
+          const zoneW = Math.max(44, Math.min(100, rect.width * 0.12));
+          const relX = e.clientX - rect.left;
+          const inPrev = relX <= zoneW && bookSpreadIdx > 0;
+          const inNext = relX >= rect.width - zoneW && bookSpreadIdx < bookTotalSpreads - 1;
+          frame.style.cursor = ((inPrev || inNext) && !isInteractiveBookTarget(e.target, frame)) ? 'pointer' : '';
+        });
       }
       if (preview) {
         preview.onmouseleave = (e) => {
@@ -9411,18 +10141,31 @@ function renderWebApp() {
         };
       }
       frame.onmouseleave = () => {
+        frame.style.cursor = '';
         if (!bookImgPreviewState.pinned) closeBookImgPreview(false);
       };
       frame.addEventListener('click', (e) => {
         const ic = e.target.closest('.book-columns .rs-bot-html .image-container');
-        if (!ic) {
-          if (bookImgPreviewState.pinned && !e.target.closest('#bookImgPreview')) closeBookImgPreview(false);
+        if (ic) {
+          if (document.body.classList.contains('asset-blur') && !ic.classList.contains('revealed')) return;
+          e.stopPropagation();
+          if (bookImgPreviewState.el === ic && bookImgPreviewState.pinned) closeBookImgPreview(false);
+          else openBookImgPreview(ic, true);
           return;
         }
-        if (document.body.classList.contains('asset-blur') && !ic.classList.contains('revealed')) return;
-        e.stopPropagation();
-        if (bookImgPreviewState.el === ic && bookImgPreviewState.pinned) closeBookImgPreview(false);
-        else openBookImgPreview(ic, true);
+        if (bookImgPreviewState.pinned && !e.target.closest('#bookImgPreview')) {
+          closeBookImgPreview(false);
+          return;
+        }
+        if (e.defaultPrevented || (e.button && e.button !== 0)) return;
+        const selTxt = window.getSelection ? String(window.getSelection()).trim() : '';
+        if (selTxt) return;
+        if (isInteractiveBookTarget(e.target, frame)) return;
+        const rect = frame.getBoundingClientRect();
+        const zoneW = Math.max(44, Math.min(100, rect.width * 0.12));
+        const relX = e.clientX - rect.left;
+        if (relX <= zoneW) flipBook(-1);
+        else if (relX >= rect.width - zoneW) flipBook(1);
       });
       let sx = 0, sy = 0;
       frame.ontouchstart = (e) => { sx = e.touches[0].clientX; sy = e.touches[0].clientY; };
@@ -9496,7 +10239,7 @@ function renderWebApp() {
           ? ('나' + (turnNum > 0 ? ' · T' + turnNum : ''))
           : (displayBotName(snap.charName) + (turnNum > 0 ? ' · T' + turnNum : ' · 프롤로그'));
         html += '<div class="msg-wrap ' + (isUser ? 'user' : 'char') + '" data-msg-idx="' + m.index + '" data-turn-num="' + turnNum + '" data-chat-id="' + esc(m.chatId || '') + '">';
-        html += '<div class="msg-role">' + esc(roleLabel) + '</div>';
+        html += '<div class="msg-role"><span>' + esc(roleLabel) + '</span>' + renderTurnTtsBtnHtml(m, key) + '</div>';
         html += '<div class="msg-bubble">' + bodyHtml + renderPluginFooterHostHtml(m, snap.assetMap) + '</div>';
         if (showTr && trText) html += '<div class="tr-box">' + esc(trText) + '</div>';
         html += renderMsgActionBarHtml(m, snap, key, showTr, isLatestChar, false);
@@ -9521,12 +10264,34 @@ function renderWebApp() {
     if (botMenuExpanded) scheduleBotMenuAutoHide();
   });
 
-  async function dispatchPluginSurfaceAction(msgIndex, actionHtml, dataset, chatId = '') {
+  function collectAmElementMeta(el) {
+    if (!el || el.nodeType !== 1) return { actionHtml: '', dataset: {}, textContent: '', ariaLabel: '', title: '', className: '', siblingIndex: -1 };
+    const ds = {};
+    for (const a of Array.from(el.attributes || [])) {
+      if (a.name.startsWith('data-') || a.name.startsWith('x-')) ds[a.name] = a.value;
+    }
+    let siblingIndex = -1;
+    if (el.parentElement) {
+      const sameTag = Array.from(el.parentElement.children || []).filter((s) => s.tagName === el.tagName);
+      siblingIndex = sameTag.indexOf(el);
+    }
+    return {
+      actionHtml: el.outerHTML || '',
+      dataset: ds,
+      textContent: (el.textContent || '').replace(/\\s+/g, ' ').trim(),
+      ariaLabel: el.getAttribute('aria-label') || '',
+      title: el.getAttribute('title') || '',
+      className: typeof el.className === 'string' ? el.className : '',
+      siblingIndex,
+    };
+  }
+
+  async function dispatchPluginSurfaceAction(msgIndex, actionHtml, dataset, chatId = '', extra = {}) {
     const snap = lastState && lastState.snapshot;
-    if (!snap || snap.charIndex < 0) return;
+    if (!snap || snap.charIndex < 0) return null;
     toast('플러그인 액션 실행 중...');
     try {
-      await api('/api/plugins/surface-action', {
+      const res = await api('/api/plugins/surface-action', {
         method: 'POST',
         body: JSON.stringify({
           charIndex: snap.charIndex,
@@ -9535,14 +10300,39 @@ function renderWebApp() {
           chatId: String(chatId || ''),
           actionHtml: String(actionHtml || ''),
           dataset: dataset || {},
+          selector: extra && extra.selector ? String(extra.selector) : '',
+          textContent: extra && extra.textContent ? String(extra.textContent) : '',
+          ariaLabel: extra && extra.ariaLabel ? String(extra.ariaLabel) : '',
+          title: extra && extra.title ? String(extra.title) : '',
+          className: extra && extra.className ? String(extra.className) : '',
+          siblingIndex: extra && Number.isInteger(extra.siblingIndex) ? extra.siblingIndex : -1,
         }),
       });
+      if (res && res.pluginFloatingUi) {
+        latestPluginFloatingUi = res.pluginFloatingUi;
+        renderRsMiniBar(false);
+      }
+      if (res && res.snapshot && lastState) {
+        if (typeof res.snapshotVersion === 'number') knownSnapshotVer = res.snapshotVersion;
+        applyState({
+          ...lastState,
+          snapshot: res.snapshot,
+          snapshotVersion: res.snapshotVersion ?? lastState.snapshotVersion,
+        });
+      }
+      if (res && res.openPluginGui && res.openPluginGui.pluginName) {
+        await openPluginGuiModal(res.openPluginGui.pluginName);
+      } else if (res && res.openedOverlay && res.openedOverlay.html) {
+        openPluginActionOverlayModal(res.openedOverlay);
+      }
       setTimeout(pollState, 250);
       setTimeout(pollState, 1000);
       setTimeout(pollState, 2500);
       setTimeout(pollState, 5000);
+      return res;
     } catch (err) {
       toast('액션 오류: ' + (err && err.message ? err.message : '실패'));
+      return null;
     }
   }
 
@@ -9586,28 +10376,45 @@ function renderWebApp() {
       e.stopPropagation();
       try {
         const info = JSON.parse(proxyBtn.getAttribute('data-am-proxy') || '{}');
-        await dispatchPluginSurfaceAction(info.msgIndex, info.actionHtml, info.dataset);
+        await dispatchPluginSurfaceAction(info.msgIndex, info.actionHtml, info.dataset, info.chatId || '', info);
       } catch (_) {}
       return true;
     }
-    const amEl = e.target.closest('[data-am-illustration-action], [data-am-chat-history-action], [data-am-chat-regenerate-action], [data-am-manual-generate-action]');
+    const amEl = e.target.closest('[data-am-illustration-action], [data-am-illustration-revision-action], [data-am-revision-action], [data-am-chat-history-action], [data-am-chat-regenerate-action], [data-am-manual-generate-action], .x-risu-am-illustration-footer button, .x-risu-am-illustration-revision-controls button, .x-risu-am-chat-history-edge-controls button');
     if (amEl) {
       e.preventDefault();
       e.stopPropagation();
       const msgWrap = amEl.closest ? amEl.closest('[data-msg-idx]') : null;
       const msgIdx = msgWrap ? Number(msgWrap.getAttribute('data-msg-idx')) : -1;
       const chatId = (msgWrap && msgWrap.getAttribute('data-chat-id')) || '';
-      const clickedOuterHtml = amEl.outerHTML;
-      const ds = {};
-      for (const a of Array.from(amEl.attributes || [])) {
-        if (a.name.startsWith('data-')) ds[a.name] = a.value;
-      }
+      const meta = collectAmElementMeta(amEl);
       if (amEl.getAttribute('data-am-illustration-action') === 'generate') {
         amEl.setAttribute('x-am-busy', 'true');
         const footerEl = amEl.closest ? amEl.closest('.x-risu-am-illustration-footer') : null;
         if (footerEl) footerEl.classList.add('is-generating');
       }
-      await dispatchPluginSurfaceAction(msgIdx, clickedOuterHtml, ds, chatId);
+      await dispatchPluginSurfaceAction(msgIdx, meta.actionHtml, meta.dataset, chatId, meta);
+      return true;
+    }
+    const amImgTrigger = e.target.closest('[data-am-image-action], [data-am-viewer-action], [data-am-lightbox-action], .x-risu-am-image, .am-image, .x-risu-am-generated-image, .am-generated-image, .x-risu-am-illustration-projection, .am-illustration-projection, .x-risu-am-illustration-slot');
+    if (amImgTrigger) {
+      if (document.body.classList.contains('asset-blur')) {
+        const blurTarget = amImgTrigger.matches('img') ? amImgTrigger : (amImgTrigger.querySelector('img') || amImgTrigger);
+        if (blurTarget && !blurTarget.classList.contains('revealed')) {
+          e.preventDefault();
+          e.stopPropagation();
+          blurTarget.classList.add('revealed');
+          return true;
+        }
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      const msgWrap = amImgTrigger.closest ? amImgTrigger.closest('[data-msg-idx]') : null;
+      const msgIdx = msgWrap ? Number(msgWrap.getAttribute('data-msg-idx')) : -1;
+      const chatId = (msgWrap && msgWrap.getAttribute('data-chat-id')) || '';
+      const exactTarget = (e.target && e.target.closest('button, [data-am-image-action], [data-am-viewer-action], .x-risu-am-image, .am-image, img')) || amImgTrigger;
+      const meta = collectAmElementMeta(exactTarget);
+      await dispatchPluginSurfaceAction(msgIdx, meta.actionHtml, meta.dataset, chatId, meta);
       return true;
     }
     const trigEl = e.target.closest('[risu-trigger]');
@@ -9762,6 +10569,13 @@ function renderWebApp() {
     }
     const imgWrap = e.target.closest('[data-img-reveal]');
     if (imgWrap) { toggleImgReveal(imgWrap); return; }
+    const ttsBtn = e.target.closest('[data-tts-msg]');
+    if (ttsBtn) {
+      e.stopPropagation();
+      e.preventDefault();
+      toggleTurnTts(ttsBtn.getAttribute('data-tts-key'), Number(ttsBtn.getAttribute('data-tts-msg')));
+      return;
+    }
     const trBtn = e.target.closest('[data-tr-key]');
     if (trBtn) { toggleTranslate(trBtn.getAttribute('data-tr-key'), Number(trBtn.getAttribute('data-tr-idx'))); return; }
     const edBtn = e.target.closest('[data-edit-msg]');
@@ -9807,6 +10621,433 @@ function renderWebApp() {
       renderChat();
     } catch (e) { toast('번역 실패: ' + e.message); }
   };
+
+  // ---------- Multi-Speaker Web Audio TTS Player ----------
+  const ttsAnalyzeCache = new Map();
+  const ttsAudioBufferCache = new Map();
+  const ttsPlayerState = {
+    runId: 0,
+    activeKey: '',
+    loading: false,
+    playing: false,
+    paused: false,
+    segments: [],
+    segIdx: 0,
+    charName: '',
+    rateMult: 1.0,
+    abortCtrl: null,
+    audioCtx: null,
+    convolver: null,
+    activeSource: null,
+    activeHtmlAudio: null,
+    segResolve: null,
+  };
+
+  function ensureTtsAudioCtx() {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    if (!ttsPlayerState.audioCtx || ttsPlayerState.audioCtx.state === 'closed') {
+      ttsPlayerState.audioCtx = new Ctx();
+      ttsPlayerState.convolver = null;
+    }
+    if (ttsPlayerState.audioCtx.state === 'suspended') {
+      ttsPlayerState.audioCtx.resume().catch(() => {});
+    }
+    return ttsPlayerState.audioCtx;
+  }
+
+  function getTtsThoughtConvolver(ctx) {
+    if (!ctx) return null;
+    if (ttsPlayerState.convolver) return ttsPlayerState.convolver;
+    const rate = ctx.sampleRate || 44100;
+    const len = Math.floor(rate * 0.85);
+    const ir = ctx.createBuffer(2, len, rate);
+    for (let ch = 0; ch < 2; ch += 1) {
+      const data = ir.getChannelData(ch);
+      for (let i = 0; i < len; i += 1) {
+        const decay = Math.pow(1 - i / len, 2.8);
+        data[i] = (Math.random() * 2 - 1) * decay * 0.42;
+      }
+    }
+    const conv = ctx.createConvolver();
+    conv.buffer = ir;
+    ttsPlayerState.convolver = conv;
+    return conv;
+  }
+
+  function updateTtsButtonsDom() {
+    document.querySelectorAll('.turn-tts-btn').forEach((btn) => {
+      const k = btn.getAttribute('data-tts-key') || '';
+      const isThis = Boolean(ttsPlayerState.activeKey && k === ttsPlayerState.activeKey);
+      btn.classList.toggle('is-loading', isThis && ttsPlayerState.loading);
+      btn.classList.toggle('is-playing', isThis && !ttsPlayerState.loading && ttsPlayerState.playing);
+    });
+  }
+
+  function renderTtsPlayerBar() {
+    const bar = document.getElementById('ttsPlayerBar');
+    if (!bar) return;
+    if (!ttsPlayerState.activeKey && !ttsPlayerState.loading && !ttsPlayerState.playing) {
+      bar.classList.remove('show');
+      return;
+    }
+    bar.classList.add('show');
+    const seg = ttsPlayerState.segments[ttsPlayerState.segIdx] || null;
+    const kindEl = document.getElementById('ttsBarKind');
+    const spkEl = document.getElementById('ttsBarSpeaker');
+    const toneEl = document.getElementById('ttsBarTone');
+    const prevEl = document.getElementById('ttsBarPreview');
+    const pauseEl = document.getElementById('ttsPauseBtn');
+    const rateEl = document.getElementById('ttsRateBtn');
+    if (kindEl) {
+      const kind = seg ? seg.kind : 'narration';
+      kindEl.className = 'tts-kind-badge' + (kind === 'thought' ? ' thought' : (kind === 'narration' ? ' narration' : ''));
+      kindEl.textContent = ttsPlayerState.loading && !seg
+        ? '⏳ 분석 중'
+        : (kind === 'thought' ? '💭 속마음' : (kind === 'dialogue' ? '💬 대화' : '📖 나레이션'));
+    }
+    if (spkEl) {
+      if (seg) {
+        const gMark = seg.gender === 'female' ? ' ♀' : (seg.gender === 'male' ? ' ♂' : '');
+        const idxTxt = ' (' + (ttsPlayerState.segIdx + 1) + '/' + ttsPlayerState.segments.length + ')';
+        spkEl.textContent = (seg.speaker || 'Narrator') + gMark + idxTxt;
+      } else {
+        spkEl.textContent = '대본 분석 중...';
+      }
+    }
+    if (toneEl) {
+      const tags = seg && Array.isArray(seg.toneTags) && seg.toneTags.length ? ('[' + seg.toneTags.join(', ') + ']') : '';
+      toneEl.textContent = tags;
+    }
+    if (prevEl) {
+      prevEl.textContent = seg ? seg.text : '문장별 화자 · 성별 · 톤을 분리하고 있습니다...';
+    }
+    if (pauseEl) pauseEl.textContent = ttsPlayerState.paused ? '▶' : '⏸';
+    if (rateEl) rateEl.textContent = ttsPlayerState.rateMult.toFixed(2).replace(/\\.00$/, '.0').replace(/0$/, '') + 'x';
+  }
+
+  function stopCurrentTtsNode() {
+    if (ttsPlayerState.activeSource) {
+      try { ttsPlayerState.activeSource.onended = null; ttsPlayerState.activeSource.stop(); } catch (_) {}
+      try { ttsPlayerState.activeSource.disconnect(); } catch (_) {}
+      ttsPlayerState.activeSource = null;
+    }
+    if (ttsPlayerState.activeHtmlAudio) {
+      try { ttsPlayerState.activeHtmlAudio.pause(); ttsPlayerState.activeHtmlAudio.src = ''; } catch (_) {}
+      ttsPlayerState.activeHtmlAudio = null;
+    }
+    if (ttsPlayerState.segResolve) {
+      const fn = ttsPlayerState.segResolve;
+      ttsPlayerState.segResolve = null;
+      fn('stopped');
+    }
+  }
+
+  function stopTtsPlayback() {
+    ttsPlayerState.runId += 1;
+    if (ttsPlayerState.abortCtrl) {
+      try { ttsPlayerState.abortCtrl.abort(); } catch (_) {}
+      ttsPlayerState.abortCtrl = null;
+    }
+    stopCurrentTtsNode();
+    ttsPlayerState.activeKey = '';
+    ttsPlayerState.loading = false;
+    ttsPlayerState.playing = false;
+    ttsPlayerState.paused = false;
+    ttsPlayerState.segments = [];
+    ttsPlayerState.segIdx = 0;
+    updateTtsButtonsDom();
+    renderTtsPlayerBar();
+  }
+
+  function getClientTtsChatKey(snap) {
+    if (!snap || typeof snap !== 'object') return '';
+    const charCtx = (snap.charContext && typeof snap.charContext === 'object') ? snap.charContext : null;
+    const rawCharId = (charCtx && (charCtx.charId || charCtx.chaId)) || snap.chaId || '';
+    const charIdx = Number(snap.charIndex);
+    const charPart = String(rawCharId || (!Number.isNaN(charIdx) && charIdx >= 0 ? ('c' + charIdx) : '')).trim();
+    const chatIdx = Number(snap.chatIndex);
+    const chatPart = (!Number.isNaN(chatIdx) && chatIdx >= 0)
+      ? ('r' + chatIdx)
+      : String(snap.chatUuid || snap.chatId || '').trim();
+    if (!charPart || !chatPart) return '';
+    return (charPart + ':' + chatPart).slice(0, 200);
+  }
+
+  async function fetchTtsSegmentAudio(seg, charName, signal, chatKey) {
+    const ttsCfg = (routerCfg && routerCfg.tts) || {};
+    const sig = hashStr(JSON.stringify({
+      p: ttsCfg.provider, u: ttsCfg.apiUrl, m: ttsCfg.model, f: ttsCfg.format, ts: ttsCfg.fishTagStyle,
+      ck: chatKey || '', k: seg.kind, s: seg.speaker, g: seg.gender, v: seg.voiceId, t: seg.toneTags, txt: seg.text,
+    }));
+    if (ttsAudioBufferCache.has(sig)) return ttsAudioBufferCache.get(sig);
+    const res = await fetch('/api/tts/synthesize', {
+      method: 'POST',
+      signal,
+      headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+      body: JSON.stringify({ segment: seg, charName, chatKey: chatKey || '' }),
+    });
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      throw new Error(errData.error || ('TTS HTTP ' + res.status));
+    }
+    const buf = await res.arrayBuffer();
+    if (ttsAudioBufferCache.size > 60) ttsAudioBufferCache.clear();
+    ttsAudioBufferCache.set(sig, buf);
+    return buf;
+  }
+
+  async function playTtsArrayBuffer(arrayBuf, seg) {
+    const ctx = ensureTtsAudioCtx();
+    const fx = (routerCfg && routerCfg.tts && routerCfg.tts.effects) || {};
+    const kind = (seg && seg.kind) || 'dialogue';
+    const masterRate = Number(fx.masterRate || 1.0) * Number(ttsPlayerState.rateMult || 1.0);
+    const rate = kind === 'thought'
+      ? Number(fx.thoughtRate || 0.95) * masterRate
+      : (kind === 'narration' ? Number(fx.narrationRate || 0.96) * masterRate : masterRate);
+
+    if (ctx && typeof ctx.decodeAudioData === 'function') {
+      try {
+        if (ctx.state === 'suspended' && !ttsPlayerState.paused) {
+          await ctx.resume().catch(() => {});
+        }
+        const decoded = await ctx.decodeAudioData(arrayBuf.slice(0));
+        return await new Promise((resolve) => {
+          const src = ctx.createBufferSource();
+          src.buffer = decoded;
+          src.playbackRate.value = Math.max(0.5, Math.min(2.0, rate));
+          const outGain = ctx.createGain();
+
+          if (kind === 'thought' && fx.thoughtFxEnabled !== false) {
+            const hp = ctx.createBiquadFilter();
+            hp.type = 'highpass';
+            hp.frequency.value = 180;
+            const lp = ctx.createBiquadFilter();
+            lp.type = 'lowpass';
+            lp.frequency.value = Number(fx.thoughtFilterHz || 2800);
+            const mix = Math.max(0, Math.min(1, Number(fx.thoughtReverbMix !== undefined ? fx.thoughtReverbMix : 0.32)));
+            const dry = ctx.createGain();
+            dry.gain.value = 1 - mix * 0.55;
+            const wet = ctx.createGain();
+            wet.gain.value = mix;
+            const conv = getTtsThoughtConvolver(ctx);
+            outGain.gain.value = Number(fx.thoughtGain || 0.85);
+            src.connect(hp);
+            hp.connect(lp);
+            lp.connect(dry);
+            dry.connect(outGain);
+            if (conv) {
+              lp.connect(conv);
+              conv.connect(wet);
+              wet.connect(outGain);
+            }
+          } else if (kind === 'narration') {
+            outGain.gain.value = Number(fx.narrationGain || 0.92);
+            src.connect(outGain);
+          } else {
+            outGain.gain.value = Number(fx.dialogueGain || 1.0);
+            src.connect(outGain);
+          }
+          outGain.connect(ctx.destination);
+
+          ttsPlayerState.activeSource = src;
+          ttsPlayerState.segResolve = resolve;
+          src.onended = () => {
+            if (ttsPlayerState.activeSource === src) ttsPlayerState.activeSource = null;
+            if (ttsPlayerState.segResolve === resolve) ttsPlayerState.segResolve = null;
+            resolve('ended');
+          };
+          src.start(0);
+        });
+      } catch (_) {}
+    }
+
+    // Fallback: HTMLAudioElement
+    return await new Promise((resolve) => {
+      const blob = new Blob([arrayBuf], { type: 'audio/mpeg' });
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.playbackRate = Math.max(0.5, Math.min(2.0, rate));
+      audio.volume = kind === 'thought' ? 0.82 : (kind === 'narration' ? 0.92 : 1.0);
+      ttsPlayerState.activeHtmlAudio = audio;
+      ttsPlayerState.segResolve = (reason) => {
+        URL.revokeObjectURL(url);
+        resolve(reason);
+      };
+      audio.onended = () => {
+        if (ttsPlayerState.activeHtmlAudio === audio) ttsPlayerState.activeHtmlAudio = null;
+        const fn = ttsPlayerState.segResolve;
+        ttsPlayerState.segResolve = null;
+        if (fn) fn('ended');
+      };
+      audio.onerror = () => {
+        if (ttsPlayerState.activeHtmlAudio === audio) ttsPlayerState.activeHtmlAudio = null;
+        const fn = ttsPlayerState.segResolve;
+        ttsPlayerState.segResolve = null;
+        if (fn) fn('error');
+      };
+      audio.play().catch(() => {
+        const fn = ttsPlayerState.segResolve;
+        ttsPlayerState.segResolve = null;
+        if (fn) fn('error');
+      });
+    });
+  }
+
+  async function runTtsPlaybackLoop(runId) {
+    while (ttsPlayerState.runId === runId && ttsPlayerState.segIdx < ttsPlayerState.segments.length) {
+      const idx = ttsPlayerState.segIdx;
+      const seg = ttsPlayerState.segments[idx];
+      ttsPlayerState.loading = true;
+      renderTtsPlayerBar();
+      updateTtsButtonsDom();
+
+      // Prefetch next 2 segments while fetching/playing current
+      const signal = ttsPlayerState.abortCtrl ? ttsPlayerState.abortCtrl.signal : undefined;
+      const ck = ttsPlayerState.chatKey || '';
+      const curProm = fetchTtsSegmentAudio(seg, ttsPlayerState.charName, signal, ck);
+      for (let look = 1; look <= 2; look += 1) {
+        if (idx + look < ttsPlayerState.segments.length) {
+          fetchTtsSegmentAudio(ttsPlayerState.segments[idx + look], ttsPlayerState.charName, signal, ck).catch(() => {});
+        }
+      }
+
+      const audioBuf = await curProm;
+      if (ttsPlayerState.runId !== runId) return;
+
+      ttsPlayerState.loading = false;
+      ttsPlayerState.playing = true;
+      renderTtsPlayerBar();
+      updateTtsButtonsDom();
+
+      const reason = await playTtsArrayBuffer(audioBuf, seg);
+      if (ttsPlayerState.runId !== runId) return;
+      if (reason === 'jump') continue;
+      if (reason === 'stopped') return;
+      ttsPlayerState.segIdx += 1;
+    }
+    if (ttsPlayerState.runId === runId) {
+      stopTtsPlayback();
+    }
+  }
+
+  window.toggleTurnTts = async (key, msgIndex) => {
+    ensureTtsAudioCtx();
+    if (ttsPlayerState.activeKey === key && (ttsPlayerState.loading || ttsPlayerState.playing)) {
+      stopTtsPlayback();
+      return;
+    }
+    const snap = (lastState && lastState.snapshot) || {};
+    const msgs = snap.messages || [];
+    const found = msgs.find((x) => x.index === msgIndex);
+    if (!found) return;
+
+    stopTtsPlayback();
+    const runId = ++ttsPlayerState.runId;
+    const abortCtrl = new AbortController();
+    ttsPlayerState.abortCtrl = abortCtrl;
+    ttsPlayerState.activeKey = key;
+    ttsPlayerState.loading = true;
+    ttsPlayerState.playing = false;
+    ttsPlayerState.paused = false;
+    ttsPlayerState.charName = snap.charName || 'Character';
+    ttsPlayerState.chatKey = getClientTtsChatKey(snap);
+    ttsPlayerState.segments = [];
+    ttsPlayerState.segIdx = 0;
+    updateTtsButtonsDom();
+    renderTtsPlayerBar();
+
+    try {
+      const ttsCfg = (routerCfg && routerCfg.tts) || {};
+      const cacheKey = key + ':' + ttsPlayerState.chatKey + ':' + hashStr((found.text || '') + '|' + (found.html || '') + '|' + (ttsCfg.parseMode || 'hybrid'));
+      let segments = ttsAnalyzeCache.get(cacheKey);
+      if (!segments) {
+        const res = await fetch('/api/tts/analyze', {
+          method: 'POST',
+          signal: abortCtrl.signal,
+          headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+          body: JSON.stringify({
+            text: found.text || '',
+            html: found.html || '',
+            role: found.role || 'char',
+            charName: snap.charName || 'Character',
+            personaName: snap.personaName || '나',
+            chatKey: ttsPlayerState.chatKey,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || ('대본 분석 실패 (' + res.status + ')'));
+        segments = Array.isArray(data.segments) ? data.segments : [];
+        if (ttsAnalyzeCache.size > 40) ttsAnalyzeCache.clear();
+        ttsAnalyzeCache.set(cacheKey, segments);
+      }
+      if (ttsPlayerState.runId !== runId) return;
+      if (!segments.length) {
+        stopTtsPlayback();
+        toast('읽을 수 있는 텍스트가 없습니다.');
+        return;
+      }
+      ttsPlayerState.segments = segments;
+      await runTtsPlaybackLoop(runId);
+    } catch (err) {
+      if (err && err.name === 'AbortError') return;
+      if (ttsPlayerState.runId === runId) {
+        stopTtsPlayback();
+        toast('TTS 오류: ' + (err && err.message ? err.message : String(err)));
+      }
+    }
+  };
+
+  (function bindTtsBarControls() {
+    const prevBtn = document.getElementById('ttsPrevSegBtn');
+    const nextBtn = document.getElementById('ttsNextSegBtn');
+    const pauseBtn = document.getElementById('ttsPauseBtn');
+    const stopBtn = document.getElementById('ttsStopBtn');
+    const rateBtn = document.getElementById('ttsRateBtn');
+    const cfgBtn = document.getElementById('ttsCfgJumpBtn');
+    if (prevBtn) prevBtn.onclick = () => {
+      if (!ttsPlayerState.segments.length) return;
+      ttsPlayerState.segIdx = Math.max(0, ttsPlayerState.segIdx - 1);
+      if (ttsPlayerState.segResolve) { const fn = ttsPlayerState.segResolve; ttsPlayerState.segResolve = null; stopCurrentTtsNode(); fn('jump'); }
+      renderTtsPlayerBar();
+    };
+    if (nextBtn) nextBtn.onclick = () => {
+      if (!ttsPlayerState.segments.length) return;
+      if (ttsPlayerState.segIdx + 1 >= ttsPlayerState.segments.length) { stopTtsPlayback(); return; }
+      ttsPlayerState.segIdx += 1;
+      if (ttsPlayerState.segResolve) { const fn = ttsPlayerState.segResolve; ttsPlayerState.segResolve = null; stopCurrentTtsNode(); fn('jump'); }
+      renderTtsPlayerBar();
+    };
+    if (pauseBtn) pauseBtn.onclick = () => {
+      const ctx = ttsPlayerState.audioCtx;
+      ttsPlayerState.paused = !ttsPlayerState.paused;
+      if (ctx) {
+        if (ttsPlayerState.paused) ctx.suspend().catch(() => {});
+        else ctx.resume().catch(() => {});
+      }
+      if (ttsPlayerState.activeHtmlAudio) {
+        if (ttsPlayerState.paused) ttsPlayerState.activeHtmlAudio.pause();
+        else ttsPlayerState.activeHtmlAudio.play().catch(() => {});
+      }
+      renderTtsPlayerBar();
+    };
+    if (stopBtn) stopBtn.onclick = () => stopTtsPlayback();
+    if (rateBtn) rateBtn.onclick = () => {
+      const steps = [1.0, 1.15, 1.3, 0.85];
+      const curIdx = steps.findIndex((x) => Math.abs(x - ttsPlayerState.rateMult) < 0.03);
+      ttsPlayerState.rateMult = steps[(curIdx + 1) % steps.length];
+      if (ttsPlayerState.activeHtmlAudio) ttsPlayerState.activeHtmlAudio.playbackRate = ttsPlayerState.rateMult;
+      renderTtsPlayerBar();
+      toast('TTS 배속: ' + ttsPlayerState.rateMult + 'x');
+    };
+    if (cfgBtn) cfgBtn.onclick = () => {
+      switchTab('router');
+      setTimeout(() => {
+        const c = document.getElementById('ttsConfigCard');
+        if (c && typeof c.scrollIntoView === 'function') c.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 60);
+    };
+  })();
 
   let msgEditState = null;
   let msgEditKeyHandler = null;
@@ -10013,14 +11254,304 @@ function renderWebApp() {
     document.getElementById('inTrBtn').classList.toggle('active', Boolean(routerCfg.translator.autoTranslateInput));
   }
 
+  function renderHome(force = false) {
+    const topEl = document.getElementById('homeTopArea');
+    if (!topEl) return;
+    const st = lastState || {};
+    const snap = st.snapshot || {};
+    const chars = (st.catalog && Array.isArray(st.catalog.characters)) ? st.catalog.characters : [];
+    const pcActiveChar = chars.find((c) => c && c.isPcActive) || null;
+    const profs = (routerCfg && Array.isArray(routerCfg.profiles)) ? routerCfg.profiles : [];
+    const activeProf = (routerCfg && routerCfg.activeProfileId) ? profs.find((p) => p && p.id === routerCfg.activeProfileId) : null;
+    const recentOpens = loadRecentOpens();
+    const recentItems = [];
+    for (const c of chars) {
+      if (!c) continue;
+      for (const ch of (c.chats || [])) {
+        const eff = getEffectiveChatDate(c, ch, recentOpens);
+        if (eff > 0) recentItems.push({ charObj: c, chatObj: ch, date: eff });
+      }
+    }
+    recentItems.sort((a, b) => b.date - a.date);
+    const topRecent = recentItems.slice(0, 6);
+    const thumbs = st.botThumbs || {};
+    const sig = JSON.stringify([
+      Boolean(st.pcConnected),
+      Boolean(st.updateAvailable),
+      pcActiveChar ? pcActiveChar.name : '',
+      activeProf ? (activeProf.name + ':' + activeProf.model) : '',
+      snap.charIndex, snap.chatIndex, snap.chatName,
+      uiPref.assetMode,
+      thumbs,
+      chars.map((c) => [c.index, c.chaId || '', c.name, c.image || '', c.lastDate ?? null, (c.chats || []).map((ch) => [ch.index, ch.id || '', ch.name, ch.turnCount ?? ch.msgCount, ch.lastDate ?? null])]),
+      topRecent.map((x) => [x.charObj.index, x.chatObj.index, x.date]),
+    ]);
+    if (!force && sig === lastHomeRenderSig) return;
+    lastHomeRenderSig = sig;
+
+    let html = '';
+
+    // 1) Status card
+    html += '<div class="card"><div class="home-status-grid">';
+    html += '<div class="home-stat-pill"><div class="k">PC 연결</div><div class="v">' + (st.pcConnected ? '🟢 연결됨' : '⚪ 대기 중') + '</div></div>';
+    html += '<div class="home-stat-pill"><div class="k">PC 활성 봇</div><div class="v">' + esc(pcActiveChar ? pcActiveChar.name : '없음 (홈)') + '</div></div>';
+    html += '<div class="home-stat-pill"><div class="k">원격 모델</div><div class="v">' + esc(activeProf ? (activeProf.name || activeProf.model) : '미설정') + '</div></div>';
+    if (st.updateAvailable) {
+      html += '<div class="home-stat-pill" style="cursor:pointer; border-color:var(--accent);" data-home-tab="modules"><div class="k">업데이트</div><div class="v" style="color:var(--accent);">✨ 새 버전 있음</div></div>';
+    }
+    html += '</div></div>';
+
+    // 2) Continue reading card
+    let resumeChar = null;
+    let resumeChat = null;
+    if (typeof snap.charIndex === 'number' && snap.charIndex >= 0 && typeof snap.chatIndex === 'number' && snap.chatIndex >= 0) {
+      resumeChar = chars.find((c) => c && c.index === snap.charIndex) || null;
+      if (resumeChar) {
+        resumeChat = (resumeChar.chats || []).find((ch) => ch && ch.index === snap.chatIndex) || { index: snap.chatIndex, name: snap.chatName || ('Chat ' + (snap.chatIndex + 1)), msgCount: (snap.messages || []).length };
+      }
+    }
+    if (!resumeChar && topRecent.length) {
+      resumeChar = topRecent[0].charObj;
+      resumeChat = topRecent[0].chatObj;
+    }
+    if (resumeChar && resumeChat) {
+      const rTurns = (typeof resumeChat.turnCount === 'number') ? resumeChat.turnCount : Math.floor(Number(resumeChat.msgCount || 0) / 2);
+      const rSub = (resumeChat.name || '채팅방') + ' · ' + rTurns + '턴';
+      html += '<div class="card home-resume-card" data-home-open-char="' + resumeChar.index + '" data-home-open-chat="' + resumeChat.index + '">' +
+        botThumbHtml(resumeChar, 'lg') +
+        '<div style="min-width:0; flex:1;">' +
+          '<div style="font-size:11px; font-weight:800; color:var(--accent); letter-spacing:0.04em; margin-bottom:2px;">이어서 읽기</div>' +
+          '<div style="font-size:15.5px; font-weight:800; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + esc(resumeChar.name) + '</div>' +
+          '<div style="font-size:12.5px; color:var(--sub); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; margin-top:2px;">' + esc(rSub) + '</div>' +
+        '</div>' +
+        '<button type="button" class="btn" style="flex-shrink:0;">열기</button>' +
+      '</div>';
+    }
+
+    // 3) Recent conversations
+    html += '<div class="card"><h3><span>🕒 최근 대화</span><span class="badge">' + topRecent.length + '</span></h3>';
+    if (topRecent.length) {
+      html += '<div class="home-recent-list">';
+      for (const item of topRecent) {
+        const c = item.charObj;
+        const ch = item.chatObj;
+        const tCnt = (typeof ch.turnCount === 'number') ? ch.turnCount : Math.floor(Number(ch.msgCount || 0) / 2);
+        const rel = formatRelTime(item.date);
+        const roomTxt = ch.name || ('Chat ' + (ch.index + 1));
+        html += '<div class="home-recent-row" data-home-open-char="' + c.index + '" data-home-open-chat="' + ch.index + '">' +
+          botThumbHtml(c, 'sm') +
+          '<div style="min-width:0; flex:1;">' +
+            '<div style="font-weight:700; font-size:13.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + esc(c.name) + '</div>' +
+            '<div style="font-size:12px; color:var(--sub); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + esc(roomTxt) + ' · ' + tCnt + '턴</div>' +
+          '</div>' +
+          '<span class="badge" style="flex-shrink:0;">' + esc(rel) + '</span>' +
+        '</div>';
+      }
+      html += '</div>';
+    } else {
+      html += '<div style="font-size:12.5px; color:var(--sub);">최근 대화 기록이 아직 없습니다. 아래 서재에서 방을 열어 보세요.</div>';
+    }
+    html += '</div>';
+
+    // 4) Shortcuts
+    html += '<div class="card"><h3><span>⚡ 바로가기</span></h3><div class="home-shortcuts">' +
+      '<button type="button" class="pill" data-home-action="logs">📜 리퀘스트 로그</button>' +
+      '<button type="button" class="pill" data-home-action="scene">🎨 장면 제어</button>' +
+      '<button type="button" class="pill" data-home-action="display">Aa 화면 설정</button>' +
+    '</div></div>';
+
+    // 5) Old plugin hint
+    if (chars.length > 0 && chars.every((c) => typeof c.lastDate !== 'number')) {
+      html += '<div class="hint" style="margin:0; padding:10px 12px; border-radius:12px; border:1px dashed var(--border); background:var(--surface);">💡 PC의 <code>risustand.js</code>를 최신으로 다시 설치하면 썸네일·최근 대화가 표시됩니다.</div>';
+    }
+
+    topEl.innerHTML = html;
+  }
+  const homeTopAreaEl = document.getElementById('homeTopArea');
+  if (homeTopAreaEl) {
+    homeTopAreaEl.addEventListener('click', (e) => {
+      const openRow = e.target.closest('[data-home-open-char][data-home-open-chat]');
+      if (openRow) {
+        selectTarget(Number(openRow.getAttribute('data-home-open-char')), Number(openRow.getAttribute('data-home-open-chat')));
+        return;
+      }
+      const tabTarget = e.target.closest('[data-home-tab]');
+      if (tabTarget) {
+        switchTab(tabTarget.getAttribute('data-home-tab'));
+        return;
+      }
+      const actEl = e.target.closest('[data-home-action]');
+      if (actEl) {
+        const act = actEl.getAttribute('data-home-action');
+        if (act === 'logs' && typeof openRequestLogModal === 'function') openRequestLogModal();
+        else if (act === 'scene' && typeof openSceneCtrlModal === 'function') openSceneCtrlModal();
+        else if (act === 'display') { e.stopPropagation(); setReadBar(true); }
+      }
+    });
+  }
+
+  let thumbPickerState = { charIndex: -1, chaId: '', charName: '' };
+  function closeThumbPickerModal() {
+    const m = document.getElementById('thumbPickerModal');
+    if (m) { m.style.display = 'none'; m.innerHTML = ''; }
+  }
+  function downscaleImageFileToDataUri(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onerror = () => reject(new Error('파일을 읽을 수 없습니다.'));
+      reader.onload = () => {
+        const img = new Image();
+        img.onerror = () => reject(new Error('올바른 이미지 파일이 아닙니다.'));
+        img.onload = () => {
+          try {
+            const maxDim = 512;
+            const w0 = img.naturalWidth || img.width || 1;
+            const h0 = img.naturalHeight || img.height || 1;
+            const scale = Math.min(1, maxDim / Math.max(w0, h0));
+            const w = Math.max(1, Math.round(w0 * scale));
+            const h = Math.max(1, Math.round(h0 * scale));
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) { resolve(String(reader.result || '')); return; }
+            ctx.drawImage(img, 0, 0, w, h);
+            let out = '';
+            try { out = canvas.toDataURL('image/webp', 0.88); } catch (_) {}
+            if (!out || !out.startsWith('data:image/webp')) {
+              out = canvas.toDataURL('image/jpeg', 0.88);
+            }
+            resolve(out);
+          } catch (err) {
+            reject(err);
+          }
+        };
+        img.src = String(reader.result || '');
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+  async function saveBotThumbChoice(payload) {
+    try {
+      const res = await api('/api/bot-thumb', { method: 'POST', body: JSON.stringify(payload) });
+      if (lastState) lastState.botThumbs = res.botThumbs || {};
+      lastHdrAvatarSig = '';
+      lastBotsRenderSig = '';
+      lastHomeRenderSig = '';
+      if (lastState) applyState(lastState);
+      renderBots(true);
+      renderHome(true);
+      closeThumbPickerModal();
+      toast('봇 썸네일이 변경되었습니다.');
+    } catch (e) {
+      toast('썸네일 변경 실패: ' + (e && e.message ? e.message : String(e)));
+    }
+  }
+  async function openThumbPickerModal(charIndex) {
+    const chars = (lastState && lastState.catalog && lastState.catalog.characters) || [];
+    const c = chars.find((x) => x && x.index === charIndex) || chars[charIndex];
+    if (!c) { toast('캐릭터 정보를 찾을 수 없습니다.'); return; }
+    const chaId = String(c.chaId || c.index);
+    thumbPickerState = { charIndex: c.index, chaId, charName: String(c.name || '') };
+    const modal = document.getElementById('thumbPickerModal');
+    if (!modal) return;
+    modal.innerHTML =
+      '<div class="thumb-picker-dialog">' +
+        '<div class="scene-ctrl-head">' +
+          '<div style="font-size:15px; font-weight:800; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🖼️ ' + esc(c.name) + ' · 썸네일 변경</div>' +
+          '<button type="button" class="pill" data-thumb-close="1">✕ 닫기</button>' +
+        '</div>' +
+        '<div class="scene-ctrl-body">' +
+          '<div style="display:flex; gap:8px; flex-wrap:wrap;">' +
+            '<button type="button" class="btn" id="thumbUploadBtn">📁 내 이미지 업로드</button>' +
+            '<button type="button" class="btn sec" id="thumbResetBtn">↺ 기본 아이콘</button>' +
+            '<input type="file" id="thumbUploadInp" accept="image/*" style="display:none;" />' +
+          '</div>' +
+          '<div id="thumbPickerBody" style="font-size:13px; color:var(--sub); padding:10px 0;">에셋 목록을 불러오는 중...</div>' +
+        '</div>' +
+      '</div>';
+    modal.style.display = 'flex';
+
+    try {
+      const data = await api('/api/bot-thumb/assets?charIndex=' + encodeURIComponent(c.index));
+      if (modal.style.display !== 'flex' || thumbPickerState.charIndex !== c.index) return;
+      thumbPickerState.chaId = String(data.chaId || chaId);
+      const bodyEl = document.getElementById('thumbPickerBody');
+      const assets = Array.isArray(data.assets) ? data.assets : [];
+      if (!bodyEl) return;
+      if (!assets.length) {
+        bodyEl.innerHTML = '<div style="padding:12px 0;">이 봇에 등록된 이미지 에셋이 없습니다. 위 버튼으로 직접 이미지를 업로드할 수 있습니다.</div>';
+        return;
+      }
+      const kindLbl = { main: '기본', emotion: '감정', additional: '에셋' };
+      bodyEl.innerHTML = '<div class="thumb-picker-grid">' +
+        assets.map((a, idx) =>
+          '<button type="button" class="thumb-asset-tile" data-thumb-asset-idx="' + idx + '">' +
+            '<img loading="lazy" decoding="async" src="' + esc(a.url) + '" alt="" />' +
+            '<div class="thumb-asset-name">' + esc(a.name || ('에셋 ' + (idx + 1))) + '</div>' +
+            '<div class="thumb-asset-kind">' + esc(kindLbl[a.kind] || a.kind || '에셋') + '</div>' +
+          '</button>'
+        ).join('') +
+      '</div>';
+    } catch (e) {
+      const bodyEl = document.getElementById('thumbPickerBody');
+      if (bodyEl) {
+        bodyEl.innerHTML = '<div style="color:var(--danger); padding:8px 0;">에셋을 불러오지 못했습니다: ' + esc(e && e.message ? e.message : String(e)) + '<br><span style="color:var(--sub); font-size:12px;">내 이미지 업로드나 기본 아이콘 복원은 PC 연결 없이도 사용할 수 있습니다.</span></div>';
+      }
+    }
+  }
+  const thumbModalEl = document.getElementById('thumbPickerModal');
+  if (thumbModalEl) {
+    thumbModalEl.addEventListener('click', async (e) => {
+      if (e.target === thumbModalEl || e.target.closest('[data-thumb-close]')) {
+        closeThumbPickerModal();
+        return;
+      }
+      if (e.target.closest('#thumbUploadBtn')) {
+        const inp = document.getElementById('thumbUploadInp');
+        if (inp) inp.click();
+        return;
+      }
+      if (e.target.closest('#thumbResetBtn')) {
+        await saveBotThumbChoice({ chaId: thumbPickerState.chaId, charIndex: thumbPickerState.charIndex, source: 'default' });
+        return;
+      }
+      const tile = e.target.closest('[data-thumb-asset-idx]');
+      if (tile) {
+        await saveBotThumbChoice({
+          chaId: thumbPickerState.chaId,
+          charIndex: thumbPickerState.charIndex,
+          source: 'asset',
+          assetIndex: Number(tile.getAttribute('data-thumb-asset-idx')),
+        });
+      }
+    });
+    thumbModalEl.addEventListener('change', async (e) => {
+      const inp = e.target;
+      if (!inp || inp.id !== 'thumbUploadInp' || !inp.files || !inp.files[0]) return;
+      try {
+        toast('이미지 처리 중...');
+        const dataUri = await downscaleImageFileToDataUri(inp.files[0]);
+        await saveBotThumbChoice({ chaId: thumbPickerState.chaId, charIndex: thumbPickerState.charIndex, source: 'custom', dataUri });
+      } catch (err) {
+        toast('이미지 업로드 실패: ' + (err && err.message ? err.message : String(err)));
+      }
+    });
+  }
+
   function renderBots(force = false) {
     const listEl = document.getElementById('botList');
     const q = (document.getElementById('botSearch').value || '').trim().toLowerCase();
     const chars = (lastState && lastState.catalog && lastState.catalog.characters) || [];
     const curChar = lastState && lastState.snapshot ? lastState.snapshot.charIndex : -1;
     const curChat = lastState && lastState.snapshot ? lastState.snapshot.chatIndex : -1;
-    const filtered = chars.filter((c) => !q || String(c.name).toLowerCase().includes(q));
-    const sig = JSON.stringify([q, curChar, curChat, expandedBotIdx, filtered.map((c) => [c.index, c.chaId || '', c.name, c.isPcActive, (c.chats || []).map((ch) => [ch.index, ch.id || '', ch.name, ch.msgCount, ch.turnCount ?? null])])]);
+    const recentOpens = loadRecentOpens();
+    const filtered = chars
+      .filter((c) => !q || String(c.name).toLowerCase().includes(q))
+      .slice()
+      .sort((a, b) => (getEffectiveCharDate(b, recentOpens) - getEffectiveCharDate(a, recentOpens)) || (chars.indexOf(a) - chars.indexOf(b)));
+    const thumbs = (lastState && lastState.botThumbs) || {};
+    const sig = JSON.stringify([q, curChar, curChat, expandedBotIdx, uiPref.assetMode, thumbs, filtered.map((c) => [c.index, c.chaId || '', c.name, c.image || '', c.lastDate ?? null, c.isPcActive, (c.chats || []).map((ch) => [ch.index, ch.id || '', ch.name, ch.msgCount, ch.turnCount ?? null, ch.lastDate ?? null])])]);
     if (!force && sig === lastBotsRenderSig) return;
     lastBotsRenderSig = sig;
     if (!filtered.length) {
@@ -10030,12 +11561,19 @@ function renderWebApp() {
     let html = '';
     for (const c of filtered) {
       const open = expandedBotIdx === c.index || (expandedBotIdx === -1 && c.index === curChar);
+      const effBotDate = getEffectiveCharDate(c, recentOpens);
+      const relTxt = effBotDate > 0 ? formatRelTime(effBotDate) : '';
       html += '<div class="bot-item"><div class="bot-head" data-toggle-bot="' + c.index + '">';
-      html += '<div style="font-weight:700; font-size:14.5px;">' + esc(c.name) + '</div><div style="display:flex; gap:5px; align-items:center;">';
+      html += '<div class="bot-head-main">' + botThumbHtml(c) + '<div class="bot-head-meta"><div class="bot-head-title">' + esc(c.name) + '</div>' +
+        (relTxt ? '<div class="bot-head-sub">최근 · ' + esc(relTxt) + '</div>' : '') + '</div></div>';
+      html += '<div style="display:flex; gap:5px; align-items:center;">';
       if (c.isPcActive) html += '<span class="badge pc">PC 활성</span>';
       html += '<span class="badge">방 ' + (c.chats ? c.chats.length : 0) + '</span></div></div>';
       if (open) {
-        html += '<div class="chat-list"><button class="btn sec" style="width:100%; margin-bottom:4px;" data-create-chat="' + c.index + '">＋ 새 채팅방 파기</button>';
+        html += '<div class="chat-list"><div style="display:flex; gap:6px; margin-bottom:4px;">' +
+          '<button class="btn sec" style="flex:1;" data-create-chat="' + c.index + '">＋ 새 채팅방 파기</button>' +
+          '<button class="btn sec" style="flex-shrink:0;" data-thumb-edit="' + c.index + '">🖼️ 썸네일 변경</button>' +
+          '</div>';
         for (const ch of (c.chats || [])) {
           const isCur = c.index === curChar && ch.index === curChat;
           const turnCnt = (typeof ch.turnCount === 'number') ? ch.turnCount : Math.floor(Number(ch.msgCount || 0) / 2);
@@ -10048,6 +11586,8 @@ function renderWebApp() {
     listEl.innerHTML = html;
   }
   document.getElementById('botList').addEventListener('click', (e) => {
+    const thumbBtn = e.target.closest('[data-thumb-edit]');
+    if (thumbBtn) { openThumbPickerModal(Number(thumbBtn.getAttribute('data-thumb-edit'))); return; }
     const createBtn = e.target.closest('[data-create-chat]');
     if (createBtn) { createChat(Number(createBtn.getAttribute('data-create-chat'))); return; }
     const chatRow = e.target.closest('[data-sel-char]');
@@ -10064,6 +11604,7 @@ function renderWebApp() {
   };
   window.toggleBot = (idx) => { expandedBotIdx = expandedBotIdx === idx ? -2 : idx; renderBots(true); };
   window.selectTarget = async (charIndex, chatIndex) => {
+    recordRecentOpen(charIndex, chatIndex);
     bookAnchorMode = 'last-user';
     bookSpreadIdx = -1;
     bookDesiredSpreadIdx = -1;
@@ -10076,6 +11617,7 @@ function renderWebApp() {
   window.createChat = async (charIndex) => {
     const name = prompt('새 채팅방 이름 (비우면 자동 생성):', '');
     if (name === null) return;
+    recordRecentOpen(charIndex, 0);
     bookAnchorMode = 'last-user';
     bookSpreadIdx = -1;
     bookDesiredSpreadIdx = -1;
@@ -11048,6 +12590,7 @@ function renderWebApp() {
       document.getElementById('imgGenCustomBox').style.display = srcVal === 'custom' ? 'block' : 'none';
       document.getElementById('imgGenComfyBox').style.display = provVal === 'comfyui' ? 'block' : 'none';
     }
+    if (typeof hydrateTtsConfigUI === 'function') hydrateTtsConfigUI();
     document.getElementById('profileList').innerHTML = profs.map((p) => {
       const active = p.id === routerCfg.activeProfileId;
       const pMeta = getProviderMeta(inferClientProviderId(p.provider, p.providerType, p.baseUrl));
@@ -11434,6 +12977,680 @@ function renderWebApp() {
       toast('삽화 프로바이더 설정 저장됨');
     };
   }
+
+  // ---------- TTS Config & Cast Management UI ----------
+  const TTS_VOICE_GROUPS_CLIENT = ${JSON.stringify(TTS_VOICE_GROUPS)};
+  const TTS_BUILTIN_VOICE_REFS_CLIENT = ${JSON.stringify(TTS_BUILTIN_VOICE_REFERENCES)};
+  const TTS_TONE_TAG_PRESETS_CLIENT = ${JSON.stringify(TTS_TONE_TAG_PRESETS)};
+  let ttsLiveVoices = { fish: [], openai_qwen: [] };
+  let activeVpTab = 'fish';
+
+  function getSavedVoiceProfiles() {
+    const vp = (routerCfg && routerCfg.tts && routerCfg.tts.voiceProfiles) || {};
+    return {
+      fish: Array.isArray(vp.fish) ? vp.fish : [],
+      openai_qwen: Array.isArray(vp.openai_qwen) ? vp.openai_qwen : [],
+    };
+  }
+
+  function getActiveTtsGroup() {
+    const provEl = document.getElementById('ttsProviderSel');
+    const prov = (provEl && provEl.value) || (routerCfg && routerCfg.tts && routerCfg.tts.provider) || 'fish_local';
+    return (prov === 'fish_local' || prov === 'fish_cloud') ? 'fish' : 'openai_qwen';
+  }
+
+  function inferClientVoiceGroup(voiceId, preferredGroup) {
+    if (preferredGroup === 'fish' || preferredGroup === 'openai_qwen') return preferredGroup;
+    const id = String(voiceId || '').trim();
+    const saved = getSavedVoiceProfiles();
+    if (id) {
+      if (saved.fish.some((v) => v.id === id)) return 'fish';
+      if (saved.openai_qwen.some((v) => v.id === id)) return 'openai_qwen';
+      if ((ttsLiveVoices.fish || []).some((v) => v.id === id)) return 'fish';
+      if ((ttsLiveVoices.openai_qwen || []).some((v) => v.id === id)) return 'openai_qwen';
+      const bi = (TTS_BUILTIN_VOICE_REFS_CLIENT.openai_qwen || []);
+      if (bi.some((v) => v.id.toLowerCase() === id.toLowerCase())) return 'openai_qwen';
+    }
+    return getActiveTtsGroup();
+  }
+
+  function getTtsVoiceOptionsForGroup(group) {
+    const grp = group === 'openai_qwen' ? 'openai_qwen' : 'fish';
+    const out = [];
+    const seen = new Set();
+    const pushItem = (id, label, badge) => {
+      const cleanId = String(id || '').trim();
+      if (!cleanId || seen.has(cleanId)) return;
+      seen.add(cleanId);
+      const rawLabel = String(label || cleanId).trim();
+      const base = rawLabel === cleanId ? cleanId : (rawLabel + ' (' + cleanId + ')');
+      out.push({ id: cleanId, label: (badge ? badge + ' ' : '') + base });
+    };
+    const saved = getSavedVoiceProfiles()[grp] || [];
+    for (const v of saved) pushItem(v.id, v.label, '★');
+    const live = ttsLiveVoices[grp] || [];
+    for (const v of live) pushItem(v.id, v.label || v.id, '🌐');
+    const builtin = TTS_BUILTIN_VOICE_REFS_CLIENT[grp] || [];
+    for (const v of builtin) pushItem(v.id, v.label || v.id, '');
+    return out;
+  }
+
+  function buildVoiceGroupOptionsHtml(selectedGroup) {
+    const grp = selectedGroup === 'openai_qwen' ? 'openai_qwen' : 'fish';
+    return TTS_VOICE_GROUPS_CLIENT.map((g) =>
+      '<option value="' + esc(g.id) + '"' + (g.id === grp ? ' selected' : '') + '>' + esc(g.label) + '</option>'
+    ).join('');
+  }
+
+  function buildVoiceRefOptionsHtml(group, currentVoiceId, emptyLabel) {
+    const cur = String(currentVoiceId || '').trim();
+    const items = getTtsVoiceOptionsForGroup(group);
+    let matched = false;
+    const opts = ['<option value="">' + esc(emptyLabel || '-- 기본 / 선택 안 함 --') + '</option>'];
+    for (const item of items) {
+      const isSel = Boolean(cur && item.id === cur);
+      if (isSel) matched = true;
+      opts.push('<option value="' + esc(item.id) + '"' + (isSel ? ' selected' : '') + '>' + esc(item.label) + '</option>');
+    }
+    const isCustom = Boolean(cur && !matched);
+    opts.push('<option value="__custom__"' + (isCustom ? ' selected' : '') + '>✏️ 직접 입력...</option>');
+    return opts.join('');
+  }
+
+  function buildToneTagOptionsHtml(currentTag, emptyLabel) {
+    const cur = String(currentTag || '').trim();
+    const emotions = TTS_TONE_TAG_PRESETS_CLIENT.filter((t) => t.category === 'emotion');
+    const delivery = TTS_TONE_TAG_PRESETS_CLIENT.filter((t) => t.category !== 'emotion');
+    let matched = !cur;
+    const renderOpt = (t) => {
+      const isSel = Boolean(cur && t.value.toLowerCase() === cur.toLowerCase());
+      if (isSel) matched = true;
+      return '<option value="' + esc(t.value) + '"' + (isSel ? ' selected' : '') + '>' + esc(t.label) + '</option>';
+    };
+    return '<option value="">' + esc(emptyLabel || '-- 톤 태그 없음 (기본) --') + '</option>' +
+      '<optgroup label="감정 (Emotions)">' + emotions.map(renderOpt).join('') + '</optgroup>' +
+      '<optgroup label="발성 · 속마음 (Delivery)">' + delivery.map(renderOpt).join('') + '</optgroup>' +
+      '<option value="__custom__"' + (!matched && cur ? ' selected' : '') + '>✏️ 직접 입력...</option>';
+  }
+
+  function syncVoiceDatalistOptions() {
+    const dl = document.getElementById('ttsVoiceDatalist');
+    if (!dl) return;
+    const all = [...getTtsVoiceOptionsForGroup('fish'), ...getTtsVoiceOptionsForGroup('openai_qwen')];
+    const seen = new Set();
+    const opts = [];
+    for (const item of all) {
+      if (seen.has(item.id)) continue;
+      seen.add(item.id);
+      opts.push('<option value="' + esc(item.id) + '" label="' + esc(item.label) + '"></option>');
+    }
+    dl.innerHTML = opts.join('');
+  }
+
+  function syncToneTagControl(selEl, inpEl, val, emptyLabel) {
+    if (!selEl || !inpEl) return;
+    const v = String(val !== undefined ? val : inpEl.value || '').trim();
+    inpEl.value = v;
+    selEl.innerHTML = buildToneTagOptionsHtml(v, emptyLabel);
+    const isCustom = selEl.value === '__custom__';
+    inpEl.style.display = isCustom ? 'block' : 'none';
+  }
+
+  function bindToneTagPair(selId, inpId, emptyLabel) {
+    const selEl = document.getElementById(selId);
+    const inpEl = document.getElementById(inpId);
+    if (!selEl || !inpEl) return;
+    selEl.onchange = () => {
+      if (selEl.value === '__custom__') {
+        inpEl.style.display = 'block';
+        inpEl.focus();
+      } else {
+        inpEl.value = selEl.value;
+        inpEl.style.display = 'none';
+      }
+    };
+    inpEl.oninput = () => {
+      const cur = inpEl.value.trim();
+      const preset = TTS_TONE_TAG_PRESETS_CLIENT.find((t) => t.value.toLowerCase() === cur.toLowerCase());
+      if (!cur) selEl.value = '';
+      else if (preset) selEl.value = preset.value;
+      else selEl.value = '__custom__';
+    };
+    syncToneTagControl(selEl, inpEl, inpEl.value, emptyLabel);
+  }
+
+  function syncVoicePickerControl(groupSelEl, refSelEl, inpEl, emptyLabel, preferredGroup) {
+    if (!groupSelEl || !refSelEl || !inpEl) return;
+    const grp = inferClientVoiceGroup(inpEl.value, preferredGroup);
+    groupSelEl.innerHTML = buildVoiceGroupOptionsHtml(grp);
+    refSelEl.innerHTML = buildVoiceRefOptionsHtml(grp, inpEl.value, emptyLabel);
+  }
+
+  function bindVoicePickerPair(groupSelId, refSelId, inpId, emptyLabel) {
+    const groupSelEl = document.getElementById(groupSelId);
+    const refSelEl = document.getElementById(refSelId);
+    const inpEl = document.getElementById(inpId);
+    if (!groupSelEl || !refSelEl || !inpEl) return;
+    groupSelEl.onchange = () => {
+      refSelEl.innerHTML = buildVoiceRefOptionsHtml(groupSelEl.value, inpEl.value, emptyLabel);
+    };
+    refSelEl.onchange = () => {
+      if (refSelEl.value === '__custom__') {
+        inpEl.focus();
+      } else {
+        inpEl.value = refSelEl.value;
+      }
+    };
+    inpEl.oninput = () => {
+      refSelEl.innerHTML = buildVoiceRefOptionsHtml(groupSelEl.value, inpEl.value, emptyLabel);
+    };
+    syncVoicePickerControl(groupSelEl, refSelEl, inpEl, emptyLabel);
+  }
+
+  function refreshAllTtsPickers() {
+    syncVoiceDatalistOptions();
+    const pairs = [
+      ['ttsNarVoiceGroupSel', 'ttsNarVoiceRefSel', 'ttsNarVoiceId', '-- 서버 기본 음성 --'],
+      ['ttsFemVoiceGroupSel', 'ttsFemVoiceRefSel', 'ttsFemVoiceId', '-- 미지정 (서버 기본) --'],
+      ['ttsMaleVoiceGroupSel', 'ttsMaleVoiceRefSel', 'ttsMaleVoiceId', '-- 미지정 (서버 기본) --'],
+      ['ttsNeuVoiceGroupSel', 'ttsNeuVoiceRefSel', 'ttsNeuVoiceId', '-- 미지정 (서버 기본) --'],
+      ['ttsTestVoiceGroupSel', 'ttsTestVoiceRefSel', 'ttsTestVoiceInp', '-- 기본 성별/나레이션 사용 --'],
+    ];
+    for (const [gId, rId, iId, lbl] of pairs) {
+      const gEl = document.getElementById(gId);
+      const rEl = document.getElementById(rId);
+      const iEl = document.getElementById(iId);
+      if (gEl && rEl && iEl) {
+        const curGrp = gEl.value || inferClientVoiceGroup(iEl.value);
+        syncVoicePickerControl(gEl, rEl, iEl, lbl, iEl.value ? inferClientVoiceGroup(iEl.value, curGrp) : curGrp);
+      }
+    }
+  }
+
+  function renderVoiceProfilesManager() {
+    const box = document.getElementById('ttsVoiceProfilesBox');
+    if (!box) return;
+    const saved = getSavedVoiceProfiles();
+    const list = saved[activeVpTab] || [];
+    box.querySelectorAll('[data-vp-tab]').forEach((btn) => {
+      btn.classList.toggle('active', btn.getAttribute('data-vp-tab') === activeVpTab);
+    });
+    const listEl = document.getElementById('ttsVpList');
+    if (listEl) {
+      if (!list.length) {
+        listEl.innerHTML = '<div class="hint" style="margin:2px 0 4px;">' +
+          (activeVpTab === 'fish'
+            ? '등록된 Fish 레퍼런스 프로필이 없습니다. 직접 ID를 저장하거나 [이 영역 서버에서 불러오기]를 누르세요.'
+            : '등록된 사용자 OpenAI/Qwen 프로필이 없습니다. (기본 내장 보이스 20종은 드롭다운에 자동 포함됩니다)') +
+          '</div>';
+      } else {
+        listEl.innerHTML = list.map((item) => {
+          const gLabel = item.gender === 'female' ? '♀' : (item.gender === 'male' ? '♂' : '·');
+          return '<div class="tts-cast-item">' +
+            '<div style="min-width:0;">' +
+              '<div style="font-size:13px; font-weight:700;">' + esc(gLabel + ' ' + item.label) + '</div>' +
+              '<div style="font-size:11px; color:var(--sub); word-break:break-all;">ID: ' + esc(item.id) + '</div>' +
+            '</div>' +
+            '<button type="button" class="pill" data-vp-del="' + esc(item.id) + '" style="color:var(--danger); flex-shrink:0;">삭제</button>' +
+          '</div>';
+        }).join('');
+      }
+    }
+    const liveBox = document.getElementById('ttsVpLiveBox');
+    const liveChips = document.getElementById('ttsVpLiveChips');
+    if (liveBox && liveChips) {
+      const liveItems = ttsLiveVoices[activeVpTab] || [];
+      const savedSet = new Set(list.map((x) => x.id));
+      const unsaved = liveItems.filter((x) => x && x.id && !savedSet.has(x.id));
+      if (unsaved.length) {
+        liveBox.style.display = 'block';
+        liveChips.innerHTML = unsaved.map((v) =>
+          '<button type="button" class="pill" data-vp-quick-id="' + esc(v.id) + '" data-vp-quick-label="' + esc(v.label || v.id) + '">+ ' + esc(v.label || v.id) + '</button>'
+        ).join('');
+      } else {
+        liveBox.style.display = 'none';
+        liveChips.innerHTML = '';
+      }
+    }
+  }
+
+  function storeLiveVoicesFromResponse(r, fallbackGroup) {
+    if (!r || !Array.isArray(r.voices)) return;
+    const grp = r.voiceGroup === 'fish' || r.voiceGroup === 'openai_qwen'
+      ? r.voiceGroup
+      : (fallbackGroup === 'openai_qwen' ? 'openai_qwen' : 'fish');
+    const items = Array.isArray(r.voiceItems) && r.voiceItems.length
+      ? r.voiceItems.map((x) => ({ id: x.id, label: x.label || x.id }))
+      : r.voices.map((v) => ({ id: String(v), label: String(v) }));
+    ttsLiveVoices[grp] = items;
+    if (r.voiceProfiles && routerCfg && routerCfg.tts) {
+      routerCfg.tts.voiceProfiles = r.voiceProfiles;
+    }
+    refreshAllTtsPickers();
+    renderVoiceProfilesManager();
+  }
+
+  const TTS_CLIENT_DEFAULTS = {
+    fish_local: { url: 'http://127.0.0.1:8080/v1/tts', model: 's2-pro', isFish: true, hint: 'Windows에서는 <b>Pinokio</b>(Fish Speech 원클릭)나 <code>fish-speech/tools/api_server.py</code>를 띄워 연결하세요.' },
+    openai_compat_local: { url: 'http://127.0.0.1:8881/v1/audio/speech', model: 'tts-1', isFish: false, hint: '<b>LocalAI · TTS-WebUI · vLLM-Omni · Qwen3-TTS FastAPI · Speaches</b> 등 <code>/v1/audio/speech</code> 호환 로컬 허브에 연결됩니다.' },
+    fish_cloud: { url: 'https://api.fish.audio/v1/tts', model: 's2-pro', isFish: true, hint: 'Fish Audio 상용 클라우드 API입니다. 로컬 Fish와 동일한 Voice ID 및 감정 태그를 사용합니다.' },
+    openai_compat_cloud: { url: 'https://api.openai.com/v1/audio/speech', model: 'gpt-4o-mini-tts', isFish: false, hint: 'OpenAI TTS(<code>gpt-4o-mini-tts</code>) 등 상용 <code>/v1/audio/speech</code> API입니다.' },
+  };
+  function collectTtsFormPayload() {
+    const prov = document.getElementById('ttsProviderSel').value;
+    const cur = (routerCfg && routerCfg.tts) || {};
+    const nar = cur.narration || {};
+    const dv = cur.defaultVoices || {};
+    const fx = cur.effects || {};
+    return {
+      enabled: document.getElementById('ttsEnabledChk').checked,
+      provider: prov,
+      apiUrl: document.getElementById('ttsApiUrl').value.trim(),
+      apiKey: document.getElementById('ttsApiKey').value.trim(),
+      model: document.getElementById('ttsModel').value.trim(),
+      format: document.getElementById('ttsFormat').value,
+      parseMode: document.getElementById('ttsParseMode').value,
+      llmSource: document.getElementById('ttsLlmSource').value,
+      fishTagStyle: document.getElementById('ttsFishTagStyle').value,
+      narration: {
+        ...nar,
+        voiceId: document.getElementById('ttsNarVoiceId').value.trim(),
+        toneTag: document.getElementById('ttsNarToneTag').value.trim(),
+        speed: Number(document.getElementById('ttsNarSpeed').value) || 0.96,
+        instruction: document.getElementById('ttsNarInstr').value.trim(),
+      },
+      defaultVoices: {
+        female: { ...(dv.female || {}), voiceId: document.getElementById('ttsFemVoiceId').value.trim(), thoughtToneTag: document.getElementById('ttsFemThoughtTag').value.trim(), thoughtSpeed: Number(document.getElementById('ttsDefThoughtSpeed').value) || 0.94 },
+        male: { ...(dv.male || {}), voiceId: document.getElementById('ttsMaleVoiceId').value.trim(), thoughtToneTag: document.getElementById('ttsMaleThoughtTag').value.trim(), thoughtSpeed: Number(document.getElementById('ttsDefThoughtSpeed').value) || 0.94 },
+        neutral: { ...(dv.neutral || {}), voiceId: document.getElementById('ttsNeuVoiceId').value.trim(), thoughtSpeed: Number(document.getElementById('ttsDefThoughtSpeed').value) || 0.94 },
+      },
+      effects: {
+        ...fx,
+        thoughtFxEnabled: document.getElementById('ttsFxEnabledChk').checked,
+        thoughtReverbMix: Number(document.getElementById('ttsFxReverbInp').value),
+        thoughtFilterHz: Number(document.getElementById('ttsFxFilterInp').value) || 2800,
+        thoughtRate: Number(document.getElementById('ttsFxThRateInp').value) || 0.95,
+        narrationRate: Number(document.getElementById('ttsFxNarRateInp').value) || 0.96,
+      },
+    };
+  }
+
+  function syncTtsProviderUI(prov, overwriteUrlModel) {
+    const meta = TTS_CLIENT_DEFAULTS[prov] || TTS_CLIENT_DEFAULTS.fish_local;
+    const hintEl = document.getElementById('ttsProviderHint');
+    const urlEl = document.getElementById('ttsApiUrl');
+    const modelEl = document.getElementById('ttsModel');
+    const tagRow = document.getElementById('ttsFishTagRow');
+    if (hintEl) hintEl.innerHTML = meta.hint;
+    if (urlEl) {
+      urlEl.placeholder = meta.url;
+      if (overwriteUrlModel) urlEl.value = '';
+    }
+    if (modelEl && overwriteUrlModel) modelEl.value = meta.model;
+    if (tagRow) tagRow.style.display = meta.isFish ? 'block' : 'none';
+  }
+
+  function hydrateTtsConfigUI() {
+    if (!document.getElementById('ttsConfigCard')) return;
+    const t = (routerCfg && routerCfg.tts && typeof routerCfg.tts === 'object') ? routerCfg.tts : {};
+    const prov = t.provider || 'fish_local';
+    document.getElementById('ttsEnabledChk').checked = t.enabled !== false;
+    document.getElementById('ttsProviderSel').value = prov;
+    document.getElementById('ttsApiUrl').value = t.apiUrl || '';
+    document.getElementById('ttsApiKey').value = '';
+    document.getElementById('ttsApiKey').placeholder = t.hasKey ? ('저장됨: ' + t.keyPreview + ' (비우면 유지)') : 'Fish Audio / OpenAI API Key (로컬은 비워도 됨)';
+    document.getElementById('ttsModel').value = t.model || (TTS_CLIENT_DEFAULTS[prov] ? TTS_CLIENT_DEFAULTS[prov].model : 's2-pro');
+    document.getElementById('ttsFormat').value = t.format || 'mp3';
+    document.getElementById('ttsParseMode').value = t.parseMode || 'hybrid';
+    document.getElementById('ttsLlmSource').value = t.llmSource || 'translator';
+    document.getElementById('ttsFishTagStyle').value = t.fishTagStyle || 'brackets';
+    const presetSel = document.getElementById('ttsEndpointPresetSel');
+    if (presetSel) presetSel.value = '';
+    const discPick = document.getElementById('ttsDiscoveredPick');
+    if (discPick) { discPick.innerHTML = ''; discPick.style.display = 'none'; }
+    const discSt = document.getElementById('ttsDiscoverStatus');
+    if (discSt) discSt.textContent = '';
+    setModelPickList('ttsModelPick', 'ttsModelStatus', [], '');
+    syncTtsProviderUI(prov, false);
+
+    const nar = t.narration || {};
+    document.getElementById('ttsNarVoiceId').value = nar.voiceId || '';
+    document.getElementById('ttsNarToneTag').value = nar.toneTag !== undefined ? nar.toneTag : 'calm';
+    document.getElementById('ttsNarSpeed').value = nar.speed || 0.96;
+    document.getElementById('ttsNarInstr').value = nar.instruction || '';
+
+    const dv = t.defaultVoices || {};
+    const fem = dv.female || {};
+    const male = dv.male || {};
+    const neu = dv.neutral || {};
+    document.getElementById('ttsFemVoiceId').value = fem.voiceId || '';
+    document.getElementById('ttsMaleVoiceId').value = male.voiceId || '';
+    document.getElementById('ttsNeuVoiceId').value = neu.voiceId || '';
+    document.getElementById('ttsFemThoughtTag').value = fem.thoughtToneTag !== undefined ? fem.thoughtToneTag : 'whispering';
+    document.getElementById('ttsMaleThoughtTag').value = male.thoughtToneTag !== undefined ? male.thoughtToneTag : 'whispering';
+    document.getElementById('ttsDefThoughtSpeed').value = fem.thoughtSpeed || 0.94;
+
+    syncToneTagControl(document.getElementById('ttsNarToneTagSel'), document.getElementById('ttsNarToneTag'), document.getElementById('ttsNarToneTag').value, '-- 톤 태그 없음 (기본) --');
+    syncToneTagControl(document.getElementById('ttsFemThoughtTagSel'), document.getElementById('ttsFemThoughtTag'), document.getElementById('ttsFemThoughtTag').value, '-- 톤 태그 없음 (기본) --');
+    syncToneTagControl(document.getElementById('ttsMaleThoughtTagSel'), document.getElementById('ttsMaleThoughtTag'), document.getElementById('ttsMaleThoughtTag').value, '-- 톤 태그 없음 (기본) --');
+    refreshAllTtsPickers();
+    renderVoiceProfilesManager();
+
+    const fx = t.effects || {};
+    document.getElementById('ttsFxEnabledChk').checked = fx.thoughtFxEnabled !== false;
+    document.getElementById('ttsFxReverbInp').value = fx.thoughtReverbMix !== undefined ? fx.thoughtReverbMix : 0.32;
+    document.getElementById('ttsFxFilterInp').value = fx.thoughtFilterHz || 2800;
+    document.getElementById('ttsFxThRateInp').value = fx.thoughtRate || 0.95;
+    document.getElementById('ttsFxNarRateInp').value = fx.narrationRate || 0.96;
+  }
+
+  (function bindTtsConfigUI() {
+    const provSel = document.getElementById('ttsProviderSel');
+    if (provSel) provSel.onchange = () => {
+      syncTtsProviderUI(provSel.value, true);
+      setModelPickList('ttsModelPick', 'ttsModelStatus', [], '');
+    };
+
+    const TTS_PRESET_MAP = {
+      fish_local_8081: { provider: 'fish_local', apiUrl: 'http://127.0.0.1:8081/v1/tts', model: 's2-pro', fishTagStyle: 'brackets' },
+      fish_local_8080: { provider: 'fish_local', apiUrl: 'http://127.0.0.1:8080/v1/tts', model: 's2-pro', fishTagStyle: 'brackets' },
+      localai_8080: { provider: 'openai_compat_local', apiUrl: 'http://127.0.0.1:8080/v1/audio/speech', model: 'fish-speech-s2-pro', fishTagStyle: 'none' },
+      qwen3_8881: { provider: 'openai_compat_local', apiUrl: 'http://127.0.0.1:8881/v1/audio/speech', model: 'tts-1', fishTagStyle: 'none' },
+      vllm_8000: { provider: 'openai_compat_local', apiUrl: 'http://127.0.0.1:8000/v1/audio/speech', model: 'fishaudio/s2-pro', fishTagStyle: 'none' },
+      fish_cloud: { provider: 'fish_cloud', apiUrl: 'https://api.fish.audio/v1/tts', model: 's2-pro', fishTagStyle: 'brackets' },
+      openai_cloud: { provider: 'openai_compat_cloud', apiUrl: 'https://api.openai.com/v1/audio/speech', model: 'gpt-4o-mini-tts', fishTagStyle: 'none' },
+    };
+
+    function applyTtsPresetValues(preset) {
+      if (!preset) return;
+      document.getElementById('ttsProviderSel').value = preset.provider;
+      syncTtsProviderUI(preset.provider, false);
+      document.getElementById('ttsApiUrl').value = preset.apiUrl || '';
+      document.getElementById('ttsModel').value = preset.model || '';
+      if (preset.fishTagStyle) document.getElementById('ttsFishTagStyle').value = preset.fishTagStyle;
+      if (Array.isArray(preset.models) && preset.models.length) {
+        setModelPickList('ttsModelPick', 'ttsModelStatus', preset.models, '서버에서 모델 ' + preset.models.length + '개를 불러왔습니다.');
+      } else {
+        setModelPickList('ttsModelPick', 'ttsModelStatus', [], '프리셋이 적용되었습니다. [🔄 모델 불러오기]로 확인하거나 바로 저장하세요.');
+      }
+    }
+
+    const presetSel = document.getElementById('ttsEndpointPresetSel');
+    if (presetSel) presetSel.onchange = () => {
+      const p = TTS_PRESET_MAP[presetSel.value];
+      if (!p) return;
+      applyTtsPresetValues(p);
+      toast('TTS 엔드포인트 프리셋 적용됨');
+    };
+
+    let ttsDiscoveredList = [];
+    const discoverBtn = document.getElementById('ttsDiscoverBtn');
+    const discoveredPick = document.getElementById('ttsDiscoveredPick');
+    const discoverSt = document.getElementById('ttsDiscoverStatus');
+    if (discoverBtn) discoverBtn.onclick = async () => {
+      discoverBtn.disabled = true;
+      if (discoverSt) discoverSt.textContent = '로컬 포트(8081 · 8080 · 8881 · 8000) 탐색 중...';
+      try {
+        const r = await api('/api/tts/discover');
+        ttsDiscoveredList = Array.isArray(r.servers) ? r.servers : [];
+        if (!ttsDiscoveredList.length) {
+          if (discoveredPick) { discoveredPick.innerHTML = ''; discoveredPick.style.display = 'none'; }
+          if (discoverSt) discoverSt.textContent = '실행 중인 로컬 TTS 서버를 찾지 못했습니다. 위 프리셋이나 주소를 직접 입력하세요.';
+          return;
+        }
+        if (discoveredPick) {
+          discoveredPick.innerHTML = '<option value="">-- 탐색된 로컬 서버 선택 (' + ttsDiscoveredList.length + '개) --</option>' +
+            ttsDiscoveredList.map((s, idx) => '<option value="' + idx + '">' + esc(s.label) + '</option>').join('');
+          discoveredPick.style.display = 'block';
+          discoveredPick.value = '0';
+        }
+        applyTtsPresetValues(ttsDiscoveredList[0]);
+        if (discoverSt) discoverSt.textContent = ttsDiscoveredList.length + '개 로컬 TTS 서버를 찾아 첫 번째 서버를 자동 입력했습니다.';
+        toast('로컬 TTS 서버 ' + ttsDiscoveredList.length + '개 발견');
+      } catch (e) {
+        if (discoverSt) discoverSt.textContent = '탐색 오류: ' + e.message;
+      } finally {
+        discoverBtn.disabled = false;
+      }
+    };
+    if (discoveredPick) discoveredPick.onchange = () => {
+      const idx = Number(discoveredPick.value);
+      if (!Number.isNaN(idx) && ttsDiscoveredList[idx]) {
+        applyTtsPresetValues(ttsDiscoveredList[idx]);
+        toast('선택한 로컬 서버로 적용됨');
+      }
+    };
+
+    const loadModelsBtn = document.getElementById('ttsLoadModelsBtn');
+    const ttsModelPick = document.getElementById('ttsModelPick');
+    if (loadModelsBtn) loadModelsBtn.onclick = async () => {
+      loadModelsBtn.disabled = true;
+      setModelPickList('ttsModelPick', 'ttsModelStatus', [], '모델 목록 조회 중...');
+      try {
+        const r = await api('/api/tts/models', {
+          method: 'POST',
+          body: JSON.stringify({
+            provider: document.getElementById('ttsProviderSel').value,
+            apiUrl: document.getElementById('ttsApiUrl').value.trim(),
+            apiKey: document.getElementById('ttsApiKey').value.trim(),
+            model: document.getElementById('ttsModel').value.trim(),
+          }),
+        });
+        if (r.resolvedEndpoint && document.getElementById('ttsApiUrl').value.trim()) {
+          document.getElementById('ttsApiUrl').value = r.resolvedEndpoint;
+        }
+        const models = Array.isArray(r.models) ? r.models : [];
+        setModelPickList('ttsModelPick', 'ttsModelStatus', models, r.statusMsg || (models.length + '개 모델 조회됨'));
+        if (models.length && !document.getElementById('ttsModel').value.trim()) {
+          document.getElementById('ttsModel').value = models[0].id;
+        }
+        storeLiveVoicesFromResponse(r, getActiveTtsGroup());
+      } catch (e) {
+        setModelPickList('ttsModelPick', 'ttsModelStatus', [], '모델 조회 실패: ' + e.message);
+      } finally {
+        loadModelsBtn.disabled = false;
+      }
+    };
+    if (ttsModelPick) ttsModelPick.onchange = () => {
+      if (ttsModelPick.value) {
+        document.getElementById('ttsModel').value = ttsModelPick.value;
+      }
+    };
+
+    const TTS_TEST_SAMPLES = {
+      dialogue: { kind: 'dialogue', text: '안녕하세요. 창밖으로 비가 내리는 밤이네요. 지금 들리는 목소리가 자연스러운가요?' },
+      thought: { kind: 'thought', text: '설마 벌써 눈치챈 건 아니겠지… 조용히 숨을 고르고 침착하게 행동해야 해.' },
+      narration: { kind: 'narration', text: '가로등 불빛 아래 젖은 돌길이 은은하게 반짝였다. 잠시 멈춰 선 채, 깊은 밤의 공기를 들이마셨다.' },
+    };
+    let ttsTestBlobUrl = '';
+
+    const testBox = document.getElementById('ttsTestBox');
+    if (testBox) testBox.addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-tts-sample]');
+      if (!btn) return;
+      const sample = TTS_TEST_SAMPLES[btn.getAttribute('data-tts-sample')];
+      if (!sample) return;
+      const txtEl = document.getElementById('ttsTestTextInp');
+      const kindEl = document.getElementById('ttsTestKindSel');
+      if (txtEl) txtEl.value = sample.text;
+      if (kindEl) kindEl.value = sample.kind;
+    });
+
+    async function runTtsSampleTest(opts) {
+      ensureTtsAudioCtx();
+      const statusEl = document.getElementById('ttsTestStatus');
+      const audioEl = document.getElementById('ttsTestAudio');
+      const tBtn = document.getElementById('testTtsBtn');
+      if (tBtn) tBtn.disabled = true;
+      if (statusEl) statusEl.textContent = '⏳ 음성 생성 중... (로컬 첫 요청은 몇 초 걸릴 수 있습니다)';
+      toast('음성 생성 테스트 중...');
+      try {
+        const res = await fetch('/api/tts/test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+          body: JSON.stringify({ ...opts, ttsOverride: collectTtsFormPayload() }),
+        });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || ('HTTP ' + res.status));
+        }
+        const buf = await res.arrayBuffer();
+        const mime = res.headers.get('content-type') || 'audio/mpeg';
+        const provName = res.headers.get('x-tts-provider') || '';
+        const voiceName = res.headers.get('x-tts-voice') || '';
+        const elapsedMs = Number(res.headers.get('x-tts-elapsed-ms') || 0);
+        const secTxt = elapsedMs > 0 ? (elapsedMs / 1000).toFixed(2) + '초' : '완료';
+        const kbTxt = (buf.byteLength / 1024).toFixed(1) + ' KB';
+        if (statusEl) {
+          statusEl.textContent = '✅ 연결 성공 · ' + secTxt + ' · ' + kbTxt + ' · ' + mime +
+            (provName ? ' · ' + provName : '') + (voiceName ? ' · Voice: ' + voiceName : '');
+        }
+        if (audioEl) {
+          if (ttsTestBlobUrl) { try { URL.revokeObjectURL(ttsTestBlobUrl); } catch (_) {} }
+          ttsTestBlobUrl = URL.createObjectURL(new Blob([buf], { type: mime }));
+          audioEl.src = ttsTestBlobUrl;
+          audioEl.style.display = 'block';
+        }
+        await playTtsArrayBuffer(buf, { kind: opts.kind || 'dialogue' });
+        toast('테스트 음성 재생 완료');
+      } catch (err) {
+        if (statusEl) statusEl.textContent = '❌ 연결 실패: ' + (err && err.message ? err.message : String(err));
+        throw err;
+      } finally {
+        if (tBtn) tBtn.disabled = false;
+      }
+    }
+
+    const testBtn = document.getElementById('testTtsBtn');
+    if (testBtn) testBtn.onclick = async () => {
+      try {
+        const txtEl = document.getElementById('ttsTestTextInp');
+        const kindEl = document.getElementById('ttsTestKindSel');
+        const genderEl = document.getElementById('ttsTestGenderSel');
+        const voiceEl = document.getElementById('ttsTestVoiceInp');
+        const sampleText = (txtEl && txtEl.value.trim()) || '안녕하세요. 지금 들리는 목소리와 톤이 자연스러운가요?';
+        await runTtsSampleTest({
+          text: sampleText,
+          kind: (kindEl && kindEl.value) || 'dialogue',
+          gender: (genderEl && genderEl.value) || 'female',
+          voiceId: (voiceEl && voiceEl.value.trim()) || '',
+        });
+      } catch (e) { toast('연결 테스트 실패: ' + e.message); }
+    };
+
+    const saveBtn = document.getElementById('saveTtsBtn');
+    if (saveBtn) saveBtn.onclick = async () => {
+      const payload = collectTtsFormPayload();
+      routerCfg = await api('/api/router/config', { method: 'POST', body: JSON.stringify({ tts: payload }) });
+      ttsAnalyzeCache.clear();
+      ttsAudioBufferCache.clear();
+      renderRouterUI();
+      if (currentTab === 'chat') renderChat();
+      toast('TTS 설정 저장됨');
+    };
+
+    bindVoicePickerPair('ttsNarVoiceGroupSel', 'ttsNarVoiceRefSel', 'ttsNarVoiceId', '-- 서버 기본 음성 --');
+    bindVoicePickerPair('ttsFemVoiceGroupSel', 'ttsFemVoiceRefSel', 'ttsFemVoiceId', '-- 미지정 (서버 기본) --');
+    bindVoicePickerPair('ttsMaleVoiceGroupSel', 'ttsMaleVoiceRefSel', 'ttsMaleVoiceId', '-- 미지정 (서버 기본) --');
+    bindVoicePickerPair('ttsNeuVoiceGroupSel', 'ttsNeuVoiceRefSel', 'ttsNeuVoiceId', '-- 미지정 (서버 기본) --');
+    bindVoicePickerPair('ttsTestVoiceGroupSel', 'ttsTestVoiceRefSel', 'ttsTestVoiceInp', '-- 기본 성별/나레이션 사용 --');
+    bindToneTagPair('ttsNarToneTagSel', 'ttsNarToneTag', '-- 톤 태그 없음 (기본) --');
+    bindToneTagPair('ttsFemThoughtTagSel', 'ttsFemThoughtTag', '-- 톤 태그 없음 (기본) --');
+    bindToneTagPair('ttsMaleThoughtTagSel', 'ttsMaleThoughtTag', '-- 톤 태그 없음 (기본) --');
+
+    const vpBox = document.getElementById('ttsVoiceProfilesBox');
+    if (vpBox) {
+      vpBox.addEventListener('click', async (e) => {
+        const tabBtn = e.target.closest('[data-vp-tab]');
+        if (tabBtn) {
+          activeVpTab = tabBtn.getAttribute('data-vp-tab') === 'openai_qwen' ? 'openai_qwen' : 'fish';
+          renderVoiceProfilesManager();
+          return;
+        }
+        const delBtn = e.target.closest('[data-vp-del]');
+        if (delBtn) {
+          const delId = delBtn.getAttribute('data-vp-del');
+          try {
+            routerCfg = await api('/api/tts/voice-profiles', {
+              method: 'POST',
+              body: JSON.stringify({ action: 'delete', group: activeVpTab, id: delId }),
+            });
+            refreshAllTtsPickers();
+            renderVoiceProfilesManager();
+            toast('보이스 프로필 삭제됨');
+          } catch (err) { toast('프로필 삭제 실패: ' + err.message); }
+          return;
+        }
+        const quickBtn = e.target.closest('[data-vp-quick-id]');
+        if (quickBtn) {
+          const qId = quickBtn.getAttribute('data-vp-quick-id');
+          const qLbl = quickBtn.getAttribute('data-vp-quick-label') || qId;
+          const gVal = (document.getElementById('ttsVpGenderSel') && document.getElementById('ttsVpGenderSel').value) || 'neutral';
+          try {
+            routerCfg = await api('/api/tts/voice-profiles', {
+              method: 'POST',
+              body: JSON.stringify({ action: 'upsert', group: activeVpTab, item: { id: qId, label: qLbl, gender: gVal } }),
+            });
+            refreshAllTtsPickers();
+            renderVoiceProfilesManager();
+            toast('프로필에 추가됨: ' + qLbl);
+          } catch (err) { toast('프로필 추가 실패: ' + err.message); }
+        }
+      });
+
+      const vpAddBtn = document.getElementById('ttsVpAddBtn');
+      if (vpAddBtn) vpAddBtn.onclick = async () => {
+        const idInp = document.getElementById('ttsVpIdInp');
+        const lblInp = document.getElementById('ttsVpLabelInp');
+        const genSel = document.getElementById('ttsVpGenderSel');
+        const idVal = (idInp && idInp.value.trim()) || '';
+        const lblVal = (lblInp && lblInp.value.trim()) || idVal;
+        const gVal = (genSel && genSel.value) || 'female';
+        if (!idVal) { toast('Voice / Reference ID를 입력하세요.'); return; }
+        try {
+          routerCfg = await api('/api/tts/voice-profiles', {
+            method: 'POST',
+            body: JSON.stringify({ action: 'upsert', group: activeVpTab, item: { id: idVal, label: lblVal, gender: gVal } }),
+          });
+          if (idInp) idInp.value = '';
+          if (lblInp) lblInp.value = '';
+          refreshAllTtsPickers();
+          renderVoiceProfilesManager();
+          toast('보이스 레퍼런스 프로필 저장됨');
+        } catch (err) { toast('프로필 저장 실패: ' + err.message); }
+      };
+
+      const vpFetchBtn = document.getElementById('ttsVpFetchBtn');
+      if (vpFetchBtn) vpFetchBtn.onclick = async () => {
+        const stEl = document.getElementById('ttsVpStatus');
+        vpFetchBtn.disabled = true;
+        if (stEl) stEl.textContent = (activeVpTab === 'fish' ? 'Fish' : 'OpenAI/Qwen') + ' 서버에서 보이스 목록 조회 중...';
+        try {
+          const payload = { group: activeVpTab };
+          if (getActiveTtsGroup() === activeVpTab) {
+            const urlVal = document.getElementById('ttsApiUrl').value.trim();
+            const keyVal = document.getElementById('ttsApiKey').value.trim();
+            const modVal = document.getElementById('ttsModel').value.trim();
+            if (urlVal) payload.apiUrl = urlVal;
+            if (keyVal) payload.apiKey = keyVal;
+            if (modVal) payload.model = modVal;
+          }
+          const r = await api('/api/tts/models', { method: 'POST', body: JSON.stringify(payload) });
+          storeLiveVoicesFromResponse(r, activeVpTab);
+          const cnt = Array.isArray(r.voices) ? r.voices.length : 0;
+          if (stEl) stEl.textContent = r.statusMsg || ('보이스 ' + cnt + '개 불러옴');
+          toast((activeVpTab === 'fish' ? 'Fish' : 'OpenAI/Qwen') + ' 보이스 ' + cnt + '개 불러옴');
+        } catch (err) {
+          if (stEl) stEl.textContent = '조회 실패: ' + err.message;
+          toast('보이스 조회 실패: ' + err.message);
+        } finally {
+          vpFetchBtn.disabled = false;
+        }
+      };
+    }
+    refreshAllTtsPickers();
+    renderVoiceProfilesManager();
+  })();
   document.getElementById('saveTrBtn').onclick = async () => {
     routerCfg.translator = {
       ...routerCfg.translator,
@@ -12643,24 +14860,58 @@ function renderWebApp() {
     });
   })();
 
+  let activeActionOverlayPlugin = '';
+
   function isPluginFloatingModalOpen() {
     const modal = document.getElementById('pluginFloatingModal');
     return Boolean(modal && modal.style.display === 'flex');
   }
 
   function closePluginFloatingModal() {
+    activeActionOverlayPlugin = '';
     const modal = document.getElementById('pluginFloatingModal');
     if (modal) {
+      modal.classList.remove('is-action-overlay');
       modal.style.display = 'none';
       modal.innerHTML = '';
       lastFloatingModalSig = '';
     }
   }
 
+  function openPluginActionOverlayModal(overlay) {
+    const modal = document.getElementById('pluginFloatingModal');
+    if (!modal || !overlay || !overlay.html) return;
+    activeActionOverlayPlugin = String(overlay.pluginName || '');
+    const snap = (lastState && lastState.snapshot) || {};
+    const safeAttrName = activeActionOverlayPlugin.replace(/[^a-zA-Z0-9_-]/g, '');
+    const scopeSel = '.rs-pfm-stage[data-rs-rw-plugin="' + safeAttrName + '"]';
+    const styleHtml = (Array.isArray(overlay.styles) ? overlay.styles : [])
+      .map((s) => '<style>' + scopeBotCss(sanitizeBotCss(s), scopeSel) + '</style>')
+      .join('');
+    const bodyHtml = sanitizePluginWidgetHtml(overlay.html || '', scopeSel, snap.assetMap || {});
+    modal.classList.add('is-action-overlay');
+    modal.innerHTML =
+      '<div class="plg-float-dialog">' +
+        '<div class="plg-float-head">' +
+          '<div style="font-size:15px; font-weight:800;">🖼️ ' + esc(overlay.displayName || activeActionOverlayPlugin || '플러그인 GUI') + '</div>' +
+          '<button type="button" class="pill" data-pfm-close="1">✕ 닫기</button>' +
+        '</div>' +
+        '<div class="plg-float-body">' +
+          '<div class="rs-pfm-stage" data-rs-rw-plugin="' + esc(safeAttrName) + '" data-rs-plugin-raw="' + esc(activeActionOverlayPlugin) + '">' +
+            styleHtml + bodyHtml +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    modal.style.display = 'flex';
+  }
+
   function renderPluginFloatingModal(force = false) {
     const modal = document.getElementById('pluginFloatingModal');
     if (!modal) return;
     if (!force && !isPluginFloatingModalOpen()) return;
+    if (!force && activeActionOverlayPlugin) return;
+    activeActionOverlayPlugin = '';
+    modal.classList.remove('is-action-overlay');
     const isHide = uiPref.assetMode === 'hide';
     const snap = (lastState && lastState.snapshot) || {};
     const uiData = latestPluginFloatingUi || { rev: '', buttons: [], rootWidgets: [] };
@@ -12735,25 +14986,13 @@ function renderWebApp() {
     }
     const modal = document.getElementById('pluginFloatingModal');
     if (!modal) return;
-    modal.addEventListener('click', async (e) => {
-      if (e.target === modal || e.target.closest('[data-pfm-close]')) {
-        closePluginFloatingModal();
-        return;
-      }
-      const stage = e.target.closest('[data-rs-rw-plugin]');
-      if (!stage) return;
+    const sendPluginRootInteraction = async (target, stage, eventType = 'click') => {
       const pName = stage.getAttribute('data-rs-plugin-raw') || stage.getAttribute('data-rs-rw-plugin');
-      const target = e.target.closest('button, [data-am-runtime-generation-count-action], [data-am-runtime-toast-action], a, [role="button"], [data-am-slot], [data-am-count-node]') || e.target;
       if (!pName || !target || target === stage) return;
-      e.preventDefault();
-      e.stopPropagation();
       const snap = (lastState && lastState.snapshot) || {};
       const cIdx = Number.isFinite(Number(snap.charIndex)) ? Number(snap.charIndex) : -1;
       const chIdx = Number.isFinite(Number(snap.chatIndex)) ? Number(snap.chatIndex) : -1;
-      const ds = {};
-      for (const a of Array.from(target.attributes || [])) {
-        if (a.name.startsWith('data-') || a.name.startsWith('x-')) ds[a.name] = a.value;
-      }
+      const meta = collectAmElementMeta(target);
       const countNode = target.getAttribute('data-am-count-node') || '';
       const actionAttr = target.getAttribute('data-am-runtime-generation-count-action');
       const toastAttr = target.getAttribute('data-am-runtime-toast-action');
@@ -12762,25 +15001,87 @@ function renderWebApp() {
       else if (actionAttr) selector = '[data-am-runtime-generation-count-action="' + actionAttr + '"]';
       else if (toastAttr) selector = '[data-am-runtime-toast-action="' + toastAttr + '"]';
 
-      try {
-        const res = await api('/api/plugins/root-click', {
-          method: 'POST',
-          body: JSON.stringify({
-            pluginName: pName,
-            charIndex: cIdx,
-            chatIndex: chIdx,
-            countNode,
-            selector,
-            actionHtml: target.outerHTML || '',
-            dataset: ds,
-            x: 24,
-            y: 24,
-          }),
-        });
-        if (res && res.pluginFloatingUi) {
-          latestPluginFloatingUi = res.pluginFloatingUi;
-          renderPluginFloatingModal(true);
+      const payload = {
+        pluginName: pName,
+        charIndex: cIdx,
+        chatIndex: chIdx,
+        countNode,
+        selector,
+        actionHtml: meta.actionHtml,
+        dataset: meta.dataset,
+        textContent: meta.textContent,
+        ariaLabel: meta.ariaLabel,
+        title: meta.title,
+        className: meta.className,
+        siblingIndex: meta.siblingIndex,
+        eventType,
+        x: 24,
+        y: 24,
+      };
+      if (eventType !== 'click') {
+        payload.value = target.value !== undefined ? target.value : '';
+        if (target.type === 'checkbox' || target.type === 'radio') payload.checked = Boolean(target.checked);
+      }
+
+      const res = await api('/api/plugins/root-click', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      if (res && res.pluginFloatingUi) {
+        latestPluginFloatingUi = res.pluginFloatingUi;
+        renderRsMiniBar(false);
+      }
+      if (res && res.snapshot && lastState) {
+        if (typeof res.snapshotVersion === 'number') knownSnapshotVer = res.snapshotVersion;
+        applyState({ ...lastState, snapshot: res.snapshot, snapshotVersion: res.snapshotVersion ?? lastState.snapshotVersion });
+      }
+      if (activeActionOverlayPlugin) {
+        if (res && res.activeOverlay && res.activeOverlay.html) {
+          if (eventType === 'click') openPluginActionOverlayModal(res.activeOverlay);
+        } else if (res && res.activeOverlay === null && eventType === 'click') {
+          closePluginFloatingModal();
         }
+      } else if (eventType === 'click') {
+        renderPluginFloatingModal(true);
+      }
+    };
+
+    modal.addEventListener('submit', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    });
+    let pfmInputTimer = null;
+    modal.addEventListener('input', (e) => {
+      const target = e.target && e.target.closest ? e.target.closest('input, textarea, select') : null;
+      const stage = target && target.closest ? target.closest('[data-rs-rw-plugin]') : null;
+      if (!target || !stage) return;
+      if (pfmInputTimer) clearTimeout(pfmInputTimer);
+      pfmInputTimer = setTimeout(() => {
+        void sendPluginRootInteraction(target, stage, 'input').catch(() => {});
+      }, 120);
+    });
+    modal.addEventListener('change', (e) => {
+      const target = e.target && e.target.closest ? e.target.closest('input, textarea, select') : null;
+      const stage = target && target.closest ? target.closest('[data-rs-rw-plugin]') : null;
+      if (!target || !stage) return;
+      void sendPluginRootInteraction(target, stage, 'change').catch(() => {});
+    });
+    modal.addEventListener('click', async (e) => {
+      if (e.target === modal || e.target.closest('[data-pfm-close]')) {
+        closePluginFloatingModal();
+        return;
+      }
+      const stage = e.target.closest('[data-rs-rw-plugin]');
+      if (!stage) return;
+      if (e.target.closest('input, textarea, select, option') && !e.target.closest('button, [role="button"], [type="submit"], [type="button"], [type="checkbox"], [type="radio"]')) {
+        return;
+      }
+      const target = e.target.closest('button, [data-am-runtime-generation-count-action], [data-am-runtime-toast-action], a, [role="button"], [data-am-slot], [data-am-count-node]') || e.target;
+      if (!target || target === stage) return;
+      e.preventDefault();
+      e.stopPropagation();
+      try {
+        await sendPluginRootInteraction(target, stage, 'click');
       } catch (err) {
         toast('컨트롤 실행 오류: ' + (err && err.message ? err.message : '실패'));
       }
@@ -12824,7 +15125,7 @@ function renderWebApp() {
         if (itemsHtml) thumbsHtml = '<div class="scene-slot-thumbs">' + itemsHtml + '</div>';
       }
       const amBtnsHtml = ctrls.map((c) => {
-        const payload = esc(JSON.stringify({ msgIndex: m.index, actionHtml: c.outerHTML, dataset: c.dataset }));
+        const payload = esc(JSON.stringify({ msgIndex: m.index, chatId: m.chatId || '', actionHtml: c.outerHTML, dataset: c.dataset }));
         return '<button type="button" class="rs-pbb-btn" data-scene-am="' + payload + '">' + esc(c.label) + '</button>';
       }).join('');
       const lbBtnHtml = hasLb
@@ -12911,6 +15212,343 @@ function renderWebApp() {
     });
   }
 
+  // ---------- Per-Chat Character Voice Cast Modal (Chat Topbar 🎙️) ----------
+  let ttsModalChatKey = '';
+  let ttsModalDraft = [];
+  let ttsModalEditIdx = -1;
+  let ttsModalKeyHandler = null;
+
+  function closeTtsCastModal() {
+    if (ttsModalKeyHandler) {
+      document.removeEventListener('keydown', ttsModalKeyHandler);
+      ttsModalKeyHandler = null;
+    }
+    const modal = document.getElementById('ttsCastModal');
+    if (modal) {
+      modal.style.display = 'none';
+      modal.innerHTML = '';
+    }
+  }
+
+  function renderTtsCastModalBody() {
+    const modal = document.getElementById('ttsCastModal');
+    if (!modal) return;
+    const snap = (lastState && lastState.snapshot) || {};
+    const roomTitle = (displayBotName(snap.charName) || 'Character') + ' · ' + (snap.chatName || ('Chat ' + (Number(snap.chatIndex || 0) + 1)));
+
+    const listHtml = ttsModalDraft.length
+      ? ttsModalDraft.map((c, idx) => {
+          const gLabel = c.gender === 'female' ? '♀ 여성' : (c.gender === 'male' ? '♂ 남성' : '중성');
+          const vTxt = c.voiceId ? ('Voice: ' + c.voiceId) : '기본 성별 풀';
+          const aliasTxt = (c.aliases && c.aliases.length) ? (' (' + c.aliases.join(', ') + ')') : '';
+          const toneTxt = [c.dialogueToneTag ? ('대화:' + c.dialogueToneTag) : '', c.thoughtToneTag ? ('속마음:' + c.thoughtToneTag) : ''].filter(Boolean).join(' · ');
+          return '<div class="tts-cast-item">' +
+            '<div style="min-width:0;">' +
+              '<div style="font-size:13.5px; font-weight:700;">' + esc(c.name) + '<span style="font-weight:500; color:var(--sub); font-size:11.5px;">' + esc(aliasTxt) + '</span></div>' +
+              '<div style="font-size:11.5px; color:var(--sub);">' + esc(gLabel + ' · ' + vTxt + (toneTxt ? ' · ' + toneTxt : '')) + '</div>' +
+            '</div>' +
+            '<div style="display:flex; gap:5px; flex-shrink:0;">' +
+              '<button type="button" class="pill" data-ttsc-preview="' + idx + '" title="미리듣기">▶</button>' +
+              '<button type="button" class="pill" data-ttsc-edit="' + idx + '">편집</button>' +
+              '<button type="button" class="pill" data-ttsc-del="' + idx + '" style="color:var(--danger);">삭제</button>' +
+            '</div>' +
+          '</div>';
+        }).join('')
+      : '<div style="font-size:12.5px; color:var(--sub); padding:10px 2px;">이 채팅방에 등록된 캐릭터 보이스가 없습니다. <b>+ 캐릭터 추가</b>로 등록하거나 미등록 화자는 기본 성별 풀을 사용합니다.</div>';
+
+    let editorHtml = '';
+    if (ttsModalEditIdx !== null) {
+      const c = (ttsModalEditIdx >= 0 && ttsModalDraft[ttsModalEditIdx]) ? ttsModalDraft[ttsModalEditIdx] : {
+        id: 'tts-char-' + Date.now(), name: '', aliases: [], gender: 'female', voiceGroup: '', voiceId: '',
+        dialogueToneTag: '', thoughtToneTag: 'whispering', speed: 1.0, thoughtSpeed: 0.94,
+      };
+      const curVoiceGroup = inferClientVoiceGroup(c.voiceId || '', c.voiceGroup || '');
+      const dlgPresetMatch = !c.dialogueToneTag || TTS_TONE_TAG_PRESETS_CLIENT.some((t) => t.value.toLowerCase() === String(c.dialogueToneTag).toLowerCase());
+      const thVal = c.thoughtToneTag !== undefined ? c.thoughtToneTag : 'whispering';
+      const thPresetMatch = !thVal || TTS_TONE_TAG_PRESETS_CLIENT.some((t) => t.value.toLowerCase() === String(thVal).toLowerCase());
+      editorHtml =
+        '<div class="tts-subbox" id="ttsModalEditor" style="margin-top:4px;">' +
+          '<div class="tts-subbox-title"><span>' + (ttsModalEditIdx >= 0 ? '✏️ 캐릭터 보이스 편집' : '➕ 새 캐릭터 보이스 추가') + '</span></div>' +
+          '<div class="grid-2">' +
+            '<div><label class="f-label" style="margin-top:2px;">캐릭터 이름</label><input class="f-inp" id="ttscNameInp" value="' + esc(c.name || '') + '" placeholder="예: ' + esc(snap.charName || '엘레나') + '" /></div>' +
+            '<div><label class="f-label" style="margin-top:2px;">성별</label>' +
+              '<select class="f-inp" id="ttscGenderSel">' +
+                '<option value="female"' + (c.gender === 'female' ? ' selected' : '') + '>여성 (♀)</option>' +
+                '<option value="male"' + (c.gender === 'male' ? ' selected' : '') + '>남성 (♂)</option>' +
+                '<option value="neutral"' + (c.gender === 'neutral' ? ' selected' : '') + '>중성/기타</option>' +
+              '</select>' +
+            '</div>' +
+          '</div>' +
+          '<label class="f-label" style="margin-top:4px;">별칭 (쉼표 구분)</label>' +
+          '<input class="f-inp" id="ttscAliasesInp" value="' + esc(Array.isArray(c.aliases) ? c.aliases.join(', ') : '') + '" placeholder="예: Elena, 그녀, 아가씨" />' +
+          '<label class="f-label" style="margin-top:6px;">전용 Voice / Reference ID (1단계: 영역 → 2단계: 보이스 ID)</label>' +
+          '<div class="tts-voice-tier">' +
+            '<select class="f-inp" id="ttscVoiceGroupSel" aria-label="캐릭터 보이스 영역">' + buildVoiceGroupOptionsHtml(curVoiceGroup) + '</select>' +
+            '<select class="f-inp" id="ttscVoiceRefSel" aria-label="캐릭터 보이스 레퍼런스">' + buildVoiceRefOptionsHtml(curVoiceGroup, c.voiceId || '', '-- 기본 성별 풀 사용 --') + '</select>' +
+          '</div>' +
+          '<div style="display:flex; gap:6px; align-items:center; margin-top:6px;">' +
+            '<input class="f-inp" id="ttscVoiceIdInp" list="ttsVoiceDatalist" value="' + esc(c.voiceId || '') + '" placeholder="Fish reference_id 또는 OpenAI/Qwen voice (직접 입력 가능)" style="flex:1; min-width:0;" />' +
+            '<button type="button" class="pill" id="ttscSaveVoiceProfileBtn" title="현재 영역 프로필로 저장" style="flex-shrink:0;">+ 프로필 저장</button>' +
+          '</div>' +
+          '<div class="grid-2">' +
+            '<div>' +
+              '<label class="f-label" style="margin-top:6px;">대화 톤 태그</label>' +
+              '<select class="f-inp" id="ttscDlgTagSel" aria-label="대화 톤 태그">' + buildToneTagOptionsHtml(c.dialogueToneTag || '', '-- 톤 태그 없음 (기본) --') + '</select>' +
+              '<input class="f-inp" id="ttscDlgTagInp" value="' + esc(c.dialogueToneTag || '') + '" placeholder="직접 입력 (예: soft)" style="margin-top:4px; display:' + (dlgPresetMatch ? 'none' : 'block') + ';" />' +
+            '</div>' +
+            '<div>' +
+              '<label class="f-label" style="margin-top:6px;">속마음 톤 태그</label>' +
+              '<select class="f-inp" id="ttscThTagSel" aria-label="속마음 톤 태그">' + buildToneTagOptionsHtml(thVal, '-- 톤 태그 없음 (기본) --') + '</select>' +
+              '<input class="f-inp" id="ttscThTagInp" value="' + esc(thVal) + '" placeholder="직접 입력 (예: whispering)" style="margin-top:4px; display:' + (thPresetMatch ? 'none' : 'block') + ';" />' +
+            '</div>' +
+          '</div>' +
+          '<div class="grid-2">' +
+            '<div><label class="f-label" style="margin-top:4px;">대화 속도</label><input class="f-inp" id="ttscSpeedInp" type="number" step="0.02" min="0.5" max="2.0" value="' + esc(String(c.speed || 1.0)) + '" /></div>' +
+            '<div><label class="f-label" style="margin-top:4px;">속마음 속도</label><input class="f-inp" id="ttscThSpeedInp" type="number" step="0.02" min="0.5" max="2.0" value="' + esc(String(c.thoughtSpeed || 0.94)) + '" /></div>' +
+          '</div>' +
+          '<div class="btn-row">' +
+            '<button type="button" class="btn" id="ttscApplyEditBtn">목록에 반영</button>' +
+            '<button type="button" class="btn sec" id="ttscEditorPreviewBtn">▶ 미리듣기</button>' +
+            '<button type="button" class="btn sec" id="ttscCancelEditBtn">취소</button>' +
+          '</div>' +
+        '</div>';
+    }
+
+    modal.innerHTML =
+      '<div class="scene-ctrl-dialog">' +
+        '<div class="scene-ctrl-head">' +
+          '<div style="min-width:0;">' +
+            '<div style="font-size:15px; font-weight:800;">🎙️ 이 채팅방 캐릭터 보이스 설정</div>' +
+            '<div style="font-size:11.5px; color:var(--sub); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">' + esc(roomTitle) + '</div>' +
+          '</div>' +
+          '<button type="button" class="pill" data-ttsc-close="1">✕ 닫기</button>' +
+        '</div>' +
+        '<div class="scene-ctrl-body">' +
+          '<div class="hint" style="margin:0;">이 채팅방에서만 적용되는 캐릭터별 성별 · Voice ID · 대화/속마음 톤 설정입니다.</div>' +
+          '<div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">' +
+            '<button type="button" class="pill active" id="ttscAddBtn">+ 캐릭터 추가</button>' +
+            '<button type="button" class="pill" id="ttscFetchFishBtn">🐟 Fish 보이스 불러오기</button>' +
+            '<button type="button" class="pill" id="ttscFetchOaBtn">🎙️ OpenAI/Qwen 불러오기</button>' +
+          '</div>' +
+          '<div class="tts-cast-list" style="margin-top:0;">' + listHtml + '</div>' +
+          editorHtml +
+          '<div class="btn-row" style="margin-top:4px; padding-top:10px; border-top:1px solid var(--border);">' +
+            '<button type="button" class="btn" id="ttscSaveRoomBtn">💾 이 채팅방 보이스 저장</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    modal.style.display = 'flex';
+  }
+
+  function openTtsCastModal() {
+    const modal = document.getElementById('ttsCastModal');
+    if (!modal) return;
+    const snap = (lastState && lastState.snapshot) || {};
+    const ck = getClientTtsChatKey(snap);
+    if (!ck) {
+      toast('먼저 채팅방을 열어 주세요.');
+      return;
+    }
+    const t = (routerCfg && routerCfg.tts && typeof routerCfg.tts === 'object') ? routerCfg.tts : {};
+    const cc = (t.chatCharacters && typeof t.chatCharacters === 'object') ? t.chatCharacters : {};
+    ttsModalChatKey = ck;
+    ttsModalDraft = Array.isArray(cc[ck]) ? JSON.parse(JSON.stringify(cc[ck])) : [];
+    ttsModalEditIdx = null;
+    if (ttsModalKeyHandler) document.removeEventListener('keydown', ttsModalKeyHandler);
+    ttsModalKeyHandler = (e) => { if (e.key === 'Escape') closeTtsCastModal(); };
+    document.addEventListener('keydown', ttsModalKeyHandler);
+    renderTtsCastModalBody();
+  }
+
+  async function previewTtsVoiceItem(opts) {
+    ensureTtsAudioCtx();
+    toast('음성 미리듣기 생성 중...');
+    const res = await fetch('/api/tts/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+      body: JSON.stringify({ ...opts, chatKey: ttsModalChatKey }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || ('HTTP ' + res.status));
+    }
+    const buf = await res.arrayBuffer();
+    await playTtsArrayBuffer(buf, { kind: opts.kind || 'dialogue' });
+  }
+
+  const ttsCastQuickBtnEl = document.getElementById('ttsCastQuickBtn');
+  if (ttsCastQuickBtnEl) ttsCastQuickBtnEl.onclick = openTtsCastModal;
+
+  const ttsCastModalEl = document.getElementById('ttsCastModal');
+  if (ttsCastModalEl) {
+    ttsCastModalEl.addEventListener('change', (e) => {
+      if (e.target && e.target.id === 'ttscVoiceGroupSel') {
+        const refSel = document.getElementById('ttscVoiceRefSel');
+        const idInp = document.getElementById('ttscVoiceIdInp');
+        if (refSel && idInp) refSel.innerHTML = buildVoiceRefOptionsHtml(e.target.value, idInp.value, '-- 기본 성별 풀 사용 --');
+      } else if (e.target && e.target.id === 'ttscVoiceRefSel') {
+        const idInp = document.getElementById('ttscVoiceIdInp');
+        if (!idInp) return;
+        if (e.target.value === '__custom__') idInp.focus();
+        else idInp.value = e.target.value;
+      } else if (e.target && (e.target.id === 'ttscDlgTagSel' || e.target.id === 'ttscThTagSel')) {
+        const inpId = e.target.id === 'ttscDlgTagSel' ? 'ttscDlgTagInp' : 'ttscThTagInp';
+        const inpEl = document.getElementById(inpId);
+        if (!inpEl) return;
+        if (e.target.value === '__custom__') {
+          inpEl.style.display = 'block';
+          inpEl.focus();
+        } else {
+          inpEl.value = e.target.value;
+          inpEl.style.display = 'none';
+        }
+      }
+    });
+    ttsCastModalEl.addEventListener('input', (e) => {
+      if (e.target && e.target.id === 'ttscVoiceIdInp') {
+        const gSel = document.getElementById('ttscVoiceGroupSel');
+        const rSel = document.getElementById('ttscVoiceRefSel');
+        if (gSel && rSel) rSel.innerHTML = buildVoiceRefOptionsHtml(gSel.value, e.target.value, '-- 기본 성별 풀 사용 --');
+      }
+    });
+    ttsCastModalEl.addEventListener('click', async (e) => {
+      if (e.target === ttsCastModalEl || e.target.closest('[data-ttsc-close]')) {
+        closeTtsCastModal();
+        return;
+      }
+      if (e.target.closest('#ttscAddBtn')) {
+        ttsModalEditIdx = -1;
+        renderTtsCastModalBody();
+        return;
+      }
+      if (e.target.closest('#ttscCancelEditBtn')) {
+        ttsModalEditIdx = null;
+        renderTtsCastModalBody();
+        return;
+      }
+      if (e.target.closest('#ttscFetchFishBtn') || e.target.closest('#ttscFetchOaBtn')) {
+        const reqGroup = e.target.closest('#ttscFetchOaBtn') ? 'openai_qwen' : 'fish';
+        try {
+          const r = await api('/api/tts/models', { method: 'POST', body: JSON.stringify({ group: reqGroup }) });
+          storeLiveVoicesFromResponse(r, reqGroup);
+          const gSel = document.getElementById('ttscVoiceGroupSel');
+          const rSel = document.getElementById('ttscVoiceRefSel');
+          const idInp = document.getElementById('ttscVoiceIdInp');
+          if (gSel && rSel && idInp) {
+            gSel.innerHTML = buildVoiceGroupOptionsHtml(reqGroup);
+            rSel.innerHTML = buildVoiceRefOptionsHtml(reqGroup, idInp.value, '-- 기본 성별 풀 사용 --');
+          }
+          const cnt = Array.isArray(r.voices) ? r.voices.length : 0;
+          toast((reqGroup === 'fish' ? 'Fish' : 'OpenAI/Qwen') + ' 보이스 ' + cnt + '개를 불러왔습니다.');
+        } catch (err) { toast('보이스 조회 실패: ' + err.message); }
+        return;
+      }
+      if (e.target.closest('#ttscSaveVoiceProfileBtn')) {
+        const gSel = document.getElementById('ttscVoiceGroupSel');
+        const idInp = document.getElementById('ttscVoiceIdInp');
+        const nameInp = document.getElementById('ttscNameInp');
+        const genSel = document.getElementById('ttscGenderSel');
+        const grp = (gSel && gSel.value) || 'fish';
+        const voiceIdVal = (idInp && idInp.value.trim()) || '';
+        if (!voiceIdVal) { toast('저장할 Voice / Reference ID를 먼저 입력하거나 선택하세요.'); return; }
+        const labelVal = (nameInp && nameInp.value.trim()) || voiceIdVal;
+        const genderVal = (genSel && genSel.value) || 'female';
+        try {
+          routerCfg = await api('/api/tts/voice-profiles', {
+            method: 'POST',
+            body: JSON.stringify({ action: 'upsert', group: grp, item: { id: voiceIdVal, label: labelVal, gender: genderVal } }),
+          });
+          refreshAllTtsPickers();
+          renderVoiceProfilesManager();
+          const rSel = document.getElementById('ttscVoiceRefSel');
+          if (rSel) rSel.innerHTML = buildVoiceRefOptionsHtml(grp, voiceIdVal, '-- 기본 성별 풀 사용 --');
+          toast((grp === 'fish' ? 'Fish' : 'OpenAI/Qwen') + ' 프로필에 저장됨');
+        } catch (err) { toast('프로필 저장 실패: ' + err.message); }
+        return;
+      }
+      if (e.target.closest('#ttscApplyEditBtn')) {
+        const name = (document.getElementById('ttscNameInp') && document.getElementById('ttscNameInp').value.trim()) || '';
+        if (!name) { toast('캐릭터 이름을 입력하세요.'); return; }
+        const item = {
+          id: (ttsModalEditIdx >= 0 && ttsModalDraft[ttsModalEditIdx]) ? ttsModalDraft[ttsModalEditIdx].id : ('tts-char-' + Date.now()),
+          name,
+          gender: (document.getElementById('ttscGenderSel') && document.getElementById('ttscGenderSel').value) || 'female',
+          aliases: ((document.getElementById('ttscAliasesInp') && document.getElementById('ttscAliasesInp').value) || '').split(',').map((s) => s.trim()).filter(Boolean),
+          voiceGroup: (document.getElementById('ttscVoiceGroupSel') && document.getElementById('ttscVoiceGroupSel').value) || '',
+          voiceId: (document.getElementById('ttscVoiceIdInp') && document.getElementById('ttscVoiceIdInp').value.trim()) || '',
+          dialogueToneTag: (document.getElementById('ttscDlgTagInp') && document.getElementById('ttscDlgTagInp').value.trim()) || '',
+          thoughtToneTag: (document.getElementById('ttscThTagInp') && document.getElementById('ttscThTagInp').value.trim()) || '',
+          speed: Number(document.getElementById('ttscSpeedInp') && document.getElementById('ttscSpeedInp').value) || 1.0,
+          thoughtSpeed: Number(document.getElementById('ttscThSpeedInp') && document.getElementById('ttscThSpeedInp').value) || 0.94,
+        };
+        if (ttsModalEditIdx >= 0) ttsModalDraft[ttsModalEditIdx] = item;
+        else ttsModalDraft.push(item);
+        ttsModalEditIdx = null;
+        renderTtsCastModalBody();
+        toast('목록에 반영되었습니다. [💾 이 채팅방 보이스 저장]을 눌러 저장하세요.');
+        return;
+      }
+      if (e.target.closest('#ttscEditorPreviewBtn')) {
+        try {
+          await previewTtsVoiceItem({
+            text: '안녕하세요. 이 목소리로 대사를 들려드릴게요.',
+            kind: 'dialogue',
+            speaker: (document.getElementById('ttscNameInp') && document.getElementById('ttscNameInp').value.trim()) || 'Tester',
+            gender: (document.getElementById('ttscGenderSel') && document.getElementById('ttscGenderSel').value) || 'female',
+            voiceId: (document.getElementById('ttscVoiceIdInp') && document.getElementById('ttscVoiceIdInp').value.trim()) || '',
+            toneTag: (document.getElementById('ttscDlgTagInp') && document.getElementById('ttscDlgTagInp').value.trim()) || '',
+          });
+        } catch (err) { toast('미리듣기 실패: ' + err.message); }
+        return;
+      }
+      const prevBtn = e.target.closest('[data-ttsc-preview]');
+      if (prevBtn) {
+        const idx = Number(prevBtn.getAttribute('data-ttsc-preview'));
+        const c = ttsModalDraft[idx];
+        if (!c) return;
+        try {
+          await previewTtsVoiceItem({
+            text: '안녕하세요. 이 목소리로 대사를 들려드릴게요.',
+            kind: 'dialogue',
+            speaker: c.name,
+            gender: c.gender,
+            voiceId: c.voiceId,
+            toneTag: c.dialogueToneTag,
+          });
+        } catch (err) { toast('미리듣기 실패: ' + err.message); }
+        return;
+      }
+      const editBtn = e.target.closest('[data-ttsc-edit]');
+      if (editBtn) {
+        ttsModalEditIdx = Number(editBtn.getAttribute('data-ttsc-edit'));
+        renderTtsCastModalBody();
+        return;
+      }
+      const delBtn = e.target.closest('[data-ttsc-del]');
+      if (delBtn) {
+        const idx = Number(delBtn.getAttribute('data-ttsc-del'));
+        if (idx >= 0 && idx < ttsModalDraft.length) {
+          ttsModalDraft.splice(idx, 1);
+          if (ttsModalEditIdx === idx) ttsModalEditIdx = null;
+          renderTtsCastModalBody();
+        }
+        return;
+      }
+      if (e.target.closest('#ttscSaveRoomBtn')) {
+        try {
+          routerCfg = await api('/api/tts/chat-cast', {
+            method: 'POST',
+            body: JSON.stringify({ chatKey: ttsModalChatKey, characters: ttsModalDraft.slice() }),
+          });
+          ttsAnalyzeCache.clear();
+          ttsAudioBufferCache.clear();
+          renderTtsCastModalBody();
+          toast('이 채팅방 캐릭터 보이스 저장됨');
+        } catch (err) { toast('저장 실패: ' + err.message); }
+      }
+    });
+  }
+
   if (token) tryLogin(token);
 </script>
 </body>
@@ -12939,6 +15577,7 @@ function sanitizeConfigForClient() {
         backendPlugins: (config.backendPlugins && typeof config.backendPlugins === 'object') ? config.backendPlugins : {},
         remoteDirectOnly: config.remoteDirectOnly !== false,
         imageGen: sanitizeImageGenForClient(config.imageGen),
+        tts: sanitizeTtsForClient(config.tts),
         profiles: config.profiles.map((p) => ({
             id: p.id,
             name: p.name,
@@ -13136,7 +15775,9 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 ? cloneJsonSafe(configOverride.backendPlugins)
                 : {},
             imageGen: normalizeImageGenConfig(configOverride.imageGen),
+            tts: normalizeTtsConfig(configOverride.tts),
             remoteDirectOnly: configOverride.remoteDirectOnly !== undefined ? Boolean(configOverride.remoteDirectOnly) : true,
+            botThumbs: normalizeBotThumbs(configOverride.botThumbs),
         };
         configPersistDisabled = true;
         customPresetsCache = [];
@@ -13427,13 +16068,17 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         runLLM: (req, pluginName, customProviders) => runUnifiedBackendLLM(req, `plugin:${pluginName}`, customProviders),
         onActivity: (info) => recordActivity(info),
         onSurfaceMutated: () => scheduleSurfaceSnapshotRefresh(60),
-        onDbMutated: ({ charIndex, chatIndex, chatObj } = {}) => {
-            if (!hostRpc.isConnected() && state.baseSnapshot && Number(charIndex) === Number(state.baseSnapshot.charIndex)) {
-                if (chatObj && Number(chatIndex) === Number(state.baseSnapshot.chatIndex) && Array.isArray(chatObj.message) && Array.isArray(state.baseSnapshot.messages)) {
+        onDbMutated: ({ charIndex, chatIndex, charObj, chatObj } = {}) => {
+            if (state.baseSnapshot && Number(charIndex) === Number(state.baseSnapshot.charIndex)) {
+                const curChatIdx = Number(state.baseSnapshot.chatIndex);
+                const targetChat = (chatObj && Number(chatIndex) === curChatIdx)
+                    ? chatObj
+                    : (charObj && Array.isArray(charObj.chats) ? charObj.chats[curChatIdx] : null);
+                if (targetChat && Array.isArray(targetChat.message) && Array.isArray(state.baseSnapshot.messages)) {
                     for (let i = 0; i < state.baseSnapshot.messages.length; i += 1) {
                         const m = state.baseSnapshot.messages[i];
                         if (!m || m.isFirstMessage || Number(m.index) < 0) continue;
-                        const src = chatObj.message[Number(m.index)];
+                        const src = targetChat.message[Number(m.index)];
                         if (!src) continue;
                         const nextRaw = String(src.data ?? src.content ?? '');
                         if (nextRaw !== String(m.raw || '')) {
@@ -13444,7 +16089,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     }
                 }
             }
-            scheduleSurfaceSnapshotRefresh(50);
+            scheduleSurfaceSnapshotRefresh(40);
         },
     });
     activePluginAdapter = pluginAdapter;
@@ -13454,6 +16099,35 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         hostRpc,
         createInlay: (data, opts) => pluginAdapter.createInlay(data, opts),
     });
+
+    const ttsProvider = createTtsProvider();
+
+    function resolveTtsLlmProfile() {
+        const ttsCfg = normalizeTtsConfig(config.tts);
+        if (ttsCfg.llmSource === 'active') {
+            return getActiveProfile();
+        }
+        if (ttsCfg.llmSource === 'aux') {
+            return getAuxProfile();
+        }
+        const tr = config.translator || {};
+        if (tr.useActiveProfile) {
+            return getActiveProfile();
+        }
+        const trProf = {
+            name: 'TTS Script Director (Translator)',
+            providerType: tr.providerType || 'gemini',
+            baseUrl: tr.baseUrl || '',
+            apiKey: tr.apiKey || '',
+            model: tr.model || 'gemini-2.5-flash',
+            temperature: 0.15,
+            maxTokens: 2048,
+        };
+        if (!trProf.apiKey && trProf.providerType !== 'openai_compat') {
+            return getActiveProfile();
+        }
+        return trProf;
+    }
 
     const moduleAdapter = createModuleAdapter({
         hostRpc,
@@ -13483,6 +16157,155 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
     });
     activeModuleAdapter = moduleAdapter;
 
+    const THUMB_CACHE_MAX_ITEMS = 96;
+    const THUMB_CACHE_MAX_BYTES = 64 * 1024 * 1024;
+    const thumbCache = new Map(); // path -> { buf: Buffer, mime: string }
+    let thumbCacheBytes = 0;
+    const thumbInFlight = new Map(); // path -> Promise<{ buf, mime } | null>
+    const charAssetListCache = new Map(); // charIndex -> { at, chaId, list }
+    const charMainImageCache = new Map(); // chaId -> path string ('' means none)
+    const charMainImageInFlight = new Map(); // chaId -> Promise<string>
+    const customThumbMemStore = new Map(); // file -> { buf: Buffer, mime: string }
+
+    function publicBotThumbs() {
+        const out = {};
+        const src = (config.botThumbs && typeof config.botThumbs === 'object') ? config.botThumbs : {};
+        for (const [k, v] of Object.entries(src)) {
+            if (!v || typeof v !== 'object') continue;
+            if (v.source === 'asset' || v.source === 'custom') {
+                out[k] = { source: v.source, v: Number(v.updatedAt || 0) };
+            }
+        }
+        return out;
+    }
+
+    function extractCharacterImageAssets(ch, charIndex) {
+        if (!ch || typeof ch !== 'object') return null;
+        const assets = [];
+        const seenPaths = new Set();
+        const mediaRx = /(?:^|\.)(?:mp3|wav|ogg|mp4|webm|m4a|flac)$/i;
+        const pushAsset = (rawName, rawPath, kind, rawExt = '') => {
+            if (assets.length >= 300) return;
+            const p = String(rawPath || '').trim();
+            if (!p || seenPaths.has(p)) return;
+            const nm = String(rawName || '').trim();
+            const ex = String(rawExt || '').trim();
+            if (kind === 'additional' && (mediaRx.test(ex) || mediaRx.test(nm) || mediaRx.test(p))) return;
+            seenPaths.add(p);
+            assets.push({ name: nm || p, path: p, kind });
+        };
+        if (typeof ch.image === 'string' && ch.image.trim()) {
+            pushAsset('기본 아이콘', ch.image, 'main');
+        }
+        if (Array.isArray(ch.emotionImages)) {
+            for (const e of ch.emotionImages) {
+                if (Array.isArray(e)) pushAsset(e[0], e[1], 'emotion', e[2]);
+            }
+        }
+        if (Array.isArray(ch.additionalAssets)) {
+            for (const item of ch.additionalAssets) {
+                if (Array.isArray(item)) pushAsset(item[0], item[1], 'additional', item[2]);
+            }
+        }
+        return {
+            chaId: String(ch.chaId || charIndex),
+            name: String(ch.name || ''),
+            image: typeof ch.image === 'string' ? ch.image : '',
+            assets,
+        };
+    }
+
+    async function readPcImageCached(assetPath) {
+        const key = String(assetPath || '').trim();
+        if (!key) return null;
+        if (thumbCache.has(key)) {
+            const hit = thumbCache.get(key);
+            thumbCache.delete(key);
+            thumbCache.set(key, hit);
+            return hit;
+        }
+        if (thumbInFlight.has(key)) return thumbInFlight.get(key);
+        const p = (async () => {
+            try {
+                if (!hostRpc.isConnected()) return null;
+                const r = await hostRpc.invoke('asset.readImage', [key], 10000);
+                if (!r || typeof r !== 'object' || typeof r.__b64 !== 'string') return null;
+                const mime = String(r.mime || '').toLowerCase();
+                if (!mime.startsWith('image/')) return null;
+                const buf = Buffer.from(r.__b64, 'base64');
+                if (!buf.length || buf.length > THUMB_CACHE_MAX_BYTES) return null;
+                while (thumbCache.size >= THUMB_CACHE_MAX_ITEMS || thumbCacheBytes + buf.length > THUMB_CACHE_MAX_BYTES) {
+                    const oldestKey = thumbCache.keys().next().value;
+                    if (!oldestKey) break;
+                    const oldestVal = thumbCache.get(oldestKey);
+                    thumbCacheBytes = Math.max(0, thumbCacheBytes - (oldestVal && oldestVal.buf ? oldestVal.buf.length : 0));
+                    thumbCache.delete(oldestKey);
+                }
+                const entry = { buf, mime };
+                thumbCache.set(key, entry);
+                thumbCacheBytes += buf.length;
+                return entry;
+            } catch (_) {
+                return null;
+            } finally {
+                thumbInFlight.delete(key);
+            }
+        })();
+        thumbInFlight.set(key, p);
+        return p;
+    }
+
+    async function resolveCharMainImagePath(ch) {
+        const chaId = ch && ch.chaId !== undefined ? String(ch.chaId) : '';
+        if (!chaId) return '';
+        if (charMainImageCache.has(chaId)) return charMainImageCache.get(chaId);
+        if (charMainImageInFlight.has(chaId)) return charMainImageInFlight.get(chaId);
+        const p = (async () => {
+            try {
+                if (!hostRpc.isConnected()) return '';
+                let imgPath = '';
+                try {
+                    const resData = await hostRpc.invoke('db.getCharacterImageAssets', [ch.index], 15000);
+                    imgPath = (resData && typeof resData.image === 'string') ? resData.image : '';
+                } catch (err) {
+                    if (err && /Unsupported host RPC op/i.test(String(err.message || ''))) {
+                        const fullChar = await hostRpc.invoke('db.getCharacter', [ch.index], 20000);
+                        imgPath = (fullChar && typeof fullChar.image === 'string') ? fullChar.image : '';
+                    } else {
+                        return '';
+                    }
+                }
+                charMainImageCache.set(chaId, imgPath);
+                return imgPath;
+            } catch (_) {
+                return '';
+            } finally {
+                charMainImageInFlight.delete(chaId);
+            }
+        })();
+        charMainImageInFlight.set(chaId, p);
+        return p;
+    }
+
+    function requireAssetAuth(req, res) {
+        const headerOk = safeTokenEqual(getRequestToken(req), resolvedToken);
+        const cookieOk = safeTokenEqual(parseCookie(req, 'rs_asset_sid'), assetCookieVal);
+        if (!headerOk && !cookieOk) {
+            sendJson(res, 401, { error: 'Unauthorized: Invalid token' }, req);
+            return false;
+        }
+        return true;
+    }
+
+    function deleteCustomThumbFile(file) {
+        if (!file || !/^[a-f0-9]{24}\.(png|jpg|webp|gif)$/.test(file)) return;
+        if (configPersistDisabled) {
+            customThumbMemStore.delete(file);
+            return;
+        }
+        try { fs.rmSync(path.join(THUMBS_DIR, file), { force: true }); } catch (_) {}
+    }
+
     const server = http.createServer(async (req, res) => {
         const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
         const pathname = urlObj.pathname;
@@ -13500,14 +16323,86 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             return;
         }
 
-        // 1b) Cached Binary Image Asset Endpoint (avoids multi-MB base64 repeats in /api/state)
+        // 1b) Bot Thumbnail & Character Asset Endpoints (before 32-hex /api/asset/:id)
+        if (req.method === 'GET' && pathname.startsWith('/api/asset/bot-thumb/')) {
+            if (!requireAssetAuth(req, res)) return;
+            let chaId = '';
+            try { chaId = decodeURIComponent(pathname.slice('/api/asset/bot-thumb/'.length)); } catch (_) {
+                return sendJson(res, 400, { error: 'Invalid character id' }, req);
+            }
+            if (!chaId || chaId.length > 200) {
+                return sendJson(res, 404, { error: 'Thumbnail not found' }, req);
+            }
+            const override = (config.botThumbs && typeof config.botThumbs === 'object') ? config.botThumbs[chaId] : null;
+            let img = null;
+            if (override && override.source === 'custom' && /^[a-f0-9]{24}\.(png|jpg|webp|gif)$/.test(String(override.file || ''))) {
+                if (configPersistDisabled) {
+                    img = customThumbMemStore.get(override.file) || null;
+                } else {
+                    try {
+                        const buf = fs.readFileSync(path.join(THUMBS_DIR, override.file));
+                        const ext = override.file.split('.').pop();
+                        const mime = ext === 'jpg' ? 'image/jpeg' : `image/${ext}`;
+                        if (buf.length) img = { buf, mime };
+                    } catch (_) { img = null; }
+                }
+            } else if (override && override.source === 'asset' && override.path) {
+                img = await readPcImageCached(override.path);
+            } else {
+                const chars = (state.catalog && Array.isArray(state.catalog.characters)) ? state.catalog.characters : [];
+                const ch = chars.find((c) => c && String(c.chaId) === chaId);
+                let imgPath = (ch && typeof ch.image === 'string') ? ch.image : '';
+                if (!imgPath && ch && ch.image === undefined && hostRpc.isConnected()) {
+                    imgPath = await resolveCharMainImagePath(ch);
+                }
+                if (imgPath) {
+                    img = await readPcImageCached(imgPath);
+                }
+            }
+            if (!img || !img.buf || !img.buf.length) {
+                return sendJson(res, 404, { error: 'Thumbnail not found' }, req);
+            }
+            res.writeHead(200, {
+                'Content-Type': img.mime,
+                'Content-Length': String(img.buf.length),
+                'Cache-Control': 'private, max-age=604800',
+                'X-Content-Type-Options': 'nosniff',
+            });
+            res.end(img.buf);
+            return;
+        }
+
+        const charAssetMatch = req.method === 'GET' && pathname.match(/^\/api\/asset\/char-asset\/(\d+)\/(\d+)$/);
+        if (charAssetMatch) {
+            if (!requireAssetAuth(req, res)) return;
+            const cIdx = Number(charAssetMatch[1]);
+            const aIdx = Number(charAssetMatch[2]);
+            const cached = charAssetListCache.get(cIdx);
+            if (!cached || (Date.now() - cached.at > 10 * 60 * 1000)) {
+                return sendJson(res, 404, { error: 'Asset list expired or not loaded' }, req);
+            }
+            const item = cached.list[aIdx];
+            if (!item || !item.path) {
+                return sendJson(res, 404, { error: 'Asset not found' }, req);
+            }
+            const img = await readPcImageCached(item.path);
+            if (!img || !img.buf || !img.buf.length) {
+                return sendJson(res, 404, { error: 'Asset read failed' }, req);
+            }
+            res.writeHead(200, {
+                'Content-Type': img.mime,
+                'Content-Length': String(img.buf.length),
+                'Cache-Control': 'private, max-age=3600',
+                'X-Content-Type-Options': 'nosniff',
+            });
+            res.end(img.buf);
+            return;
+        }
+
+        // 1c) Cached Binary Image Asset Endpoint (avoids multi-MB base64 repeats in /api/state)
         const assetMatch = req.method === 'GET' && pathname.match(/^\/api\/asset\/([a-f0-9]{32})$/);
         if (assetMatch) {
-            const headerOk = safeTokenEqual(getRequestToken(req), resolvedToken);
-            const cookieOk = safeTokenEqual(parseCookie(req, 'rs_asset_sid'), assetCookieVal);
-            if (!headerOk && !cookieOk) {
-                return sendJson(res, 401, { error: 'Unauthorized: Invalid token' }, req);
-            }
+            if (!requireAssetAuth(req, res)) return;
             const entry = assetStore.get(assetMatch[1]);
             if (!entry) {
                 return sendJson(res, 404, { error: 'Asset not found' }, req);
@@ -13744,6 +16639,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 snapshotVersion: state.snapshotVersion,
                 runtimeActivity: getActivitySnapshot(),
                 pluginFloatingUi: pluginAdapter.getFloatingUiState(),
+                botThumbs: publicBotThumbs(),
             };
             if (reqCv === null || reqCv !== state.catalogVersion) payload.catalog = state.catalog;
             if (reqSv === null || reqSv !== state.snapshotVersion) {
@@ -13757,6 +16653,112 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             return sendJson(res, 200, payload, req, {
                 'Set-Cookie': `rs_asset_sid=${assetCookieVal}; Path=/api/asset; HttpOnly; SameSite=Strict`,
             });
+        }
+
+        if (pathname === '/api/bot-thumb/assets' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            const rawIdx = urlObj.searchParams.get('charIndex');
+            const charIndex = (rawIdx !== null && rawIdx !== '') ? Number(rawIdx) : -1;
+            if (!Number.isInteger(charIndex) || charIndex < 0) {
+                return sendJson(res, 400, { error: 'Invalid charIndex' }, req);
+            }
+            if (!hostRpc.isConnected()) {
+                return sendJson(res, 503, { error: 'PC RisuAI 브릿지가 연결되어 있지 않습니다.' }, req);
+            }
+            try {
+                let resData = null;
+                try {
+                    resData = await hostRpc.invoke('db.getCharacterImageAssets', [charIndex], 15000);
+                } catch (err) {
+                    if (err && /Unsupported host RPC op/i.test(String(err.message || ''))) {
+                        const ch = await hostRpc.invoke('db.getCharacter', [charIndex], 20000);
+                        resData = extractCharacterImageAssets(ch, charIndex);
+                    } else {
+                        throw err;
+                    }
+                }
+                if (!resData || !Array.isArray(resData.assets)) {
+                    return sendJson(res, 404, { error: '캐릭터 정보를 찾을 수 없습니다.' }, req);
+                }
+                const chaId = String(resData.chaId || charIndex);
+                charAssetListCache.set(charIndex, { at: Date.now(), chaId, list: resData.assets });
+                return sendJson(res, 200, {
+                    chaId,
+                    assets: resData.assets.map((a, i) => ({
+                        name: a.name,
+                        kind: a.kind,
+                        url: `/api/asset/char-asset/${charIndex}/${i}`,
+                    })),
+                }, req);
+            } catch (e) {
+                return sendJson(res, 502, { error: e && e.message ? e.message : String(e) }, req);
+            }
+        }
+
+        if (pathname === '/api/bot-thumb' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req, 10 * 1024 * 1024)) || '{}');
+                const chaId = typeof body.chaId === 'string' ? body.chaId.trim() : '';
+                if (!chaId || chaId.length > 200) {
+                    return sendJson(res, 400, { error: '유효한 캐릭터 ID(chaId)가 필요합니다.' }, req);
+                }
+                const source = String(body.source || '');
+                if (!config.botThumbs || typeof config.botThumbs !== 'object') config.botThumbs = {};
+                const prev = config.botThumbs[chaId];
+                if (source === 'asset') {
+                    const cIdx = Number(body.charIndex);
+                    const aIdx = Number(body.assetIndex);
+                    const cached = Number.isInteger(cIdx) ? charAssetListCache.get(cIdx) : null;
+                    if (!cached || (Date.now() - cached.at > 10 * 60 * 1000) || cached.chaId !== chaId || !Number.isInteger(aIdx) || aIdx < 0 || aIdx >= cached.list.length) {
+                        return sendJson(res, 400, { error: '에셋 목록이 만료되었거나 올바르지 않습니다. 다시 열어 주세요.' }, req);
+                    }
+                    const chosen = cached.list[aIdx];
+                    if (prev && prev.source === 'custom' && prev.file) deleteCustomThumbFile(prev.file);
+                    config.botThumbs[chaId] = {
+                        source: 'asset',
+                        path: String(chosen.path || '').slice(0, 500),
+                        updatedAt: Date.now(),
+                    };
+                } else if (source === 'custom') {
+                    const m = String(body.dataUri || '').match(/^data:image\/(png|jpeg|webp|gif);base64,([A-Za-z0-9+/=\s]+)$/i);
+                    if (!m) {
+                        return sendJson(res, 400, { error: '지원하지 않는 이미지 형식입니다. (PNG/JPEG/WebP/GIF)' }, req);
+                    }
+                    const rawExt = m[1].toLowerCase();
+                    const ext = rawExt === 'jpeg' ? 'jpg' : rawExt;
+                    const mime = `image/${rawExt}`;
+                    const buf = Buffer.from(m[2].replace(/\s+/g, ''), 'base64');
+                    if (!buf.length || buf.length > 6 * 1024 * 1024) {
+                        return sendJson(res, 400, { error: '이미지 크기는 6MB 이하여야 합니다.' }, req);
+                    }
+                    const hash = crypto.createHash('sha256').update(chaId).digest('hex').slice(0, 24);
+                    const file = `${hash}.${ext}`;
+                    if (prev && prev.source === 'custom' && prev.file && prev.file !== file) {
+                        deleteCustomThumbFile(prev.file);
+                    }
+                    if (configPersistDisabled) {
+                        customThumbMemStore.set(file, { buf, mime });
+                    } else {
+                        fs.mkdirSync(THUMBS_DIR, { recursive: true });
+                        fs.writeFileSync(path.join(THUMBS_DIR, file), buf);
+                    }
+                    config.botThumbs[chaId] = {
+                        source: 'custom',
+                        file,
+                        updatedAt: Date.now(),
+                    };
+                } else if (source === 'default') {
+                    if (prev && prev.source === 'custom' && prev.file) deleteCustomThumbFile(prev.file);
+                    delete config.botThumbs[chaId];
+                } else {
+                    return sendJson(res, 400, { error: 'Invalid source' }, req);
+                }
+                saveConfig();
+                return sendJson(res, 200, { ok: true, botThumbs: publicBotThumbs() }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
+            }
         }
 
         // 5) Generic Bridge Command
@@ -13990,6 +16992,230 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             }
         }
 
+        // 7b) Multi-Speaker TTS Script Analysis, Synthesis & Connection Test
+        if (pathname === '/api/tts/analyze' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const chatKey = String(body.chatKey || buildTtsChatKey(state.snapshot) || '').trim();
+                const effectiveTtsCfg = normalizeTtsConfig({
+                    ...config.tts,
+                    ...(body.parseMode ? { parseMode: body.parseMode } : {}),
+                });
+                const result = await analyzeTtsSegments({
+                    text: body.text || '',
+                    html: body.html || '',
+                    role: body.role || 'char',
+                    charName: body.charName || ((state.snapshot && state.snapshot.charName) || 'Character'),
+                    personaName: body.personaName || ((state.snapshot && state.snapshot.personaName) || '나'),
+                    chatKey,
+                    ttsConfig: effectiveTtsCfg,
+                    callLlm: async (messages) => {
+                        const profile = resolveTtsLlmProfile();
+                        if (!profile) throw new Error('대본 분석용 모델 프로필이 설정되지 않았습니다.');
+                        const llmRes = await callLLMNonStream(profile, messages, {
+                            forceTemperature: 0.15,
+                            timeoutMs: 45000,
+                            source: 'tts_analyze',
+                        });
+                        return llmRes && llmRes.text ? llmRes.text : '';
+                    },
+                });
+                return sendJson(res, 200, { ok: true, ...result }, req);
+            } catch (e) {
+                return sendJson(res, 500, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/tts/synthesize' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const chatKey = String(body.chatKey || buildTtsChatKey(state.snapshot) || '').trim();
+                const result = await ttsProvider.synthesizeSegment(body.segment, config.tts, {
+                    charName: body.charName || ((state.snapshot && state.snapshot.charName) || 'Character'),
+                    overrideVoiceId: body.overrideVoiceId || '',
+                    chatKey,
+                });
+                res.writeHead(200, {
+                    'Content-Type': result.mime || 'audio/mpeg',
+                    'Content-Length': String(result.bytes.length),
+                    'Cache-Control': 'no-store',
+                    'X-Content-Type-Options': 'nosniff',
+                    'X-TTS-Cache': result.cacheHit ? 'HIT' : 'MISS',
+                    'X-TTS-Voice': String(result.voiceId || ''),
+                    'X-TTS-Provider': String(result.provider || ''),
+                    ...corsHeaders(req),
+                });
+                res.end(result.bytes);
+                return;
+            } catch (e) {
+                return sendJson(res, 502, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/tts/test' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const chatKey = String(body.chatKey || buildTtsChatKey(state.snapshot) || '').trim();
+                const ov = (body.ttsOverride && typeof body.ttsOverride === 'object') ? body.ttsOverride : {};
+                const mergedCfg = normalizeTtsConfig({
+                    ...config.tts,
+                    ...ov,
+                    apiKey: ov.apiKey ? String(ov.apiKey) : (config.tts ? config.tts.apiKey : ''),
+                });
+                const t0 = Date.now();
+                const result = await ttsProvider.testConnection(mergedCfg, {
+                    text: body.text || '안녕하세요. RisuStand 음성 테스트입니다.',
+                    kind: body.kind || 'dialogue',
+                    speaker: body.speaker || 'Tester',
+                    gender: body.gender || 'female',
+                    voiceId: body.voiceId || '',
+                    toneTag: body.toneTag || '',
+                    chatKey,
+                });
+                const elapsedMs = Date.now() - t0;
+                res.writeHead(200, {
+                    'Content-Type': result.mime || 'audio/mpeg',
+                    'Content-Length': String(result.bytes.length),
+                    'Cache-Control': 'no-store',
+                    'X-Content-Type-Options': 'nosniff',
+                    'X-TTS-Provider': String(result.provider || ''),
+                    'X-TTS-Voice': String(result.voiceId || ''),
+                    'X-TTS-Elapsed-Ms': String(elapsedMs),
+                    ...corsHeaders(req),
+                });
+                res.end(result.bytes);
+                return;
+            } catch (e) {
+                return sendJson(res, 502, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/tts/models' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const curCfg = normalizeTtsConfig(config.tts);
+                const reqGroup = normalizeVoiceGroup(body.group, '');
+                let targetProvider = typeof body.provider === 'string' && body.provider ? body.provider : '';
+                let targetApiUrl = body.apiUrl;
+                let targetModel = typeof body.model === 'string' && body.model ? body.model : '';
+                if (!targetProvider && reqGroup) {
+                    const curIsFish = (TTS_PROVIDER_DEFAULTS[curCfg.provider] || {}).kind === 'fish';
+                    if (reqGroup === 'fish') {
+                        targetProvider = curIsFish ? curCfg.provider : 'fish_local';
+                        if (targetApiUrl === undefined && !curIsFish) targetApiUrl = 'http://127.0.0.1:8081/v1/tts';
+                        if (!targetModel && !curIsFish) targetModel = 's2-pro';
+                    } else {
+                        targetProvider = !curIsFish ? curCfg.provider : 'openai_compat_local';
+                        if (targetApiUrl === undefined && curIsFish) targetApiUrl = TTS_PROVIDER_DEFAULTS.openai_compat_local.apiUrl;
+                        if (!targetModel && curIsFish) targetModel = TTS_PROVIDER_DEFAULTS.openai_compat_local.model;
+                    }
+                }
+                const mergedCfg = normalizeTtsConfig({
+                    ...config.tts,
+                    ...(targetProvider ? { provider: targetProvider } : {}),
+                    ...(targetApiUrl !== undefined ? { apiUrl: targetApiUrl } : {}),
+                    ...(targetModel ? { model: targetModel } : {}),
+                    apiKey: body.apiKey ? String(body.apiKey) : (config.tts ? config.tts.apiKey : ''),
+                });
+                const result = await listTtsModels(mergedCfg);
+                return sendJson(res, 200, { ok: true, ...result, voiceProfiles: curCfg.voiceProfiles }, req);
+            } catch (e) {
+                return sendJson(res, 500, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/tts/voice-profiles' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const curTts = normalizeTtsConfig(config.tts);
+                const nextProfiles = {
+                    fish: [...(curTts.voiceProfiles.fish || [])],
+                    openai_qwen: [...(curTts.voiceProfiles.openai_qwen || [])],
+                };
+                if (body.voiceProfiles && typeof body.voiceProfiles === 'object') {
+                    const normAll = normalizeVoiceProfiles(body.voiceProfiles);
+                    nextProfiles.fish = normAll.fish;
+                    nextProfiles.openai_qwen = normAll.openai_qwen;
+                } else {
+                    const grp = normalizeVoiceGroup(body.group, '');
+                    if (!grp) return sendJson(res, 400, { error: '유효한 보이스 영역(fish | openai_qwen)을 지정하세요.' }, req);
+                    const action = String(body.action || '').toLowerCase().trim();
+                    if (action === 'delete') {
+                        const delId = String(body.id || '').trim();
+                        nextProfiles[grp] = nextProfiles[grp].filter((item) => item.id !== delId);
+                    } else if (action === 'upsert') {
+                        const item = (body.item && typeof body.item === 'object') ? body.item : body;
+                        const normGroup = normalizeVoiceProfiles({ [grp]: [...nextProfiles[grp], item] })[grp];
+                        const id = String((item && (item.id || item.voiceId)) || '').trim();
+                        if (!id) return sendJson(res, 400, { error: 'Voice / Reference ID가 비어 있습니다.' }, req);
+                        const updatedEntry = normGroup.find((x) => x.id === id);
+                        if (updatedEntry) {
+                            const idx = nextProfiles[grp].findIndex((x) => x.id === id);
+                            if (idx >= 0) {
+                                const customLabel = String((item && (item.label || item.name)) || id).trim();
+                                nextProfiles[grp][idx] = {
+                                    ...updatedEntry,
+                                    label: customLabel || updatedEntry.label,
+                                };
+                            } else {
+                                nextProfiles[grp].push(updatedEntry);
+                            }
+                        }
+                    } else if (Array.isArray(body.profiles)) {
+                        nextProfiles[grp] = normalizeVoiceProfiles({ [grp]: body.profiles })[grp];
+                    } else {
+                        return sendJson(res, 400, { error: '지원하지 않는 voice-profiles 요청 형식입니다.' }, req);
+                    }
+                }
+                curTts.voiceProfiles = normalizeVoiceProfiles(nextProfiles);
+                config.tts = normalizeTtsConfig(curTts);
+                ttsProvider.clearCache();
+                saveConfig();
+                return sendJson(res, 200, sanitizeConfigForClient(), req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/tts/discover' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const servers = await scanLocalTtsServers();
+                return sendJson(res, 200, { ok: true, servers, presets: TTS_ENDPOINT_PRESETS }, req);
+            } catch (e) {
+                return sendJson(res, 500, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/tts/chat-cast' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const scopeKey = String(body.chatKey || buildTtsChatKey(state.snapshot) || '').trim();
+                const chars = Array.isArray(body.characters) ? body.characters : [];
+                const curTts = normalizeTtsConfig(config.tts);
+                if (!scopeKey || scopeKey === '__global__') {
+                    curTts.characters = chars;
+                } else {
+                    const nextChatChars = { ...(curTts.chatCharacters || {}) };
+                    if (chars.length) nextChatChars[scopeKey] = chars;
+                    else delete nextChatChars[scopeKey];
+                    curTts.chatCharacters = nextChatChars;
+                }
+                config.tts = normalizeTtsConfig(curTts);
+                ttsProvider.clearCache();
+                saveConfig();
+                return sendJson(res, 200, sanitizeConfigForClient(), req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e.message }, req);
+            }
+        }
+
         // 8) Router & Translator Config API
         if (pathname === '/api/router/config' && req.method === 'GET') {
             if (!requireAuth(req, res)) return;
@@ -14034,6 +17260,31 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                         ...body.imageGen,
                         apiKey: body.imageGen.apiKey ? String(body.imageGen.apiKey) : (config.imageGen ? config.imageGen.apiKey : ''),
                     });
+                }
+                if (body.tts && typeof body.tts === 'object') {
+                    const existingChatChars = (config.tts && config.tts.chatCharacters && typeof config.tts.chatCharacters === 'object')
+                        ? config.tts.chatCharacters
+                        : {};
+                    const mergedChatChars = { ...existingChatChars };
+                    if (body.tts.chatCharacters && typeof body.tts.chatCharacters === 'object' && !Array.isArray(body.tts.chatCharacters)) {
+                        for (const [ck, cv] of Object.entries(body.tts.chatCharacters)) {
+                            const key = String(ck || '').trim();
+                            if (!key) continue;
+                            if (Array.isArray(cv) && cv.length) mergedChatChars[key] = cv;
+                            else delete mergedChatChars[key];
+                        }
+                    }
+                    const existingVoiceProfiles = (config.tts && config.tts.voiceProfiles && typeof config.tts.voiceProfiles === 'object')
+                        ? config.tts.voiceProfiles
+                        : { fish: [], openai_qwen: [] };
+                    config.tts = normalizeTtsConfig({
+                        ...config.tts,
+                        ...body.tts,
+                        chatCharacters: mergedChatChars,
+                        voiceProfiles: body.tts.voiceProfiles !== undefined ? body.tts.voiceProfiles : existingVoiceProfiles,
+                        apiKey: body.tts.apiKey ? String(body.tts.apiKey) : (config.tts ? config.tts.apiKey : ''),
+                    });
+                    ttsProvider.clearCache();
                 }
                 if (typeof body.directPresetId === 'string') {
                     config.directPresetId = body.directPresetId;
@@ -14523,6 +17774,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 const snapNow = state.snapshot || {};
                 const charIndex = Number.isFinite(Number(body.charIndex)) ? Number(body.charIndex) : snapNow.charIndex;
                 const chatIndex = Number.isFinite(Number(body.chatIndex)) ? Number(body.chatIndex) : snapNow.chatIndex;
+                const prevVer = state.snapshotVersion;
                 const out = await pluginAdapter.dispatchSurfaceAction({
                     charIndex,
                     chatIndex,
@@ -14530,9 +17782,33 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     chatId: String(body.chatId || ''),
                     actionHtml: String(body.actionHtml || ''),
                     dataset: (body.dataset && typeof body.dataset === 'object') ? body.dataset : {},
+                    selector: String(body.selector || ''),
+                    textContent: String(body.textContent || ''),
+                    ariaLabel: String(body.ariaLabel || ''),
+                    title: String(body.title || ''),
+                    className: String(body.className || ''),
+                    siblingIndex: Number.isInteger(Number(body.siblingIndex)) ? Number(body.siblingIndex) : -1,
                 });
+                if (out.dbMutated && hostRpc.isConnected()) {
+                    await waitForSnapshotBump(prevVer, 280);
+                }
                 await refreshDisplaySnapshot();
-                return sendJson(res, 200, { ok: true, ...out }, req);
+                const resolvedOverlay = out.openedOverlay
+                    ? await resolvePluginUiAssets(out.openedOverlay, pluginAdapter, state.baseSnapshot)
+                    : null;
+                const resolvedFloatingUi = await resolvePluginUiAssets(
+                    out.pluginFloatingUi || pluginAdapter.getFloatingUiState(),
+                    pluginAdapter,
+                    state.baseSnapshot
+                );
+                return sendJson(res, 200, {
+                    ok: true,
+                    ...out,
+                    openedOverlay: resolvedOverlay,
+                    pluginFloatingUi: resolvedFloatingUi,
+                    snapshot: state.snapshot,
+                    snapshotVersion: state.snapshotVersion,
+                }, req);
             } catch (e) {
                 return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
             }
@@ -14545,7 +17821,8 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 const snapNow = state.snapshot || {};
                 const charIndex = Number.isFinite(Number(body.charIndex)) ? Number(body.charIndex) : snapNow.charIndex;
                 const chatIndex = Number.isFinite(Number(body.chatIndex)) ? Number(body.chatIndex) : snapNow.chatIndex;
-                const ui = await pluginAdapter.prepareFloatingPopupWidgets({ charIndex, chatIndex });
+                const rawUi = await pluginAdapter.prepareFloatingPopupWidgets({ charIndex, chatIndex });
+                const ui = await resolvePluginUiAssets(rawUi, pluginAdapter, state.baseSnapshot);
                 return sendJson(res, 200, { ok: true, pluginFloatingUi: ui }, req);
             } catch (e) {
                 return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
@@ -14559,6 +17836,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 const snapNow = state.snapshot || {};
                 const charIndex = Number.isFinite(Number(body.charIndex)) ? Number(body.charIndex) : snapNow.charIndex;
                 const chatIndex = Number.isFinite(Number(body.chatIndex)) ? Number(body.chatIndex) : snapNow.chatIndex;
+                const prevVer = state.snapshotVersion;
                 const out = await pluginAdapter.dispatchRootWidgetClick({
                     pluginName: String(body.pluginName || ''),
                     charIndex,
@@ -14567,13 +17845,39 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     countNode: String(body.countNode || ''),
                     actionHtml: String(body.actionHtml || ''),
                     dataset: (body.dataset && typeof body.dataset === 'object') ? body.dataset : {},
+                    textContent: String(body.textContent || ''),
+                    ariaLabel: String(body.ariaLabel || ''),
+                    title: String(body.title || ''),
+                    className: String(body.className || ''),
+                    siblingIndex: Number.isInteger(Number(body.siblingIndex)) ? Number(body.siblingIndex) : -1,
+                    eventType: String(body.eventType || 'click'),
+                    value: body.value,
+                    checked: body.checked,
                     x: Number(body.x ?? 24),
                     y: Number(body.y ?? 24),
                 });
-                if (pluginAdapter.hasEditDisplayHandlers()) {
+                if (out.dbMutated && hostRpc.isConnected()) {
+                    await waitForSnapshotBump(prevVer, 260);
+                }
+                if (out.dbMutated || out.surfaceMutated || pluginAdapter.hasEditDisplayHandlers()) {
                     await refreshDisplaySnapshot();
                 }
-                return sendJson(res, 200, { ok: true, ...out, pluginFloatingUi: pluginAdapter.getFloatingUiState() }, req);
+                const resolvedActiveOverlay = out.activeOverlay
+                    ? await resolvePluginUiAssets(out.activeOverlay, pluginAdapter, state.baseSnapshot)
+                    : null;
+                const resolvedFloatingUi = await resolvePluginUiAssets(
+                    pluginAdapter.getFloatingUiState(),
+                    pluginAdapter,
+                    state.baseSnapshot
+                );
+                return sendJson(res, 200, {
+                    ok: true,
+                    ...out,
+                    activeOverlay: resolvedActiveOverlay,
+                    pluginFloatingUi: resolvedFloatingUi,
+                    snapshot: state.snapshot,
+                    snapshotVersion: state.snapshotVersion,
+                }, req);
             } catch (e) {
                 return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
             }
