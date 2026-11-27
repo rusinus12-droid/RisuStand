@@ -77,8 +77,11 @@ function defaultConfig() {
         activeProfileId: '',
         auxProfileId: 'inherit',
         directPresetId: 'bundled:leave',
+        directHistoryMode: 'chunked',
+        directPipelineMode: 'single',
         remoteToggleValues: {},
         disabledLoreEntries: {},
+        enabledModuleLoreEntries: {},
         pinnedLoreEntries: {},
         presetToggles: [],
         backendPlugins: {},
@@ -162,8 +165,11 @@ function loadConfig() {
                 activeProfileId: typeof raw.activeProfileId === 'string' ? raw.activeProfileId : def.activeProfileId,
                 auxProfileId: typeof raw.auxProfileId === 'string' && raw.auxProfileId ? raw.auxProfileId : 'inherit',
                 directPresetId: typeof raw.directPresetId === 'string' ? raw.directPresetId : def.directPresetId,
+                directHistoryMode: ['chunked', 'full', 'sliding_30'].includes(raw.directHistoryMode) ? raw.directHistoryMode : 'chunked',
+                directPipelineMode: ['single', 'two_pass'].includes(raw.directPipelineMode) ? raw.directPipelineMode : 'single',
                 remoteToggleValues,
                 disabledLoreEntries: normalizeStrArrayMap(raw.disabledLoreEntries),
+                enabledModuleLoreEntries: normalizeStrArrayMap(raw.enabledModuleLoreEntries),
                 pinnedLoreEntries: normalizeStrArrayMap(raw.pinnedLoreEntries),
                 profiles: Array.isArray(raw.profiles) ? raw.profiles : def.profiles,
                 presetToggles: Array.isArray(raw.presetToggles) ? raw.presetToggles : [],
@@ -196,7 +202,144 @@ let config = loadConfig();
 // Byte substitution table matching RisuAI's .risup / rpack container format
 const RISUP_RPACK_MAP_BASE64 = 'xA0eC70rP1X8RW71ZlNPGuC7MJSGumu/QVBvm+/etxBhFyDfMomonW2ryZAADF2v0sFW5RZkkYJldJfKI9ZS0f+0oOgvilg4WmAZlknb18g7PkNLpWNHqmopkvQVz2I0eNMdPOIFjipXDhvNTC3yQCwleUgPsnq1p2w35px7VH7+h9yaAuQzouuxLgPdmaaw59WIGIN89r7hXJ/DIUYfCE7QdhJf7v2PROqjXosoCTWeacwKx4UHrUrzd+ln1NqEgJO2TXP6JyZ/BMb78XI5UcI2qWis+O3FucvOdaQ9gdlCcByVEbzYjJj5WaET9xR9s+xxwOON8AGuWzEGJCI6uCz3hIvJZfu2n66zAy0BaXQf5KPs7lw0IZNKD2riYgKeIpz9PPxxx8atWWcFcG2KRBL6JIZfr9F6R87+UGPdUQZvGOBSqAmdVnNMuFNsw6AOGc8+DX4HMmhG6kj5mS6rpEkgXlU1OAy807FYFnkoChrh8s3EOduiumBydn2V73/IwN43lL+1FIGSJUWs5/Vmpys2WsET40s66I2DG3wnsJpC64eq3FSOeCbSVynUt/gvj4l18EF3wh7/2BUR5QSXF/Mx0JsA18q0Tyo72bJr2l2hPzBhvZE9Tubfvk2CjB0jEJhk9IUze5BDu6mI8dalHPbMbrlbC5bt1enFywimgEA=';
 const RISUP_MAP_BYTES = Uint8Array.from(Buffer.from(RISUP_RPACK_MAP_BASE64, 'base64'));
+const RISUP_ENCODE_MAP = RISUP_MAP_BYTES.subarray(0, 256);
 const RISUP_DECODE_MAP = RISUP_MAP_BYTES.subarray(256, 512);
+
+function msgpackEncode(val) {
+    const chunks = [];
+    const writeUInt8 = (v) => chunks.push(Buffer.from([v & 0xff]));
+    const writeInt = (v) => {
+        if (v >= 0 && v <= 0x7f) return writeUInt8(v);
+        if (v < 0 && v >= -32) return writeUInt8(v & 0xff);
+        if (v >= 0 && v <= 0xff) return chunks.push(Buffer.from([0xcc, v]));
+        if (v >= 0 && v <= 0xffff) {
+            const b = Buffer.allocUnsafe(3);
+            b[0] = 0xcd; b.writeUInt16BE(v, 1);
+            return chunks.push(b);
+        }
+        if (v >= 0 && v <= 0xffffffff) {
+            const b = Buffer.allocUnsafe(5);
+            b[0] = 0xce; b.writeUInt32BE(v, 1);
+            return chunks.push(b);
+        }
+        if (v >= -128 && v <= 127) {
+            const b = Buffer.allocUnsafe(2);
+            b[0] = 0xd0; b.writeInt8(v, 1);
+            return chunks.push(b);
+        }
+        if (v >= -32768 && v <= 32767) {
+            const b = Buffer.allocUnsafe(3);
+            b[0] = 0xd1; b.writeInt16BE(v, 1);
+            return chunks.push(b);
+        }
+        if (v >= -2147483648 && v <= 2147483647) {
+            const b = Buffer.allocUnsafe(5);
+            b[0] = 0xd2; b.writeInt32BE(v, 1);
+            return chunks.push(b);
+        }
+        const b = Buffer.allocUnsafe(9);
+        b[0] = 0xcb; b.writeDoubleBE(v, 1);
+        return chunks.push(b);
+    };
+    const writeStr = (s) => {
+        const strBuf = Buffer.from(String(s), 'utf8');
+        const len = strBuf.length;
+        if (len <= 31) writeUInt8(0xa0 | len);
+        else if (len <= 0xff) chunks.push(Buffer.from([0xd9, len]));
+        else if (len <= 0xffff) {
+            const b = Buffer.allocUnsafe(3);
+            b[0] = 0xda; b.writeUInt16BE(len, 1);
+            chunks.push(b);
+        } else {
+            const b = Buffer.allocUnsafe(5);
+            b[0] = 0xdb; b.writeUInt32BE(len, 1);
+            chunks.push(b);
+        }
+        chunks.push(strBuf);
+    };
+    const writeBin = (buf) => {
+        const len = buf.length;
+        if (len <= 0xff) chunks.push(Buffer.from([0xc4, len]));
+        else if (len <= 0xffff) {
+            const b = Buffer.allocUnsafe(3);
+            b[0] = 0xc5; b.writeUInt16BE(len, 1);
+            chunks.push(b);
+        } else {
+            const b = Buffer.allocUnsafe(5);
+            b[0] = 0xc6; b.writeUInt32BE(len, 1);
+            chunks.push(b);
+        }
+        chunks.push(buf);
+    };
+    function write(v) {
+        if (v === null || v === undefined) return writeUInt8(0xc0);
+        if (v === false) return writeUInt8(0xc2);
+        if (v === true) return writeUInt8(0xc3);
+        if (typeof v === 'number') {
+            if (!Number.isFinite(v)) return writeUInt8(0xc0);
+            if (Number.isInteger(v)) return writeInt(v);
+            const b = Buffer.allocUnsafe(9);
+            b[0] = 0xcb; b.writeDoubleBE(v, 1);
+            return chunks.push(b);
+        }
+        if (typeof v === 'string') return writeStr(v);
+        if (Buffer.isBuffer(v) || v instanceof Uint8Array) {
+            return writeBin(Buffer.isBuffer(v) ? v : Buffer.from(v));
+        }
+        if (Array.isArray(v)) {
+            const len = v.length;
+            if (len <= 15) writeUInt8(0x90 | len);
+            else if (len <= 0xffff) {
+                const b = Buffer.allocUnsafe(3);
+                b[0] = 0xdc; b.writeUInt16BE(len, 1);
+                chunks.push(b);
+            } else {
+                const b = Buffer.allocUnsafe(5);
+                b[0] = 0xdd; b.writeUInt32BE(len, 1);
+                chunks.push(b);
+            }
+            for (let i = 0; i < len; i += 1) write(v[i]);
+            return;
+        }
+        if (typeof v === 'object') {
+            const keys = Object.keys(v).filter((k) => v[k] !== undefined);
+            const len = keys.length;
+            if (len <= 15) writeUInt8(0x80 | len);
+            else if (len <= 0xffff) {
+                const b = Buffer.allocUnsafe(3);
+                b[0] = 0xde; b.writeUInt16BE(len, 1);
+                chunks.push(b);
+            } else {
+                const b = Buffer.allocUnsafe(5);
+                b[0] = 0xdf; b.writeUInt32BE(len, 1);
+                chunks.push(b);
+            }
+            for (const k of keys) {
+                writeStr(k);
+                write(v[k]);
+            }
+            return;
+        }
+        writeStr(String(v));
+    }
+    write(val);
+    return Buffer.concat(chunks);
+}
+
+function encodeRisupPreset(presetObj) {
+    if (!presetObj || typeof presetObj !== 'object') throw new Error('Invalid preset object for .risup encoding');
+    const inner = msgpackEncode(presetObj);
+    const aesKey = crypto.createHash('sha256').update('risupreset').digest();
+    const cipher = crypto.createCipheriv('aes-256-gcm', aesKey, Buffer.alloc(12));
+    const encBuf = Buffer.concat([cipher.update(inner), cipher.final(), cipher.getAuthTag()]);
+    const outer = msgpackEncode({ presetVersion: 2, type: 'preset', preset: encBuf });
+    const zipped = zlib.gzipSync(outer);
+    const out = Buffer.allocUnsafe(zipped.length);
+    for (let i = 0; i < zipped.length; i += 1) {
+        out[i] = RISUP_ENCODE_MAP[zipped[i]];
+    }
+    return out;
+}
 
 function msgpackDecode(u8) {
     const buf = Buffer.isBuffer(u8) ? u8 : Buffer.from(u8);
@@ -288,6 +431,16 @@ function decodeRisupPreset(buf) {
     return msgpackDecode(decrypted);
 }
 
+function normalizePresetSampling(parsed) {
+    const rawTemp = parseOptionalNumber(parsed && parsed.temperature);
+    const temperature = rawTemp !== undefined
+        ? (rawTemp > 2 ? Math.round((rawTemp / 100) * 1000) / 1000 : rawTemp)
+        : undefined;
+    const rawMaxResp = parseOptionalNumber(parsed && parsed.maxResponse);
+    const maxResponse = rawMaxResp !== undefined && rawMaxResp > 0 ? Math.floor(rawMaxResp) : undefined;
+    return { temperature, maxResponse };
+}
+
 const LEAVE_PRESET_ID = 'preset-leave-r1.1';
 let cachedLeavePreset = null;
 function loadBundledLeavePreset() {
@@ -302,6 +455,7 @@ function loadBundledLeavePreset() {
         }
         const rawRisup = fs.readFileSync(risupPath);
         const parsed = decodeRisupPreset(rawRisup);
+        const sampling = normalizePresetSampling(parsed);
         const value = {
             id: LEAVE_PRESET_ID,
             name: String((parsed && parsed.name) || 'Leave — Wandering Librarian Engine r1.1'),
@@ -311,6 +465,8 @@ function loadBundledLeavePreset() {
             globalNote: String((parsed && parsed.globalNote) || ''),
             mainPrompt: String((parsed && parsed.mainPrompt) || ''),
             jailbreak: String((parsed && parsed.jailbreak) || ''),
+            ...(sampling.temperature !== undefined ? { temperature: sampling.temperature } : {}),
+            ...(sampling.maxResponse !== undefined ? { maxResponse: sampling.maxResponse } : {}),
             hasGuide,
             filename: 'Leave_RisuAI_Preset.risup',
             rawRisup,
@@ -470,6 +626,7 @@ function sanitizeUploadedPresetEntry(parsed, { id = '', filename = '' } = {}) {
         throw new Error('프리셋에 promptTemplate 또는 mainPrompt가 없습니다.');
     }
     const baseName = String(parsed.name || filename.replace(/\.(risup|json)$/i, '') || 'Custom Preset').trim();
+    const sampling = normalizePresetSampling(parsed);
     return {
         id: id || ('custom-' + crypto.randomBytes(6).toString('hex')),
         name: baseName.slice(0, 120),
@@ -491,6 +648,8 @@ function sanitizeUploadedPresetEntry(parsed, { id = '', filename = '' } = {}) {
         globalNote,
         mainPrompt,
         jailbreak,
+        ...(sampling.temperature !== undefined ? { temperature: sampling.temperature } : {}),
+        ...(sampling.maxResponse !== undefined ? { maxResponse: sampling.maxResponse } : {}),
     };
 }
 
@@ -1102,6 +1261,10 @@ function getProfileForMode(mode = 'model') {
     return getActiveProfile();
 }
 
+function getAuxProfile() {
+    return getProfileForMode('aux');
+}
+
 function pruneCommandQueue(now = Date.now()) {
     state.commandQueue = state.commandQueue.filter((c) => now - c.createdAt <= CMD_TTL_MS);
     if (state.commandQueue.length > CMD_MAX_LEN) {
@@ -1335,28 +1498,91 @@ function normalizeMessageText(content) {
 
 function normalizeTurnMessages(messages, { assistantRole = 'assistant', ensureUserFirst = false } = {}) {
     const sysParts = [];
+    const sysBlocks = [];
     const turns = [];
+    const turnCachePoints = [];
     for (const m of Array.isArray(messages) ? messages : []) {
         const txt = normalizeMessageText(m && m.content);
+        const cp = Boolean(m && m._cachePoint);
         if (m && m.role === 'system') {
-            if (txt) sysParts.push(txt);
+            if (txt) {
+                sysParts.push(txt);
+                sysBlocks.push({ text: txt, cachePoint: cp });
+            } else if (cp && sysBlocks.length) {
+                sysBlocks[sysBlocks.length - 1].cachePoint = true;
+            }
             continue;
         }
         const role = m && m.role === 'assistant' ? assistantRole : 'user';
-        const last = turns[turns.length - 1];
-        if (last && last.role === role) {
-            if (txt) last.text = last.text ? `${last.text}\n\n${txt}` : txt;
+        const lastIdx = turns.length - 1;
+        if (lastIdx >= 0 && turns[lastIdx].role === role) {
+            if (txt) turns[lastIdx].text = turns[lastIdx].text ? `${turns[lastIdx].text}\n\n${txt}` : txt;
+            if (cp) turnCachePoints[lastIdx] = true;
         } else {
             turns.push({ role, text: txt });
+            turnCachePoints.push(cp);
         }
     }
     if (ensureUserFirst) {
-        if (!turns.length) turns.push({ role: 'user', text: 'Continue.' });
-        else if (turns[0].role !== 'user') turns.unshift({ role: 'user', text: '[Start]' });
+        if (!turns.length) {
+            turns.push({ role: 'user', text: 'Continue.' });
+            turnCachePoints.push(false);
+        } else if (turns[0].role !== 'user') {
+            turns.unshift({ role: 'user', text: '[Start]' });
+            turnCachePoints.unshift(false);
+        }
     } else if (!turns.length) {
         turns.push({ role: 'user', text: 'Continue.' });
+        turnCachePoints.push(false);
     }
-    return { sysParts, turns };
+    return { sysParts, sysBlocks, turns, turnCachePoints };
+}
+
+function computeUATurnStats(messages) {
+    const list = Array.isArray(messages) ? messages : [];
+    let completed = 0;
+    let hasPendingUser = false;
+    let hasAssistantInPair = false;
+    let activeTurnNum = 0;
+    const turnByIndex = new Array(list.length).fill(0);
+    for (let i = 0; i < list.length; i += 1) {
+        const m = list[i];
+        if (!m || typeof m !== 'object') continue;
+        if (m.disabled === true || m.isComment === true || m.isFirstMessage === true) continue;
+        const rawBody = m.data ?? m.raw ?? m.content ?? m.text ?? '';
+        let hasBody = String(rawBody).trim().length > 0;
+        if (!hasBody && m.html) {
+            hasBody = String(m.html).replace(/<[^>]+>/g, ' ').trim().length > 0 || /<img\b/i.test(String(m.html));
+        }
+        if (!hasBody) continue;
+        const roleRaw = String(m.role || '').toLowerCase();
+        if (roleRaw === 'user') {
+            if (!hasPendingUser) {
+                activeTurnNum = completed + 1;
+                hasPendingUser = true;
+                hasAssistantInPair = false;
+            } else if (hasAssistantInPair) {
+                completed += 1;
+                activeTurnNum = completed + 1;
+                hasPendingUser = true;
+                hasAssistantInPair = false;
+            }
+            turnByIndex[i] = activeTurnNum;
+        } else if (roleRaw === 'char' || roleRaw === 'assistant' || roleRaw === 'bot' || roleRaw === 'model') {
+            if (!hasPendingUser) {
+                turnByIndex[i] = 0;
+            } else {
+                hasAssistantInPair = true;
+                turnByIndex[i] = activeTurnNum;
+            }
+        }
+    }
+    if (hasPendingUser && hasAssistantInPair) completed += 1;
+    return {
+        completedTurns: completed,
+        pendingTurn: (hasPendingUser && !hasAssistantInPair) ? activeTurnNum : 0,
+        turnByIndex,
+    };
 }
 
 function createTimeoutSignal(timeoutMs, externalSignal) {
@@ -1830,7 +2056,42 @@ function cgExtractRequestSegments(rawBodyObj, fallbackMessages, providerType) {
     return { segments, lastCacheBreakpointSegIdx, providerType: providerType || 'openai_compat' };
 }
 
-function detectAuxiliaryOrSubRequest({ source, endpoint, ok, status, rawBodyObj, segments }) {
+function detectRemotePromptMainNarrative(segments) {
+    const segs = Array.isArray(segments) ? segments : [];
+    const sysCombined = segs
+        .filter((s) => s && (s.kind === 'system' || s.kind === 'sys_tail'))
+        .map((s) => String(s.text || ''))
+        .join('\n\n');
+    if (!sysCombined) return { matched: false, presetName: '' };
+
+    if (/\[LEAVE ENGINE\b|\[LEAVE WRITING MODE\b|\[LEAVE FINAL EXECUTION CHECK\b|\[LEAVE CORE AIDE\b|\[LEAVE\s*[×x]\s*GRADIA|\[LEAVE OOC COMMITMENT LOCK/i.test(sysCombined)) {
+        return { matched: true, presetName: 'Leave — Wandering Librarian Engine' };
+    }
+
+    const activeDirectId = (config && typeof config.directPresetId === 'string') ? config.directPresetId.trim() : '';
+    if (activeDirectId.startsWith('custom:')) {
+        const activePreset = resolveDirectPreset(activeDirectId);
+        if (activePreset && Array.isArray(activePreset.promptTemplate)) {
+            for (const item of activePreset.promptTemplate) {
+                if (!item || typeof item !== 'object' || item.type !== 'plain' || !item.text) continue;
+                const staticLine = String(item.text)
+                    .replace(/\{\{[\s\S]*?\}\}/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                if (staticLine.length >= 48) {
+                    const probe = staticLine.slice(0, 72);
+                    if (sysCombined.replace(/\s+/g, ' ').includes(probe)) {
+                        return { matched: true, presetName: String(activePreset.name || '원격 커스텀 프리셋') };
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    return { matched: false, presetName: '' };
+}
+
+function detectAuxiliaryOrSubRequest({ source, endpoint, ok, status, rawBodyObj, segments, remotePrompt = false, presetName = '' }) {
     if (source !== 'proxy' && source !== 'direct_chat' && source !== 'direct_reroll') {
         return {
             eligible: false,
@@ -1861,6 +2122,29 @@ function detectAuxiliaryOrSubRequest({ source, endpoint, ok, status, rawBodyObj,
         };
     }
 
+    const remoteMatch = detectRemotePromptMainNarrative(segs);
+    if (source === 'direct_chat' || source === 'direct_reroll') {
+        return {
+            eligible: true,
+            isRemotePrompt: Boolean(remotePrompt || remoteMatch.matched),
+            mainNarrativeKind: (remotePrompt || remoteMatch.matched) ? 'remote_prompt' : 'direct_chat',
+            detectedPresetName: presetName || remoteMatch.presetName || '',
+            excludedReason: '',
+            excludedLabel: '',
+        };
+    }
+
+    if (source === 'proxy' && remoteMatch.matched) {
+        return {
+            eligible: true,
+            isRemotePrompt: true,
+            mainNarrativeKind: 'remote_prompt_proxy',
+            detectedPresetName: remoteMatch.presetName || '',
+            excludedReason: '',
+            excludedLabel: '',
+        };
+    }
+
     const sysSegs = segs.filter((s) => s.kind === 'system');
     const chatSegs = segs.filter((s) => s.kind === 'chat');
     const sysProbe = sysSegs.map((s) => s.text.slice(0, 3500)).join('\n');
@@ -1868,63 +2152,70 @@ function detectAuxiliaryOrSubRequest({ source, endpoint, ok, status, rawBodyObj,
         ? segs.map((s) => s.text.slice(0, 2500)).join('\n')
         : segs.map((s) => s.text.slice(0, 400)).join('\n');
     const probeText = sysProbe + '\n' + shortTurnProbe;
+    const startsWithAuxDirective = /^(?:\s|[\r\n])*(?:\[?\s*hayaku\b|<hayaku\b|##\s*hayaku|FLASHBACK\s*Memory|\[?\s*flashback\b|<flashback\b|\[LBDATA|<lb-|\[StatusPanel\]|AssetMaid)/i.test(sysProbe);
+    const looksMultiTurnMainChat = chatSegs.length >= 4 && !startsWithAuxDirective;
 
-    // 1) Hayaku / HypaMemory / SupaMemory / Summary requests
-    if (
-        /\[?\s*hayaku\b|<hayaku\b|##\s*hayaku|hayaku_|하야쿠|서사\s*요약|\[?\s*hypamemory|HypaV[23]|\[?\s*supamemory|장기\s*기억\s*요약/i.test(probeText) ||
-        (/^(?:\s|[\r\n])*(?:you are (?:a|an) )?(?:helpful )?(?:ai |assistant )?(?:that |whose job is to )?summariz/im.test(sysProbe) && chatSegs.length <= 3) ||
-        (/(?:summarize the following (?:conversation|chat|story|roleplay|events|messages)|write a concise summary of (?:the )?(?:story|conversation|roleplay)|다음\s*(?:대화|서사|내용)(?:을|를)\s*요약)/i.test(shortTurnProbe) && chatSegs.length <= 3)
-    ) {
-        return {
-            eligible: false,
-            excludedReason: 'hayaku',
-            excludedLabel: '하야쿠 / 요약 보조 요청',
-        };
-    }
+    if (!looksMultiTurnMainChat) {
+        // 1) Hayaku / HypaMemory / SupaMemory / Summary requests
+        if (
+            /\[?\s*hayaku\b|<hayaku\b|##\s*hayaku|hayaku_|하야쿠|서사\s*요약|\[?\s*hypamemory|HypaV[23]|\[?\s*supamemory|장기\s*기억\s*요약/i.test(probeText) ||
+            (/^(?:\s|[\r\n])*(?:you are (?:a|an) )?(?:helpful )?(?:ai |assistant )?(?:that |whose job is to )?summariz/im.test(sysProbe) && chatSegs.length <= 3) ||
+            (/(?:summarize the following (?:conversation|chat|story|roleplay|events|messages)|write a concise summary of (?:the )?(?:story|conversation|roleplay)|다음\s*(?:대화|서사|내용)(?:을|를)\s*요약)/i.test(shortTurnProbe) && chatSegs.length <= 3)
+        ) {
+            return {
+                eligible: false,
+                excludedReason: 'hayaku',
+                excludedLabel: '하야쿠 / 요약 보조 요청',
+            };
+        }
 
-    // 2) Flashback Memory requests
-    if (
-        /FLASHBACK\s*Memory|flashback_memory|\[?\s*flashback\b|<flashback\b|##\s*flashback|플래시백|회상\s*메모리/i.test(probeText) ||
-        (/(?:extract relevant memor|select relevant (?:past )?memor|retrieve relevant memor|memory retrieval|기억\s*검색|회상\s*추출)/i.test(shortTurnProbe) && chatSegs.length <= 3)
-    ) {
-        return {
-            eligible: false,
-            excludedReason: 'flashback',
-            excludedLabel: '플래시백 / 기억 검색 요청',
-        };
-    }
+        // 2) Flashback Memory requests
+        if (
+            /FLASHBACK\s*Memory|flashback_memory|\[?\s*flashback\b|<flashback\b|##\s*flashback|플래시백|회상\s*메모리/i.test(probeText) ||
+            (/(?:extract relevant memor|select relevant (?:past )?memor|retrieve relevant memor|memory retrieval|기억\s*검색|회상\s*추출)/i.test(shortTurnProbe) && chatSegs.length <= 3)
+        ) {
+            return {
+                eligible: false,
+                excludedReason: 'flashback',
+                excludedLabel: '플래시백 / 기억 검색 요청',
+            };
+        }
 
-    // 3) Translator prompts sent through proxy
-    if (
-        /(?:<translate_request|\[translation\]|translation_only|translate the following (?:text|dialogue|passage) (?:to|into)|다음\s*(?:문장|텍스트)(?:을|를)\s*(?:한국어|영어|일본어)로\s*번역)/i.test(shortTurnProbe) &&
-        chatSegs.length <= 2
-    ) {
-        return {
-            eligible: false,
-            excludedReason: 'translator_prompt',
-            excludedLabel: '번역 보조 요청',
-        };
-    }
+        // 3) Translator prompts sent through proxy
+        if (
+            /(?:<translate_request|\[translation\]|translation_only|translate the following (?:text|dialogue|passage) (?:to|into)|다음\s*(?:문장|텍스트)(?:을|를)\s*(?:한국어|영어|일본어)로\s*번역)/i.test(shortTurnProbe) &&
+            chatSegs.length <= 2
+        ) {
+            return {
+                eligible: false,
+                excludedReason: 'translator_prompt',
+                excludedLabel: '번역 보조 요청',
+            };
+        }
 
-    // 4) Other auxiliary plugins/modules (Lightboard/LBDATA, LIBRA, RETRACE, Asset Maid, Hanurai, status window updaters)
-    if (
-        /(?:\[LBDATA|<lb-|StatusPanel|\[StatusPanel\]|AssetMaid|asset\s*maid|hanurai|generate\s+(?:an?\s+)?(?:image\s+generation|danbooru|stable\s*diffusion|novelai)\s+prompt|삽화\s*프롬프트\s*생성|상태창\s*업데이트)/i.test(probeText)
-    ) {
-        return {
-            eligible: false,
-            excludedReason: 'plugin_aux',
-            excludedLabel: '플러그인/모듈 보조 요청',
-        };
+        // 4) Other auxiliary plugins/modules (Lightboard/LBDATA, LIBRA, RETRACE, Asset Maid, Hanurai, status window updaters)
+        if (
+            /(?:\[LBDATA|<lb-|StatusPanel|\[StatusPanel\]|AssetMaid|asset\s*maid|hanurai|generate\s+(?:an?\s+)?(?:image\s+generation|danbooru|stable\s*diffusion|novelai)\s+prompt|삽화\s*프롬프트\s*생성|상태창\s*업데이트)/i.test(probeText)
+        ) {
+            return {
+                eligible: false,
+                excludedReason: 'plugin_aux',
+                excludedLabel: '플러그인/모듈 보조 요청',
+            };
+        }
     }
 
     return {
         eligible: true,
+        isRemotePrompt: false,
+        mainNarrativeKind: 'proxy_narrative',
+        detectedPresetName: '',
         excludedReason: '',
         excludedLabel: '',
     };
 }
 
-function buildLaneSignature(entry, segInfo) {
+function buildLaneSignature(entry, segInfo, cls = null) {
     const namespace = entry.source === 'proxy' ? 'proxy' : 'direct';
     const segs = segInfo && Array.isArray(segInfo.segments) ? segInfo.segments : [];
     const sysSegs = segs.filter((s) => s.kind === 'system');
@@ -1942,6 +2233,11 @@ function buildLaneSignature(entry, segInfo) {
     const sysPreview = sysAll.replace(/\s+/g, ' ').trim().slice(0, 80);
     return {
         namespace,
+        chatScopeKey: String(entry.narrativeScopeKey || ''),
+        charName: String(entry.charName || ''),
+        isRemotePrompt: Boolean(entry.remotePrompt || (cls && cls.isRemotePrompt)),
+        presetName: String(entry.presetName || (cls && cls.detectedPresetName) || ''),
+        mainNarrativeKind: String((cls && cls.mainNarrativeKind) || (namespace === 'proxy' ? 'proxy_narrative' : 'direct_chat')),
         systemHash,
         sysHeadHash,
         sysMidHash,
@@ -1959,9 +2255,12 @@ function findMatchingMainLane(lanes, sig) {
     let bestScore = 0;
     for (const lane of lanes) {
         if (lane.namespace !== sig.namespace) continue;
+        if (sig.chatScopeKey && lane.chatScopeKey && sig.chatScopeKey !== lane.chatScopeKey) continue;
         let score = 0;
-        // Tier 1: exact system hash match
-        if (sig.systemHash !== 'none' && lane.systemHash === sig.systemHash) {
+        if (sig.chatScopeKey && lane.chatScopeKey && sig.chatScopeKey === lane.chatScopeKey) {
+            score = 120;
+        } else if (sig.systemHash !== 'none' && lane.systemHash === sig.systemHash) {
+            // Tier 1: exact system hash match
             score = 100;
         } else {
             // Tier 2: partial system anchors (tolerates lorebook insertions / dynamic toggles)
@@ -2133,13 +2432,40 @@ function computePrefixDiff(prevTurn, currTurn, options = {}) {
     const prevSnippet = cgSnippetAround(pSeg ? pSeg.text : '', diffOffset);
     const currSnippet = cgSnippetAround(cSeg ? cSeg.text : '', diffOffset);
     const afterBreakpoint = Boolean(currTurn.lastCacheBreakpointSegIdx >= 0 && diffSegIdx > currTurn.lastCacheBreakpointSegIdx);
+    const isMultiBlockTailShift = () => {
+        if (diffSegIdx <= 0 || !pSeg || pSeg.kind === 'system') return false;
+        if (currSegs.length <= prevSegs.length) return false;
+        const prevTail = prevSegs.slice(diffSegIdx);
+        if (!prevTail.length || prevTail.length > 6) return false;
+        const currTail = currSegs.slice(currSegs.length - prevTail.length);
+        let sawSysTail = false;
+        let shiftedChatCount = 0;
+        const insertedSlice = currSegs.slice(diffSegIdx, currSegs.length - prevTail.length + 1);
+        for (let j = 0; j < prevTail.length; j++) {
+            const pt = prevTail[j];
+            const ct = currTail[j];
+            if (!ct) return false;
+            if (pt.kind === 'sys_tail') {
+                if (ct.kind !== 'sys_tail' || pt.role !== ct.role || pt.exactHash !== ct.exactHash) return false;
+                sawSysTail = true;
+            } else if (pt.kind === 'chat' && pt.role === 'user') {
+                shiftedChatCount += 1;
+                if (shiftedChatCount > 1) return false;
+                if (!insertedSlice.some((s) => s && s.role === 'user' && s.exactHash === pt.exactHash)) return false;
+            } else {
+                return false;
+            }
+        }
+        return sawSysTail;
+    };
     const tailShiftOnly = Boolean(
-        diffSegIdx === prevSegs.length - 1 &&
-        pSeg &&
-        pSeg.kind === 'sys_tail' &&
-        currSegs.length > prevSegs.length &&
-        currSegs[currSegs.length - 1] &&
-        currSegs[currSegs.length - 1].exactHash === pSeg.exactHash
+        (diffSegIdx === prevSegs.length - 1 &&
+            pSeg &&
+            pSeg.kind === 'sys_tail' &&
+            currSegs.length > prevSegs.length &&
+            currSegs[currSegs.length - 1] &&
+            currSegs[currSegs.length - 1].exactHash === pSeg.exactHash) ||
+        isMultiBlockTailShift()
     );
     const lorebookMatch = identifyLorebookCulprit(
         pSeg ? pSeg.text.slice(Math.max(0, diffOffset - 120), diffOffset + 400) : '',
@@ -2294,6 +2620,8 @@ function recomputeRequestLogsCacheGuard(logs, options = {}) {
             status: item.status,
             rawBodyObj: bodyObj,
             segments: segInfo.segments,
+            remotePrompt: Boolean(item.remotePrompt),
+            presetName: item.presetName || '',
         });
 
         if (!cls.eligible) {
@@ -2318,15 +2646,19 @@ function recomputeRequestLogsCacheGuard(logs, options = {}) {
         const minCacheTokens = cgGetMinCacheTokensForModel(item.model);
         const belowMinCacheTokens = promptTokens > 0 && promptTokens < minCacheTokens;
 
-        const sig = buildLaneSignature(item, segInfo);
+        const sig = buildLaneSignature(item, segInfo, cls);
         let lane = findMatchingMainLane(lanes, sig);
         if (!lane) {
             nextLaneSeq++;
             lane = {
                 laneId: `${sig.namespace}-lane-${nextLaneSeq}`,
                 laneNumber: nextLaneSeq,
-                laneLabel: `그룹 #${nextLaneSeq}`,
+                laneLabel: sig.charName ? `그룹 #${nextLaneSeq} · ${sig.charName}` : `그룹 #${nextLaneSeq}`,
                 namespace: sig.namespace,
+                chatScopeKey: sig.chatScopeKey,
+                charName: sig.charName,
+                isRemotePrompt: sig.isRemotePrompt,
+                presetName: sig.presetName,
                 systemHash: sig.systemHash,
                 sysHeadHash: sig.sysHeadHash,
                 sysMidHash: sig.sysMidHash,
@@ -2345,6 +2677,12 @@ function recomputeRequestLogsCacheGuard(logs, options = {}) {
             if (lane.systemHash === 'none' && sig.systemHash !== 'none') lane.systemHash = sig.systemHash;
             if (!lane.sysAnchor512 && sig.sysAnchor512) lane.sysAnchor512 = sig.sysAnchor512;
             if (!lane.sysAnchor2048 && sig.sysAnchor2048) lane.sysAnchor2048 = sig.sysAnchor2048;
+            if (!lane.isRemotePrompt && sig.isRemotePrompt) lane.isRemotePrompt = true;
+            if (!lane.presetName && sig.presetName) lane.presetName = sig.presetName;
+            if (!lane.charName && sig.charName) {
+                lane.charName = sig.charName;
+                lane.laneLabel = `그룹 #${lane.laneNumber} · ${sig.charName}`;
+            }
         }
 
         const prevTurn = lane.turns.length > 0 ? lane.turns[lane.turns.length - 1] : null;
@@ -2363,6 +2701,10 @@ function recomputeRequestLogsCacheGuard(logs, options = {}) {
             cacheGuard = {
                 eligible: true,
                 namespace: sig.namespace,
+                isRemotePrompt: Boolean(sig.isRemotePrompt || lane.isRemotePrompt),
+                mainNarrativeKind: sig.mainNarrativeKind,
+                presetName: sig.presetName || lane.presetName || '',
+                charName: sig.charName || lane.charName || '',
                 laneId: lane.laneId,
                 laneNumber: lane.laneNumber,
                 laneLabel: lane.laneLabel,
@@ -2380,7 +2722,9 @@ function recomputeRequestLogsCacheGuard(logs, options = {}) {
                 minCacheTokens,
                 belowMinCacheTokens,
                 causeCode: 'baseline',
-                causeLabel: '그룹의 첫 서사 요청입니다.',
+                causeLabel: (sig.isRemotePrompt || lane.isRemotePrompt)
+                    ? '원격 프롬프트 메인 서사 그룹의 첫 턴입니다.'
+                    : '그룹의 첫 서사 요청입니다.',
                 afterBreakpoint: false,
                 tailShiftOnly: false,
                 culpritLorebook: null,
@@ -2423,6 +2767,10 @@ function recomputeRequestLogsCacheGuard(logs, options = {}) {
             cacheGuard = {
                 eligible: true,
                 namespace: sig.namespace,
+                isRemotePrompt: Boolean(sig.isRemotePrompt || lane.isRemotePrompt),
+                mainNarrativeKind: sig.mainNarrativeKind,
+                presetName: sig.presetName || lane.presetName || '',
+                charName: sig.charName || lane.charName || '',
                 laneId: lane.laneId,
                 laneNumber: lane.laneNumber,
                 laneLabel: lane.laneLabel,
@@ -2480,6 +2828,10 @@ function summarizeCacheGuardForList(cg) {
     return {
         eligible: true,
         namespace: cg.namespace,
+        isRemotePrompt: Boolean(cg.isRemotePrompt),
+        mainNarrativeKind: cg.mainNarrativeKind || '',
+        presetName: cg.presetName || '',
+        charName: cg.charName || '',
         laneId: cg.laneId,
         laneNumber: cg.laneNumber,
         laneLabel: cg.laneLabel,
@@ -2510,6 +2862,11 @@ function recordRequestLog(entry) {
         id: `req-${++requestLogSeq}-${crypto.randomBytes(3).toString('hex')}`,
         at: new Date().toISOString(),
         source: entry.source || 'llm',
+        remotePrompt: Boolean(entry.remotePrompt),
+        presetId: entry.presetId || '',
+        presetName: entry.presetName || '',
+        narrativeScopeKey: entry.narrativeScopeKey || '',
+        charName: entry.charName || '',
         profileName: entry.profileName || '',
         providerType: entry.providerType || 'openai_compat',
         model: entry.model || '',
@@ -2545,6 +2902,11 @@ function summarizeRequestLog(entry) {
         id: entry.id,
         at: entry.at,
         source: entry.source,
+        remotePrompt: Boolean(entry.remotePrompt),
+        presetId: entry.presetId || '',
+        presetName: entry.presetName || '',
+        narrativeScopeKey: entry.narrativeScopeKey || '',
+        charName: entry.charName || '',
         profileName: entry.profileName,
         providerType: entry.providerType,
         model: entry.model,
@@ -2567,6 +2929,18 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
     const startedAt = Date.now();
     const source = extraOpts.source || 'llm';
     const wantStreamFlag = Boolean(extraOpts.stream);
+    const remotePromptFlag = Boolean(extraOpts.remotePrompt);
+    const presetIdVal = String(extraOpts.presetId || '');
+    const presetNameVal = String(extraOpts.presetName || '');
+    const narrativeScopeKeyVal = String(extraOpts.narrativeScopeKey || '');
+    const charNameVal = String(extraOpts.charName || '');
+    const logMetaFields = {
+        remotePrompt: remotePromptFlag,
+        presetId: presetIdVal,
+        presetName: presetNameVal,
+        narrativeScopeKey: narrativeScopeKeyVal,
+        charName: charNameVal,
+    };
     let logEndpoint = profile.baseUrl || '';
     let logHeaders = {};
     let logBodyObj = null;
@@ -2576,10 +2950,10 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
 
     const tempVal = extraOpts.forceTemperature !== undefined
         ? extraOpts.forceTemperature
-        : (parseOptionalNumber(profile.temperature) ?? parseOptionalNumber(extraOpts.temperature));
+        : (parseOptionalNumber(profile.temperature) ?? parseOptionalNumber(extraOpts.temperature) ?? parseOptionalNumber(extraOpts.presetTemperature));
     const maxTokVal = extraOpts.forceMaxTokens !== undefined
         ? extraOpts.forceMaxTokens
-        : (parseOptionalNumber(profile.maxTokens) ?? parseOptionalNumber(extraOpts.maxTokens));
+        : (parseOptionalNumber(profile.maxTokens) ?? parseOptionalNumber(extraOpts.maxTokens) ?? parseOptionalNumber(extraOpts.presetMaxTokens));
     const timeoutMs = Number(extraOpts.timeoutMs) || 180000;
     const { signal, cleanup } = createTimeoutSignal(timeoutMs, extraOpts.signal);
 
@@ -2589,13 +2963,46 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
         }
 
         if (profile.providerType === 'anthropic') {
-            const { sysParts, turns } = normalizeTurnMessages(messages, { assistantRole: 'assistant', ensureUserFirst: true });
+            const { sysParts, sysBlocks, turns, turnCachePoints } = normalizeTurnMessages(messages, { assistantRole: 'assistant', ensureUserFirst: true });
+            const hasCachePoints = sysBlocks.some((b) => b.cachePoint) || turnCachePoints.some(Boolean);
+            let anthropicMessages = turns.map((t) => ({ role: t.role, content: t.text }));
+            let anthropicSystem = sysParts.length ? sysParts.join('\n\n') : undefined;
+            if (hasCachePoints) {
+                // Anthropic allows up to 4 ephemeral cache_control breakpoints per request; retain the last 4 marks
+                const allMarked = [];
+                sysBlocks.forEach((b, i) => { if (b.cachePoint) allMarked.push(`s:${i}`); });
+                turnCachePoints.forEach((cp, i) => { if (cp) allMarked.push(`t:${i}`); });
+                const activeSet = new Set(allMarked.slice(-4));
+                if (sysBlocks.length) {
+                    const collapsedSys = [];
+                    for (let i = 0; i < sysBlocks.length; i += 1) {
+                        const sb = sysBlocks[i];
+                        const isBp = activeSet.has(`s:${i}`);
+                        const prev = collapsedSys[collapsedSys.length - 1];
+                        if (prev && !prev.cache_control && !isBp) {
+                            prev.text += `\n\n${sb.text}`;
+                        } else {
+                            collapsedSys.push({
+                                type: 'text',
+                                text: sb.text,
+                                ...(isBp ? { cache_control: { type: 'ephemeral' } } : {}),
+                            });
+                        }
+                    }
+                    anthropicSystem = collapsedSys;
+                }
+                anthropicMessages = turns.map((t, i) => (
+                    activeSet.has(`t:${i}`)
+                        ? { role: t.role, content: [{ type: 'text', text: t.text, cache_control: { type: 'ephemeral' } }] }
+                        : { role: t.role, content: t.text }
+                ));
+            }
             let body = {
                 model: profile.model,
                 max_tokens: maxTokVal || 4096,
-                messages: turns.map((t) => ({ role: t.role, content: t.text })),
+                messages: anthropicMessages,
             };
-            if (sysParts.length) body.system = sysParts.join('\n\n');
+            if (anthropicSystem !== undefined) body.system = anthropicSystem;
             if (tempVal !== undefined) body.temperature = tempVal;
             if (typeof extraOpts.interceptBody === 'function') {
                 body = (await extraOpts.interceptBody(body, 'anthropic')) || body;
@@ -2623,6 +3030,7 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
             logModel = data.model || profile.model || '';
             recordRequestLog({
                 source,
+                ...logMetaFields,
                 profileName: profile.name || '',
                 providerType: profile.providerType,
                 model: logModel,
@@ -2681,6 +3089,7 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
             const out = parts.map((p) => p.text || '').join('');
             recordRequestLog({
                 source,
+                ...logMetaFields,
                 profileName: profile.name || '',
                 providerType: profile.providerType,
                 model: profile.model || '',
@@ -2714,7 +3123,7 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
 
         let body = {
             model: profile.model,
-            messages: (Array.isArray(messages) ? messages : []).map(({ memo: _omitMemo, data: _omitData, ...rest }) => rest),
+            messages: (Array.isArray(messages) ? messages : []).map(({ memo: _omitMemo, data: _omitData, _cachePoint: _omitCP, ...rest }) => rest),
             stream: false,
         };
         if (tempVal !== undefined) body.temperature = tempVal;
@@ -2741,6 +3150,7 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
         logModel = data.model || profile.model || '';
         recordRequestLog({
             source,
+            ...logMetaFields,
             profileName: profile.name || '',
             providerType: profile.providerType || 'openai_compat',
             model: logModel,
@@ -2764,6 +3174,7 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
     } catch (err) {
         recordRequestLog({
             source,
+            ...logMetaFields,
             profileName: profile.name || '',
             providerType: profile.providerType || 'openai_compat',
             model: logModel,
@@ -3263,7 +3674,9 @@ function evalSimpleCbsExpr(expr) {
     function parseUnary() {
         const rest = peek();
         if (rest.startsWith('!')) { pos += 1; return isCbsTruthy(parseUnary()) ? 0 : 1; }
+        if (/^not(?![a-zA-Z0-9_])/i.test(rest)) { pos += 3; return isCbsTruthy(parseUnary()) ? 0 : 1; }
         if (rest.startsWith('-') && !/^-\d/.test(rest)) { pos += 1; return -Number(parseUnary() || 0); }
+        if (rest.startsWith('+') && !/^\+\d/.test(rest)) { pos += 1; return Number(parseUnary() || 0); }
         return parsePrimary();
     }
     function parseMul() {
@@ -3313,8 +3726,11 @@ function evalSimpleCbsExpr(expr) {
     }
     function parseAnd() {
         let left = parseCmp();
-        while (peek().startsWith('&&')) {
-            pos += 2;
+        while (true) {
+            const rest = peek();
+            if (rest.startsWith('&&')) pos += 2;
+            else if (/^and(?![a-zA-Z0-9_])/i.test(rest)) pos += 3;
+            else break;
             const right = parseCmp();
             left = isCbsTruthy(left) && isCbsTruthy(right) ? 1 : 0;
         }
@@ -3322,8 +3738,11 @@ function evalSimpleCbsExpr(expr) {
     }
     function parseOr() {
         let left = parseAnd();
-        while (peek().startsWith('||')) {
-            pos += 2;
+        while (true) {
+            const rest = peek();
+            if (rest.startsWith('||')) pos += 2;
+            else if (/^or(?![a-zA-Z0-9_])/i.test(rest)) pos += 2;
+            else break;
             const right = parseAnd();
             left = isCbsTruthy(left) || isCbsTruthy(right) ? 1 : 0;
         }
@@ -3431,13 +3850,30 @@ function evalCbsWhenCondition(condExpr, ctx, depth) {
                 }
                 const op = (rem[opIdx] || '').trim().toLowerCase();
                 const rhs = evalPresetCbs(rem.slice(opIdx + 1).join('::'), ctx, depth + 1);
-                if (op === 'is' || op === '==' || op === 'equal') res = String(lhs) === String(rhs);
-                else if (op === 'isnot' || op === '!=' || op === 'notequal') res = String(lhs) !== String(rhs);
-                else if (op === '>' || op === 'greater') res = Number(lhs) > Number(rhs);
-                else if (op === '<' || op === 'less') res = Number(lhs) < Number(rhs);
-                else if (op === '>=' || op === 'greater_equal' || op === 'greaterequal') res = Number(lhs) >= Number(rhs);
-                else if (op === '<=' || op === 'less_equal' || op === 'lessequal') res = Number(lhs) <= Number(rhs);
-                else res = isCbsTruthy(lhs);
+                const lhsTrim = String(lhs ?? '').trim();
+                const rhsTrim = String(rhs ?? '').trim();
+                const lhsNum = Number(lhsTrim);
+                const rhsNum = Number(rhsTrim);
+                const bothNums = lhsTrim !== '' && rhsTrim !== '' && Number.isFinite(lhsNum) && Number.isFinite(rhsNum);
+                if (op === 'is' || op === 'equal') {
+                    res = String(lhs) === String(rhs);
+                } else if (op === '==' || op === '===' || op === 'eq') {
+                    res = String(lhs) === String(rhs) || (bothNums && lhsNum === rhsNum);
+                } else if (op === 'isnot' || op === 'notequal' || op === 'not_equal') {
+                    res = String(lhs) !== String(rhs);
+                } else if (op === '!=' || op === '!==' || op === 'neq') {
+                    res = String(lhs) !== String(rhs) && !(bothNums && lhsNum === rhsNum);
+                } else if (op === '>' || op === 'gt' || op === 'greater' || op === 'greaterthan' || op === 'greater_than') {
+                    res = (bothNums ? lhsNum : Number(lhs)) > (bothNums ? rhsNum : Number(rhs));
+                } else if (op === '<' || op === 'lt' || op === 'less' || op === 'lessthan' || op === 'less_than') {
+                    res = (bothNums ? lhsNum : Number(lhs)) < (bothNums ? rhsNum : Number(rhs));
+                } else if (op === '>=' || op === 'gte' || op === 'greater_equal' || op === 'greaterequal' || op === 'greater_than_equal' || op === 'greaterthanequal') {
+                    res = (bothNums ? lhsNum : Number(lhs)) >= (bothNums ? rhsNum : Number(rhs));
+                } else if (op === '<=' || op === 'lte' || op === 'less_equal' || op === 'lessequal' || op === 'less_than_equal' || op === 'lessthanequal') {
+                    res = (bothNums ? lhsNum : Number(lhs)) <= (bothNums ? rhsNum : Number(rhs));
+                } else {
+                    res = isCbsTruthy(lhs);
+                }
             }
         }
         return negate ? !res : res;
@@ -3825,10 +4261,18 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
                 : '';
         } else if (cmd === 'return') {
             replaced = String(args[0] ?? '');
-        } else if (cmd === 'equal') {
-            replaced = String(args[0] ?? '') === String(args[1] ?? '') ? '1' : '0';
-        } else if (cmd === 'notequal' || cmd === 'not_equal') {
-            replaced = String(args[0] ?? '') !== String(args[1] ?? '') ? '1' : '0';
+        } else if (cmd === 'equal' || cmd === 'eq' || cmd === '==') {
+            const a = String(args[0] ?? '');
+            const b = String(args[1] ?? '');
+            const na = Number(a.trim());
+            const nb = Number(b.trim());
+            replaced = (a === b || (cmd !== 'equal' && a.trim() !== '' && b.trim() !== '' && Number.isFinite(na) && Number.isFinite(nb) && na === nb)) ? '1' : '0';
+        } else if (cmd === 'notequal' || cmd === 'not_equal' || cmd === 'neq' || cmd === '!=') {
+            const a = String(args[0] ?? '');
+            const b = String(args[1] ?? '');
+            const na = Number(a.trim());
+            const nb = Number(b.trim());
+            replaced = (a !== b && !(cmd !== 'notequal' && cmd !== 'not_equal' && a.trim() !== '' && b.trim() !== '' && Number.isFinite(na) && Number.isFinite(nb) && na === nb)) ? '1' : '0';
         } else if (cmd === 'any') {
             replaced = args.some(isCbsTruthy) ? '1' : '0';
         } else if (cmd === 'all') {
@@ -3839,13 +4283,13 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
             replaced = args.some(isCbsTruthy) ? '1' : '0';
         } else if (cmd === 'not') {
             replaced = isCbsTruthy(args[0]) ? '0' : '1';
-        } else if (cmd === 'greater') {
+        } else if (cmd === 'greater' || cmd === 'gt' || cmd === 'greaterthan' || cmd === 'greater_than' || cmd === '>') {
             replaced = Number(args[0]) > Number(args[1]) ? '1' : '0';
-        } else if (cmd === 'less') {
+        } else if (cmd === 'less' || cmd === 'lt' || cmd === 'lessthan' || cmd === 'less_than' || cmd === '<') {
             replaced = Number(args[0]) < Number(args[1]) ? '1' : '0';
-        } else if (cmd === 'greater_equal' || cmd === 'greaterequal') {
+        } else if (cmd === 'greater_equal' || cmd === 'greaterequal' || cmd === 'gte' || cmd === 'greaterthanequal' || cmd === 'greater_than_equal' || cmd === '>=') {
             replaced = Number(args[0]) >= Number(args[1]) ? '1' : '0';
-        } else if (cmd === 'less_equal' || cmd === 'lessequal') {
+        } else if (cmd === 'less_equal' || cmd === 'lessequal' || cmd === 'lte' || cmd === 'lessthanequal' || cmd === 'less_than_equal' || cmd === '<=') {
             replaced = Number(args[0]) <= Number(args[1]) ? '1' : '0';
         } else if (cmd === 'trim') {
             replaced = String(args.join('::')).trim();
@@ -4107,6 +4551,11 @@ function matchesLoreKeys(corpus, keys, { useRegex = false, fullWord = false, req
     return requireAll ? cleanKeys.every(hitOne) : cleanKeys.some(hitOne);
 }
 
+function isModuleLoreEntry(entry) {
+    if (!entry || typeof entry !== 'object') return false;
+    return String(entry.source || '').toLowerCase() === 'module' || String(entry.uid || '').startsWith('module:');
+}
+
 function evaluateLorebookEntries({
     loreEntries = [],
     chatList = [],
@@ -4118,15 +4567,21 @@ function evaluateLorebookEntries({
     fmIndex = -1,
     totalChatMessages = 0,
     disabledLoreUids = [],
+    enabledModuleLoreUids = [],
     pinnedLoreUids = [],
 } = {}) {
     const disabledSet = new Set((Array.isArray(disabledLoreUids) ? disabledLoreUids : []).map(String));
+    const enabledModuleSet = new Set((Array.isArray(enabledModuleLoreUids) ? enabledModuleLoreUids : []).map(String));
     const pinnedSet = new Set((Array.isArray(pinnedLoreUids) ? pinnedLoreUids : []).map(String));
     const parsed = [];
     for (let i = 0; i < (Array.isArray(loreEntries) ? loreEntries.length : 0); i += 1) {
         const raw = loreEntries[i];
         if (!raw || raw.enabled === false || raw.mode === 'folder') continue;
-        if (raw.uid && disabledSet.has(String(raw.uid))) continue;
+        if (isModuleLoreEntry(raw)) {
+            if (!raw.uid || !enabledModuleSet.has(String(raw.uid))) continue;
+        } else if (raw.uid && disabledSet.has(String(raw.uid))) {
+            continue;
+        }
         const dec = parseLoreDecorators(raw.content || '');
         if (!dec.content) continue;
         const msgCount = Number(totalChatMessages || chatList.length || 0);
@@ -4257,6 +4712,273 @@ function evaluateLorebookEntries({
     return buckets;
 }
 
+function normalizeDirectHistoryMode(mode) {
+    const v = typeof mode === 'string' ? mode.trim() : '';
+    return ['chunked', 'full', 'sliding_30'].includes(v) ? v : 'chunked';
+}
+
+function normalizeDirectPipelineMode(mode) {
+    const v = typeof mode === 'string' ? mode.trim() : '';
+    return ['single', 'two_pass'].includes(v) ? v : 'single';
+}
+
+function selectCacheFriendlyHistory(messages, { mode = 'chunked', maxMsgs = 30, chunkStep = 10, fullLimit = 100 } = {}) {
+    const list = Array.isArray(messages) ? messages : [];
+    const normMode = normalizeDirectHistoryMode(mode);
+    if (normMode === 'sliding_30') {
+        return list.length > maxMsgs ? list.slice(-maxMsgs) : list.slice();
+    }
+    if (normMode === 'full') {
+        return list.length > fullLimit ? list.slice(-fullLimit) : list.slice();
+    }
+    if (list.length <= maxMsgs) return list.slice();
+    const minCutPos = list.length - maxMsgs;
+    const maxCutPos = list.length - Math.max(2, maxMsgs - chunkStep);
+    for (let pos = minCutPos; pos <= maxCutPos && pos < list.length; pos += 1) {
+        const m = list[pos];
+        const refIdx = (m && typeof m.index === 'number' && Number.isFinite(m.index) && m.index >= 0) ? m.index : pos;
+        if (refIdx % chunkStep === 0) {
+            return list.slice(pos);
+        }
+    }
+    return list.slice(minCutPos);
+}
+
+function normalizeChatObjMessagesForHistory(chatObj, beforeIndex = Infinity) {
+    if (!chatObj || !Array.isArray(chatObj.message)) return [];
+    const out = [];
+    for (let idx = 0; idx < chatObj.message.length && idx < beforeIndex; idx += 1) {
+        const m = chatObj.message[idx];
+        if (!m || typeof m !== 'object') continue;
+        if (m.disabled === true || m.isComment === true || m.isFirstMessage === true) continue;
+        const data = String(m.data ?? '');
+        if (!data.trim() && m.role !== 'user') continue;
+        out.push({
+            index: idx,
+            role: String(m.role || '').toLowerCase() === 'user' ? 'user' : 'char',
+            raw: data,
+            text: data,
+            ...(m.chatId ? { chatId: String(m.chatId) } : {}),
+        });
+    }
+    return out;
+}
+
+function detectLeaveModelAdapterCode(modelName) {
+    const m = String(modelName || '').trim().toLowerCase();
+    if (!m) return '';
+    if (/claude|anthropic/.test(m)) return '1';
+    if (/gemini|gemma/.test(m)) return '2';
+    if (/(?:^|\/|\b)(?:gpt[-_.]|o[134](?:[-_]|$)|chatgpt)/.test(m)) return '3';
+    if (/deepseek/.test(m)) return '4';
+    return '';
+}
+
+function reconcileLeaveHayakuFooterContract(messages) {
+    const list = Array.isArray(messages) ? messages : [];
+    if (!list.length) return list;
+    const hasLeaveFooter = list.some((m) => {
+        const t = String((m && m.content) || '');
+        return /\[LEAVE FINAL EXECUTION CHECK\b|<statusdata>/i.test(t) && /STEP 3\s*—\s*CHARACTER-CARD STATUS LINE|LEAVE HUD/i.test(t);
+    });
+    if (!hasLeaveFooter) return list;
+
+    let changed = false;
+    const out = list.map((m) => {
+        if (!m || typeof m !== 'object' || typeof m.content !== 'string') return m;
+        const content = m.content;
+        if (!/HAYAKU|HAYAKU_STATE_PACKET/i.test(content)) return m;
+        if (!/<\/?statusdata>/i.test(content)) return m;
+        let next = content
+            .replace(/IMMEDIATELY BEFORE <\/statusdata>\.\s*FINAL CONTENT MUST END WITH:\s*<\/statusdata>/gi,
+                'AFTER </statusdata> and any character-card status line (at the very bottom of the response)')
+            .replace(/(?:place|emit|output|put|append)\b[^.\n]*?\binside\s*<statusdata>[^.\n]*?<\/statusdata>/gi,
+                'append the HAYAKU state packet at the very bottom AFTER </statusdata> and any character-card status line');
+        if (next === content) {
+            next = content.replace(/FINAL CONTENT MUST END WITH:\s*<\/statusdata>/gi,
+                'FINAL CONTENT MUST END WITH THE HAYAKU PACKET AFTER </statusdata> AND ANY STATUS LINE');
+        }
+        if (next === content) return m;
+        changed = true;
+        return { ...m, content: next };
+    });
+    return changed ? out : list;
+}
+
+function stripAuxBlocksFromProse(text) {
+    return String(text || '')
+        .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
+        .replace(/<Thoughts>[\s\S]*?<\/Thoughts>/gi, '')
+        .replace(/<statusdata>[\s\S]*?<\/statusdata>/gi, '')
+        .replace(/<!--\s*HAYAKU_STATE_PACKET_START\s*-->[\s\S]*?<!--\s*HAYAKU_STATE_PACKET_END\s*-->/gi, '')
+        .replace(/^\s*\[[☀️🌤️⛅🌥️🌦️🌧️⛈️🌩️❄️🌫️🌙✨][^\n]*\]\s*$/gm, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+function extractTerminalSceneTail(historyMessages, maxChars = 2400) {
+    const list = Array.isArray(historyMessages) ? historyMessages : [];
+    for (let i = list.length - 1; i >= 0; i -= 1) {
+        const m = list[i];
+        if (!m || typeof m !== 'object') continue;
+        const r = String(m.role || '').toLowerCase();
+        if (r === 'user' || r === 'system') continue;
+        const cleaned = stripAuxBlocksFromProse(m.raw ?? m.text ?? m.content ?? '');
+        if (!cleaned) continue;
+        return cleaned.length > maxChars ? cleaned.slice(-maxChars).trim() : cleaned;
+    }
+    return '';
+}
+
+function auditDraftWithDeterministicGuards(draftText, { prevAssistantText = '', userText = '', personaName = '', isRpMode = true } = {}) {
+    const issues = [];
+    const rawDraft = String(draftText || '');
+    const visibleDraft = stripAuxBlocksFromProse(rawDraft);
+    const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+
+    // 1) Prior-turn regression check (repeating sentences from immediately preceding assistant turn)
+    const prevNorm = norm(stripAuxBlocksFromProse(prevAssistantText));
+    if (prevNorm.length >= 30 && visibleDraft.length >= 30) {
+        const draftSentences = visibleDraft
+            .split(/(?<=[.!?…。！？\n])\s+/)
+            .map((s) => norm(s))
+            .filter((s) => s.length >= 16);
+        if (draftSentences.length >= 2) {
+            const matched = draftSentences.filter((s) => prevNorm.includes(s)).length;
+            if (matched / draftSentences.length >= 0.35) {
+                issues.push({
+                    code: 'prior_turn_regression',
+                    message: `Prior-turn regression (${matched}/${draftSentences.length} sentences repeat the previous assistant response). Advance forward directly from the terminal boundary instead of replaying earlier beats.`,
+                });
+            }
+        }
+    }
+
+    // 2) RP Persona impersonation check
+    if (isRpMode) {
+        const cleanPersona = String(personaName || '').trim();
+        const userNorm = norm(userText);
+        const thirdPersonRe = /(?:^|[\s.!?…"”'’])(?:그가|그녀가)\s+[가-힣]{1,12}(?:을|를|에|에서|에게|로|으로)?\s*(?:들었|받았|받아\s*들|주워\s*들|말했|웃었|고개를|일어섰|걸어|내밀|바라보|움직|대답|물었)/;
+        let impersonated = false;
+        if (cleanPersona && cleanPersona.length >= 2 && !/^user$/i.test(cleanPersona)) {
+            const escaped = cleanPersona.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const subjRe = new RegExp(`${escaped}(?:은|는|이|가)\\s+[^.!?\\n]{2,32}(?:했다|말했다|물었다|받았다|들었다|웃었다|움직였다|대답했다)`);
+            const mSub = visibleDraft.match(subjRe);
+            if (mSub && !userNorm.includes(norm(mSub[0]).slice(0, 14))) {
+                impersonated = true;
+            }
+        }
+        if (!impersonated && thirdPersonRe.test(visibleDraft)) {
+            const m3 = visibleDraft.match(thirdPersonRe);
+            if (m3 && !userNorm.includes(norm(m3[0]))) {
+                impersonated = true;
+            }
+        }
+        if (impersonated) {
+            issues.push({
+                code: 'rp_impersonation',
+                message: 'RP agency violation detected (inventing {{user}} actions/dialogue or acting as "그가/그녀가"). Delete every invented {{user}} beat and stop cleanly at the NPC/world reaction.',
+            });
+        }
+    }
+
+    // 3) Crutch adverb ("아주 + 부사") overuse check
+    const crutchMatches = visibleDraft.match(/아주\s*(?:천천히|짧게|낮게|미세하게|조용하게|조용히|느리게|얇게|가볍게|살짝|잠시)/g) || [];
+    if (crutchMatches.length >= 3) {
+        issues.push({
+            code: 'crutch_adverb_overuse',
+            message: `Repetitive crutch adverbs detected (${crutchMatches.length}× "아주 + 부사"). Keep at most 1 and replace the rest with concrete physical timing or motion.`,
+        });
+    }
+
+    // 4) User-quote echo in opening
+    const userQuoteMatch = String(userText || '').match(/["“']([^"”']{6,40})["”']/);
+    if (userQuoteMatch) {
+        const quoted = norm(userQuoteMatch[1]);
+        const head = norm(visibleDraft.slice(0, 240));
+        if (quoted && (head.includes(`"${quoted}"`) || head.includes(`“${quoted}”`) || head.includes(quoted))) {
+            issues.push({
+                code: 'user_quote_echo',
+                message: `Echo-loop detected: opening repeats user phrase "${quoted}". Open directly with the NPC's own voice or physical reaction.`,
+            });
+        }
+    }
+
+    // 5) Footer order check (status line placed before <statusdata>)
+    const hudIdx = rawDraft.search(/<statusdata>/i);
+    const cardStatusIdx = rawDraft.search(/^\s*\[[☀️🌤️⛅🌥️🌦️🌧️⛈️🌩️❄️🌫️🌙✨][^\n]*\]/m);
+    if (hudIdx >= 0 && cardStatusIdx >= 0 && cardStatusIdx < hudIdx) {
+        issues.push({
+            code: 'footer_order_violation',
+            message: 'Footer order violation: Character-Card Status Line appeared before <statusdata>. Always output Prose -> <statusdata> -> Card Status Line -> HAYAKU packet.',
+        });
+    }
+
+    return { ok: issues.length === 0, issues };
+}
+
+function buildTwoPassDraftMessages({ builtMessages, historyMessages, terminalTail, userText, charName = '', personaName = '', isRpMode = true } = {}) {
+    const baseMsgs = Array.isArray(builtMessages) ? builtMessages : [];
+    const safeChar = charName || 'Character';
+    const compactSys = [];
+    for (const m of baseMsgs) {
+        if (!m || m.role !== 'system') continue;
+        const txt = String(m.content || '');
+        if (!txt) continue;
+        if (/\[LEAVE FINAL EXECUTION CHECK\b|<statusdata>|HAYAKU SIDE-WRITE FINAL REMINDER|HAYAKU_STATE_PACKET_START/i.test(txt)) {
+            continue;
+        }
+        compactSys.push(txt.slice(0, 6000));
+    }
+    const sysPrompt = [
+        `[TWO-PASS DRAFT ENGINE — PASS 1 (IN-WORLD SCENE DRAFT)]`,
+        `- You are writing a clean Pass 1 scene draft for "${safeChar}"${personaName ? ` (User persona: ${personaName})` : ''}.`,
+        isRpMode
+            ? '- RP AGENCY LOCK: {{user}} performs ONLY what their latest input explicitly states. Never invent unstated {{user}} dialogue, actions, feelings, or third-person "그가/그녀가" follow-ups.'
+            : '- NOVEL MODE: Advance the full cast naturally while honoring author reservations.',
+        '- TERMINAL-FIRST CONTINUITY: Continue seamlessly from the immediately preceding scene tail without replaying earlier turns or adding sudden contrived interruptions.',
+        '- PROSE ONLY: Output ONLY the raw in-world prose draft. Omit <thinking>, <statusdata>, character-card status lines, and trailing memory packets (Pass 2 will polish and append footers).',
+        compactSys.length ? compactSys.join('\n\n').slice(0, 14000) : '',
+    ].filter(Boolean).join('\n\n');
+
+    const msgs = [{ role: 'system', content: sysPrompt }];
+    const recentChat = (Array.isArray(historyMessages) ? historyMessages : []).slice(-6);
+    for (const cm of recentChat) {
+        const body = stripAuxBlocksFromProse(cm && (cm.raw || cm.text));
+        if (!body) continue;
+        msgs.push({ role: cm.role === 'user' ? 'user' : 'assistant', content: body });
+    }
+    if (terminalTail) {
+        msgs.push({
+            role: 'system',
+            content: `[TERMINAL SCENE TAIL — LAST 2,400 CHARS BEFORE THIS TURN]\n${terminalTail}`,
+        });
+    }
+    if (userText) {
+        msgs.push({ role: 'user', content: String(userText) });
+    } else if (msgs.length === 1) {
+        msgs.push({ role: 'user', content: 'Continue directly from the current scene.' });
+    }
+    return msgs;
+}
+
+function appendTwoPassPolishDirective(finalMsgs, { draftText = '', terminalTail = '', audit = null } = {}) {
+    const list = Array.isArray(finalMsgs) ? finalMsgs.slice() : [];
+    const issues = (audit && Array.isArray(audit.issues)) ? audit.issues : [];
+    const auditBlock = issues.length
+        ? issues.map((it, idx) => `${idx + 1}. [${it.code}] ${it.message}`).join('\n')
+        : 'NONE — Candidate passed all structural checks. Elevate prose cadence, sensory specificity, and strict closing footer order.';
+    const directive = [
+        '[TWO-PASS EDITORIAL POLISH — PASS 2 FINISHING]',
+        'Below is a Pass 1 candidate draft produced against the Terminal-First lock. Treat it as your raw material: preserve forward plot progress while fixing every listed guard issue, sharpening character voices, cutting crutch adverbs ("아주 천천히/짧게/낮게" max 1), balancing sentence rhythm, and appending all required closing blocks in exact order (Prose -> <statusdata> -> Card Status Line -> External Memory Packet).',
+        terminalTail ? `\n<terminal_scene_tail_anchor>\n${terminalTail.slice(-1200)}\n</terminal_scene_tail_anchor>` : '',
+        `\n<deterministic_guard_audit>\n${auditBlock}\n</deterministic_guard_audit>`,
+        `\n<pass1_candidate_draft>\n${String(draftText || '').slice(0, 9000)}\n</pass1_candidate_draft>`,
+    ].filter(Boolean).join('\n');
+    list.push({ role: 'system', content: directive });
+    return list;
+}
+
 function buildDirectPromptMessages({
     preset = null,
     snap = null,
@@ -4265,7 +4987,9 @@ function buildDirectPromptMessages({
     stagedUserChatId = '',
     remoteToggleValues = null,
     disabledLoreUids = [],
+    enabledModuleLoreUids = [],
     pinnedLoreUids = [],
+    modelName = '',
 } = {}) {
     const s = snap || {};
     const rawCtx = s.charContext && typeof s.charContext === 'object'
@@ -4299,6 +5023,15 @@ function buildDirectPromptMessages({
     normalizeToggleMapInto(globalVars, remoteToggleValues);
     if (s.useLocallySetGlobalVariables) {
         normalizeToggleMapInto(globalVars, s.localToggleValues);
+    }
+    if (modelName && (Object.prototype.hasOwnProperty.call(globalVars, 'toggle_model_adapter') || combinedToggleSyntax.includes('model_adapter='))) {
+        const curAdapter = String(globalVars.toggle_model_adapter ?? '').trim();
+        if (!curAdapter || curAdapter === '0' || curAdapter === 'null') {
+            const detected = detectLeaveModelAdapterCode(modelName);
+            if (detected) {
+                globalVars.toggle_model_adapter = detected;
+            }
+        }
     }
 
     const chatVars = {};
@@ -4371,6 +5104,7 @@ function buildDirectPromptMessages({
             fmIndex: rawCtx.fmIndex ?? s.fmIndex ?? -1,
             totalChatMessages: rawCtx.totalChatMessages ?? s.totalMessages ?? chatList.length,
             disabledLoreUids,
+            enabledModuleLoreUids,
             pinnedLoreUids,
         })
         : {
@@ -4566,6 +5300,9 @@ function buildDirectPromptMessages({
                 const evaluated = cleanPresetPromptText(evalPresetCbs(String(item.text), baseCtx));
                 if (evaluated) msgs.push({ role: mapRole(item.role), content: evaluated });
             }
+            if (msgs.length > 0) {
+                msgs[msgs.length - 1]._cachePoint = true;
+            }
             continue;
         }
         if (item.text) {
@@ -4606,6 +5343,104 @@ function syncSnapVarsFromChatObj(snap, chatObj) {
     return { ...snap, chatVariables: nextVars };
 }
 
+function resolveEffectiveWritingRpMode(preset, snap, remoteToggleValues = null) {
+    const vars = parsePresetDefaultToggles(
+        (preset && (preset.toggleSyntax || preset.customPromptTemplateToggle)) || '',
+        (preset && (preset.defaultVariables || preset.templateDefaultVariables)) || ''
+    );
+    normalizeToggleMapInto(vars, snap && snap.globalToggleValues);
+    normalizeToggleMapInto(vars, remoteToggleValues);
+    if (snap && snap.useLocallySetGlobalVariables) {
+        normalizeToggleMapInto(vars, snap.localToggleValues);
+    }
+    return String(vars.toggle_writing_mode ?? '0').trim() !== '1';
+}
+
+function selectSourceHistoryForTurn(tCtx, snap, beforeIndex = Infinity) {
+    const chatObj = tCtx && tCtx.chatObj;
+    const snapMsgs = Array.isArray(snap && snap.messages)
+        ? snap.messages.filter((m) => !(Number.isFinite(beforeIndex) && typeof m.index === 'number' && m.index >= beforeIndex))
+        : [];
+    if (chatObj && Array.isArray(chatObj.message)) {
+        const fullMsgs = normalizeChatObjMessagesForHistory(chatObj, beforeIndex);
+        if (fullMsgs.length >= snapMsgs.length) return fullMsgs;
+    }
+    return snapMsgs;
+}
+
+async function executeDirectModelTurn({
+    profile,
+    preset,
+    snap,
+    historyMessages,
+    userText = '',
+    builtMessages,
+    finalMsgs,
+    charIndex,
+    chatIndex,
+    source = 'direct_chat',
+    adapter = null,
+}) {
+    const charName = String((snap && (snap.charName || (snap.charContext && snap.charContext.name))) || '');
+    const personaName = String((snap && snap.charContext && snap.charContext.personaName) || 'User');
+    const narrativeScopeKey = `${charIndex}:${chatIndex}`;
+    const presetTemperature = preset && preset.temperature;
+    const presetMaxTokens = preset && preset.maxResponse;
+
+    let outgoingMsgs = finalMsgs;
+    if (normalizeDirectPipelineMode(config.directPipelineMode) === 'two_pass' && preset) {
+        const draftProfile = getAuxProfile() || profile;
+        const terminalTail = extractTerminalSceneTail(historyMessages, 2400);
+        const isRpMode = resolveEffectiveWritingRpMode(preset, snap, config.remoteToggleValues);
+        const draftMsgs = buildTwoPassDraftMessages({
+            builtMessages,
+            historyMessages,
+            terminalTail,
+            userText,
+            charName,
+            personaName,
+            isRpMode,
+        });
+        console.log(`[DirectChat Pass1] char#${charIndex} chat#${chatIndex} via ${draftProfile.name} (${draftProfile.model}) tail=${terminalTail.length}c`);
+        const draftRes = await callLLMNonStream(draftProfile, draftMsgs, {
+            source: 'direct_draft',
+            remotePrompt: false,
+            presetId: String(preset.id || config.directPresetId || ''),
+            presetName: String(preset.name || ''),
+            narrativeScopeKey,
+            charName,
+            presetTemperature,
+            presetMaxTokens: Math.min(4096, Number(presetMaxTokens) || 4096),
+        });
+        const audit = auditDraftWithDeterministicGuards(draftRes && draftRes.text, {
+            prevAssistantText: terminalTail,
+            userText,
+            personaName,
+            isRpMode,
+        });
+        if (!audit.ok) {
+            console.log(`[DirectChat Guard] ${audit.issues.map((x) => x.code).join(', ')}`);
+        }
+        outgoingMsgs = appendTwoPassPolishDirective(finalMsgs, {
+            draftText: draftRes && draftRes.text,
+            terminalTail,
+            audit,
+        });
+    }
+
+    return callLLMNonStream(profile, outgoingMsgs, {
+        source,
+        remotePrompt: Boolean(preset),
+        presetId: preset ? String(preset.id || config.directPresetId || '') : '',
+        presetName: preset ? String(preset.name || '') : '',
+        narrativeScopeKey,
+        charName,
+        presetTemperature,
+        presetMaxTokens,
+        interceptBody: adapter ? (b, t) => adapter.runBodyIntercepters(b, t) : undefined,
+    });
+}
+
 // ================= Direct Remote Chat (for non-PC-active chars) =================
 async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = state.snapshot) {
     const profile = getActiveProfile();
@@ -4614,7 +5449,6 @@ async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = st
     }
     let snap = snapView || state.snapshot;
     const preset = resolveDirectPreset(config.directPresetId);
-    const history = Array.isArray(snap && snap.messages) ? snap.messages.slice(-30) : [];
     const loreKey = getLoreCharKeyFromSnap(snap);
     const adapter = activePluginAdapter && (activePluginAdapter.hasEnabledPlugins() || (activeHostRpc && activeHostRpc.isConnected()))
         ? activePluginAdapter
@@ -4655,6 +5489,10 @@ async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = st
             }
         }
 
+        const tCtxPreStage = adapter ? adapter.getTurnContext() : null;
+        const sourceHistory = selectSourceHistoryForTurn(tCtxPreStage, snap);
+        const history = selectCacheFriendlyHistory(sourceHistory, { mode: normalizeDirectHistoryMode(config.directHistoryMode) });
+
         if (adapter && effectiveUserText) {
             adapter.stageUserTurnMessage(effectiveUserText);
         }
@@ -4688,7 +5526,9 @@ async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = st
             stagedUserChatId: tCtx1.stagedUserChatId || '',
             remoteToggleValues: config.remoteToggleValues,
             disabledLoreUids: (config.disabledLoreEntries && config.disabledLoreEntries[loreKey]) || [],
+            enabledModuleLoreUids: (config.enabledModuleLoreEntries && config.enabledModuleLoreEntries[loreKey]) || [],
             pinnedLoreUids: (config.pinnedLoreEntries && config.pinnedLoreEntries[loreKey]) || [],
+            modelName: profile.model || '',
         });
 
         if (modAdapter) {
@@ -4697,14 +5537,24 @@ async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = st
         if (adapter) {
             msgs = await adapter.runBeforeRequest(msgs, 'model');
         }
+        msgs = reconcileLeaveHayakuFooterContract(msgs);
 
         const finalMsgs = applyPromptOverride(msgs, profile);
-        console.log(`[DirectChat] char#${charIndex} chat#${chatIndex} via ${profile.name} (${profile.model}) preset=${preset ? preset.name : 'off'}${adapter ? ' +plugins' : ''}`);
+        console.log(`[DirectChat] char#${charIndex} chat#${chatIndex} via ${profile.name} (${profile.model}) preset=${preset ? preset.name : 'off'} hist=${history.length}/${sourceHistory.length}(${normalizeDirectHistoryMode(config.directHistoryMode)}) pipe=${normalizeDirectPipelineMode(config.directPipelineMode)}${adapter ? ' +plugins' : ''}`);
         let result;
         try {
-            result = await callLLMNonStream(profile, finalMsgs, {
+            result = await executeDirectModelTurn({
+                profile,
+                preset,
+                snap,
+                historyMessages: history,
+                userText: effectiveUserText,
+                builtMessages: msgs,
+                finalMsgs,
+                charIndex,
+                chatIndex,
                 source: 'direct_chat',
-                interceptBody: adapter ? (b, t) => adapter.runBodyIntercepters(b, t) : undefined,
+                adapter,
             });
         } catch (err) {
             if (adapter) adapter.unstageUserTurnMessage();
@@ -4774,9 +5624,6 @@ async function runDirectRemoteReroll(charIndex, chatIndex, msgIndex, snapView = 
     }
     let snap = snapView || state.snapshot;
     const preset = resolveDirectPreset(config.directPresetId);
-    const prior = (Array.isArray(snap && snap.messages) ? snap.messages : [])
-        .filter((m) => m.index < msgIndex)
-        .slice(-30);
     const loreKey = getLoreCharKeyFromSnap(snap);
     const adapter = activePluginAdapter && (activePluginAdapter.hasEnabledPlugins() || (activeHostRpc && activeHostRpc.isConnected()))
         ? activePluginAdapter
@@ -4807,6 +5654,9 @@ async function runDirectRemoteReroll(charIndex, chatIndex, msgIndex, snapView = 
                 snap = syncSnapVarsFromChatObj(snap, tCtx0.chatObj);
             }
         }
+        const tCtxPrior = adapter ? adapter.getTurnContext() : null;
+        const sourcePrior = selectSourceHistoryForTurn(tCtxPrior, snap, msgIndex);
+        const prior = selectCacheFriendlyHistory(sourcePrior, { mode: normalizeDirectHistoryMode(config.directHistoryMode) });
         let msgs = buildDirectPromptMessages({
             preset,
             snap,
@@ -4814,7 +5664,9 @@ async function runDirectRemoteReroll(charIndex, chatIndex, msgIndex, snapView = 
             userText: '',
             remoteToggleValues: config.remoteToggleValues,
             disabledLoreUids: (config.disabledLoreEntries && config.disabledLoreEntries[loreKey]) || [],
+            enabledModuleLoreUids: (config.enabledModuleLoreEntries && config.enabledModuleLoreEntries[loreKey]) || [],
             pinnedLoreUids: (config.pinnedLoreEntries && config.pinnedLoreEntries[loreKey]) || [],
+            modelName: profile.model || '',
         });
         if (modAdapter) {
             msgs = await modAdapter.runEditPhase('editRequest', msgs);
@@ -4822,12 +5674,22 @@ async function runDirectRemoteReroll(charIndex, chatIndex, msgIndex, snapView = 
         if (adapter) {
             msgs = await adapter.runBeforeRequest(msgs, 'model');
         }
+        msgs = reconcileLeaveHayakuFooterContract(msgs);
 
         const finalMsgs = applyPromptOverride(msgs, profile);
-        console.log(`[DirectReroll] char#${charIndex} chat#${chatIndex} msg#${msgIndex} via ${profile.name} (${profile.model}) preset=${preset ? preset.name : 'off'}${adapter ? ' +plugins' : ''}`);
-        const result = await callLLMNonStream(profile, finalMsgs, {
+        console.log(`[DirectReroll] char#${charIndex} chat#${chatIndex} msg#${msgIndex} via ${profile.name} (${profile.model}) preset=${preset ? preset.name : 'off'} hist=${prior.length}/${sourcePrior.length}${adapter ? ' +plugins' : ''}`);
+        const result = await executeDirectModelTurn({
+            profile,
+            preset,
+            snap,
+            historyMessages: prior,
+            userText: '',
+            builtMessages: msgs,
+            finalMsgs,
+            charIndex,
+            chatIndex,
             source: 'direct_reroll',
-            interceptBody: adapter ? (b, t) => adapter.runBodyIntercepters(b, t) : undefined,
+            adapter,
         });
         let finalReply = result.text;
         if (modAdapter) {
@@ -5349,6 +6211,9 @@ function renderWebApp() {
   html body #bookBotOverlay .side-panel,
   html body #bookBotOverlay .floating,
   html body #bookBotOverlay .buttons-container,
+  html body #bookBotOverlay [class*="side-panel" i],
+  html body #bookBotOverlay [class*="floating" i],
+  html body #bookBotOverlay [class*="buttons-container" i],
   html body #bookBotOverlay [risu-trigger],
   html body #bookBotOverlay [risu-btn],
   html body #bookBotOverlay label,
@@ -5627,10 +6492,6 @@ function renderWebApp() {
     display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
     padding:10px 14px; border-bottom:1px solid var(--border); background:var(--surface); flex-shrink:0;
   }
-  .plg-gui-tabs {
-    display:flex; gap:6px; flex-wrap:wrap; padding:8px 14px; border-bottom:1px solid var(--border);
-    background:var(--bg); flex-shrink:0;
-  }
   #pluginGuiFrame {
     flex:1; width:100%; min-height:0; border:none; background:#0f172a;
   }
@@ -5868,27 +6729,29 @@ function renderWebApp() {
   /* ===== RisuStand Floating Mini-Bar & Zen Mode ===== */
   #rsMiniBar {
     position:fixed; z-index:46; left:50%; top:calc(14px + env(safe-area-inset-top)); transform:translateX(-50%);
-    display:inline-flex; align-items:center; gap:5px; border-radius:999px;
+    box-sizing:border-box; display:inline-flex; align-items:center; gap:5px; border-radius:999px;
     background:color-mix(in srgb, var(--elev) 90%, transparent); color:var(--text);
     border:1px solid var(--border); box-shadow:0 4px 16px rgba(0,0,0,0.28);
     -webkit-backdrop-filter:blur(14px); backdrop-filter:blur(14px);
-    user-select:none; touch-action:none; max-width:calc(100vw - 16px); overflow-x:auto; scrollbar-width:none;
+    user-select:none; max-width:calc(100vw - 16px); overflow-x:auto; overflow-y:hidden;
+    -webkit-overflow-scrolling:touch; overscroll-behavior-x:contain; scrollbar-width:none;
   }
   #rsMiniBar::-webkit-scrollbar { display:none; }
-  #rsMiniBar.minimized { padding:4px 10px; font-size:12px; font-weight:700; opacity:0.8; cursor:grab; }
-  #rsMiniBar.expanded { padding:5px 10px; font-size:12px; font-weight:600; }
+  #rsMiniBar.minimized { padding:4px 10px; font-size:12px; font-weight:700; opacity:0.8; cursor:grab; touch-action:none; }
+  #rsMiniBar.expanded { padding:5px 10px; font-size:12px; font-weight:600; touch-action:pan-x; }
   .rs-mb-handle {
     display:inline-flex; align-items:center; gap:4px; padding:2px 6px;
     cursor:grab; white-space:nowrap; opacity:0.9; font-weight:700; font-size:11.5px;
+    flex-shrink:0; touch-action:none;
   }
   .rs-mb-pill {
     border:1px solid var(--border); background:var(--surface); color:var(--text);
     border-radius:999px; padding:4px 9px; font-size:11.5px; font-weight:600;
     cursor:pointer; white-space:nowrap; display:inline-flex; align-items:center; gap:3px;
+    flex-shrink:0; touch-action:pan-x;
   }
   .rs-mb-pill:hover { border-color:var(--accent); }
   .rs-mb-pill.active { background:var(--accent); color:var(--on-accent); border-color:var(--accent); }
-  body:not(.tab-chat-active) #rsMiniBar,
   body:not(.rs-zen-mode) #rsMiniBar { display:none !important; }
   body.rs-zen-mode header, body.rs-zen-mode nav.tabbar { display:none !important; }
   body.rs-zen-mode #app {
@@ -6313,22 +7176,40 @@ function renderWebApp() {
         <span class="badge" id="loreCountBadge">0 / 0 반영</span>
       </h3>
       <div class="hint" style="margin-top:0; margin-bottom:8px;">
-        기본적으로 모든 로어북이 <b>체크(반영 대상)</b>되어 있으며, 체크를 해제한 로어북만 요청에서 제외됩니다. 키워드 로어북은 <b>📌 고정</b>으로 키워드와 무관하게 강제 포함할 수도 있습니다.
+        캐릭터·이 방 로어북은 기본적으로 <b>체크(반영 대상)</b>되어 있으며, 체크를 해제한 항목만 제외됩니다. 키워드 로어북은 <b>📌 고정</b>으로 강제 포함할 수 있습니다. (모듈 로어북은 아래 별도 카드로 분리됨)
       </div>
       <div style="display:flex; gap:6px; margin-bottom:8px;">
-        <input class="search-inp" id="loreSearch" placeholder="로어북 제목 · 키워드 · 내용 검색..." />
+        <input class="search-inp" id="loreSearch" placeholder="캐릭터 · 채팅 로어북 제목 · 키워드 · 내용 검색..." />
         <button type="button" class="btn sec" id="loreRefreshBtn" style="flex-shrink:0;">🔄</button>
       </div>
       <div id="loreFilters" style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px;">
         <button type="button" class="pill active" data-lore-src="all">전체</button>
         <button type="button" class="pill" data-lore-src="char">캐릭터</button>
         <button type="button" class="pill" data-lore-src="local">이 방</button>
-        <button type="button" class="pill" data-lore-src="module">모듈</button>
         <span style="flex:1;"></span>
         <button type="button" class="pill" id="loreEnableAllBtn">전체 반영</button>
         <button type="button" class="pill" id="loreExcludeShownBtn">표시 제외</button>
       </div>
       <div id="loreList" style="display:flex; flex-direction:column; gap:8px; max-height:420px; overflow-y:auto;"></div>
+    </div>
+    <div class="card" id="moduleLorebookCard">
+      <h3>
+        <span>🧩 모듈 로어북</span>
+        <span class="badge" id="modLoreCountBadge">0 / 0 반영</span>
+      </h3>
+      <div class="hint" style="margin-top:0; margin-bottom:8px;">
+        모듈 로어북은 <b>전체 비활성(미반영)</b>이 원칙이며 전체 반영되지 않습니다. 꼭 필요한 항목만 개별 체크하여 선택 반영하세요.
+      </div>
+      <div style="display:flex; gap:6px; margin-bottom:8px;">
+        <input class="search-inp" id="modLoreSearch" placeholder="모듈 로어북 제목 · 모듈명 · 키워드 검색..." />
+        <button type="button" class="btn sec" id="modLoreRefreshBtn" style="flex-shrink:0;">🔄</button>
+      </div>
+      <div style="display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; align-items:center;">
+        <span style="font-size:11.5px; color:var(--sub);">원칙: 기본 전체 비활성 · 개별 선택만 허용</span>
+        <span style="flex:1;"></span>
+        <button type="button" class="pill" id="modLoreDisableAllBtn">전체 비활성</button>
+      </div>
+      <div id="modLoreList" style="display:flex; flex-direction:column; gap:8px; max-height:360px; overflow-y:auto;"></div>
     </div>
     <div class="card">
       <h3>👤 페르소나 선택</h3>
@@ -6442,6 +7323,23 @@ function renderWebApp() {
     <div class="card" id="directPresetCard">
       <h3>📜 원격 직접 요청 프롬프트 프리셋</h3>
       <select class="f-inp" id="directPresetSel"></select>
+      <div class="grid-2" style="margin-top:8px;">
+        <div>
+          <label class="f-label">대화 히스토리 창</label>
+          <select class="f-inp" id="directHistoryModeSel">
+            <option value="chunked">캐시 친화 청크 (기본 · 5턴 고정)</option>
+            <option value="full">전체 히스토리 (최대 100메시지)</option>
+            <option value="sliding_30">슬라이딩 30메시지 (레거시)</option>
+          </select>
+        </div>
+        <div>
+          <label class="f-label">생성 파이프라인</label>
+          <select class="f-inp" id="directPipelineModeSel">
+            <option value="single">단일 패스 (기본 · 빠름)</option>
+            <option value="two_pass">경량 2-Pass (초안+가드+퇴고)</option>
+          </select>
+        </div>
+      </div>
       <div class="hint" id="directPresetHint" style="margin-top:6px;">
         PC에서 <code>risuai.sendChat()</code>을 쓸 수 없는 <code>원격 라우팅</code>에서는 이 프리셋과 <b>[🧩 모듈/설정]</b> 토글·로어북이 반영되며, <b>백엔드 플러그인 어댑터</b>에 켠 RisuAI v3 플러그인도 RisuAI <code>pluginStorage</code>·<code>DB</code>에 직접 연결되어 함께 동작합니다. (어댑터에 켜지 않은 다른 RisuAI 플러그인은 <b>PC 활성</b> 상태에서 동작합니다.)
       </div>
@@ -6540,7 +7438,7 @@ function renderWebApp() {
         </div>
       </div>
       <div class="hint" style="margin-bottom:8px;">
-        PC RisuAI 프록시(<code>/v1/chat/completions</code>), 원격 직접 채팅/리롤, 번역기에서 나간 최근 40건의 요청·응답 로그를 서버 메모리에 보관합니다. 같은 서사 요청만 그룹화해 프롬프트 캐싱 깨짐 여부를 실시간 감시하며, 하야쿠·플래시백·보조 호출은 자동 제외됩니다.
+        PC RisuAI 프록시(<code>/v1/chat/completions</code>), 원격 프롬프트 채팅/리롤, 번역기에서 나간 최근 40건의 요청·응답 로그를 서버 메모리에 보관합니다. 원격 프롬프트(Leave 등)로 요청된 응답도 메인 서사로 자동 인식해 프롬프트 캐싱 깨짐 여부를 실시간 감시하며, 하야쿠·플래시백·보조 호출은 자동 제외됩니다.
       </div>
       <div id="reqLogCgSummary" class="cg-summary-bar" style="display:none;"></div>
       <div class="req-log-filters" id="reqLogFilters">
@@ -6694,8 +7592,11 @@ function renderWebApp() {
   }
   document.getElementById('richHtmlBtn').onclick = () => {
     uiPref.richHtml = !uiPref.richHtml;
+    lastChatRenderSig = '';
+    lastBotOverlaySig = '';
     applyUiPrefs();
-    renderChat();
+    if (lastState) applyState(lastState);
+    else renderChat();
     toast('봇 정규식 UI: ' + (uiPref.richHtml ? '켜짐' : '꺼짐'));
   };
   window.toggleImgReveal = (el) => { if (el) el.classList.toggle('revealed'); };
@@ -6778,8 +7679,10 @@ function renderWebApp() {
     bookSpreadIdx = -1;
     bookDesiredSpreadIdx = -1;
     pendingReplyTarget = null;
+    lastChatRenderSig = '';
     applyUiPrefs();
-    renderChat();
+    if (lastState) applyState(lastState);
+    else renderChat();
   }
   document.getElementById('fontSel').onchange = (e) => { uiPref.font = e.target.value; applyUiPrefs(); if (isBookMode()) requestAnimationFrame(() => layoutBookSpreads(false)); };
   document.getElementById('fsDec').onclick = () => { uiPref.fsize = Math.max(12, uiPref.fsize - 0.5); applyUiPrefs(); if (isBookMode()) requestAnimationFrame(() => layoutBookSpreads(false)); };
@@ -7102,9 +8005,27 @@ function renderWebApp() {
     }
   }
 
+  const BOT_FIXED_CLASS_SEL = '[class*="buttons-container" i], [class*="side-panel" i], [class*="overlay" i], [class*="floating" i]';
+
+  function isBotFixedMenuElement(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    if (!['div', 'nav', 'aside', 'section'].includes(tag)) return false;
+    const cls = typeof el.className === 'string' ? el.className : '';
+    if (/(?:buttons-container|side-panel|overlay|floating)/i.test(cls)) return true;
+    const stAttr = el.getAttribute('style') || '';
+    return /position\\s*:\\s*fixed/i.test(stAttr);
+  }
+
   function stripBotFixedMenuNodes(container) {
     if (!container) return;
-    container.querySelectorAll('input[type="checkbox"], input[type="radio"], .buttons-container, .side-panel, .overlay, .floating').forEach((n) => n.remove());
+    container.querySelectorAll('input[type="checkbox"], input[type="radio"], ' + BOT_FIXED_CLASS_SEL).forEach((n) => n.remove());
+    container.querySelectorAll('div[style], nav[style], aside[style], section[style]').forEach((n) => {
+      if (/position\\s*:\\s*fixed/i.test(n.getAttribute('style') || '')) n.remove();
+    });
+    container.querySelectorAll('style').forEach((st) => {
+      if (/position\\s*:\\s*fixed/i.test(st.textContent || '')) st.remove();
+    });
   }
 
   function containerHasBotFixedMenu(container) {
@@ -7113,15 +8034,14 @@ function renderWebApp() {
     container.querySelectorAll('style').forEach((st) => {
       if (/position\\s*:\\s*fixed/i.test(st.textContent || '')) hasFixed = true;
     });
+    if (!hasFixed && container.querySelector(BOT_FIXED_CLASS_SEL)) {
+      hasFixed = true;
+    }
     if (!hasFixed) {
       for (const ch of Array.from(container.children || [])) {
-        const tag = (ch.tagName || '').toLowerCase();
-        if (tag === 'div' && /(?:buttons-container|side-panel|overlay|floating)/i.test(ch.className || '')) {
-          const stAttr = ch.getAttribute('style') || '';
-          if (/position\\s*:\\s*fixed/i.test(stAttr) || /(?:buttons-container|floating)/i.test(ch.className || '')) {
-            hasFixed = true;
-            break;
-          }
+        if (isBotFixedMenuElement(ch)) {
+          hasFixed = true;
+          break;
         }
       }
     }
@@ -7353,6 +8273,7 @@ function renderWebApp() {
     document.getElementById('composerBar').style.display = tab === 'chat' ? 'flex' : 'none';
     if (tab === 'chat' && isBookMode()) setTimeout(() => layoutBookSpreads(false), 30);
     syncBotMenuVisibility();
+    if (typeof renderRsMiniBar === 'function') renderRsMiniBar(false);
     if (tab === 'router') { loadRouterConfig(); if (typeof loadRequestLogs === 'function') loadRequestLogs(); }
     if (tab === 'bots') {
       renderBots();
@@ -7739,13 +8660,62 @@ function renderWebApp() {
     return renderPluginBubbleBarHtml(m) + (acts ? '<div class="msg-actions" style="flex-wrap:wrap; align-items:center;">' + acts + '</div>' : '');
   }
 
+  function computeUATurnStats(messages) {
+    const list = Array.isArray(messages) ? messages : [];
+    let completed = 0;
+    let hasPendingUser = false;
+    let hasAssistantInPair = false;
+    let activeTurnNum = 0;
+    const turnByIndex = new Array(list.length).fill(0);
+    for (let i = 0; i < list.length; i++) {
+      const m = list[i];
+      if (!m || typeof m !== 'object') continue;
+      if (m.disabled === true || m.isComment === true || m.isFirstMessage === true) continue;
+      const rawBody = m.data !== undefined ? m.data : (m.raw !== undefined ? m.raw : (m.content !== undefined ? m.content : (m.text || '')));
+      let hasBody = String(rawBody).trim().length > 0;
+      if (!hasBody && m.html) {
+        hasBody = String(m.html).replace(/<[^>]+>/g, ' ').trim().length > 0 || /<img/i.test(String(m.html));
+      }
+      if (!hasBody) continue;
+      const roleRaw = String(m.role || '').toLowerCase();
+      if (roleRaw === 'user') {
+        if (!hasPendingUser) {
+          activeTurnNum = completed + 1;
+          hasPendingUser = true;
+          hasAssistantInPair = false;
+        } else if (hasAssistantInPair) {
+          completed += 1;
+          activeTurnNum = completed + 1;
+          hasPendingUser = true;
+          hasAssistantInPair = false;
+        }
+        turnByIndex[i] = activeTurnNum;
+      } else if (roleRaw === 'char' || roleRaw === 'assistant' || roleRaw === 'bot' || roleRaw === 'model') {
+        if (!hasPendingUser) {
+          turnByIndex[i] = 0;
+        } else {
+          hasAssistantInPair = true;
+          turnByIndex[i] = activeTurnNum;
+        }
+      }
+    }
+    if (hasPendingUser && hasAssistantInPair) completed += 1;
+    return {
+      completedTurns: completed,
+      pendingTurn: (hasPendingUser && !hasAssistantInPair) ? activeTurnNum : 0,
+      turnByIndex: turnByIndex,
+    };
+  }
+
   function renderBookContent(msgs, snap) {
     if (!msgs || !msgs.length) return '<div style="color:var(--sub); font-size:13px; text-align:center; margin-top:30px;">대화가 비어 있습니다.</div>';
     const lastIdx = Number(snap.totalMessages || 0) - 1;
+    const fallbackTurns = computeUATurnStats(msgs);
     let out = '';
     for (let mi = 0; mi < msgs.length; mi++) {
       const m = msgs[mi];
       const isUser = m.role === 'user';
+      const turnNum = (typeof m.turnIndex === 'number') ? m.turnIndex : (fallbackTurns.turnByIndex[mi] || 0);
       const key = snap.charIndex + ':' + snap.chatIndex + ':' + m.index;
       const trText = localTranslations.get(key);
       const showTr = shownTranslations.has(key);
@@ -7754,8 +8724,11 @@ function renderWebApp() {
         ? esc(trText)
         : (useRich ? '<div class="rs-bot-html">' + renderBotRichHtml(m.html, snap.assetMap) + '</div>' : renderInlineBody(m.text, m.images));
       const isLatestChar = m.index >= 0 && !isUser && (m.index === lastIdx || (lastIdx < 0 && mi === msgs.length - 1));
-      out += '<div class="' + (isUser ? 'book-user-block' : 'book-char-block') + '" data-msg-idx="' + m.index + '" data-chat-id="' + esc(m.chatId || '') + '">';
-      out += '<div class="book-turn-tag">' + esc(isUser ? '나' : displayBotName(snap.charName)) + '</div>';
+      const turnTagLabel = isUser
+        ? ('나' + (turnNum > 0 ? ' · Turn ' + turnNum : ''))
+        : (displayBotName(snap.charName) + (turnNum > 0 ? ' · Turn ' + turnNum : ' · 프롤로그'));
+      out += '<div class="' + (isUser ? 'book-user-block' : 'book-char-block') + '" data-msg-idx="' + m.index + '" data-turn-num="' + turnNum + '" data-chat-id="' + esc(m.chatId || '') + '">';
+      out += '<div class="book-turn-tag">' + esc(turnTagLabel) + '</div>';
       out += '<div>' + bodyHtml + '</div>';
       out += renderPluginFooterHostHtml(m, snap.assetMap);
       out += renderMsgActionBarHtml(m, snap, key, showTr, isLatestChar, true);
@@ -8110,7 +9083,8 @@ function renderWebApp() {
     if (!overlay || !rootEl) return;
 
     const snap = (lastState && lastState.snapshot) || null;
-    const hasInlineFixed = Boolean(rootEl.querySelector('.rs-bot-html .buttons-container, .rs-bot-html .side-panel, .rs-bot-html .floating'));
+    const matchedContainers = Array.from(rootEl.querySelectorAll('.rs-bot-html')).filter(containerHasBotFixedMenu);
+    const hasInlineFixed = matchedContainers.length > 0;
     const nextOverlaySig = JSON.stringify([
       snap ? snap.charIndex : -1,
       snap ? snap.chatIndex : -1,
@@ -8130,25 +9104,36 @@ function renderWebApp() {
         const hostWrap = document.createElement('div');
         hostWrap.className = 'rs-bot-html';
         let moved = false;
-        for (const ch of Array.from(container.children)) {
-          const tag = (ch.tagName || '').toLowerCase();
-          if (tag === 'style' && /position\\s*:\\s*fixed/i.test(ch.textContent || '')) {
-            hostWrap.appendChild(ch.cloneNode(true));
-          } else if (
-            (tag === 'input' && (ch.type === 'checkbox' || ch.type === 'radio')) ||
-            (tag === 'div' && /(?:buttons-container|side-panel|overlay|floating)/i.test(ch.className || ''))
-          ) {
-            if (tag === 'div' && /(?:buttons-container|floating)/i.test(ch.className || '')) {
-              ch.setAttribute('data-rs-bot-fab', '1');
+        let hasFabAttr = false;
+        const collectFromParent = (parent) => {
+          for (const ch of Array.from(parent.children || [])) {
+            const tag = (ch.tagName || '').toLowerCase();
+            const cls = typeof ch.className === 'string' ? ch.className : '';
+            if (tag === 'style' && /position\\s*:\\s*fixed/i.test(ch.textContent || '')) {
+              hostWrap.appendChild(ch.cloneNode(true));
+            } else if (tag === 'input' && (ch.type === 'checkbox' || ch.type === 'radio')) {
+              hostWrap.appendChild(ch);
+              moved = true;
+            } else if (isBotFixedMenuElement(ch)) {
+              if (/(?:buttons-container|floating)/i.test(cls)) {
+                ch.setAttribute('data-rs-bot-fab', '1');
+                hasFabAttr = true;
+              }
+              hostWrap.appendChild(ch);
+              moved = true;
+            } else if (ch.querySelector && ch.querySelector(BOT_FIXED_CLASS_SEL)) {
+              collectFromParent(ch);
             }
-            hostWrap.appendChild(ch);
-            moved = true;
           }
+        };
+        collectFromParent(container);
+        if (moved && !hasFabAttr) {
+          const fallbackBar = hostWrap.querySelector('div, nav, aside, section');
+          if (fallbackBar) fallbackBar.setAttribute('data-rs-bot-fab', '1');
         }
         if (moved) overlay.appendChild(hostWrap);
       };
 
-      const matchedContainers = Array.from(rootEl.querySelectorAll('.rs-bot-html')).filter(containerHasBotFixedMenu);
       if (matchedContainers.length > 0) {
         const winner = matchedContainers[matchedContainers.length - 1];
         extractFixedFromContainer(winner);
@@ -8161,7 +9146,7 @@ function renderWebApp() {
           tmp.innerHTML = renderBotRichHtml(snap.botWidgetHtml, snap.assetMap);
           extractFixedFromContainer(tmp);
         }
-        if (!overlay.querySelector('[data-rs-bot-fab="1"]') && snap.backgroundHtml && /(?:buttons-container|side-panel|floating)/i.test(snap.backgroundHtml)) {
+        if (!overlay.querySelector('[data-rs-bot-fab="1"]') && snap.backgroundHtml && /(?:buttons-container|side-panel|overlay|floating)/i.test(snap.backgroundHtml)) {
           const tmpBg = document.createElement('div');
           tmpBg.className = 'rs-bot-html';
           tmpBg.innerHTML = renderBotRichHtml(snap.backgroundHtml, snap.assetMap);
@@ -8171,9 +9156,9 @@ function renderWebApp() {
     }
 
     // Never allow duplicate un-collapsed bot menu copies to remain inside chat bubbles or background host
-    rootEl.querySelectorAll('.rs-bot-html').forEach((c) => {
-      if (containerHasBotFixedMenu(c)) stripBotFixedMenuNodes(c);
-    });
+    for (const c of matchedContainers) {
+      stripBotFixedMenuNodes(c);
+    }
     stripBotFixedMenuNodes(document.getElementById('botBgHost'));
 
     const fixedStyleEls = rootEl.querySelectorAll('.rs-bot-html [style*="fixed" i]');
@@ -8383,10 +9368,12 @@ function renderWebApp() {
       html += '<div class="empty-hint"><span class="big">💬</span>대화가 비어 있습니다.<br>아래에서 메시지를 보내 시작해 보세요.</div>';
     } else {
       const lastIdx = Number(snap.totalMessages || 0) - 1;
+      const fallbackTurns = computeUATurnStats(msgs);
       for (let mi = 0; mi < msgs.length; mi++) {
         const m = msgs[mi];
         const key = snap.charIndex + ':' + snap.chatIndex + ':' + m.index;
         const isUser = m.role === 'user';
+        const turnNum = (typeof m.turnIndex === 'number') ? m.turnIndex : (fallbackTurns.turnByIndex[mi] || 0);
         const trText = localTranslations.get(key);
         const showTr = shownTranslations.has(key) || (autoTr && !isUser && trText);
         const useRich = uiPref.richHtml && m.html;
@@ -8394,8 +9381,11 @@ function renderWebApp() {
           ? '<div class="rs-bot-html">' + renderBotRichHtml(m.html, snap.assetMap) + '</div>'
           : renderInlineBody(m.text, m.images);
         const isLatestChar = m.index >= 0 && !isUser && (m.index === lastIdx || (lastIdx < 0 && mi === msgs.length - 1));
-        html += '<div class="msg-wrap ' + (isUser ? 'user' : 'char') + '" data-msg-idx="' + m.index + '" data-chat-id="' + esc(m.chatId || '') + '">';
-        html += '<div class="msg-role">' + esc(isUser ? '나' : displayBotName(snap.charName)) + '</div>';
+        const roleLabel = isUser
+          ? ('나' + (turnNum > 0 ? ' · T' + turnNum : ''))
+          : (displayBotName(snap.charName) + (turnNum > 0 ? ' · T' + turnNum : ' · 프롤로그'));
+        html += '<div class="msg-wrap ' + (isUser ? 'user' : 'char') + '" data-msg-idx="' + m.index + '" data-turn-num="' + turnNum + '" data-chat-id="' + esc(m.chatId || '') + '">';
+        html += '<div class="msg-role">' + esc(roleLabel) + '</div>';
         html += '<div class="msg-bubble">' + bodyHtml + renderPluginFooterHostHtml(m, snap.assetMap) + '</div>';
         if (showTr && trText) html += '<div class="tr-box">' + esc(trText) + '</div>';
         html += renderMsgActionBarHtml(m, snap, key, showTr, isLatestChar, false);
@@ -8919,7 +9909,7 @@ function renderWebApp() {
     const curChar = lastState && lastState.snapshot ? lastState.snapshot.charIndex : -1;
     const curChat = lastState && lastState.snapshot ? lastState.snapshot.chatIndex : -1;
     const filtered = chars.filter((c) => !q || String(c.name).toLowerCase().includes(q));
-    const sig = JSON.stringify([q, curChar, curChat, expandedBotIdx, filtered.map((c) => [c.index, c.chaId || '', c.name, c.isPcActive, (c.chats || []).map((ch) => [ch.index, ch.id || '', ch.name, ch.msgCount])])]);
+    const sig = JSON.stringify([q, curChar, curChat, expandedBotIdx, filtered.map((c) => [c.index, c.chaId || '', c.name, c.isPcActive, (c.chats || []).map((ch) => [ch.index, ch.id || '', ch.name, ch.msgCount, ch.turnCount ?? null])])]);
     if (!force && sig === lastBotsRenderSig) return;
     lastBotsRenderSig = sig;
     if (!filtered.length) {
@@ -8937,7 +9927,8 @@ function renderWebApp() {
         html += '<div class="chat-list"><button class="btn sec" style="width:100%; margin-bottom:4px;" data-create-chat="' + c.index + '">＋ 새 채팅방 파기</button>';
         for (const ch of (c.chats || [])) {
           const isCur = c.index === curChar && ch.index === curChat;
-          html += '<div class="chat-row' + (isCur ? ' cur' : '') + '" data-sel-char="' + c.index + '" data-sel-chat="' + ch.index + '"><span>' + esc(ch.name) + '</span><span class="badge">' + ch.msgCount + '턴</span></div>';
+          const turnCnt = (typeof ch.turnCount === 'number') ? ch.turnCount : Math.floor(Number(ch.msgCount || 0) / 2);
+          html += '<div class="chat-row' + (isCur ? ' cur' : '') + '" data-sel-char="' + c.index + '" data-sel-chat="' + ch.index + '"><span>' + esc(ch.name) + '</span><span class="badge" title="U+A 완료 턴 (메시지 ' + Number(ch.msgCount || 0) + '개)">' + turnCnt + '턴</span></div>';
         }
         html += '</div>';
       }
@@ -9398,7 +10389,7 @@ function renderWebApp() {
   let lastAuthorNoteChatKey = '';
   let authorNoteDirty = false;
   let charGlobalNoteDirty = false;
-  let loreCache = { charKey: '', charIndex: -1, chatIndex: -1, disabledUids: [], pinnedUids: [], entries: [] };
+  let loreCache = { charKey: '', charIndex: -1, chatIndex: -1, disabledUids: [], enabledModuleUids: [], pinnedUids: [], entries: [] };
   let loreSrcFilter = 'all';
   let lastLoreFetchKey = '';
   let loreFetchInFlight = false;
@@ -9456,26 +10447,67 @@ function renderWebApp() {
     }
   }
 
-  async function saveLoreSelection(charKey, disabledUids, pinnedUids) {
+  function isClientModuleLoreEntry(e) {
+    return Boolean(e && (e.isModule || e.source === 'module' || String(e.uid || '').startsWith('module:')));
+  }
+
+  async function saveLoreSelection(charKey, disabledUids, pinnedUids, enabledModuleUids) {
+    const payload = { charKey, disabledUids, pinnedUids };
+    if (Array.isArray(enabledModuleUids)) payload.enabledModuleUids = enabledModuleUids;
     const res = await api('/api/lorebook/selection', {
       method: 'POST',
-      body: JSON.stringify({ charKey, disabledUids, pinnedUids }),
+      body: JSON.stringify(payload),
     });
     if (res) {
       loreCache.disabledUids = Array.isArray(res.disabledUids) ? res.disabledUids : [];
+      if (Array.isArray(res.enabledModuleUids)) loreCache.enabledModuleUids = res.enabledModuleUids;
       loreCache.pinnedUids = Array.isArray(res.pinnedUids) ? res.pinnedUids : [];
     }
     renderLorebookList();
+    renderModuleLorebookList();
+  }
+
+  function renderLoreEntryCardHtml(e, idx, opts) {
+    const checked = Boolean(opts && opts.checked);
+    const pinned = Boolean(opts && opts.pinned);
+    const showPin = Boolean(opts && opts.showPin);
+    const chkAttr = (opts && opts.chkAttr) || 'data-lore-chk';
+    const pinAttr = (opts && opts.pinAttr) || 'data-lore-pin';
+    const srcLabel = e.source === 'char' ? '캐릭터' : (e.source === 'local' ? '이 방' : '모듈');
+    const title = e.comment || e.key || ('로어북 #' + (idx + 1));
+    const trigText = e.alwaysActive ? '상시' : ('키워드: ' + (e.key || '(없음)'));
+    return '<div style="padding:10px 12px; border-radius:12px; border:1px solid ' + (checked ? 'var(--border)' : 'color-mix(in srgb, var(--border) 60%, transparent)') + '; background:var(--bg); opacity:' + (checked ? '1' : '0.62') + ';">' +
+      '<div style="display:flex; align-items:flex-start; justify-content:space-between; gap:8px;">' +
+        '<div style="min-width:0; flex:1;">' +
+          '<div style="font-size:13px; font-weight:700; word-break:break-word;">' + esc(title) + '</div>' +
+          '<div style="display:flex; gap:4px; flex-wrap:wrap; margin-top:4px; align-items:center;">' +
+            '<span class="badge">' + esc(srcLabel) + (e.sourceName && isClientModuleLoreEntry(e) ? ' · ' + esc(e.sourceName) : '') + '</span>' +
+            '<span class="badge' + (e.alwaysActive ? ' pc' : '') + '">' + esc(trigText) + '</span>' +
+            (e.decorator ? '<span class="badge">' + esc(e.decorator) + '</span>' : '') +
+            '<span style="font-size:11px; color:var(--sub);">' + Number(e.charLen || 0) + '자</span>' +
+          '</div>' +
+        '</div>' +
+        '<div style="display:flex; align-items:center; gap:6px; flex-shrink:0;">' +
+          (showPin ? '<button type="button" class="pill' + (pinned ? ' active' : '') + '" style="min-height:28px; padding:0 8px; font-size:11.5px;" ' + pinAttr + '="' + esc(e.uid) + '" title="키워드가 없어도 항상 포함">' + (pinned ? '📌 고정' : '고정') + '</button>' : '') +
+          '<input type="checkbox" ' + (checked ? 'checked' : '') + ' ' + chkAttr + '="' + esc(e.uid) + '" title="이 로어북 반영 여부" />' +
+        '</div>' +
+      '</div>' +
+      '<details style="margin-top:6px;">' +
+        '<summary style="cursor:pointer; font-size:11.5px; color:var(--sub);">내용 확인</summary>' +
+        '<div style="margin-top:6px; padding:8px; border-radius:8px; background:var(--surface); font-size:12px; white-space:pre-wrap; word-break:break-word; max-height:180px; overflow-y:auto; line-height:1.5;">' + esc(e.content || '') + '</div>' +
+      '</details>' +
+    '</div>';
   }
 
   function renderLorebookList() {
     const listEl = document.getElementById('loreList');
     const badgeEl = document.getElementById('loreCountBadge');
     if (!listEl) return;
+    if (loreSrcFilter === 'module') loreSrcFilter = 'all';
     document.querySelectorAll('#loreFilters [data-lore-src]').forEach((btn) => {
       btn.classList.toggle('active', btn.getAttribute('data-lore-src') === loreSrcFilter);
     });
-    const entries = Array.isArray(loreCache.entries) ? loreCache.entries : [];
+    const entries = (Array.isArray(loreCache.entries) ? loreCache.entries : []).filter((e) => !isClientModuleLoreEntry(e));
     const disSet = new Set(Array.isArray(loreCache.disabledUids) ? loreCache.disabledUids : []);
     const pinSet = new Set(Array.isArray(loreCache.pinnedUids) ? loreCache.pinnedUids : []);
     const activeCount = entries.filter((e) => !disSet.has(e.uid)).length;
@@ -9492,37 +10524,52 @@ function renderWebApp() {
     });
     if (!visible.length) {
       listEl.innerHTML = '<div style="font-size:12.5px; color:var(--sub); padding:6px 2px;">' +
-        (entries.length ? '검색·필터 조건에 맞는 로어북이 없습니다.' : '표시할 캐릭터 · 채팅 로어북이 없습니다.') +
+        (entries.length ? '검색·필터 조건에 맞는 캐릭터 · 채팅 로어북이 없습니다.' : '표시할 캐릭터 · 채팅 로어북이 없습니다.') +
         '</div>';
       return;
     }
-    const srcLabel = (s) => (s === 'char' ? '캐릭터' : (s === 'local' ? '이 방' : '모듈'));
+    listEl.innerHTML = visible.map((e, idx) => renderLoreEntryCardHtml(e, idx, {
+      checked: !disSet.has(e.uid),
+      pinned: pinSet.has(e.uid),
+      showPin: !e.alwaysActive,
+      chkAttr: 'data-lore-chk',
+      pinAttr: 'data-lore-pin',
+    })).join('');
+  }
+
+  function renderModuleLorebookList() {
+    const listEl = document.getElementById('modLoreList');
+    const badgeEl = document.getElementById('modLoreCountBadge');
+    if (!listEl) return;
+    const entries = (Array.isArray(loreCache.entries) ? loreCache.entries : []).filter((e) => isClientModuleLoreEntry(e));
+    const enabledSet = new Set(Array.isArray(loreCache.enabledModuleUids) ? loreCache.enabledModuleUids : []);
+    const pinSet = new Set(Array.isArray(loreCache.pinnedUids) ? loreCache.pinnedUids : []);
+    const activeCount = entries.filter((e) => enabledSet.has(e.uid)).length;
+    if (badgeEl) badgeEl.textContent = activeCount + ' / ' + entries.length + ' 반영';
+
+    const q = (document.getElementById('modLoreSearch') ? document.getElementById('modLoreSearch').value : '').trim().toLowerCase();
+    const visible = entries.filter((e) => {
+      if (!q) return true;
+      return String(e.comment || '').toLowerCase().includes(q) ||
+        String(e.key || '').toLowerCase().includes(q) ||
+        String(e.content || '').toLowerCase().includes(q) ||
+        String(e.sourceName || '').toLowerCase().includes(q);
+    });
+    if (!visible.length) {
+      listEl.innerHTML = '<div style="font-size:12.5px; color:var(--sub); padding:6px 2px;">' +
+        (entries.length ? '검색 조건에 맞는 모듈 로어북이 없습니다.' : '표시할 모듈 로어북이 없습니다.') +
+        '</div>';
+      return;
+    }
     listEl.innerHTML = visible.map((e, idx) => {
-      const checked = !disSet.has(e.uid);
-      const pinned = pinSet.has(e.uid);
-      const title = e.comment || e.key || ('로어북 #' + (idx + 1));
-      const trigText = e.alwaysActive ? '상시' : ('키워드: ' + (e.key || '(없음)'));
-      return '<div style="padding:10px 12px; border-radius:12px; border:1px solid ' + (checked ? 'var(--border)' : 'color-mix(in srgb, var(--border) 60%, transparent)') + '; background:var(--bg); opacity:' + (checked ? '1' : '0.62') + ';">' +
-        '<div style="display:flex; align-items:flex-start; justify-content:space-between; gap:8px;">' +
-          '<div style="min-width:0; flex:1;">' +
-            '<div style="font-size:13px; font-weight:700; word-break:break-word;">' + esc(title) + '</div>' +
-            '<div style="display:flex; gap:4px; flex-wrap:wrap; margin-top:4px; align-items:center;">' +
-              '<span class="badge">' + esc(srcLabel(e.source)) + (e.sourceName && e.source === 'module' ? ' · ' + esc(e.sourceName) : '') + '</span>' +
-              '<span class="badge' + (e.alwaysActive ? ' pc' : '') + '">' + esc(trigText) + '</span>' +
-              (e.decorator ? '<span class="badge">' + esc(e.decorator) + '</span>' : '') +
-              '<span style="font-size:11px; color:var(--sub);">' + Number(e.charLen || 0) + '자</span>' +
-            '</div>' +
-          '</div>' +
-          '<div style="display:flex; align-items:center; gap:6px; flex-shrink:0;">' +
-            (!e.alwaysActive ? '<button type="button" class="pill' + (pinned ? ' active' : '') + '" style="min-height:28px; padding:0 8px; font-size:11.5px;" data-lore-pin="' + esc(e.uid) + '" title="키워드가 없어도 항상 포함">' + (pinned ? '📌 고정' : '고정') + '</button>' : '') +
-            '<input type="checkbox" ' + (checked ? 'checked' : '') + ' data-lore-chk="' + esc(e.uid) + '" title="이 로어북 반영 여부" />' +
-          '</div>' +
-        '</div>' +
-        '<details style="margin-top:6px;">' +
-          '<summary style="cursor:pointer; font-size:11.5px; color:var(--sub);">내용 확인</summary>' +
-          '<div style="margin-top:6px; padding:8px; border-radius:8px; background:var(--surface); font-size:12px; white-space:pre-wrap; word-break:break-word; max-height:180px; overflow-y:auto; line-height:1.5;">' + esc(e.content || '') + '</div>' +
-        '</details>' +
-      '</div>';
+      const checked = enabledSet.has(e.uid);
+      return renderLoreEntryCardHtml(e, idx, {
+        checked,
+        pinned: checked && pinSet.has(e.uid),
+        showPin: checked && !e.alwaysActive,
+        chkAttr: 'data-mod-lore-chk',
+        pinAttr: 'data-mod-lore-pin',
+      });
     }).join('');
   }
 
@@ -9540,10 +10587,12 @@ function renderWebApp() {
         charIndex: res.charIndex,
         chatIndex: res.chatIndex,
         disabledUids: Array.isArray(res.disabledUids) ? res.disabledUids : [],
+        enabledModuleUids: Array.isArray(res.enabledModuleUids) ? res.enabledModuleUids : [],
         pinnedUids: Array.isArray(res.pinnedUids) ? res.pinnedUids : [],
         entries: Array.isArray(res.entries) ? res.entries : [],
       };
       renderLorebookList();
+      renderModuleLorebookList();
     } catch (_) {
     } finally {
       loreFetchInFlight = false;
@@ -9620,7 +10669,7 @@ function renderWebApp() {
     if (e.target.id === 'loreEnableAllBtn') {
       if (!loreCache.charKey) return;
       await saveLoreSelection(loreCache.charKey, [], loreCache.pinnedUids);
-      toast('모든 로어북 반영으로 설정됨');
+      toast('캐릭터 · 채팅 로어북 전체 반영됨 (모듈 로어북은 별도 관리)');
       return;
     }
     if (e.target.id === 'loreExcludeShownBtn') {
@@ -9628,12 +10677,13 @@ function renderWebApp() {
       const q = (document.getElementById('loreSearch').value || '').trim().toLowerCase();
       const dis = new Set(loreCache.disabledUids || []);
       for (const item of loreCache.entries || []) {
+        if (isClientModuleLoreEntry(item)) continue;
         if (loreSrcFilter !== 'all' && item.source !== loreSrcFilter) continue;
         if (q && !String(item.comment || '').toLowerCase().includes(q) && !String(item.key || '').toLowerCase().includes(q) && !String(item.content || '').toLowerCase().includes(q)) continue;
         dis.add(item.uid);
       }
       await saveLoreSelection(loreCache.charKey, Array.from(dis), loreCache.pinnedUids);
-      toast('표시 중인 로어북 제외됨');
+      toast('표시 중인 캐릭터 · 채팅 로어북 제외됨');
     }
   });
   document.getElementById('loreList').addEventListener('change', async (e) => {
@@ -9657,6 +10707,51 @@ function renderWebApp() {
     await saveLoreSelection(loreCache.charKey, loreCache.disabledUids, Array.from(pins));
     toast(nextPinned ? '로어북 항상 고정됨' : '고정 해제됨');
   });
+  const modLoreSearchEl = document.getElementById('modLoreSearch');
+  if (modLoreSearchEl) modLoreSearchEl.oninput = () => renderModuleLorebookList();
+  const modLoreRefreshBtn = document.getElementById('modLoreRefreshBtn');
+  if (modLoreRefreshBtn) modLoreRefreshBtn.onclick = () => loadLorebookList(true);
+  const modLoreDisableAllBtn = document.getElementById('modLoreDisableAllBtn');
+  if (modLoreDisableAllBtn) {
+    modLoreDisableAllBtn.onclick = async () => {
+      if (!loreCache.charKey) return;
+      const modUidSet = new Set((loreCache.entries || []).filter((it) => isClientModuleLoreEntry(it)).map((it) => it.uid));
+      const nextPins = (loreCache.pinnedUids || []).filter((u) => !modUidSet.has(u) && !String(u).startsWith('module:'));
+      await saveLoreSelection(loreCache.charKey, loreCache.disabledUids, nextPins, []);
+      toast('모듈 로어북 전체 비활성화됨');
+    };
+  }
+  const modLoreListEl = document.getElementById('modLoreList');
+  if (modLoreListEl) {
+    modLoreListEl.addEventListener('change', async (e) => {
+      const chk = e.target.closest('[data-mod-lore-chk]');
+      if (!chk || !loreCache.charKey) return;
+      const uid = chk.getAttribute('data-mod-lore-chk');
+      const en = new Set(loreCache.enabledModuleUids || []);
+      const pins = new Set(loreCache.pinnedUids || []);
+      if (chk.checked) {
+        en.add(uid);
+      } else {
+        en.delete(uid);
+        pins.delete(uid);
+      }
+      await saveLoreSelection(loreCache.charKey, loreCache.disabledUids, Array.from(pins), Array.from(en));
+      toast(chk.checked ? '모듈 로어북 개별 반영됨' : '모듈 로어북 비활성화됨');
+    });
+    modLoreListEl.addEventListener('click', async (e) => {
+      const pinBtn = e.target.closest('[data-mod-lore-pin]');
+      if (!pinBtn || !loreCache.charKey) return;
+      const uid = pinBtn.getAttribute('data-mod-lore-pin');
+      const en = new Set(loreCache.enabledModuleUids || []);
+      if (!en.has(uid)) return;
+      const pins = new Set(loreCache.pinnedUids || []);
+      const nextPinned = !pins.has(uid);
+      if (nextPinned) pins.add(uid);
+      else pins.delete(uid);
+      await saveLoreSelection(loreCache.charKey, loreCache.disabledUids, Array.from(pins), Array.from(en));
+      toast(nextPinned ? '모듈 로어북 항상 고정됨' : '고정 해제됨');
+    });
+  }
 
   function renderModules(force = false) {
     renderCustomToggles(false);
@@ -9893,6 +10988,44 @@ function renderWebApp() {
     }
     const adderEl = document.getElementById('presetToggleAdder');
     if (adderEl && adderEl.style.display !== 'none') populatePtParentSelect();
+    const histModeEl = document.getElementById('directHistoryModeSel');
+    if (histModeEl) {
+      histModeEl.value = routerCfg.directHistoryMode || 'chunked';
+    }
+    const pipeModeEl = document.getElementById('directPipelineModeSel');
+    if (pipeModeEl) {
+      pipeModeEl.value = routerCfg.directPipelineMode || 'single';
+    }
+  }
+  const directHistoryModeSelEl = document.getElementById('directHistoryModeSel');
+  if (directHistoryModeSelEl) {
+    directHistoryModeSelEl.onchange = async () => {
+      try {
+        routerCfg = await api('/api/router/config', {
+          method: 'POST',
+          body: JSON.stringify({ directHistoryMode: directHistoryModeSelEl.value }),
+        });
+        renderRouterUI();
+        toast('원격 히스토리 창 모드 변경됨');
+      } catch (e) {
+        toast('설정 저장 실패: ' + (e && e.message ? e.message : '오류'));
+      }
+    };
+  }
+  const directPipelineModeSelEl = document.getElementById('directPipelineModeSel');
+  if (directPipelineModeSelEl) {
+    directPipelineModeSelEl.onchange = async () => {
+      try {
+        routerCfg = await api('/api/router/config', {
+          method: 'POST',
+          body: JSON.stringify({ directPipelineMode: directPipelineModeSelEl.value }),
+        });
+        renderRouterUI();
+        toast('원격 생성 파이프라인 모드 변경됨');
+      } catch (e) {
+        toast('설정 저장 실패: ' + (e && e.message ? e.message : '오류'));
+      }
+    };
   }
   const directPresetSelEl = document.getElementById('directPresetSel');
   if (directPresetSelEl) {
@@ -10353,6 +11486,9 @@ function renderWebApp() {
     if (!cg.eligible) {
       return '<span class="req-log-badge cg-excl" title="하야쿠/플래시백 등 비서사 요청은 캐시 비교에서 제외됩니다">' + esc('제외 · ' + (cg.excludedLabel || cg.excludedReason || '보조')) + '</span>';
     }
+    const remoteBadge = cg.isRemotePrompt
+      ? '<span class="req-log-badge src" title="원격 프롬프트 메인 서사로 인식되어 캐싱 감시 중">🍃 원격 서사</span>'
+      : '';
     const laneBadge = '<span class="req-log-badge cg-lane">' + esc((cg.laneLabel || '그룹') + ' · T' + (cg.turnIndex || 1)) + '</span>';
     let statusBadge = '';
     if (cg.verdict === 'baseline') {
@@ -10365,7 +11501,7 @@ function renderWebApp() {
       statusBadge = '<span class="req-log-badge cg-ok">' + esc(hitText) + '</span>';
     }
     const minBadge = cg.belowMinCacheTokens ? '<span class="req-log-badge cg-excl" title="모델 최소 캐시 토큰 기준 미만">소용량</span>' : '';
-    return laneBadge + statusBadge + minBadge;
+    return remoteBadge + laneBadge + statusBadge + minBadge;
   }
 
   function filterRequestLogs(list) {
@@ -10418,7 +11554,9 @@ function renderWebApp() {
       if (!groups.has(key)) {
         groups.set(key, {
           key,
-          label: key === '__excluded__' ? '🚫 집계 제외 (하야쿠 / 플래시백 / 번역 / 오류)' : ('📂 ' + (cg.laneLabel || key) + ' (' + (cg.namespace === 'proxy' ? '프록시' : '원격 직접') + ')'),
+          label: key === '__excluded__'
+            ? '🚫 집계 제외 (하야쿠 / 플래시백 / 번역 / 오류)'
+            : ('📂 ' + (cg.laneLabel || key) + ' (' + (cg.isRemotePrompt ? '원격 프롬 서사' : (cg.namespace === 'proxy' ? '프록시' : '원격 직접')) + ')'),
           items: [],
           broken: 0,
         });
@@ -10602,7 +11740,7 @@ function renderWebApp() {
         (cg.belowMinCacheTokens ? '<div style="font-size:11.5px; color:var(--sub);">참고: 현재 입력 토큰(' + Number(cg.promptTokens || 0) + ')이 모델 최소 캐시 기준(' + Number(cg.minCacheTokens || 1024) + ')보다 작습니다.</div>' : '') +
       '</div>' +
       '<div class="req-log-meta-grid">' +
-        '<div class="req-log-meta-item"><b>그룹 / 턴</b><span>' + esc((cg.laneLabel || '-') + ' · T' + (cg.turnIndex || 1) + ' (' + (cg.namespace === 'proxy' ? '프록시' : '원격 직접') + ')') + '</span></div>' +
+        '<div class="req-log-meta-item"><b>그룹 / 턴 / 분류</b><span>' + esc((cg.laneLabel || '-') + ' · T' + (cg.turnIndex || 1) + ' (' + (cg.isRemotePrompt ? ('원격 프롬 서사 · ' + (cg.presetName || '메인 서사')) : (cg.namespace === 'proxy' ? '프록시' : '원격 직접')) + ')') + '</span></div>' +
         '<div class="req-log-meta-item"><b>프리픽스 일치율</b><span>' + esc(matchStr) + '</span></div>' +
         '<div class="req-log-meta-item"><b>서버 KV 적중률</b><span>' + esc(hitStr) + '</span></div>' +
         '<div class="req-log-meta-item"><b>캐시 읽기 / 쓰기 / 입력</b><span>' + esc(Number(cg.cachedTokens || 0) + ' / ' + Number(cg.cacheCreationTokens || 0) + ' / ' + Number(cg.promptTokens || 0)) + '</span></div>' +
@@ -10990,22 +12128,6 @@ function renderWebApp() {
     }
   }
 
-  function renderPluginGuiModalHeader() {
-    const tabsEl = document.getElementById('pluginGuiTabs');
-    if (!tabsEl) return;
-    const items = Array.isArray(pluginGuiState.uiItems) ? pluginGuiState.uiItems : [];
-    if (!items.length) {
-      tabsEl.style.display = 'none';
-      tabsEl.innerHTML = '';
-      return;
-    }
-    tabsEl.style.display = 'flex';
-    tabsEl.innerHTML = items.map((u) => {
-      const active = pluginGuiState.entryId ? (u.id === pluginGuiState.entryId) : (u === items[0]);
-      return '<button type="button" class="pill' + (active ? ' active' : '') + '" data-plg-gui-entry="' + esc(u.id) + '">' + esc(u.name) + '</button>';
-    }).join('');
-  }
-
   function closePluginGuiModal() {
     pluginGuiState.open = false;
     pluginGuiState.pluginName = '';
@@ -11036,10 +12158,8 @@ function renderWebApp() {
             '<button type="button" class="pill" data-plg-gui-close="1">✕ 닫기</button>' +
           '</div>' +
         '</div>' +
-        '<div class="plg-gui-tabs" id="pluginGuiTabs" style="display:none;"></div>' +
         '<iframe id="pluginGuiFrame" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads"></iframe>' +
       '</div>';
-    renderPluginGuiModalHeader();
     modal.style.display = 'flex';
 
     try {
@@ -11063,9 +12183,15 @@ function renderWebApp() {
       closePluginGuiModal();
       return;
     }
-    if (d.__rsGuiItems === 1 && Array.isArray(d.items)) {
-      pluginGuiState.uiItems = d.items;
-      renderPluginGuiModalHeader();
+    if (d.__rsGuiReloadPlugin === 1) {
+      toast('플러그인 리로드 완료');
+      if (typeof loadBackendPlugins === 'function') loadBackendPlugins(true);
+      if (typeof pollState === 'function') pollState();
+      if (pluginGuiState.open && pluginGuiState.pluginName) {
+        setTimeout(() => {
+          if (pluginGuiState.open) openPluginGuiModal(pluginGuiState.pluginName, pluginGuiState.entryId);
+        }, 120);
+      }
       return;
     }
     if (d.__rsGuiRpc === 1 && d.reqId) {
@@ -11091,16 +12217,6 @@ function renderWebApp() {
       if (e.target.closest('[data-plg-gui-reload]')) {
         openPluginGuiModal(pluginGuiState.pluginName, pluginGuiState.entryId);
         return;
-      }
-      const entryBtn = e.target.closest('[data-plg-gui-entry]');
-      if (entryBtn) {
-        const eid = entryBtn.getAttribute('data-plg-gui-entry') || '';
-        pluginGuiState.entryId = eid;
-        renderPluginGuiModalHeader();
-        const frame = document.getElementById('pluginGuiFrame');
-        if (frame && frame.contentWindow) {
-          frame.contentWindow.postMessage({ __rsGuiInvokeEntry: 1, entryId: eid }, '*');
-        }
       }
     });
   }
@@ -11141,8 +12257,14 @@ function renderWebApp() {
   if (reloadPcPluginsBtn) {
     reloadPcPluginsBtn.onclick = async () => {
       try {
-        await api('/api/plugins/reload-pc', { method: 'POST', body: '{}' });
-        toast('PC RisuAI 플러그인 리로드 요청됨');
+        const res = await api('/api/plugins/reload-pc', { method: 'POST', body: '{}' });
+        if (res && Array.isArray(res.plugins)) {
+          backendPluginsCache = res.plugins;
+          backendPluginsLoadedAt = Date.now();
+          renderBackendPluginsList();
+        }
+        if (typeof pollState === 'function') pollState();
+        toast('플러그인 리로드 완료');
       } catch (e) {
         toast('리로드 오류: ' + (e && e.message ? e.message : '실패'));
       }
@@ -11261,8 +12383,10 @@ function renderWebApp() {
       if (saved && typeof saved.x === 'number' && typeof saved.y === 'number') {
         const vw = window.innerWidth || 390;
         const vh = window.innerHeight || 844;
-        el.style.left = Math.max(8, Math.min(vw - 48, saved.x)) + 'px';
-        el.style.top = Math.max(8, Math.min(vh - 48, saved.y)) + 'px';
+        const barW = Math.min(vw - 16, Math.max(48, el.offsetWidth || 48));
+        const barH = Math.min(vh - 16, Math.max(32, el.offsetHeight || 36));
+        el.style.left = Math.max(8, Math.min(vw - barW - 8, saved.x)) + 'px';
+        el.style.top = Math.max(8, Math.min(vh - barH - 8, saved.y)) + 'px';
         el.style.transform = 'none';
         return;
       }
@@ -11297,8 +12421,10 @@ function renderWebApp() {
     const rwCount = (latestPluginFloatingUi && Array.isArray(latestPluginFloatingUi.rootWidgets)) ? latestPluginFloatingUi.rootWidgets.length : 0;
     const sig = JSON.stringify([rsMiniBarMinimized, uiPref.theme, uiPref.assetMode, uiPref.zenMode, rwCount]);
     el.style.display = 'inline-flex';
-    applyRsMiniBarPos(el);
-    if (!force && sig === lastRsMiniBarSig) return;
+    if (!force && sig === lastRsMiniBarSig) {
+      applyRsMiniBarPos(el);
+      return;
+    }
     lastRsMiniBarSig = sig;
     if (rsMiniBarMinimized) {
       el.className = 'minimized';
@@ -11320,11 +12446,18 @@ function renderWebApp() {
         '<button type="button" class="rs-mb-pill" data-rsmb-act="theme">🎨 테마</button>' +
         '<button type="button" class="rs-mb-pill" data-rsmb-act="min" title="미니바 접기">—</button>';
     }
+    applyRsMiniBarPos(el);
   }
   (function bindRsMiniBarEvents() {
     const el = document.getElementById('rsMiniBar');
     if (!el) return;
     let suppressTapUntil = 0;
+    el.addEventListener('scroll', () => {
+      if (!rsMiniBarMinimized && !rsMiniBarDrag) scheduleRsMiniBarAutoMin();
+    }, { passive: true });
+    el.addEventListener('touchmove', () => {
+      if (!rsMiniBarMinimized && !rsMiniBarDrag) scheduleRsMiniBarAutoMin();
+    }, { passive: true });
     el.addEventListener('pointerdown', (e) => {
       if (!rsMiniBarMinimized && !e.target.closest('[data-rsmb-drag]')) return;
       const r = el.getBoundingClientRect();
@@ -11378,11 +12511,11 @@ function renderWebApp() {
       }
       scheduleRsMiniBarAutoMin();
       if (act === 'bottom') {
-        const box = document.getElementById('tab-chat');
-        if (isBookMode() && typeof goToBookSpread === 'function') {
+        const activePanel = document.getElementById('tab-' + currentTab) || document.getElementById('tab-chat');
+        if (currentTab === 'chat' && isBookMode() && typeof goToBookSpread === 'function') {
           goToBookSpread(Math.max(0, bookTotalSpreads - 1), false);
-        } else if (box) {
-          box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
+        } else if (activePanel) {
+          activePanel.scrollTo({ top: activePanel.scrollHeight, behavior: 'smooth' });
         }
       } else if (act === 'eye') {
         const order = ['show', 'blur', 'hide'];
@@ -11684,9 +12817,12 @@ function sanitizeConfigForClient() {
         activeProfileId: config.activeProfileId,
         auxProfileId: typeof config.auxProfileId === 'string' && config.auxProfileId ? config.auxProfileId : 'inherit',
         directPresetId: typeof config.directPresetId === 'string' ? config.directPresetId : 'bundled:leave',
+        directHistoryMode: normalizeDirectHistoryMode(config.directHistoryMode),
+        directPipelineMode: normalizeDirectPipelineMode(config.directPipelineMode),
         directPresets: listDirectPresets(),
         remoteToggleValues,
         disabledLoreEntries: (config.disabledLoreEntries && typeof config.disabledLoreEntries === 'object') ? config.disabledLoreEntries : {},
+        enabledModuleLoreEntries: (config.enabledModuleLoreEntries && typeof config.enabledModuleLoreEntries === 'object') ? config.enabledModuleLoreEntries : {},
         pinnedLoreEntries: (config.pinnedLoreEntries && typeof config.pinnedLoreEntries === 'object') ? config.pinnedLoreEntries : {},
         presetToggles: Array.isArray(config.presetToggles) ? config.presetToggles : [],
         backendPlugins: (config.backendPlugins && typeof config.backendPlugins === 'object') ? config.backendPlugins : {},
@@ -11871,11 +13007,16 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             ...defaultConfig(),
             ...configOverride,
             auxProfileId: typeof configOverride.auxProfileId === 'string' && configOverride.auxProfileId ? configOverride.auxProfileId : 'inherit',
+            directHistoryMode: normalizeDirectHistoryMode(configOverride.directHistoryMode),
+            directPipelineMode: normalizeDirectPipelineMode(configOverride.directPipelineMode),
             remoteToggleValues: (configOverride.remoteToggleValues && typeof configOverride.remoteToggleValues === 'object')
                 ? { ...configOverride.remoteToggleValues }
                 : {},
             disabledLoreEntries: (configOverride.disabledLoreEntries && typeof configOverride.disabledLoreEntries === 'object')
                 ? { ...configOverride.disabledLoreEntries }
+                : {},
+            enabledModuleLoreEntries: (configOverride.enabledModuleLoreEntries && typeof configOverride.enabledModuleLoreEntries === 'object')
+                ? { ...configOverride.enabledModuleLoreEntries }
                 : {},
             pinnedLoreEntries: (configOverride.pinnedLoreEntries && typeof configOverride.pinnedLoreEntries === 'object')
                 ? { ...configOverride.pinnedLoreEntries }
@@ -12786,6 +13927,12 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 if (typeof body.directPresetId === 'string') {
                     config.directPresetId = body.directPresetId;
                 }
+                if (typeof body.directHistoryMode === 'string') {
+                    config.directHistoryMode = normalizeDirectHistoryMode(body.directHistoryMode);
+                }
+                if (typeof body.directPipelineMode === 'string') {
+                    config.directPipelineMode = normalizeDirectPipelineMode(body.directPipelineMode);
+                }
                 if (body.remoteToggleValues && typeof body.remoteToggleValues === 'object' && !Array.isArray(body.remoteToggleValues)) {
                     const nextRT = {};
                     for (const [k, v] of Object.entries(body.remoteToggleValues)) {
@@ -13013,6 +14160,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 return {
                     uid: String((e && e.uid) || `idx:${idx}`),
                     source: String((e && e.source) || 'char'),
+                    isModule: isModuleLoreEntry(e),
                     sourceName: String((e && e.sourceName) || ''),
                     comment: String((e && e.comment) || ''),
                     key: String((e && e.key) || ''),
@@ -13024,8 +14172,13 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     content: dec.content || String((e && e.content) || ''),
                 };
             });
+            const charEntries = entries.filter((e) => !e.isModule);
+            const moduleEntries = entries.filter((e) => e.isModule);
             const disabledUids = (config.disabledLoreEntries && Array.isArray(config.disabledLoreEntries[charKey]))
                 ? config.disabledLoreEntries[charKey]
+                : [];
+            const enabledModuleUids = (config.enabledModuleLoreEntries && Array.isArray(config.enabledModuleLoreEntries[charKey]))
+                ? config.enabledModuleLoreEntries[charKey]
                 : [];
             const pinnedUids = (config.pinnedLoreEntries && Array.isArray(config.pinnedLoreEntries[charKey]))
                 ? config.pinnedLoreEntries[charKey]
@@ -13037,8 +14190,11 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 charIndex: typeof snap.charIndex === 'number' ? snap.charIndex : -1,
                 chatIndex: typeof snap.chatIndex === 'number' ? snap.chatIndex : -1,
                 disabledUids,
+                enabledModuleUids,
                 pinnedUids,
                 entries,
+                charEntries,
+                moduleEntries,
             }, req);
         }
 
@@ -13049,12 +14205,23 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 const charKey = String(body.charKey || getLoreCharKeyFromSnap(state.snapshot) || '').trim();
                 if (!charKey) return sendJson(res, 400, { error: 'Missing charKey' }, req);
                 if (!config.disabledLoreEntries || typeof config.disabledLoreEntries !== 'object') config.disabledLoreEntries = {};
+                if (!config.enabledModuleLoreEntries || typeof config.enabledModuleLoreEntries !== 'object') config.enabledModuleLoreEntries = {};
                 if (!config.pinnedLoreEntries || typeof config.pinnedLoreEntries !== 'object') config.pinnedLoreEntries = {};
 
                 if (Array.isArray(body.disabledUids)) {
                     const next = Array.from(new Set(body.disabledUids.map((x) => String(x || '')).filter(Boolean)));
                     if (next.length) config.disabledLoreEntries[charKey] = next;
                     else delete config.disabledLoreEntries[charKey];
+                }
+                if (Array.isArray(body.enabledModuleUids)) {
+                    const nextM = Array.from(new Set(body.enabledModuleUids.map((x) => String(x || '')).filter(Boolean)));
+                    if (nextM.length) config.enabledModuleLoreEntries[charKey] = nextM;
+                    else delete config.enabledModuleLoreEntries[charKey];
+                    const enabledSet = new Set(nextM);
+                    const curPins = Array.isArray(config.pinnedLoreEntries[charKey]) ? config.pinnedLoreEntries[charKey] : [];
+                    const prunedPins = curPins.filter((u) => !String(u).startsWith('module:') || enabledSet.has(String(u)));
+                    if (prunedPins.length) config.pinnedLoreEntries[charKey] = prunedPins;
+                    else delete config.pinnedLoreEntries[charKey];
                 }
                 if (Array.isArray(body.pinnedUids)) {
                     const nextP = Array.from(new Set(body.pinnedUids.map((x) => String(x || '')).filter(Boolean)));
@@ -13063,17 +14230,40 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 }
                 if (body.uid) {
                     const uid = String(body.uid);
+                    const rawCtx = state.snapshot && state.snapshot.charContext && typeof state.snapshot.charContext === 'object' ? state.snapshot.charContext : {};
+                    const rawList = Array.isArray(rawCtx.loreEntries) ? rawCtx.loreEntries : [];
+                    const matchedRaw = rawList.find((item) => item && String(item.uid || '') === uid);
+                    const targetIsModule = Boolean(body.isModule || uid.startsWith('module:') || (matchedRaw && isModuleLoreEntry(matchedRaw)));
                     const disSet = new Set(config.disabledLoreEntries[charKey] || []);
+                    const modEnSet = new Set(config.enabledModuleLoreEntries[charKey] || []);
                     const pinSet = new Set(config.pinnedLoreEntries[charKey] || []);
                     if (typeof body.enabled === 'boolean') {
-                        if (body.enabled) disSet.delete(uid);
-                        else disSet.add(uid);
-                        if (disSet.size) config.disabledLoreEntries[charKey] = Array.from(disSet);
-                        else delete config.disabledLoreEntries[charKey];
+                        if (targetIsModule) {
+                            if (body.enabled) modEnSet.add(uid);
+                            else {
+                                modEnSet.delete(uid);
+                                pinSet.delete(uid);
+                            }
+                            disSet.delete(uid);
+                            if (modEnSet.size) config.enabledModuleLoreEntries[charKey] = Array.from(modEnSet);
+                            else delete config.enabledModuleLoreEntries[charKey];
+                            if (disSet.size) config.disabledLoreEntries[charKey] = Array.from(disSet);
+                            else delete config.disabledLoreEntries[charKey];
+                            if (pinSet.size) config.pinnedLoreEntries[charKey] = Array.from(pinSet);
+                            else delete config.pinnedLoreEntries[charKey];
+                        } else {
+                            if (body.enabled) disSet.delete(uid);
+                            else disSet.add(uid);
+                            if (disSet.size) config.disabledLoreEntries[charKey] = Array.from(disSet);
+                            else delete config.disabledLoreEntries[charKey];
+                        }
                     }
                     if (typeof body.pinned === 'boolean') {
-                        if (body.pinned) pinSet.add(uid);
-                        else pinSet.delete(uid);
+                        if (body.pinned) {
+                            if (!targetIsModule || modEnSet.has(uid)) pinSet.add(uid);
+                        } else {
+                            pinSet.delete(uid);
+                        }
                         if (pinSet.size) config.pinnedLoreEntries[charKey] = Array.from(pinSet);
                         else delete config.pinnedLoreEntries[charKey];
                     }
@@ -13083,6 +14273,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     ok: true,
                     charKey,
                     disabledUids: config.disabledLoreEntries[charKey] || [],
+                    enabledModuleUids: config.enabledModuleLoreEntries[charKey] || [],
                     pinnedUids: config.pinnedLoreEntries[charKey] || [],
                 }, req);
             } catch (e) {
@@ -13134,8 +14325,16 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         if (pathname === '/api/plugins/reload-pc' && req.method === 'POST') {
             if (!requireAuth(req, res)) return;
             try {
-                await hostRpc.invoke('db.reloadPcPlugins', []);
-                return sendJson(res, 200, { ok: true }, req);
+                const body = JSON.parse((await readBody(req)) || '{}');
+                if (hostRpc.isConnected()) {
+                    await hostRpc.invoke('db.reloadPcPlugins', [], 8000).catch(() => {});
+                    await new Promise((r) => setTimeout(r, 150));
+                }
+                const plugins = typeof pluginAdapter.reloadPlugins === 'function'
+                    ? await pluginAdapter.reloadPlugins(body.name || '')
+                    : pluginAdapter.listPlugins();
+                await refreshDisplaySnapshot();
+                return sendJson(res, 200, { ok: true, plugins }, req);
             } catch (e) {
                 return sendJson(res, 502, { error: e.message }, req);
             }
@@ -13508,6 +14707,7 @@ module.exports = {
     loadSavedPort,
     parseOptionalNumber,
     normalizeTurnMessages,
+    computeUATurnStats,
     applyPromptOverride,
     safeTokenEqual,
     isLoopbackAddress,
@@ -13515,15 +14715,25 @@ module.exports = {
     corsHeaders,
     sanitizeConfigForClient,
     decodeRisupPreset,
+    encodeRisupPreset,
     parsePresetDefaultToggles,
     evalPresetCbs,
     parseLoreDecorators,
+    isModuleLoreEntry,
     evaluateLorebookEntries,
+    normalizeDirectHistoryMode,
+    normalizeDirectPipelineMode,
+    selectCacheFriendlyHistory,
+    detectLeaveModelAdapterCode,
+    reconcileLeaveHayakuFooterContract,
+    extractTerminalSceneTail,
+    auditDraftWithDeterministicGuards,
     buildDirectPromptMessages,
     loadBundledLeavePreset,
     syncBundledLeavePresetToggles,
     mergeStreamUsage,
     mapUsageToOpenAI,
+    detectRemotePromptMainNarrative,
     detectAuxiliaryOrSubRequest,
     buildLaneSignature,
     findMatchingMainLane,

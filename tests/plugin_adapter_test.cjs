@@ -1169,3 +1169,78 @@ globalThis.BIG_PLUGIN_TAG = ${JSON.stringify(tag)};
         fs.rmSync(tmpDir, { recursive: true, force: true });
     }
 });
+
+test('Plugin Adapter: self-update via setDatabase({ plugins }) + location.reload() / loadPlugins() hot-reloads without RPC error', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rs-self-upd-'));
+    const pluginsPath = path.join(tmpDir, 'plugins.json');
+    const cfg = { backendPlugins: {} };
+    let reloadRpcCalls = 0;
+
+    const makeScript = (ver) => `
+//@name self_upd_plugin
+//@display-name Self Updater
+//@api 3.0
+//@version ${ver}
+(async () => {
+  await risuai.registerSetting('Self Updater v${ver}', async () => {});
+  await risuai.addRisuReplacer('beforeRequest', async (msgs) => {
+    return [...msgs, { role: 'system', content: 'SELF_UPD_${ver}' }];
+  });
+})();
+`;
+
+    const mockRpc = {
+        isConnected: () => true,
+        invoke: async (op) => {
+            if (op === 'db.reloadPcPlugins') {
+                reloadRpcCalls += 1;
+                return true;
+            }
+            if (op === 'db.getDatabase') {
+                return { characters: [], plugins: [] };
+            }
+            if (op === 'db.setDatabase' || op === 'db.setDatabaseLite') {
+                return true;
+            }
+            if (op === 'db.listPluginsMeta') {
+                return [];
+            }
+            return null;
+        },
+    };
+
+    const adapter = adapterMod.createPluginAdapter({
+        pluginsPath,
+        persistDisabled: false,
+        getBackendConfig: () => cfg,
+        saveBackendConfig: () => {},
+        hostRpc: mockRpc,
+    });
+
+    try {
+        await adapter.addCustomPlugin({ filename: 'self_upd.js', script: makeScript('1.0.0'), enabled: true });
+        let list = adapter.listPlugins();
+        assert.equal(list.find((p) => p.name === 'self_upd_plugin').version, '1.0.0');
+
+        // Simulate in-plugin self-update updating DB plugins array + calling location.reload()
+        const guiOut = await adapter.handleGuiRpc({ pluginName: 'self_upd_plugin', method: 'db.getDatabase', args: [['plugins']] });
+        const target = guiOut.plugins.find((p) => p && p.name === 'self_upd_plugin');
+        assert.ok(target && target.script.includes('1.0.0'));
+
+        target.script = makeScript('2.0.0');
+        target.versionOfPlugin = '2.0.0';
+        await adapter.handleGuiRpc({ pluginName: 'self_upd_plugin', method: 'db.setDatabase', args: [{ plugins: guiOut.plugins }] });
+        await adapter.handleGuiRpc({ pluginName: 'self_upd_plugin', method: 'db.reloadPcPlugins', args: ['self_upd_plugin'] });
+        await new Promise((r) => setTimeout(r, 120));
+
+        list = await adapter.reloadPlugins('self_upd_plugin');
+        assert.equal(list.find((p) => p.name === 'self_upd_plugin').version, '2.0.0');
+        assert.ok(reloadRpcCalls >= 1);
+
+        const reqOut = await adapter.runBeforeRequest([{ role: 'user', content: 'hi' }], {});
+        assert.ok(reqOut.some((m) => String(m.content || '').includes('SELF_UPD_2.0.0')), 'hot-reloaded hook must emit v2.0.0 content');
+    } finally {
+        await adapter.dispose();
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});

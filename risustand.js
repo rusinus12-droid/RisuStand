@@ -753,6 +753,54 @@
         return out;
     }
 
+    // Canonical U+A turn counting (aligned with HAYAKU & Flashback Memory)
+    function computeUATurnStats(messages) {
+        const list = Array.isArray(messages) ? messages : [];
+        let completed = 0;
+        let hasPendingUser = false;
+        let hasAssistantInPair = false;
+        let activeTurnNum = 0;
+        const turnByIndex = new Array(list.length).fill(0);
+        for (let i = 0; i < list.length; i += 1) {
+            const m = list[i];
+            if (!m || typeof m !== 'object') continue;
+            if (m.disabled === true || m.isComment === true || m.isFirstMessage === true) continue;
+            const rawBody = m.data ?? m.raw ?? m.content ?? m.text ?? '';
+            let hasBody = String(rawBody).trim().length > 0;
+            if (!hasBody && m.html) {
+                hasBody = String(m.html).replace(/<[^>]+>/g, ' ').trim().length > 0 || /<img\b/i.test(String(m.html));
+            }
+            if (!hasBody) continue;
+            const roleRaw = String(m.role || '').toLowerCase();
+            if (roleRaw === 'user') {
+                if (!hasPendingUser) {
+                    activeTurnNum = completed + 1;
+                    hasPendingUser = true;
+                    hasAssistantInPair = false;
+                } else if (hasAssistantInPair) {
+                    completed += 1;
+                    activeTurnNum = completed + 1;
+                    hasPendingUser = true;
+                    hasAssistantInPair = false;
+                }
+                turnByIndex[i] = activeTurnNum;
+            } else if (roleRaw === 'char' || roleRaw === 'assistant' || roleRaw === 'bot' || roleRaw === 'model') {
+                if (!hasPendingUser) {
+                    turnByIndex[i] = 0;
+                } else {
+                    hasAssistantInPair = true;
+                    turnByIndex[i] = activeTurnNum;
+                }
+            }
+        }
+        if (hasPendingUser && hasAssistantInPair) completed += 1;
+        return {
+            completedTurns: completed,
+            pendingTurn: (hasPendingUser && !hasAssistantInPair) ? activeTurnNum : 0,
+            turnByIndex,
+        };
+    }
+
     function mergeConfig(saved) {
         if (!saved || typeof saved !== 'object') return structuredClone(DEFAULT_CONFIG);
         const merged = {
@@ -2231,7 +2279,8 @@
         const items = await collectMessagesForReader(modeKey);
         const twoPage = isEpub && (typeof preset.epubSpread === 'boolean' ? preset.epubSpread : config.layout.epubTwoPage);
 
-        let turnCounter = 0;
+        const uaStats = computeUATurnStats(items);
+        const seenUserTurns = new Set();
         const userTurns = [];
         const extractSnippet = (htmlStr) => {
             const plain = String(htmlStr || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
@@ -2241,35 +2290,37 @@
             ? items
                   .map((item, idx) => {
                       const isUser = item.role === 'user';
-                      if (isUser || idx === 0) turnCounter += 1;
-                      if (isUser) {
-                          userTurns.push({ turnNum: turnCounter, snippet: extractSnippet(item.html) });
+                      const turnNum = uaStats.turnByIndex[idx] || 0;
+                      const isFirstOfTurn = isUser && turnNum > 0 && !seenUserTurns.has(turnNum);
+                      if (isFirstOfTurn) {
+                          seenUserTurns.add(turnNum);
+                          userTurns.push({ turnNum, snippet: extractSnippet(item.html) });
                       }
                       if (isEpub) {
                           if (isUser) {
                               return `
-                                  <div class="epub-user-block" data-user-turn="${turnCounter}">
-                                      <div class="epub-turn-tag">▸ 나 · Turn ${turnCounter}</div>
+                                  <div class="epub-user-block"${isFirstOfTurn ? ` data-user-turn="${turnNum}"` : ''} data-turn-num="${turnNum}">
+                                      <div class="epub-turn-tag">▸ 나 · Turn ${turnNum}</div>
                                       <div class="epub-turn-body">${item.html}</div>
                                   </div>
                               `;
                           }
                           return `
-                              <div class="epub-bot-block">
-                                  <div class="epub-turn-divider"><span>✦ Turn ${turnCounter}</span></div>
+                              <div class="epub-bot-block" data-turn-num="${turnNum}">
+                                  <div class="epub-turn-divider"><span>${turnNum > 0 ? `✦ Turn ${turnNum}` : '✦ 프롤로그'}</span></div>
                                   <div class="epub-turn-body">${item.html}</div>
                               </div>
                           `;
                       }
                       if (isUser) {
                           return `
-                              <div class="msg-row user" data-user-turn="${turnCounter}">
+                              <div class="msg-row user"${isFirstOfTurn ? ` data-user-turn="${turnNum}"` : ''} data-turn-num="${turnNum}">
                                   <div class="user-bubble">${item.html}</div>
                               </div>
                           `;
                       }
                       return `
-                          <div class="msg-row bot">
+                          <div class="msg-row bot" data-turn-num="${turnNum}">
                               <div class="bot-avatar" style="background:${preset.badgeBg}"></div>
                               <div class="bot-content">
                                   <div class="bot-label">${escapeHtml(preset.brandTitle || 'Assistant')}</div>
@@ -5237,6 +5288,7 @@
                         id: (ch && ch.id) || String(cIdx),
                         name: (ch && ch.name) || `Chat ${cIdx + 1}`,
                         msgCount: Array.isArray(ch && ch.message) ? ch.message.length : 0,
+                        turnCount: computeUATurnStats(ch && ch.message).completedTurns,
                     });
                 }
                 characters.push({
@@ -5296,6 +5348,7 @@
                     x.name,
                     x.chatPage,
                     x.chats.map((ch) => [ch.index, ch.id, ch.name, ch.msgCount]),
+                    x.chats.map((ch) => ch.turnCount),
                 ]),
                 m: modules.map((x) => [x.id, x.enabled, x.assetCount]),
                 pe: personas.map((x) => x.name),
@@ -5472,6 +5525,7 @@
             const collector = createAssetCollector(findPath, Boolean(cfg.includeImages), renderCtx.vars.current_season_suffix || '');
             const outMsgs = [];
 
+            const uaStats = computeUATurnStats(allMsgs);
             let greetingControls = [];
             let inferredDefaults = {};
             let botWidgetHtml = '';
@@ -5521,6 +5575,7 @@
                         raw: firstStr,
                         images: parsedFirst.images,
                         isFirstMessage: true,
+                        turnIndex: 0,
                     });
                 }
             } else if (charObj.firstMessage) {
@@ -5580,6 +5635,7 @@
                     html: parsed.html,
                     raw: String(msg.data || ''),
                     images: parsed.images,
+                    turnIndex: uaStats.turnByIndex[startOffset + i] || 0,
                     swipeCount: swEntry && Array.isArray(swEntry.swipes) ? swEntry.swipes.length : 1,
                     swipeIndex: swEntry && typeof swEntry.index === 'number' ? swEntry.index : 0,
                 });
@@ -5624,6 +5680,8 @@
                     chatName: chatObj.name || `Chat ${viewChatIndex + 1}`,
                     isPcActive,
                     totalMessages: allMsgs.length,
+                    totalTurns: uaStats.completedTurns,
+                    pendingTurn: uaStats.pendingTurn,
                     fmIndex: fmIdx,
                     firstMessageCount,
                     greetingControls,
@@ -8189,7 +8247,13 @@
             if (kindOp === 'db.reloadPcPlugins') {
                 cachedPcPluginsList = null;
                 cachedPcPluginsAt = 0;
-                if (typeof risuai.loadPlugins === 'function') await risuai.loadPlugins();
+                setTimeout(() => {
+                    try {
+                        if (typeof risuai.loadPlugins === 'function') {
+                            Promise.resolve(risuai.loadPlugins()).catch(() => {});
+                        }
+                    } catch (_) {}
+                }, 120);
                 return true;
             }
             if (kindOp === 'db.getActiveModules') {

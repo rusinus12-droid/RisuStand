@@ -1840,3 +1840,774 @@ test('Cache Guard monitors proxy narrative lanes, excludes Hayaku/Flashback/tran
         await new Promise((r) => upstream.close(r));
     }
 });
+
+test('Zen minibar visibility on all tabs, horizontal touch-scroll CSS, bot menu theme dedup & /api/plugins/reload-pc resilience', async () => {
+    const tok = 'ui-fix-token-99';
+    const server = relay.createRelayServer({
+        token: tok,
+        configOverride: { activeProfileId: '', presetToggles: [], profiles: [] },
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    try {
+        const authHdr = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+
+        // 1) POST /api/plugins/reload-pc succeeds even when PC bridge RPC is offline
+        const relRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/plugins/reload-pc',
+            headers: authHdr,
+            body: '{}',
+        });
+        assert.equal(relRes.status, 200);
+        const relBody = JSON.parse(relRes.body);
+        assert.equal(relBody.ok, true);
+        assert.ok(Array.isArray(relBody.plugins));
+
+        // 2) Web UI HTML/CSS/JS invariants
+        const htmlRes = await requestHttp(port, { path: '/' });
+        assert.equal(htmlRes.status, 200);
+        const html = htmlRes.body;
+
+        assert.ok(!html.includes('body:not(.tab-chat-active) #rsMiniBar'), 'Zen minibar must remain visible across non-chat tabs');
+        assert.ok(html.includes('body:not(.rs-zen-mode) #rsMiniBar { display:none !important; }'));
+        assert.ok(html.includes('#rsMiniBar.expanded { padding:5px 10px; font-size:12px; font-weight:600; touch-action:pan-x; }'));
+        assert.ok(html.includes('BOT_FIXED_CLASS_SEL'));
+        assert.ok(html.includes('function isBotFixedMenuElement('));
+        assert.ok(html.includes('__rsGuiReloadPlugin'));
+
+        const setThemeMatch = html.match(/function setTheme\(key\)\s*\{[\s\S]*?\n  \}/);
+        assert.ok(setThemeMatch && setThemeMatch[0].includes("lastChatRenderSig = ''"), 'setTheme must reset lastChatRenderSig before re-rendering');
+
+        const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(scriptMatch);
+        new vm.Script(scriptMatch[1], { filename: 'webapp-ui-fixes-inline.js' });
+    } finally {
+        await new Promise((r) => server.close(r));
+    }
+});
+
+test('U+A turn recognition matches Hayaku & Flashback pairing rules across plugin and relay UI', () => {
+    assert.deepEqual(relay.computeUATurnStats([]), { completedTurns: 0, pendingTurn: 0, turnByIndex: [] });
+
+    // Leading greeting / prologue before first user turn is Turn 0
+    const greetingOnly = relay.computeUATurnStats([
+        { role: 'char', isFirstMessage: true, data: 'Greeting' },
+        { role: 'char', data: 'Prologue narration' },
+    ]);
+    assert.equal(greetingOnly.completedTurns, 0);
+    assert.equal(greetingOnly.pendingTurn, 0);
+    assert.deepEqual(greetingOnly.turnByIndex, [0, 0]);
+
+    // Standard U+A pairs + consecutive assistant continuations + consecutive user inputs
+    const mixed = relay.computeUATurnStats([
+        { role: 'char', isFirstMessage: true, data: 'Greeting' },
+        { role: 'user', data: 'U1' },
+        { role: 'char', data: 'A1 part 1' },
+        { role: 'assistant', data: 'A1 part 2' },
+        { role: 'user', data: 'U2a (unanswered)' },
+        { role: 'user', data: 'U2b (combined before reply)' },
+        { role: 'char', data: 'A2' },
+        { role: 'char', disabled: true, data: 'disabled note' },
+        { role: 'user', isComment: true, data: 'comment note' },
+        { role: 'user', data: 'U3 pending' },
+    ]);
+    assert.equal(mixed.completedTurns, 2);
+    assert.equal(mixed.pendingTurn, 3);
+    assert.deepEqual(mixed.turnByIndex, [0, 1, 1, 1, 2, 2, 2, 0, 0, 3]);
+
+    const pluginSrc = fs.readFileSync(path.join(REPO, 'risustand.js'), 'utf8');
+    assert.ok(pluginSrc.includes('function computeUATurnStats('));
+    assert.ok(pluginSrc.includes('turnCount: computeUATurnStats('));
+    assert.ok(pluginSrc.includes('totalTurns: uaStats.completedTurns'));
+    assert.ok(pluginSrc.includes('✦ 프롤로그'));
+});
+
+test('Cache Guard recognizes remote-prompt requests (direct Leave preset & proxy Leave) as main narrative', async () => {
+    let callCount = 0;
+    const upstream = http.createServer(async (req, res) => {
+        const chunks = [];
+        for await (const c of req) chunks.push(c);
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        callCount += 1;
+        const cached = callCount === 2 ? 2200 : 0;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            id: `chatcmpl-remote-${callCount}`,
+            model: body.model || 'gpt-4o',
+            choices: [{ message: { role: 'assistant', content: `Remote narrative reply #${callCount}` } }],
+            usage: { prompt_tokens: 2600, completion_tokens: 45, total_tokens: 2645, prompt_tokens_details: { cached_tokens: cached } },
+        }));
+    });
+    await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+    const upPort = upstream.address().port;
+
+    const tok = 'remote-cg-token-88';
+    const server = relay.createRelayServer({
+        token: tok,
+        configOverride: {
+            activeProfileId: 'rm-p1',
+            directPresetId: 'bundled:leave',
+            presetToggles: [],
+            profiles: [{
+                id: 'rm-p1',
+                name: 'RemoteMock',
+                provider: 'custom',
+                providerType: 'openai_compat',
+                baseUrl: `http://127.0.0.1:${upPort}/v1/chat/completions`,
+                apiKey: 'sk-remote-mock',
+                model: 'gpt-4o',
+                temperature: '',
+                maxTokens: '',
+                overrideMode: 'off',
+                systemOverride: '',
+            }],
+        },
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    try {
+        const hdrs = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+        const proxyHdr = { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' };
+
+        await requestHttp(port, { method: 'DELETE', path: '/api/logs', headers: hdrs });
+
+        // Seed PC snapshot containing [HAYAKU] & [FLASHBACK] memory blocks in lore/history
+        await requestHttp(port, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({
+                supportsBatchCommands: true,
+                catalog: { characters: [{ index: 0, name: 'Elena', chats: [{ index: 0, id: 'c-elena', name: 'Room 1', msgCount: 2, turnCount: 1 }] }] },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: 'Elena',
+                    chatName: 'Room 1',
+                    isPcActive: false,
+                    charContext: {
+                        charId: 'elena-1',
+                        name: 'Elena',
+                        desc: 'Elena is a quiet librarian.',
+                        note: 'Keep atmospheric tone.',
+                        memory: '[HAYAKU] Turn 1 summary: Elena greeted the traveler.\n[FLASHBACK] Past memory of the rain.',
+                        loreEntries: [],
+                    },
+                    messages: [
+                        { index: 0, role: 'user', raw: 'Good evening, Elena.' },
+                        { index: 1, role: 'char', raw: 'Welcome back to the archive.' },
+                    ],
+                },
+            }),
+        });
+
+        const waitForLogs = async (expectedCount) => {
+            for (let i = 0; i < 60; i += 1) {
+                const res = JSON.parse((await requestHttp(port, { path: '/api/logs', headers: hdrs })).body);
+                if (res.logs.length >= expectedCount) return res;
+                await new Promise((r) => setTimeout(r, 25));
+            }
+            return JSON.parse((await requestHttp(port, { path: '/api/logs', headers: hdrs })).body);
+        };
+
+        // Turn 1 via direct remote chat (Leave preset)
+        assert.equal((await requestHttp(port, {
+            method: 'POST',
+            path: '/api/chat/send',
+            headers: hdrs,
+            body: JSON.stringify({ charIndex: 0, chatIndex: 0, text: 'Let us inspect the upper shelf.' }),
+        })).status, 200);
+        await waitForLogs(1);
+
+        // Sync snapshot after Turn 1 (matching PC bridge append_messages sync)
+        await requestHttp(port, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({
+                supportsBatchCommands: true,
+                catalog: { characters: [{ index: 0, name: 'Elena', chats: [{ index: 0, id: 'c-elena', name: 'Room 1', msgCount: 4, turnCount: 2 }] }] },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: 'Elena',
+                    chatName: 'Room 1',
+                    isPcActive: false,
+                    charContext: {
+                        charId: 'elena-1',
+                        name: 'Elena',
+                        desc: 'Elena is a quiet librarian.',
+                        note: 'Keep atmospheric tone.',
+                        memory: '[HAYAKU] Turn 1 summary: Elena greeted the traveler.\n[FLASHBACK] Past memory of the rain.',
+                        loreEntries: [],
+                    },
+                    messages: [
+                        { index: 0, role: 'user', raw: 'Good evening, Elena.' },
+                        { index: 1, role: 'char', raw: 'Welcome back to the archive.' },
+                        { index: 2, role: 'user', raw: 'Let us inspect the upper shelf.' },
+                        { index: 3, role: 'char', raw: 'Remote narrative reply #1' },
+                    ],
+                },
+            }),
+        });
+
+        // Turn 2 via direct remote chat (intact prefix + normal post-history tail shift + KV hit reported)
+        assert.equal((await requestHttp(port, {
+            method: 'POST',
+            path: '/api/chat/send',
+            headers: hdrs,
+            body: JSON.stringify({ charIndex: 0, chatIndex: 0, text: 'Pull out the brass lantern.' }),
+        })).status, 200);
+        await waitForLogs(2);
+
+        // Mutate Author's Note so Turn 3 mutates system/authornote prefix -> MUST stay in same lane & report cacheBroken
+        assert.equal((await requestHttp(port, {
+            method: 'POST',
+            path: '/api/command',
+            headers: hdrs,
+            body: JSON.stringify({ type: 'set_author_note', payload: { charIndex: 0, chatIndex: 0, note: 'MUTATED_AUTHOR_NOTE_BREAKS_CACHE' } }),
+        })).status, 200);
+        assert.equal((await requestHttp(port, {
+            method: 'POST',
+            path: '/api/chat/send',
+            headers: hdrs,
+            body: JSON.stringify({ charIndex: 0, chatIndex: 0, text: 'Open the locked folio.' }),
+        })).status, 200);
+        await waitForLogs(3);
+
+        // Turn 4 via proxy carrying Leave Engine prompt mentioning HAYAKU/Flashback -> MUST also be recognized as main narrative
+        assert.equal((await requestHttp(port, {
+            method: 'POST',
+            path: '/v1/chat/completions',
+            headers: proxyHdr,
+            body: JSON.stringify({
+                model: 'risustand-router',
+                stream: false,
+                messages: [
+                    { role: 'system', content: '[LEAVE ENGINE — OUTPUT CONTRACT & BASE QUALITY FLOOR]\nCross-check LIBRA, HAYAKU, Flashback blocks if present.' },
+                    { role: 'user', content: 'Hello from proxy Leave.' },
+                ],
+            }),
+        })).status, 200);
+
+        const logsRes = await waitForLogs(4);
+        assert.equal(logsRes.logs.length, 4);
+        assert.equal(logsRes.summary.narrativeCount, 4);
+        assert.equal(logsRes.summary.excludedCount, 0);
+
+        // Newest-first: [proxyLeave, directT3, directT2, directT1]
+        const [logProxy, logT3, logT2, logT1] = logsRes.logs;
+
+        assert.equal(logT1.source, 'direct_chat');
+        assert.equal(logT1.remotePrompt, true);
+        assert.equal(logT1.cacheGuard.eligible, true);
+        assert.equal(logT1.cacheGuard.isRemotePrompt, true);
+        assert.equal(logT1.cacheGuard.verdict, 'baseline');
+        assert.equal(logT1.cacheGuard.turnIndex, 1);
+
+        assert.equal(logT2.cacheGuard.eligible, true);
+        assert.equal(logT2.cacheGuard.isRemotePrompt, true);
+        assert.equal(logT2.cacheGuard.laneId, logT1.cacheGuard.laneId);
+        assert.equal(logT2.cacheGuard.turnIndex, 2);
+        assert.equal(logT2.cacheGuard.cacheBroken, false);
+        assert.ok(logT2.cacheGuard.serverHitPct > 80);
+
+        assert.equal(logT3.cacheGuard.eligible, true);
+        assert.equal(logT3.cacheGuard.isRemotePrompt, true);
+        assert.equal(logT3.cacheGuard.laneId, logT1.cacheGuard.laneId);
+        assert.equal(logT3.cacheGuard.turnIndex, 3);
+        assert.equal(logT3.cacheGuard.cacheBroken, true);
+        assert.equal(logT3.cacheGuard.verdict, 'broken');
+
+        assert.equal(logProxy.source, 'proxy');
+        assert.equal(logProxy.cacheGuard.eligible, true);
+        assert.equal(logProxy.cacheGuard.isRemotePrompt, true);
+
+        const htmlRes = await requestHttp(port, { path: '/' });
+        assert.equal(htmlRes.status, 200);
+        assert.ok(htmlRes.body.includes('🍃 원격 서사'));
+        assert.ok(htmlRes.body.includes('function computeUATurnStats('));
+        const scriptMatch = htmlRes.body.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(scriptMatch);
+        new vm.Script(scriptMatch[1], { filename: 'webapp-ua-remote-cg-inline.js' });
+
+        await requestHttp(port, { method: 'DELETE', path: '/api/logs', headers: hdrs });
+    } finally {
+        await new Promise((r) => server.close(r));
+        await new Promise((r) => upstream.close(r));
+    }
+});
+
+test('module lorebooks are separated from character/chat lorebooks and disabled by default (opt-in only)', async () => {
+    const capturedPayloads = [];
+    const upstream = http.createServer((req, res) => {
+        const chunks = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+            capturedPayloads.push(JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}'));
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                id: 'chatcmpl-modlore',
+                model: 'deepseek-test',
+                choices: [{ message: { role: 'assistant', content: 'ok' } }],
+            }));
+        });
+    });
+    await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+    const upPort = upstream.address().port;
+
+    const tok = 'modlore-sep-token-55';
+    const server = relay.createRelayServer({
+        token: tok,
+        configOverride: {
+            activeProfileId: 'ml-p1',
+            directPresetId: 'off',
+            disabledLoreEntries: {},
+            enabledModuleLoreEntries: {},
+            pinnedLoreEntries: {},
+            profiles: [{
+                id: 'ml-p1',
+                name: 'MockML',
+                providerType: 'openai_compat',
+                baseUrl: `http://127.0.0.1:${upPort}/v1/chat/completions`,
+                apiKey: 'mock-key',
+                model: 'deepseek-test',
+                temperature: '',
+                maxTokens: '',
+                overrideMode: 'off',
+                systemOverride: '',
+            }],
+        },
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+
+    try {
+        const hdrs = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+        await requestHttp(port, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({
+                supportsBatchCommands: true,
+                catalog: { characters: [{ index: 0, name: 'CharA', chats: [{ index: 0, id: 'c0', name: 'Chat 1', msgCount: 1 }] }] },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: 'CharA',
+                    chatName: 'Chat 1',
+                    isPcActive: false,
+                    charContext: {
+                        charId: 'char-mod-sep',
+                        name: 'CharA',
+                        desc: 'Base description.',
+                        loreEntries: [
+                            { uid: 'char:c1', source: 'char', sourceName: 'CharA', comment: 'Char Always', key: '', alwaysActive: true, insertorder: 100, content: 'CHAR_LORE_ACTIVE' },
+                            { uid: 'local:l1', source: 'local', sourceName: '이 채팅방', comment: 'Local Room', key: 'lantern', alwaysActive: false, insertorder: 95, content: 'LOCAL_LORE_ACTIVE' },
+                            { uid: 'module:m1', source: 'module', sourceName: 'HeavyModule', comment: 'Mod Always', key: '', alwaysActive: true, insertorder: 90, content: 'MODULE_ALWAYS_SHOULD_DEFAULT_OFF' },
+                            { uid: 'module:m2', source: 'module', sourceName: 'HeavyModule', comment: 'Mod Keyword', key: 'lantern', alwaysActive: false, insertorder: 85, content: 'MODULE_KEYWORD_SHOULD_DEFAULT_OFF' },
+                        ],
+                    },
+                    messages: [{ index: 0, role: 'char', raw: 'Hello.' }],
+                },
+            }),
+        });
+
+        // 1) GET /api/lorebook separates charEntries & moduleEntries and reports enabledModuleUids: []
+        const lbRes = JSON.parse((await requestHttp(port, { path: '/api/lorebook', headers: hdrs })).body);
+        assert.equal(lbRes.charEntries.length, 2);
+        assert.equal(lbRes.moduleEntries.length, 2);
+        assert.deepEqual(lbRes.enabledModuleUids, []);
+
+        // 2) Default chat send: char + local active; BOTH module lorebooks excluded despite alwaysActive & keyword match
+        const sendAndWait = async (text) => {
+            const before = capturedPayloads.length;
+            const r = await requestHttp(port, {
+                method: 'POST',
+                path: '/api/chat/send',
+                headers: hdrs,
+                body: JSON.stringify({ charIndex: 0, chatIndex: 0, text }),
+            });
+            assert.equal(r.status, 200);
+            for (let i = 0; i < 60 && capturedPayloads.length === before; i += 1) {
+                await new Promise((resolve) => setTimeout(resolve, 20));
+            }
+            return capturedPayloads[capturedPayloads.length - 1].messages.map((m) => m.content).join('\n');
+        };
+
+        const sentDefault = await sendAndWait('Hold up the lantern.');
+        assert.ok(sentDefault.includes('CHAR_LORE_ACTIVE'));
+        assert.ok(sentDefault.includes('LOCAL_LORE_ACTIVE'));
+        assert.ok(!sentDefault.includes('MODULE_ALWAYS_SHOULD_DEFAULT_OFF'));
+        assert.ok(!sentDefault.includes('MODULE_KEYWORD_SHOULD_DEFAULT_OFF'));
+
+        // 3) Opt-in ONLY module:m2 -> module:m2 included, module:m1 still excluded
+        const optInRes = JSON.parse((await requestHttp(port, {
+            method: 'POST',
+            path: '/api/lorebook/selection',
+            headers: hdrs,
+            body: JSON.stringify({ charKey: 'char-mod-sep', uid: 'module:m2', enabled: true }),
+        })).body);
+        assert.deepEqual(optInRes.enabledModuleUids, ['module:m2']);
+
+        const sentOptIn = await sendAndWait('Hold up the lantern.');
+        assert.ok(!sentOptIn.includes('MODULE_ALWAYS_SHOULD_DEFAULT_OFF'));
+        assert.ok(sentOptIn.includes('MODULE_KEYWORD_SHOULD_DEFAULT_OFF'));
+
+        // 4) Character "전체 반영" (disabledUids: []) must NOT touch enabledModuleUids
+        await requestHttp(port, {
+            method: 'POST',
+            path: '/api/lorebook/selection',
+            headers: hdrs,
+            body: JSON.stringify({ charKey: 'char-mod-sep', disabledUids: [] }),
+        });
+        const lbAfterCharAll = JSON.parse((await requestHttp(port, { path: '/api/lorebook', headers: hdrs })).body);
+        assert.deepEqual(lbAfterCharAll.enabledModuleUids, ['module:m2']);
+
+        // 5) "전체 비활성" clears enabledModuleUids -> module:m2 excluded again
+        await requestHttp(port, {
+            method: 'POST',
+            path: '/api/lorebook/selection',
+            headers: hdrs,
+            body: JSON.stringify({ charKey: 'char-mod-sep', enabledModuleUids: [] }),
+        });
+        const sentDisabledAll = await sendAndWait('Hold up the lantern.');
+        assert.ok(!sentDisabledAll.includes('MODULE_ALWAYS_SHOULD_DEFAULT_OFF'));
+        assert.ok(!sentDisabledAll.includes('MODULE_KEYWORD_SHOULD_DEFAULT_OFF'));
+
+        // 6) Web UI separates #moduleLorebookCard, removes module filter from #loreFilters, and compiles cleanly
+        const htmlRes = await requestHttp(port, { path: '/' });
+        assert.equal(htmlRes.status, 200);
+        assert.ok(htmlRes.body.includes('id="moduleLorebookCard"'));
+        assert.ok(htmlRes.body.includes('id="modLoreList"'));
+        assert.ok(htmlRes.body.includes('id="modLoreDisableAllBtn"'));
+        assert.ok(!htmlRes.body.includes('data-lore-src="module"'));
+        assert.ok(!htmlRes.body.includes('id="pluginGuiTabs"'));
+        assert.ok(!htmlRes.body.includes('plg-gui-tabs'));
+        assert.ok(htmlRes.body.includes('function renderModuleLorebookList('));
+        const scriptMatch = htmlRes.body.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(scriptMatch);
+        new vm.Script(scriptMatch[1], { filename: 'webapp-module-lore-sep-inline.js' });
+    } finally {
+        await new Promise((r) => server.close(r));
+        await new Promise((r) => upstream.close(r));
+    }
+});
+
+test('CBS negative-number comparisons, keywords, and Leave Preset r1.1 AIDE/encoder upgrades', () => {
+    const ctx = {
+        charName: 'Char',
+        personaName: 'User',
+        globalVars: { toggle_bianca_inject: '1', toggle_prose_tone: '4', toggle_ooc_mode: '0' },
+        chatVars: { aff_sieun: '-85', aff_dain: '-50', aff_minji: '120' },
+    };
+
+    assert.equal(
+        relay.evalPresetCbs('{{#when::var::aff_sieun::lt::0}}NEG{{:else}}ZERO_PLUS{{/when}}', ctx),
+        'NEG'
+    );
+    assert.equal(
+        relay.evalPresetCbs('{{#when::var::aff_dain::gte::0}}STAGE_0{{:else}}HOSTILE{{/when}}', ctx),
+        'HOSTILE'
+    );
+    assert.equal(
+        relay.evalPresetCbs('{{#when::var::aff_dain::lte::-50}}AT_OR_BELOW_NEG50{{:else}}ABOVE{{/when}}', ctx),
+        'AT_OR_BELOW_NEG50'
+    );
+    assert.equal(
+        relay.evalPresetCbs('{{lt::-85::0}}|{{lte::-50::-50}}|{{gt::-10::-50}}|{{gte::0::0}}|{{eq::-85::-85}}|{{neq::-85::0}}', ctx),
+        '1|1|1|1|1|1'
+    );
+    assert.equal(
+        relay.evalPresetCbs('{{? -85 < 0 and -50 < 0 and not (0 < 0)}}', ctx),
+        '1'
+    );
+    assert.equal(
+        relay.evalPresetCbs('{{#if {{greater_equal::{{getvar::aff_sieun}}::0}}}}Stage0{{:else}}Hostile({{getvar::aff_sieun}}){{/if}}', ctx),
+        'Hostile(-85)'
+    );
+
+    // .risup encoder round-trip
+    const sampleObj = {
+        name: 'RoundTrip Test Preset',
+        temperature: 85,
+        maxResponse: 4096,
+        promptTemplate: [{ type: 'plain', role: 'system', text: '한국어 UTF-8 테스트' }],
+    };
+    const encoded = relay.encodeRisupPreset(sampleObj);
+    assert.deepEqual(relay.decodeRisupPreset(encoded), sampleObj);
+
+    // Upgraded bundled Leave preset checks
+    const leave = relay.loadBundledLeavePreset();
+    assert.equal(leave.temperature, 0.85);
+    assert.equal(leave.maxResponse, 16384);
+    assert.ok(leave.defaultVariables.includes('toggle_pipeline_mode=1'));
+
+    const msgsWithBiancaConflict = relay.buildDirectPromptMessages({
+        preset: leave,
+        snap: { charName: 'TestChar', charContext: { name: 'TestChar', desc: 'World.' } },
+        historyMessages: [{ index: 0, role: 'user', raw: '안녕' }],
+        userText: '계속해.',
+        remoteToggleValues: { toggle_bianca_inject: '1', toggle_prose_tone: '4' },
+        modelName: 'deepseek-v4.1-flash:1017-cloud',
+    });
+    const combinedBianca = msgsWithBiancaConflict.map((m) => m.content).join('\n');
+    assert.ok(combinedBianca.includes('[PROCEDURAL DRAFTING PIPELINE — LIGHTWEIGHT 4-STEP CHECK]'), 'Default pipeline_mode=1 should be active');
+    assert.ok(combinedBianca.includes('FAIL (impersonation):'));
+    assert.ok(combinedBianca.includes('Terminal-First Continuity Lock'));
+    assert.ok(combinedBianca.includes('FAIL (echo-loop):'));
+    assert.ok(combinedBianca.includes('FAIL (crutch chop):'));
+    assert.ok(combinedBianca.includes('[PROSE VOICE PRIORITY]'));
+    assert.ok(!combinedBianca.includes('[LEAVE PROSE TONE — LIVELY LIGHT-NOVEL'), 'BIANCA active must suppress contradictory prose_tone=4');
+    assert.ok(/DeepSeek/i.test(combinedBianca), 'Auto model_adapter must inject DeepSeek adapter when modelName contains deepseek');
+    assert.ok(combinedBianca.includes('STRICT ORDER: Prose -> Step 2'));
+    assert.ok(msgsWithBiancaConflict.some((m) => m._cachePoint === true), 'Leave cache template entries must tag _cachePoint');
+    assert.ok(!/\{\{#if|\{\{getglobalvar|\{\{\/if\}\}/.test(combinedBianca));
+});
+
+test('selectCacheFriendlyHistory preserves prefix across 5 turns & reconcileLeaveHayakuFooterContract fixes </statusdata>', () => {
+    const makeMsgs = (count) => Array.from({ length: count }, (_, idx) => ({
+        index: idx,
+        role: idx % 2 === 0 ? 'user' : 'char',
+        raw: `msg-${idx}`,
+    }));
+
+    const startIndices = [32, 34, 36, 38, 40].map((len) => relay.selectCacheFriendlyHistory(makeMsgs(len), { mode: 'chunked' })[0].index);
+    assert.deepEqual(startIndices, [10, 10, 10, 10, 10], 'Prefix start index must stay locked at 10 across 5 U+A turns');
+    assert.equal(relay.selectCacheFriendlyHistory(makeMsgs(42), { mode: 'chunked' })[0].index, 20);
+    assert.equal(relay.selectCacheFriendlyHistory(makeMsgs(50), { mode: 'full' }).length, 50);
+    assert.equal(relay.selectCacheFriendlyHistory(makeMsgs(40), { mode: 'sliding_30' })[0].index, 10);
+    assert.equal(relay.selectCacheFriendlyHistory(makeMsgs(34), { mode: 'sliding_30' })[0].index, 4);
+
+    // Footer conflict reconciliation
+    const conflicting = [
+        { role: 'system', content: '[LEAVE FINAL EXECUTION CHECK]\n- STEP 3 — CHARACTER-CARD STATUS LINE\n<statusdata>\n• 현장: A\n</statusdata>' },
+        { role: 'system', content: '[HAYAKU SIDE-WRITE FINAL REMINDER]\nWrap raw JSON between <!-- HAYAKU_STATE_PACKET_START --> and <!-- HAYAKU_STATE_PACKET_END --> IMMEDIATELY BEFORE </statusdata>. FINAL CONTENT MUST END WITH: </statusdata>', _cachePoint: true },
+    ];
+    const reconciled = relay.reconcileLeaveHayakuFooterContract(conflicting);
+    assert.ok(reconciled[1].content.includes('AFTER </statusdata> and any character-card status line'));
+    assert.ok(!reconciled[1].content.includes('IMMEDIATELY BEFORE </statusdata>. FINAL CONTENT MUST END WITH: </statusdata>'));
+    assert.equal(reconciled[1]._cachePoint, true);
+
+    const nonLeave = [{ role: 'system', content: 'Plain prompt' }, conflicting[1]];
+    assert.equal(relay.reconcileLeaveHayakuFooterContract(nonLeave)[1].content, conflicting[1].content);
+});
+
+test('Anthropic cache_control + preset sampling fallback, deterministic guards, and Two-Pass 2-stage pipeline', async () => {
+    const capturedAnthropic = [];
+    const anthropicUpstream = http.createServer((req, res) => {
+        const chunks = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+            const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            capturedAnthropic.push(parsed);
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                id: 'msg_test',
+                model: parsed.model,
+                content: [{ type: 'text', text: 'Anthropic cached reply.' }],
+                usage: { input_tokens: 100, cache_read_input_tokens: 800, cache_creation_input_tokens: 50, output_tokens: 40 },
+            }));
+        });
+    });
+    await new Promise((r) => anthropicUpstream.listen(0, '127.0.0.1', r));
+    const antPort = anthropicUpstream.address().port;
+
+    const capturedOai = [];
+    const oaiUpstream = http.createServer((req, res) => {
+        const chunks = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+            const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+            capturedOai.push(parsed);
+            const isDraftPass = parsed.messages.some((m) => String(m.content || '').includes('[TWO-PASS DRAFT ENGINE — PASS 1'));
+            const replyText = isDraftPass
+                ? '그가 서류를 받아 들고 아주 천천히 고개를 들었다. 아주 짧게 숨을 삼키더니 아주 낮게 중얼거렸다. "아직 느낌이 안 와?"'
+                : '문고리가 철컥 잠기는 소리가 복도 끝에서 먼저 끊겼다.\n<statusdata>\n📖 Leave HUD · 오후 · 음악실\n• 현장: 강다인\n• 다음 씨앗: 잠긴 문\n</statusdata>';
+            res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({
+                id: 'oai_test',
+                model: parsed.model,
+                choices: [{ index: 0, message: { role: 'assistant', content: replyText }, finish_reason: 'stop' }],
+                usage: { prompt_tokens: 500, completion_tokens: 80, prompt_cache_hit_tokens: isDraftPass ? 0 : 400 },
+            }));
+        });
+    });
+    await new Promise((r) => oaiUpstream.listen(0, '127.0.0.1', r));
+    const oaiPort = oaiUpstream.address().port;
+
+    try {
+        // Unit checks on extractTerminalSceneTail & auditDraftWithDeterministicGuards
+        const tail = relay.extractTerminalSceneTail([
+            { role: 'user', raw: '문 열어.' },
+            { role: 'char', raw: '<thinking>plan</thinking>\n강다인이 빗장을 손끝으로 눌렀다.\n<statusdata>\nHUD\n</statusdata>\n[☀️][7°C][2025.03.03]\n<!-- HAYAKU_STATE_PACKET_START -->{}<!-- HAYAKU_STATE_PACKET_END -->' },
+        ], 2400);
+        assert.equal(tail, '강다인이 빗장을 손끝으로 눌렀다.');
+
+        const guardAudit = relay.auditDraftWithDeterministicGuards(
+            '[☀️][7°C]\n<statusdata>\nHUD\n</statusdata>\n강다인이 빗장을 손끝으로 눌렀다. 강다인이 빗장을 손끝으로 눌렀다.\n진우가 조용히 웃었다. 아주 천천히, 아주 짧게, 아주 낮게 대답했다. "아직 느낌이 안 와?"',
+            {
+                prevAssistantText: '강다인이 빗장을 손끝으로 눌렀다. 음악실 문틈 사이로 차가운 복도 공기가 흘러들어오고 있었다.',
+                userText: '"아직 느낌이 안 와?" 진우는 가만히 물었다.',
+                personaName: '진우',
+                isRpMode: true,
+            }
+        );
+        const issueCodes = new Set(guardAudit.issues.map((i) => i.code));
+        assert.equal(guardAudit.ok, false);
+        assert.ok(issueCodes.has('prior_turn_regression'));
+        assert.ok(issueCodes.has('rp_impersonation'));
+        assert.ok(issueCodes.has('crutch_adverb_overuse'));
+        assert.ok(issueCodes.has('user_quote_echo'));
+        assert.ok(issueCodes.has('footer_order_violation'));
+
+        // 1) Anthropic cache_control + Leave sampling fallback
+        const tok1 = 'ant-cache-token';
+        const srv1 = relay.createRelayServer({
+            token: tok1,
+            configOverride: {
+                activeProfileId: 'prof-ant',
+                directPresetId: 'bundled:leave',
+                profiles: [{
+                    id: 'prof-ant',
+                    name: 'Claude Blank Sampling',
+                    providerType: 'anthropic',
+                    baseUrl: `http://127.0.0.1:${antPort}/v1/messages`,
+                    apiKey: 'sk-ant-test',
+                    model: 'claude-sonnet-4-20250514',
+                    temperature: '',
+                    maxTokens: '',
+                }],
+            },
+        });
+        await new Promise((r) => srv1.listen(0, '127.0.0.1', r));
+        const port1 = srv1.address().port;
+        try {
+            const hdrs1 = { 'X-RisuStand-Token': tok1, 'Content-Type': 'application/json' };
+            await requestHttp(port1, {
+                method: 'POST',
+                path: '/api/pc/poll',
+                headers: hdrs1,
+                body: JSON.stringify({
+                    catalog: { characters: [{ index: 0, name: 'CharA', chats: [{ index: 0, id: 'c0', name: 'Chat 1', msgCount: 2 }] }] },
+                    snapshot: {
+                        charIndex: 0,
+                        chatIndex: 0,
+                        charName: 'CharA',
+                        chatName: 'Chat 1',
+                        isPcActive: false,
+                        charContext: { name: 'CharA', desc: 'Campus room.' },
+                        messages: [{ index: 0, role: 'user', raw: 'Hi' }, { index: 1, role: 'char', raw: 'Hello there.' }],
+                    },
+                }),
+            });
+            const sendAnt = await requestHttp(port1, {
+                method: 'POST',
+                path: '/api/chat/send',
+                headers: hdrs1,
+                body: JSON.stringify({ charIndex: 0, chatIndex: 0, text: 'Continue cleanly.' }),
+            });
+            assert.equal(sendAnt.status, 200);
+            for (let i = 0; i < 60 && capturedAnthropic.length === 0; i += 1) await new Promise((r) => setTimeout(r, 20));
+            assert.equal(capturedAnthropic.length, 1);
+            const antBody = capturedAnthropic[0];
+            assert.equal(antBody.temperature, 0.85, 'Leave preset temperature 0.85 should apply when profile leaves it blank');
+            assert.equal(antBody.max_tokens, 16384, 'Leave preset maxResponse 16384 should apply when profile leaves it blank');
+            assert.ok(Array.isArray(antBody.system), 'Anthropic system should serialize as content-block array when cachePoint is active');
+            assert.ok(antBody.system.some((b) => b.cache_control && b.cache_control.type === 'ephemeral'));
+        } finally {
+            await new Promise((r) => srv1.close(r));
+        }
+
+        // 2) Two-pass pipeline end-to-end + Web UI script & config API
+        const tok2 = 'two-pass-token';
+        const srv2 = relay.createRelayServer({
+            token: tok2,
+            configOverride: {
+                activeProfileId: 'prof-oai',
+                directPresetId: 'bundled:leave',
+                directHistoryMode: 'chunked',
+                directPipelineMode: 'two_pass',
+                profiles: [{
+                    id: 'prof-oai',
+                    name: 'DeepSeek Main',
+                    providerType: 'openai_compat',
+                    baseUrl: `http://127.0.0.1:${oaiPort}/v1/chat/completions`,
+                    apiKey: 'sk-oai-test',
+                    model: 'deepseek-v4.1-flash:1017-cloud',
+                    temperature: '0.6',
+                    maxTokens: '2048',
+                }],
+            },
+        });
+        await new Promise((r) => srv2.listen(0, '127.0.0.1', r));
+        const port2 = srv2.address().port;
+        try {
+            const hdrs2 = { 'X-RisuStand-Token': tok2, 'Content-Type': 'application/json' };
+            await requestHttp(port2, {
+                method: 'POST',
+                path: '/api/pc/poll',
+                headers: hdrs2,
+                body: JSON.stringify({
+                    catalog: { characters: [{ index: 0, name: 'CharA', chats: [{ index: 0, id: 'c0', name: 'Chat 1', msgCount: 2 }] }] },
+                    snapshot: {
+                        charIndex: 0,
+                        chatIndex: 0,
+                        charName: 'CharA',
+                        chatName: 'Chat 1',
+                        isPcActive: false,
+                        charContext: { name: 'CharA', personaName: '진우', desc: 'Campus room.' },
+                        messages: [{ index: 0, role: 'user', raw: '문 열어.' }, { index: 1, role: 'char', raw: '강다인이 빗장을 손끝으로 눌렀다.\n<statusdata>\nHUD\n</statusdata>' }],
+                    },
+                }),
+            });
+            const send2 = await requestHttp(port2, {
+                method: 'POST',
+                path: '/api/chat/send',
+                headers: hdrs2,
+                body: JSON.stringify({ charIndex: 0, chatIndex: 0, text: '"아직 느낌이 안 와?" 진우는 가만히 물었다.' }),
+            });
+            assert.equal(send2.status, 200);
+            for (let i = 0; i < 80 && capturedOai.length < 2; i += 1) await new Promise((r) => setTimeout(r, 20));
+            assert.equal(capturedOai.length, 2, 'Two-pass mode must issue Pass 1 draft + Pass 2 polish');
+            assert.equal(capturedOai[1].temperature, 0.6, 'Explicit profile temperature must override Leave preset');
+            assert.equal(capturedOai[1].max_tokens, 2048, 'Explicit profile maxTokens must override Leave preset');
+            assert.ok(!capturedOai[1].messages.some((m) => '_cachePoint' in m), '_cachePoint metadata must be stripped for OpenAI payloads');
+            const pass2Text = capturedOai[1].messages.map((m) => m.content).join('\n');
+            assert.ok(pass2Text.includes('[TWO-PASS EDITORIAL POLISH — PASS 2 FINISHING]'));
+            assert.ok(pass2Text.includes('crutch_adverb_overuse'));
+            assert.ok(pass2Text.includes('user_quote_echo'));
+            assert.ok(pass2Text.includes('rp_impersonation'));
+
+            const logsRes = JSON.parse((await requestHttp(port2, { path: '/api/logs', headers: hdrs2 })).body);
+            const pass2Log = logsRes.logs.find((l) => l.source === 'direct_chat');
+            const pass1Log = logsRes.logs.find((l) => l.source === 'direct_draft');
+            assert.ok(pass2Log && pass2Log.cacheGuard.eligible === true);
+            assert.ok(pass1Log && pass1Log.cacheGuard.eligible === false, 'Pass 1 direct_draft must be excluded from main Cache Guard lane');
+
+            const cfgRes = JSON.parse((await requestHttp(port2, {
+                method: 'POST',
+                path: '/api/router/config',
+                headers: hdrs2,
+                body: JSON.stringify({ directHistoryMode: 'full', directPipelineMode: 'single' }),
+            })).body);
+            assert.equal(cfgRes.directHistoryMode, 'full');
+            assert.equal(cfgRes.directPipelineMode, 'single');
+
+            const htmlRes = await requestHttp(port2, { path: '/' });
+            assert.ok(htmlRes.body.includes('id="directHistoryModeSel"'));
+            assert.ok(htmlRes.body.includes('id="directPipelineModeSel"'));
+            const scriptMatch = htmlRes.body.match(/<script>([\s\S]*?)<\/script>/);
+            assert.ok(scriptMatch);
+            new vm.Script(scriptMatch[1], { filename: 'webapp-two-pass-inline.js' });
+        } finally {
+            await new Promise((r) => srv2.close(r));
+        }
+    } finally {
+        if (typeof anthropicUpstream.closeAllConnections === 'function') anthropicUpstream.closeAllConnections();
+        if (typeof oaiUpstream.closeAllConnections === 'function') oaiUpstream.closeAllConnections();
+        await new Promise((r) => anthropicUpstream.close(r));
+        await new Promise((r) => oaiUpstream.close(r));
+    }
+});

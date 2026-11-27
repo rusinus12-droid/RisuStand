@@ -1940,7 +1940,21 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
     getCurrentChat: () => rpcCall('db.getChatActive', []),
     getChatFromIndex: (cIdx, chIdx) => rpcCall('db.getChat', [Number(cIdx), Number(chIdx)]),
     setChatToIndex: (cIdx, chIdx, chat) => rpcCall('db.setChat', [Number(cIdx), Number(chIdx), chat]),
-    loadPlugins: () => rpcCall('db.reloadPcPlugins', []),
+    loadPlugins: async () => {
+      await rpcCall('db.reloadPcPlugins', [meta.name]);
+      window.parent.postMessage({ __rsGuiReloadPlugin: 1, pluginName: meta.name }, '*');
+      return true;
+    },
+    reloadPlugins: async () => {
+      await rpcCall('db.reloadPcPlugins', [meta.name]);
+      window.parent.postMessage({ __rsGuiReloadPlugin: 1, pluginName: meta.name }, '*');
+      return true;
+    },
+    reload: async () => {
+      await rpcCall('db.reloadPcPlugins', [meta.name]);
+      window.parent.postMessage({ __rsGuiReloadPlugin: 1, pluginName: meta.name }, '*');
+      return true;
+    },
     readImage: async (p) => {
       const r = await rpcCall('asset.readImage', [String(p || '')]);
       return (r && r.__b64) ? decodeBase64ToBytes(r.__b64) : null;
@@ -2657,8 +2671,9 @@ function createPluginAdapter({
     async function dbGetDatabase(keys = 'all') {
         const want = keys === undefined ? 'all' : keys;
         let out = {};
+        const includesPlugins = want === 'all' || (Array.isArray(want) && want.includes('plugins'));
         if (isRpcConnected()) {
-            out = (await hostRpc.invoke('db.getDatabase', [want])) || {};
+            out = (await hostRpc.invoke('db.getDatabase', [want], includesPlugins ? 60000 : 15000)) || {};
         } else {
             const snap = getFallbackSnapshot();
             const fbChar = getOrSeedFallbackChar(snap && typeof snap.charIndex === 'number' ? snap.charIndex : 0) || buildSnapshotCharFallback(snap);
@@ -2677,7 +2692,7 @@ function createPluginAdapter({
                 out.characters[turnCache.charIndex].chats[turnCache.chatIndex] = cloneJson(turnCache.chatObj);
             }
         }
-        if (want === 'all' || (Array.isArray(want) && want.includes('plugins'))) {
+        if (includesPlugins) {
             const merged = Array.isArray(out.plugins) ? out.plugins.slice() : [];
             for (const entry of getAllKnownEntries()) {
                 if (!merged.some((p) => p && p.name === entry.name)) {
@@ -2686,6 +2701,7 @@ function createPluginAdapter({
                         displayName: entry.displayName,
                         version: '3.0',
                         versionOfPlugin: entry.version,
+                        script: entry.script || '',
                         enabled: isPluginEnabled(entry.name),
                         allowedIPC: entry.header ? entry.header.allowedIPC : [],
                         realArg: mergePluginArgs(entry),
@@ -2705,8 +2721,46 @@ function createPluginAdapter({
                 turnCache.chatObj = cloneJson(turnCache.charObj.chats[turnCache.chatIndex]);
             }
         }
+        if (safePatch && Array.isArray(safePatch.plugins)) {
+            let touchedCustom = false;
+            for (const rawPlg of safePatch.plugins) {
+                if (!rawPlg || typeof rawPlg !== 'object' || !rawPlg.name || typeof rawPlg.script !== 'string') continue;
+                const pName = String(rawPlg.name);
+                if (pName === 'risustand') continue;
+                const nextScript = String(rawPlg.script);
+                const nextHeader = parsePluginHeader(nextScript, pName);
+                const customIdx = customPlugins.findIndex((p) => p && p.name === pName);
+                if (customIdx >= 0) {
+                    customPlugins[customIdx] = {
+                        ...customPlugins[customIdx],
+                        displayName: String(rawPlg.displayName || nextHeader.displayName || customPlugins[customIdx].displayName || pName),
+                        version: String(rawPlg.versionOfPlugin || nextHeader.version || customPlugins[customIdx].version || '0.0.0'),
+                        script: nextScript,
+                        header: nextHeader,
+                        updatedAt: Date.now(),
+                    };
+                    touchedCustom = true;
+                }
+                const prevPc = pcPlugins.get(pName);
+                if (prevPc || customIdx < 0) {
+                    pcPlugins.set(pName, {
+                        ...(prevPc || {}),
+                        name: pName,
+                        displayName: String(rawPlg.displayName || nextHeader.displayName || (prevPc && prevPc.displayName) || pName),
+                        version: String(rawPlg.versionOfPlugin || nextHeader.version || (prevPc && prevPc.version) || '0.0.0'),
+                        script: nextScript,
+                        header: nextHeader,
+                        pcRealArg: (rawPlg.realArg && typeof rawPlg.realArg === 'object') ? cloneJson(rawPlg.realArg) : ((prevPc && prevPc.pcRealArg) || {}),
+                        pcEnabled: rawPlg.enabled !== false,
+                        updatedAt: Date.now(),
+                    });
+                }
+            }
+            if (touchedCustom) saveCustomPluginsToDisk();
+        }
         if (isRpcConnected()) {
-            await hostRpc.invoke(method, [safePatch]);
+            const timeoutMs = (safePatch && Array.isArray(safePatch.plugins)) ? 60000 : 15000;
+            await hostRpc.invoke(method, [safePatch], timeoutMs);
         }
         return true;
     }
@@ -3136,7 +3190,31 @@ function createPluginAdapter({
             setDatabaseLite: (patch) => dbSetDatabase('db.setDatabaseLite', patch),
             setDatabase: (patch) => dbSetDatabase('db.setDatabase', patch),
             loadPlugins: async () => {
-                if (isRpcConnected()) await hostRpc.invoke('db.reloadPcPlugins', []);
+                if (isRpcConnected()) {
+                    await hostRpc.invoke('db.reloadPcPlugins', [], 8000).catch(() => {});
+                }
+                setTimeout(() => {
+                    reloadPlugins(pluginName).catch(() => {});
+                }, 25);
+                return true;
+            },
+            reloadPlugins: async () => {
+                if (isRpcConnected()) {
+                    await hostRpc.invoke('db.reloadPcPlugins', [], 8000).catch(() => {});
+                }
+                setTimeout(() => {
+                    reloadPlugins(pluginName).catch(() => {});
+                }, 25);
+                return true;
+            },
+            reload: async () => {
+                if (isRpcConnected()) {
+                    await hostRpc.invoke('db.reloadPcPlugins', [], 8000).catch(() => {});
+                }
+                setTimeout(() => {
+                    reloadPlugins(pluginName).catch(() => {});
+                }, 25);
+                return true;
             },
 
             onUnload: async (cb) => { addUnload(cb); },
@@ -3237,8 +3315,30 @@ function createPluginAdapter({
         pluginDoms.set(name, sharedMockDom);
         const { api, trackedUnloads } = makePluginApiFor(entry, record, sharedMockDom);
         const timers = new Set();
-        const { syncDoc } = sharedMockDom;
+        const { syncDoc, asyncDoc } = sharedMockDom;
         const sandboxCrypto = createSandboxCrypto();
+        const triggerSandboxReload = () => {
+            if (isRpcConnected()) {
+                void hostRpc.invoke('db.reloadPcPlugins', [], 8000).catch(() => {});
+            }
+            setTimeout(() => {
+                reloadPlugins(name).catch(() => {});
+            }, 25);
+            return true;
+        };
+        const mockLocation = {
+            href: 'https://risuai.local/',
+            origin: 'https://risuai.local',
+            protocol: 'https:',
+            host: 'risuai.local',
+            hostname: 'risuai.local',
+            pathname: '/',
+            search: '',
+            hash: '',
+            reload: triggerSandboxReload,
+            assign: () => {},
+            replace: () => {},
+        };
 
         const sandbox = {
             console: {
@@ -3306,9 +3406,16 @@ function createPluginAdapter({
             matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
             requestAnimationFrame: (fn) => sandbox.setTimeout(fn, 16),
             cancelAnimationFrame: (id) => sandbox.clearTimeout(id),
+            location: mockLocation,
         };
+        syncDoc.location = mockLocation;
+        syncDoc.defaultView = sandbox;
+        asyncDoc.location = mockLocation;
+        asyncDoc.defaultView = { location: mockLocation, reload: triggerSandboxReload };
         sandbox.window = sandbox;
         sandbox.self = sandbox;
+        sandbox.top = sandbox;
+        sandbox.parent = sandbox;
         sandbox.globalThis = sandbox;
 
         try {
@@ -3346,6 +3453,29 @@ function createPluginAdapter({
                 await unloadPlugin(entry.name);
             }
         }
+    }
+
+    async function reloadPlugins(targetName = '') {
+        if (isRpcConnected()) {
+            await syncPcPlugins().catch(() => {});
+        }
+        const t = String(targetName || '').trim();
+        if (t) {
+            const entry = getPluginEntry(t);
+            if (entry) {
+                if (isPluginEnabled(t)) await loadPlugin(t);
+                else if (activeHosts.has(t)) await unloadPlugin(t);
+            }
+            return listPlugins();
+        }
+        for (const entry of getAllKnownEntries()) {
+            if (isPluginEnabled(entry.name)) {
+                await loadPlugin(entry.name);
+            } else if (activeHosts.has(entry.name)) {
+                await unloadPlugin(entry.name);
+            }
+        }
+        return listPlugins();
     }
 
     const PLUGIN_SCRIPT_CHUNK_CHARS = 1500000;
@@ -4121,7 +4251,13 @@ function createPluginAdapter({
         if (method === 'db.setDatabaseLite') return dbSetDatabase('db.setDatabaseLite', a[0]);
         if (method === 'db.setDatabase') return dbSetDatabase('db.setDatabase', a[0]);
         if (method === 'db.reloadPcPlugins') {
-            if (isRpcConnected()) await hostRpc.invoke('db.reloadPcPlugins', []);
+            const target = (a && a[0]) ? String(a[0]) : pluginName;
+            if (isRpcConnected()) {
+                await hostRpc.invoke('db.reloadPcPlugins', [], 8000).catch(() => {});
+            }
+            setTimeout(() => {
+                reloadPlugins(target).catch(() => {});
+            }, 25);
             return true;
         }
         if (method === 'asset.readImage') {
@@ -4190,6 +4326,7 @@ function createPluginAdapter({
     return {
         listPlugins,
         syncPcPlugins,
+        reloadPlugins,
         addCustomPlugin,
         removePlugin,
         togglePlugin,
