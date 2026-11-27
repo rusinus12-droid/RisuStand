@@ -2431,32 +2431,38 @@ function computePrefixDiff(prevTurn, currTurn, options = {}) {
     const cSeg = currSegs[diffSegIdx];
     const prevSnippet = cgSnippetAround(pSeg ? pSeg.text : '', diffOffset);
     const currSnippet = cgSnippetAround(cSeg ? cSeg.text : '', diffOffset);
-    const afterBreakpoint = Boolean(currTurn.lastCacheBreakpointSegIdx >= 0 && diffSegIdx > currTurn.lastCacheBreakpointSegIdx);
+    const afterBreakpoint = Boolean(
+        (currTurn.lastCacheBreakpointSegIdx >= 0 && diffSegIdx > currTurn.lastCacheBreakpointSegIdx) ||
+        (prevTurn.lastCacheBreakpointSegIdx >= 0 && diffSegIdx > prevTurn.lastCacheBreakpointSegIdx)
+    );
     const isMultiBlockTailShift = () => {
         if (diffSegIdx <= 0 || !pSeg || pSeg.kind === 'system') return false;
         if (currSegs.length <= prevSegs.length) return false;
         const prevTail = prevSegs.slice(diffSegIdx);
-        if (!prevTail.length || prevTail.length > 6) return false;
-        const currTail = currSegs.slice(currSegs.length - prevTail.length);
-        let sawSysTail = false;
-        let shiftedChatCount = 0;
-        const insertedSlice = currSegs.slice(diffSegIdx, currSegs.length - prevTail.length + 1);
-        for (let j = 0; j < prevTail.length; j++) {
-            const pt = prevTail[j];
-            const ct = currTail[j];
-            if (!ct) return false;
-            if (pt.kind === 'sys_tail') {
-                if (ct.kind !== 'sys_tail' || pt.role !== ct.role || pt.exactHash !== ct.exactHash) return false;
-                sawSysTail = true;
-            } else if (pt.kind === 'chat' && pt.role === 'user') {
-                shiftedChatCount += 1;
-                if (shiftedChatCount > 1) return false;
-                if (!insertedSlice.some((s) => s && s.role === 'user' && s.exactHash === pt.exactHash)) return false;
-            } else {
+        if (!prevTail.length || prevTail.length > 12) return false;
+        // Any assistant turn at/after diffSegIdx means an already-committed history block changed
+        if (prevTail.some((s) => !s || s.role === 'assistant')) return false;
+        const prevSysTails = prevTail.filter((s) => s.kind === 'sys_tail');
+        if (!prevSysTails.length) return false;
+
+        const currTail = currSegs.slice(diffSegIdx);
+        // Any Author's Note / static tail note present before must remain hash-identical
+        for (const pt of prevSysTails) {
+            if (/^\[(?:Author's Note|LEAVE AUTHOR'S NOTE)\]/i.test(String(pt.text || ''))) {
+                if (!currTail.some((ct) => ct && ct.kind === 'sys_tail' && ct.role === pt.role && ct.exactHash === pt.exactHash)) {
+                    return false;
+                }
+            }
+        }
+        // Any real user turn in prevTail (excluding synthetic plugin heads like HAYAKU scene head) must shift forward intact
+        const realPrevUsers = prevTail.filter((s) => s.role === 'user' && !/^\s*\[HAYAKU\b/i.test(String(s.text || '')));
+        for (const pu of realPrevUsers) {
+            if (!currTail.some((ct) => ct && ct.role === 'user' && ct.exactHash === pu.exactHash)) {
                 return false;
             }
         }
-        return sawSysTail;
+        // Current request must still terminate with a post-history sys_tail (e.g. Leave Final / Jailbreak / Reminder)
+        return currTail.some((ct) => ct && ct.kind === 'sys_tail');
     };
     const tailShiftOnly = Boolean(
         (diffSegIdx === prevSegs.length - 1 &&
@@ -4643,6 +4649,8 @@ function evaluateLorebookEntries({
             const evaluated = cleanPresetPromptText(evalPresetCbs(dec.content, cbsCtx));
             if (!evaluated) continue;
 
+            const isDynamicMacroContent = /\{\{(?:getvar|getchatvar|chat_index|lastmessageid|previous_chat_log|time|date|idle_duration|random|roll|position|#when|#if)\b/i.test(String(dec.content || ''));
+            const isStaticAlwaysActive = Boolean((raw.alwaysActive || item.pinned) && !isDynamicMacroContent);
             const formatted = raw.comment ? `[${raw.comment}]\n${evaluated}` : evaluated;
             activeMap.set(item.idx, {
                 idx: item.idx,
@@ -4651,6 +4659,7 @@ function evaluateLorebookEntries({
                 pos: dec.pos,
                 depth: dec.depth,
                 role: dec.role,
+                isStaticAlwaysActive,
                 content: formatted,
                 rawEvaluated: evaluated,
             });
@@ -4791,9 +4800,9 @@ function reconcileLeaveHayakuFooterContract(messages) {
         if (!/<\/?statusdata>/i.test(content)) return m;
         let next = content
             .replace(/IMMEDIATELY BEFORE <\/statusdata>\.\s*FINAL CONTENT MUST END WITH:\s*<\/statusdata>/gi,
-                'AFTER </statusdata> and any character-card status line (at the very bottom of the response)')
+                'Place the entire HAYAKU packet AFTER </statusdata> and any character-card status line (at the very bottom of the response).')
             .replace(/(?:place|emit|output|put|append)\b[^.\n]*?\binside\s*<statusdata>[^.\n]*?<\/statusdata>/gi,
-                'append the HAYAKU state packet at the very bottom AFTER </statusdata> and any character-card status line');
+                'Place the entire HAYAKU packet AFTER </statusdata> and any character-card status line (at the very bottom of the response).');
         if (next === content) {
             next = content.replace(/FINAL CONTENT MUST END WITH:\s*<\/statusdata>/gi,
                 'FINAL CONTENT MUST END WITH THE HAYAKU PACKET AFTER </statusdata> AND ANY STATUS LINE');
@@ -4814,6 +4823,62 @@ function stripAuxBlocksFromProse(text) {
         .replace(/^\s*\[[☀️🌤️⛅🌥️🌦️🌧️⛈️🌩️❄️🌫️🌙✨][^\n]*\]\s*$/gm, '')
         .replace(/\n{3,}/g, '\n\n')
         .trim();
+}
+
+function dedupeTrailingStatusLines(text) {
+    const src = String(text ?? '');
+    if (!src) return src;
+    const isCardStatusLine = (trimmed) => (
+        /^\[(?:☀️|🌤️|⛅|🌥️|🌦️|🌧️|⛈️|🌩️|❄️|🌫️|🌙|✨)[^\n]*\]$/.test(trimmed) ||
+        /^\[[^\]\n]+\|[^\]\n]+\|[^\]\n]+\]$/.test(trimmed) ||
+        /^◈CG\b[^\n]*$/.test(trimmed)
+    );
+
+    const hayakuMatch = src.match(/\n*\s*(?:<!--\s*)?HAYAKU_STATE_PACKET_START(?:\s*-->)?[\s\S]*$/);
+    const body = hayakuMatch ? src.slice(0, hayakuMatch.index) : src;
+    const hayakuTail = hayakuMatch ? hayakuMatch[0] : '';
+
+    const lastCloseIdx = body.toLowerCase().lastIndexOf('</statusdata>');
+    const lines = body.split('\n');
+    let footerStartLine = lines.length;
+    if (lastCloseIdx >= 0) {
+        const upToClose = body.slice(0, lastCloseIdx + '</statusdata>'.length);
+        footerStartLine = upToClose.split('\n').length;
+    } else {
+        // Scan backwards over blank lines and trailing status lines
+        let i = lines.length - 1;
+        while (i >= 0) {
+            const tr = lines[i].trim();
+            if (!tr || isCardStatusLine(tr)) {
+                footerStartLine = i;
+                i -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+    if (footerStartLine >= lines.length) return src;
+
+    const headLines = lines.slice(0, footerStartLine);
+    const tailLines = lines.slice(footerStartLine);
+    const seenStatus = new Set();
+    const cleanedTail = [];
+    for (const line of tailLines) {
+        const tr = line.trim();
+        if (lastCloseIdx >= 0 && /^<\/statusdata>$/i.test(tr)) continue;
+        if (isCardStatusLine(tr)) {
+            if (seenStatus.has(tr)) continue;
+            seenStatus.add(tr);
+            cleanedTail.push(tr);
+            continue;
+        }
+        cleanedTail.push(line);
+    }
+    const mergedTail = cleanedTail.join('\n').replace(/^\s+/, '').replace(/\s+$/, '');
+    const mergedHead = headLines.join('\n').replace(/\s+$/, '');
+    const combinedBody = mergedTail ? (mergedHead ? `${mergedHead}\n\n${mergedTail}` : mergedTail) : mergedHead;
+    if (!hayakuTail) return combinedBody;
+    return `${combinedBody}\n\n${hayakuTail.replace(/^\s+/, '')}`;
 }
 
 function extractTerminalSceneTail(historyMessages, maxChars = 2400) {
@@ -4854,49 +4919,68 @@ function auditDraftWithDeterministicGuards(draftText, { prevAssistantText = '', 
         }
     }
 
-    // 2) RP Persona impersonation check
+    // 2) RP Persona impersonation check (KO / EN / JP)
     if (isRpMode) {
         const cleanPersona = String(personaName || '').trim();
         const userNorm = norm(userText);
-        const thirdPersonRe = /(?:^|[\s.!?…"”'’])(?:그가|그녀가)\s+[가-힣]{1,12}(?:을|를|에|에서|에게|로|으로)?\s*(?:들었|받았|받아\s*들|주워\s*들|말했|웃었|고개를|일어섰|걸어|내밀|바라보|움직|대답|물었)/;
+        const thirdPersonPatterns = [
+            /(?:^|[\s.!?…"”'’])(?:그가|그녀가)\s+[가-힣]{1,12}(?:을|를|에|에서|에게|로|으로)?\s*(?:들었|받았|받아\s*들|주워\s*들|말했|웃었|고개를|일어섰|걸어|내밀|바라보|움직|대답|물었)/,
+            /(?:^|[.!?…"”'’\n]\s*)(?:he|she)\s+(?:took|picked\s+up|replied|nodded|grabbed|smiled|stood\s+up|walked\s+over|handed|reached\s+out|answered)\b/i,
+            /(?:^|[。！？「」『』\n\s])(?:彼|彼女)(?:は|が)[^。！？\n]{0,16}(?:受け取|拾い上げ|拾っ|拾い|言っ|言い|笑っ|笑い|頷い|立ち上が|歩き出|手を伸ば|握っ|握り)/,
+        ];
         let impersonated = false;
         if (cleanPersona && cleanPersona.length >= 2 && !/^user$/i.test(cleanPersona)) {
             const escaped = cleanPersona.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            const subjRe = new RegExp(`${escaped}(?:은|는|이|가)\\s+[^.!?\\n]{2,32}(?:했다|말했다|물었다|받았다|들었다|웃었다|움직였다|대답했다)`);
-            const mSub = visibleDraft.match(subjRe);
-            if (mSub && !userNorm.includes(norm(mSub[0]).slice(0, 14))) {
-                impersonated = true;
+            const personaPatterns = [
+                new RegExp(`${escaped}(?:은|는|이|가)\\s+[^.!?\\n]{2,32}(?:했다|말했다|물었다|받았다|들었다|웃었다|움직였다|대답했다)`),
+                new RegExp(`\\b${escaped}\\s+(?:said|asked|replied|took|picked\\s+up|grabbed|smiled|nodded|turned|stood\\s+up|walked|reached|answered)\\b`, 'i'),
+                new RegExp(`${escaped}(?:は|が)[^。！？\\n]{0,20}(?:言った|聞いた|答えた|受け取った|拾った|笑った|頷いた|立ち上がった|歩いた|掴んだ)`),
+            ];
+            for (const pRe of personaPatterns) {
+                const mSub = visibleDraft.match(pRe);
+                if (mSub && !userNorm.toLowerCase().includes(norm(mSub[0]).slice(0, 14).toLowerCase())) {
+                    impersonated = true;
+                    break;
+                }
             }
         }
-        if (!impersonated && thirdPersonRe.test(visibleDraft)) {
-            const m3 = visibleDraft.match(thirdPersonRe);
-            if (m3 && !userNorm.includes(norm(m3[0]))) {
-                impersonated = true;
+        if (!impersonated) {
+            for (const tpRe of thirdPersonPatterns) {
+                const m3 = visibleDraft.match(tpRe);
+                if (m3 && !userNorm.toLowerCase().includes(norm(m3[0]).toLowerCase())) {
+                    impersonated = true;
+                    break;
+                }
             }
         }
         if (impersonated) {
             issues.push({
                 code: 'rp_impersonation',
-                message: 'RP agency violation detected (inventing {{user}} actions/dialogue or acting as "그가/그녀가"). Delete every invented {{user}} beat and stop cleanly at the NPC/world reaction.',
+                message: 'RP agency violation detected (inventing {{user}} actions/dialogue or third-person proxying via 그가/그녀가 / he/she / 彼/彼女). Delete every invented {{user}} beat and stop cleanly at the NPC/world reaction.',
             });
         }
     }
 
-    // 3) Crutch adverb ("아주 + 부사") overuse check
-    const crutchMatches = visibleDraft.match(/아주\s*(?:천천히|짧게|낮게|미세하게|조용하게|조용히|느리게|얇게|가볍게|살짝|잠시)/g) || [];
+    // 3) Crutch adverb overuse check (KO / EN / JP)
+    const crutchMatches = [
+        ...(visibleDraft.match(/아주\s*(?:천천히|짧게|낮게|미세하게|조용하게|조용히|느리게|얇게|가볍게|살짝|잠시|작게|조금|살며시|조심스럽게|은근히)/g) || []),
+        ...(visibleDraft.match(/\b(?:very|ever\s+so|almost|barely|faintly|slightly)\s+(?:slowly|quietly|softly|slightly|gently|briefly|lowly|faintly)\b/gi) || []),
+        ...(visibleDraft.match(/(?:とても|ごく|ほんの|かすかに|すごく)\s*(?:ゆっくり|小さく|わずかに|静かに|低く|薄く|少し|軽く|短く)/g) || []),
+    ];
     if (crutchMatches.length >= 3) {
         issues.push({
             code: 'crutch_adverb_overuse',
-            message: `Repetitive crutch adverbs detected (${crutchMatches.length}× "아주 + 부사"). Keep at most 1 and replace the rest with concrete physical timing or motion.`,
+            message: `Repetitive crutch intensifier adverbs detected (${crutchMatches.length} matches). Keep at most 1 per scene and replace the rest with concrete physical timing or motion.`,
         });
     }
 
-    // 4) User-quote echo in opening
-    const userQuoteMatch = String(userText || '').match(/["“']([^"”']{6,40})["”']/);
-    if (userQuoteMatch) {
-        const quoted = norm(userQuoteMatch[1]);
+    // 4) User-quote echo in opening (Latin ""/“”/'' and CJK 「」/『』)
+    const userQuoteMatch = String(userText || '').match(/(?:["“']([^"”']{6,40})["”']|[「『]([^」』]{4,40})[」』])/);
+    const quotedRaw = userQuoteMatch ? (userQuoteMatch[1] || userQuoteMatch[2] || '') : '';
+    if (quotedRaw) {
+        const quoted = norm(quotedRaw);
         const head = norm(visibleDraft.slice(0, 240));
-        if (quoted && (head.includes(`"${quoted}"`) || head.includes(`“${quoted}”`) || head.includes(quoted))) {
+        if (quoted && (head.includes(`"${quoted}"`) || head.includes(`“${quoted}”`) || head.includes(`「${quoted}」`) || head.includes(`『${quoted}』`) || head.includes(quoted))) {
             issues.push({
                 code: 'user_quote_echo',
                 message: `Echo-loop detected: opening repeats user phrase "${quoted}". Open directly with the NPC's own voice or physical reaction.`,
@@ -4934,7 +5018,7 @@ function buildTwoPassDraftMessages({ builtMessages, historyMessages, terminalTai
         `[TWO-PASS DRAFT ENGINE — PASS 1 (IN-WORLD SCENE DRAFT)]`,
         `- You are writing a clean Pass 1 scene draft for "${safeChar}"${personaName ? ` (User persona: ${personaName})` : ''}.`,
         isRpMode
-            ? '- RP AGENCY LOCK: {{user}} performs ONLY what their latest input explicitly states. Never invent unstated {{user}} dialogue, actions, feelings, or third-person "그가/그녀가" follow-ups.'
+            ? '- RP AGENCY LOCK: {{user}} performs ONLY what their latest input explicitly states. Never invent unstated {{user}} dialogue, actions, feelings, or third-person proxying ("그가/그녀가" / "he/she" / "彼/彼女").'
             : '- NOVEL MODE: Advance the full cast naturally while honoring author reservations.',
         '- TERMINAL-FIRST CONTINUITY: Continue seamlessly from the immediately preceding scene tail without replaying earlier turns or adding sudden contrived interruptions.',
         '- PROSE ONLY: Output ONLY the raw in-world prose draft. Omit <thinking>, <statusdata>, character-card status lines, and trailing memory packets (Pass 2 will polish and append footers).',
@@ -4970,7 +5054,7 @@ function appendTwoPassPolishDirective(finalMsgs, { draftText = '', terminalTail 
         : 'NONE — Candidate passed all structural checks. Elevate prose cadence, sensory specificity, and strict closing footer order.';
     const directive = [
         '[TWO-PASS EDITORIAL POLISH — PASS 2 FINISHING]',
-        'Below is a Pass 1 candidate draft produced against the Terminal-First lock. Treat it as your raw material: preserve forward plot progress while fixing every listed guard issue, sharpening character voices, cutting crutch adverbs ("아주 천천히/짧게/낮게" max 1), balancing sentence rhythm, and appending all required closing blocks in exact order (Prose -> <statusdata> -> Card Status Line -> External Memory Packet).',
+        'Below is a Pass 1 candidate draft produced against the Terminal-First lock. Treat it as your raw material: preserve forward plot progress while fixing every listed guard issue, sharpening character voices, cutting crutch intensifier adverbs (e.g., "아주 천천히", "very slowly", "とてもゆっくり" max 1), balancing sentence rhythm, and appending all required closing blocks in exact order (Prose -> <statusdata> -> Card Status Line -> External Memory Packet).',
         terminalTail ? `\n<terminal_scene_tail_anchor>\n${terminalTail.slice(-1200)}\n</terminal_scene_tail_anchor>` : '',
         `\n<deterministic_guard_audit>\n${auditBlock}\n</deterministic_guard_audit>`,
         `\n<pass1_candidate_draft>\n${String(draftText || '').slice(0, 9000)}\n</pass1_candidate_draft>`,
@@ -5199,6 +5283,21 @@ function buildDirectPromptMessages({
 
     const resolveItemRole = (item, fallback = 'system') => mapRole((item && (item.role || item.role2)) || fallback);
 
+    const firstChatIdx = preset.promptTemplate.findIndex((it) => it && it.type === 'chat');
+    const firstLoreIdx = preset.promptTemplate.findIndex((it) => it && it.type === 'lorebook');
+    const hasCacheBlock = preset.promptTemplate.some((it) => it && it.type === 'cache');
+    const splitStaticLoreForCache = hasCacheBlock && firstChatIdx >= 0 && firstLoreIdx > firstChatIdx;
+    const staticNormalLoreItems = splitStaticLoreForCache
+        ? loreBuckets.normal.filter((x) => x && x.isStaticAlwaysActive)
+        : [];
+    const dynamicNormalLoreItems = splitStaticLoreForCache
+        ? loreBuckets.normal.filter((x) => !x || !x.isStaticAlwaysActive)
+        : loreBuckets.normal;
+    const staticNormalLoreText = staticNormalLoreItems.map((x) => x.content).filter(Boolean).join('\n\n');
+    const dynamicNormalLoreText = dynamicNormalLoreItems.map((x) => x.content).filter(Boolean).join('\n\n');
+    const loreTemplateItem = firstLoreIdx >= 0 ? preset.promptTemplate[firstLoreIdx] : null;
+    let emittedStaticLore = false;
+
     const msgs = [];
     let sawChatBlock = false;
     let emittedPostEverything = false;
@@ -5240,11 +5339,21 @@ function buildDirectPromptMessages({
         if (type === 'description') {
             const body = applyInnerFormat(item, buildDescText());
             if (body) msgs.push({ role: resolveItemRole(item), content: body });
+            if (splitStaticLoreForCache && staticNormalLoreText && !emittedStaticLore) {
+                const staticLoreBody = applyInnerFormat(loreTemplateItem, cleanPresetPromptText(`[Static World Lorebook]\n${staticNormalLoreText}`));
+                if (staticLoreBody) {
+                    msgs.push({ role: resolveItemRole(loreTemplateItem || item), content: staticLoreBody });
+                }
+                emittedStaticLore = true;
+            }
             continue;
         }
         if (type === 'lorebook') {
-            if (normalLoreText) {
-                const body = applyInnerFormat(item, cleanPresetPromptText(`[World / Module Lorebook]\n${normalLoreText}`));
+            const loreContent = splitStaticLoreForCache
+                ? (emittedStaticLore ? dynamicNormalLoreText : normalLoreText)
+                : normalLoreText;
+            if (loreContent) {
+                const body = applyInnerFormat(item, cleanPresetPromptText(`[World / Module Lorebook]\n${loreContent}`));
                 if (body) msgs.push({ role: resolveItemRole(item), content: body });
             }
             continue;
@@ -5568,6 +5677,7 @@ async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = st
         if (adapter) {
             finalReply = await adapter.runAfterRequest(finalReply, 'model');
         }
+        finalReply = dedupeTrailingStatusLines(finalReply);
 
         if (adapter) {
             const tCtxPre = adapter.getTurnContext();
@@ -5698,6 +5808,7 @@ async function runDirectRemoteReroll(charIndex, chatIndex, msgIndex, snapView = 
         if (adapter) {
             finalReply = await adapter.runAfterRequest(finalReply, 'model');
         }
+        finalReply = dedupeTrailingStatusLines(finalReply);
 
         if (adapter) {
             const tCtxPre = adapter.getTurnContext();
@@ -14726,6 +14837,7 @@ module.exports = {
     selectCacheFriendlyHistory,
     detectLeaveModelAdapterCode,
     reconcileLeaveHayakuFooterContract,
+    dedupeTrailingStatusLines,
     extractTerminalSceneTail,
     auditDraftWithDeterministicGuards,
     buildDirectPromptMessages,

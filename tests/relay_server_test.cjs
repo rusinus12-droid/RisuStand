@@ -2340,9 +2340,12 @@ test('CBS negative-number comparisons, keywords, and Leave Preset r1.1 AIDE/enco
 
     // Upgraded bundled Leave preset checks
     const leave = relay.loadBundledLeavePreset();
-    assert.equal(leave.temperature, 0.85);
-    assert.equal(leave.maxResponse, 16384);
+    assert.equal(leave.temperature, 0.8);
+    assert.equal(leave.maxResponse, 8192);
     assert.ok(leave.defaultVariables.includes('toggle_pipeline_mode=1'));
+    assert.ok(leave.defaultVariables.includes('toggle_sub_body_state=1'));
+    assert.ok(leave.defaultVariables.includes('toggle_sub_relationship_sim=1'));
+    assert.ok(leave.defaultVariables.includes('toggle_sub_world_dynamics=1'));
 
     const msgsWithBiancaConflict = relay.buildDirectPromptMessages({
         preset: leave,
@@ -2364,6 +2367,35 @@ test('CBS negative-number comparisons, keywords, and Leave Preset r1.1 AIDE/enco
     assert.ok(combinedBianca.includes('STRICT ORDER: Prose -> Step 2'));
     assert.ok(msgsWithBiancaConflict.some((m) => m._cachePoint === true), 'Leave cache template entries must tag _cachePoint');
     assert.ok(!/\{\{#if|\{\{getglobalvar|\{\{\/if\}\}/.test(combinedBianca));
+
+    // EN & JP localized Leave AIDE checks (zero Korean leakage in AIDE blocks)
+    const msgsEn = relay.buildDirectPromptMessages({
+        preset: leave,
+        snap: { charName: 'Alice', charContext: { name: 'Alice', desc: 'Room.' } },
+        historyMessages: [{ index: 0, role: 'user', raw: 'Hi' }],
+        userText: 'Go',
+        remoteToggleValues: { toggle_output_lang: '1' },
+    });
+    const bodyEn = msgsEn.slice(0, -1).map((m) => m.content).join('\n');
+    assert.ok(!/[가-힣]/.test(bodyEn), 'English Leave AIDE blocks must not leak Korean Hangul');
+    assert.ok(bodyEn.includes('FAIL (impersonation): "When the guard handed over the folder'));
+    assert.ok(bodyEn.includes('FAIL (echo-loop): User: "Still don\'t feel it?"'));
+    assert.ok(bodyEn.includes('FAIL (crutch chop): "She very slowly looked up.'));
+    assert.ok(!/\{\{#if|\{\{getglobalvar|\{\{\/if\}\}/.test(msgsEn.map((m) => m.content).join('\n')));
+
+    const msgsJp = relay.buildDirectPromptMessages({
+        preset: leave,
+        snap: { charName: 'Alice', charContext: { name: 'Alice', desc: 'Room.' } },
+        historyMessages: [{ index: 0, role: 'user', raw: 'Hi' }],
+        userText: 'Go',
+        remoteToggleValues: { toggle_output_lang: '2' },
+    });
+    const bodyJp = msgsJp.slice(0, -1).map((m) => m.content).join('\n');
+    assert.ok(!/[가-힣]/.test(bodyJp), 'Japanese Leave AIDE blocks must not leak Korean Hangul');
+    assert.ok(bodyJp.includes('FAIL (impersonation): 「警備員が書類を差し出すと'));
+    assert.ok(bodyJp.includes('FAIL (echo-loop): User: 「まだ実感わかない？」'));
+    assert.ok(bodyJp.includes('FAIL (crutch chop): 「彼女はとてもゆっくり顔を上げた。'));
+    assert.ok(!/\{\{#if|\{\{getglobalvar|\{\{\/if\}\}/.test(msgsJp.map((m) => m.content).join('\n')));
 });
 
 test('selectCacheFriendlyHistory preserves prefix across 5 turns & reconcileLeaveHayakuFooterContract fixes </statusdata>', () => {
@@ -2380,18 +2412,181 @@ test('selectCacheFriendlyHistory preserves prefix across 5 turns & reconcileLeav
     assert.equal(relay.selectCacheFriendlyHistory(makeMsgs(40), { mode: 'sliding_30' })[0].index, 10);
     assert.equal(relay.selectCacheFriendlyHistory(makeMsgs(34), { mode: 'sliding_30' })[0].index, 4);
 
-    // Footer conflict reconciliation
+    // Footer conflict reconciliation & duplicate status-line cleanup
     const conflicting = [
         { role: 'system', content: '[LEAVE FINAL EXECUTION CHECK]\n- STEP 3 — CHARACTER-CARD STATUS LINE\n<statusdata>\n• 현장: A\n</statusdata>' },
         { role: 'system', content: '[HAYAKU SIDE-WRITE FINAL REMINDER]\nWrap raw JSON between <!-- HAYAKU_STATE_PACKET_START --> and <!-- HAYAKU_STATE_PACKET_END --> IMMEDIATELY BEFORE </statusdata>. FINAL CONTENT MUST END WITH: </statusdata>', _cachePoint: true },
     ];
     const reconciled = relay.reconcileLeaveHayakuFooterContract(conflicting);
-    assert.ok(reconciled[1].content.includes('AFTER </statusdata> and any character-card status line'));
+    assert.ok(reconciled[1].content.includes('Place the entire HAYAKU packet AFTER </statusdata> and any character-card status line'));
     assert.ok(!reconciled[1].content.includes('IMMEDIATELY BEFORE </statusdata>. FINAL CONTENT MUST END WITH: </statusdata>'));
     assert.equal(reconciled[1]._cachePoint, true);
 
     const nonLeave = [{ role: 'system', content: 'Plain prompt' }, conflicting[1]];
     assert.equal(relay.reconcileLeaveHayakuFooterContract(nonLeave)[1].content, conflicting[1].content);
+
+    // Multi-plugin tail shift (Leave + Lorebook + HAYAKU head [user] + Flashback + Leave Final + HAYAKU Reminder) & TTL miss
+    const baseIntroMsgs = [
+        { role: 'system', content: '[LEAVE ENGINE] System contract' },
+        { role: 'system', content: '[Static World Lorebook]\nCampus Guide V1' },
+        { role: 'user', content: 'Intro user greeting message long enough for lane sig.' },
+        { role: 'assistant', content: 'Intro assistant reply message long enough for lane sig.' },
+    ];
+    const multiTailLogs = [
+        // Turn 4 (newest): static lore mutated -> broken!
+        {
+            id: 'mt-4', source: 'direct_chat', ok: true, status: 200, model: 'deepseek-v4.1-flash:1017-cloud',
+            remotePrompt: true, narrativeScopeKey: '0:0', charName: 'Cheongwon',
+            usage: { prompt_tokens: 49000, cached_tokens: 1000, completion_tokens: 500, cache_reported: true },
+            messages: [
+                { role: 'system', content: '[LEAVE ENGINE] System contract' },
+                { role: 'system', content: '[Static World Lorebook]\nMUTATED_STATIC_GUIDE' },
+                { role: 'user', content: 'Intro user greeting message long enough for lane sig.' },
+                { role: 'assistant', content: 'Intro assistant reply message long enough for lane sig.' },
+                { role: 'user', content: 'U1 first turn content here.' }, { role: 'assistant', content: 'A1 first assistant reply.' },
+                { role: 'user', content: 'U2 second turn content here.' }, { role: 'assistant', content: 'A2 second assistant reply.' },
+                { role: 'user', content: 'U3 third turn content here.' }, { role: 'assistant', content: 'A3 third assistant reply.' },
+                { role: 'user', content: 'U4 fourth turn content here.' },
+                { role: 'system', content: '[LEAVE FINAL EXECUTION CHECK]\nDone' },
+            ],
+        },
+        // Turn 3: intact prefix + +2 turn growth, but server reported cached_tokens=0 (TTL expired)
+        {
+            id: 'mt-3', source: 'direct_chat', ok: true, status: 200, model: 'deepseek-v4.1-flash:1017-cloud',
+            remotePrompt: true, narrativeScopeKey: '0:0', charName: 'Cheongwon',
+            usage: { prompt_tokens: 47261, cached_tokens: 0, completion_tokens: 500, cache_reported: true },
+            messages: [
+                ...baseIntroMsgs,
+                { role: 'user', content: 'U1 first turn content here.' }, { role: 'assistant', content: 'A1 first assistant reply.' },
+                { role: 'user', content: 'U2 second turn content here.' }, { role: 'assistant', content: 'A2 second assistant reply.' },
+                { role: 'system', content: '[World / Module Lorebook]\nDYNAMIC_SCENE_LORE_T3' },
+                { role: 'user', content: '[HAYAKU 활성 장면 헤드]\nScene T3' },
+                { role: 'system', content: '[ACTIVE CONTINUITY EVIDENCE]\nEvidence T3' },
+                { role: 'user', content: 'U3 third turn content here.' },
+                { role: 'system', content: '[♥️ 호감도]\n-160' },
+                { role: 'system', content: '[LEAVE FINAL EXECUTION CHECK]\nDone' },
+                { role: 'system', content: '[HAYAKU SIDE-WRITE FINAL REMINDER]\nPacket' },
+            ],
+        },
+        // Turn 2: intact prefix + +2 turn growth + multi-plugin tail shifted -> cacheBroken MUST be false!
+        {
+            id: 'mt-2', source: 'direct_chat', ok: true, status: 200, model: 'deepseek-v4.1-flash:1017-cloud',
+            remotePrompt: true, narrativeScopeKey: '0:0', charName: 'Cheongwon',
+            usage: { prompt_tokens: 45754, cached_tokens: 29184, completion_tokens: 500, cache_reported: true },
+            messages: [
+                ...baseIntroMsgs,
+                { role: 'user', content: 'U1 first turn content here.' }, { role: 'assistant', content: 'A1 first assistant reply.' },
+                { role: 'system', content: '[World / Module Lorebook]\nDYNAMIC_SCENE_LORE_T2' },
+                { role: 'user', content: '[HAYAKU 활성 장면 헤드]\nScene T2' },
+                { role: 'system', content: '[ACTIVE CONTINUITY EVIDENCE]\nEvidence T2' },
+                { role: 'user', content: 'U2 second turn content here.' },
+                { role: 'system', content: '[♥️ 호감도]\n-150' },
+                { role: 'system', content: '[LEAVE FINAL EXECUTION CHECK]\nDone' },
+                { role: 'system', content: '[HAYAKU SIDE-WRITE FINAL REMINDER]\nPacket' },
+            ],
+        },
+        // Turn 1: baseline
+        {
+            id: 'mt-1', source: 'direct_chat', ok: true, status: 200, model: 'deepseek-v4.1-flash:1017-cloud',
+            remotePrompt: true, narrativeScopeKey: '0:0', charName: 'Cheongwon',
+            usage: { prompt_tokens: 39738, cached_tokens: 0, completion_tokens: 500, cache_reported: true },
+            messages: [
+                ...baseIntroMsgs,
+                { role: 'system', content: '[World / Module Lorebook]\nDYNAMIC_SCENE_LORE_T1' },
+                { role: 'user', content: '[HAYAKU 활성 장면 헤드]\nScene T1' },
+                { role: 'system', content: '[ACTIVE CONTINUITY EVIDENCE]\nEvidence T1' },
+                { role: 'user', content: 'U1 first turn content here.' },
+                { role: 'system', content: '[♥️ 호감도]\n-145' },
+                { role: 'system', content: '[LEAVE FINAL EXECUTION CHECK]\nDone' },
+                { role: 'system', content: '[HAYAKU SIDE-WRITE FINAL REMINDER]\nPacket' },
+            ],
+        },
+    ];
+    relay.recomputeRequestLogsCacheGuard(multiTailLogs);
+    const [mt4, mt3, mt2, mt1] = multiTailLogs;
+    assert.equal(mt1.cacheGuard.verdict, 'baseline');
+    assert.equal(mt2.cacheGuard.cacheBroken, false, 'Normal multi-plugin tail shift must NOT falsely flag lorebook_removed');
+    assert.equal(mt2.cacheGuard.causeCode, 'tail_post_history_shift');
+    assert.equal(mt2.cacheGuard.verdict, 'ok');
+    assert.equal(mt3.cacheGuard.cacheBroken, true);
+    assert.equal(mt3.cacheGuard.causeCode, 'server_cache_miss', 'Zero cached_tokens on intact multi-plugin turn shift should report TTL/server_cache_miss');
+    assert.equal(mt4.cacheGuard.cacheBroken, true, 'Mutating static lore prefix must still be caught');
+    assert.notEqual(mt4.cacheGuard.causeCode, 'tail_post_history_shift');
+
+    const dupFooter = [
+        '본문 서사입니다.',
+        '',
+        '<statusdata>',
+        '📖 Leave HUD · 2025.03.04 PM 01:32 · 뒷산',
+        '• 현장: 시은',
+        '</statusdata>',
+        '',
+        '[☀️][7°C][2025.03.04][PM 01:32][뒷산][접촉]',
+        '',
+        ' ',
+        '[☀️][7°C][2025.03.04][PM 01:32][뒷산][접촉]',
+        '',
+        'HAYAKU_STATE_PACKET_START',
+        '{"ok":true}',
+        'HAYAKU_STATE_PACKET_END',
+    ].join('\n');
+    const deduped = relay.dedupeTrailingStatusLines(dupFooter);
+    assert.equal(deduped.match(/\[☀️\]\[7°C\]\[2025\.03\.04\]\[PM 01:32\]\[뒷산\]\[접촉\]/g).length, 1);
+    assert.ok(deduped.includes('<statusdata>\n📖 Leave HUD'));
+    assert.ok(deduped.includes('HAYAKU_STATE_PACKET_START'));
+
+    const auditExpandedCrutch = relay.auditDraftWithDeterministicGuards(
+        '손가락이 아주 작게 움직였고 아주 얇게 배어 나오더니 아주 조금 흔들렸다.',
+        { isRpMode: false }
+    );
+    assert.ok(auditExpandedCrutch.issues.some((i) => i.code === 'crutch_adverb_overuse'));
+
+    const auditEn = relay.auditDraftWithDeterministicGuards(
+        'She said "Still don\'t feel it?" and nodded. Jin smiled as she very slowly, faintly slightly, ever so quietly stepped back.',
+        { userText: '"Still don\'t feel it?" Jin asked.', personaName: 'Jin', isRpMode: true }
+    );
+    const enCodes = new Set(auditEn.issues.map((i) => i.code));
+    assert.ok(enCodes.has('rp_impersonation'));
+    assert.ok(enCodes.has('crutch_adverb_overuse'));
+    assert.ok(enCodes.has('user_quote_echo'));
+
+    // Static vs Dynamic Lorebook Cache-Tier Separation (Leave preset puts lorebook after chat)
+    const leave = relay.loadBundledLeavePreset();
+    const tieredMsgs = relay.buildDirectPromptMessages({
+        preset: leave,
+        snap: {
+            charName: 'Cheongwon',
+            charContext: {
+                name: 'Cheongwon',
+                desc: 'School campus.',
+                loreEntries: [
+                    { uid: 'c-static', source: 'char', comment: '🏫 기본 정보', key: '', alwaysActive: true, insertorder: 100, content: 'STATIC_CAMPUS_WORLD_GUIDE' },
+                    { uid: 'c-dyn-macro', source: 'char', comment: '♥️ 호감도', key: '', alwaysActive: true, insertorder: 90, content: 'AFFECTION_DYNAMIC={{getvar::aff_sieun}}' },
+                    { uid: 'c-dyn-kw', source: 'char', comment: '주시은 시트', key: '시은', alwaysActive: false, insertorder: 80, content: 'DYNAMIC_SIEUN_SHEET' },
+                ],
+            },
+            chatVariables: { aff_sieun: '-160' },
+        },
+        historyMessages: [{ index: 0, role: 'user', raw: '안녕' }],
+        userText: '시은아.',
+    });
+    const staticIdx = tieredMsgs.findIndex((m) => m.content.includes('STATIC_CAMPUS_WORLD_GUIDE'));
+    const firstChatMsgIdx = tieredMsgs.findIndex((m) => m.role === 'user' && m.content === '안녕');
+    const dynMacroIdx = tieredMsgs.findIndex((m) => m.content.includes('AFFECTION_DYNAMIC=-160'));
+    const dynKwIdx = tieredMsgs.findIndex((m) => m.content.includes('DYNAMIC_SIEUN_SHEET'));
+    assert.ok(staticIdx >= 0 && staticIdx < firstChatMsgIdx, 'Static alwaysActive lorebook must sit BEFORE chat in cached prefix');
+    assert.ok(tieredMsgs[staticIdx]._cachePoint === true || tieredMsgs.slice(0, firstChatMsgIdx).some((m) => m._cachePoint === true));
+    assert.ok(dynMacroIdx > firstChatMsgIdx, 'Macro-dependent alwaysActive lorebook must stay AFTER chat');
+    assert.ok(dynKwIdx > firstChatMsgIdx, 'Keyword lorebook must stay AFTER chat');
+
+    const auditJp = relay.auditDraftWithDeterministicGuards(
+        '「まだ実感わかない？」彼は封筒を受け取り、とてもゆっくり、ごくわずかに、ほんの少し後ろへ下がった。',
+        { userText: '「まだ実感わかない？」とレンは聞いた。', personaName: 'レン', isRpMode: true }
+    );
+    const jpCodes = new Set(auditJp.issues.map((i) => i.code));
+    assert.ok(jpCodes.has('rp_impersonation'));
+    assert.ok(jpCodes.has('crutch_adverb_overuse'));
+    assert.ok(jpCodes.has('user_quote_echo'));
 });
 
 test('Anthropic cache_control + preset sampling fallback, deterministic guards, and Two-Pass 2-stage pipeline', async () => {
@@ -2512,8 +2707,8 @@ test('Anthropic cache_control + preset sampling fallback, deterministic guards, 
             for (let i = 0; i < 60 && capturedAnthropic.length === 0; i += 1) await new Promise((r) => setTimeout(r, 20));
             assert.equal(capturedAnthropic.length, 1);
             const antBody = capturedAnthropic[0];
-            assert.equal(antBody.temperature, 0.85, 'Leave preset temperature 0.85 should apply when profile leaves it blank');
-            assert.equal(antBody.max_tokens, 16384, 'Leave preset maxResponse 16384 should apply when profile leaves it blank');
+            assert.equal(antBody.temperature, 0.8, 'Leave preset temperature 0.8 should apply when profile leaves it blank');
+            assert.equal(antBody.max_tokens, 8192, 'Leave preset maxResponse 8192 should apply when profile leaves it blank');
             assert.ok(Array.isArray(antBody.system), 'Anthropic system should serialize as content-block array when cachePoint is active');
             assert.ok(antBody.system.some((b) => b.cache_control && b.cache_control.type === 'ephemeral'));
         } finally {
