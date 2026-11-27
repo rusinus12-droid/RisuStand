@@ -79,6 +79,11 @@ function __rsCallTrigger(fnName, ...)
     return __rsAwaitIfPromise(fn(...))
 end
 
+function __rsHasEditHandler(kind)
+    local l = __rsEditHandlers[tostring(kind or "")]
+    return l ~= nil and #l > 0
+end
+
 function __rsRunEditHandlers(kind, id, data, meta)
     local list = __rsEditHandlers[tostring(kind or "")]
     if not list or #list == 0 then
@@ -125,6 +130,14 @@ function setFullChat(id, tbl)
     setFullChatMain(id, json.encode(tbl or {}))
 end
 
+function getRecentChats(id, count)
+    local raw = getRecentChatsMain(id, tonumber(count) or 0)
+    if not raw or raw == "" then return {} end
+    local ok, decoded = pcall(json.decode, raw)
+    if ok and type(decoded) == "table" then return decoded end
+    return {}
+end
+
 function getChat(id, idx)
     local raw = getChatMain(id, idx)
     if not raw or raw == "" or raw == "null" then return nil end
@@ -153,35 +166,107 @@ function upsertLocalLoreBook(id, name, content, options)
     return upsertLocalLoreBookMain(id, tostring(name or ""), tostring(content or ""), json.encode(options or {}))
 end
 
-LLM = async(function(id, prompt, useMultimodal, options)
-    local pJson = type(prompt) == "string" and prompt or json.encode(prompt or {})
-    local oJson = type(options) == "string" and options or json.encode(options or {})
-    local resJson = LLMMain(id, pJson, useMultimodal == true, oJson):await()
+__rsResolvedMeta = {
+    __index = {
+        await = function(self)
+            return self
+        end
+    }
+}
+
+local function __rsWrapLLMResult(resJson, fallbackMsg)
     local ok, decoded = pcall(json.decode, resJson)
-    if ok and type(decoded) == "table" then return decoded end
-    return { success = false, result = tostring(resJson or "LLM decode error") }
+    if ok and type(decoded) == "table" then
+        return setmetatable(decoded, __rsResolvedMeta)
+    end
+    return setmetatable({ success = false, result = tostring(resJson or fallbackMsg) }, __rsResolvedMeta)
+end
+
+local __rsLLMAsync = async(function(id, pJson, useMM, oJson)
+    local resJson = LLMMain(id, pJson, useMM, oJson):await()
+    return __rsWrapLLMResult(resJson, "LLM decode error")
 end)
 
-axLLM = async(function(id, prompt, useMultimodal, options)
-    local pJson = type(prompt) == "string" and prompt or json.encode(prompt or {})
-    local oJson = type(options) == "string" and options or json.encode(options or {})
-    local resJson = axLLMMain(id, pJson, useMultimodal == true, oJson):await()
-    local ok, decoded = pcall(json.decode, resJson)
-    if ok and type(decoded) == "table" then return decoded end
-    return { success = false, result = tostring(resJson or "axLLM decode error") }
+local __rsAxLLMAsync = async(function(id, pJson, useMM, oJson)
+    local resJson = axLLMMain(id, pJson, useMM, oJson):await()
+    return __rsWrapLLMResult(resJson, "axLLM decode error")
 end)
 
-simpleLLM = async(function(id, prompt)
-    local resJson = simpleLLMMain(id, tostring(prompt or "")):await()
-    local ok, decoded = pcall(json.decode, resJson)
-    if ok and type(decoded) == "table" then return decoded end
-    return { success = false, result = tostring(resJson or "simpleLLM decode error") }
+local __rsSimpleLLMAsync = async(function(id, promptStr)
+    local resJson = simpleLLMMain(id, promptStr):await()
+    return __rsWrapLLMResult(resJson, "simpleLLM decode error")
 end)
+
+function LLM(id, prompt, useMultimodal, options)
+    local pJson = type(prompt) == "string" and prompt or json.encode(prompt or {})
+    local oJson = type(options) == "string" and options or json.encode(options or {})
+    if coroutine.isyieldable() then
+        local resJson = LLMMain(id, pJson, useMultimodal == true, oJson):await()
+        return __rsWrapLLMResult(resJson, "LLM decode error")
+    end
+    return __rsLLMAsync(id, pJson, useMultimodal == true, oJson)
+end
+
+function axLLM(id, prompt, useMultimodal, options)
+    local pJson = type(prompt) == "string" and prompt or json.encode(prompt or {})
+    local oJson = type(options) == "string" and options or json.encode(options or {})
+    if coroutine.isyieldable() then
+        local resJson = axLLMMain(id, pJson, useMultimodal == true, oJson):await()
+        return __rsWrapLLMResult(resJson, "axLLM decode error")
+    end
+    return __rsAxLLMAsync(id, pJson, useMultimodal == true, oJson)
+end
+
+function simpleLLM(id, prompt)
+    local promptStr = tostring(prompt or "")
+    if coroutine.isyieldable() then
+        local resJson = simpleLLMMain(id, promptStr):await()
+        return __rsWrapLLMResult(resJson, "simpleLLM decode error")
+    end
+    return __rsSimpleLLMAsync(id, promptStr)
+end
 `;
 
 function extractOrderFlag(flagStr) {
     const m = String(flagStr || '').match(/<order\s+(-?\d+)>/i);
     return m ? Number(m[1]) : 0;
+}
+
+function assignBothToggleKeys(out, rawKey, rawVal) {
+    const k = String(rawKey || '').trim();
+    if (!k) return;
+    const v = String(rawVal ?? '');
+    out[k] = v;
+    if (k.startsWith('toggle_')) {
+        out[k.slice(7)] = v;
+    } else {
+        out[`toggle_${k}`] = v;
+    }
+}
+
+function applyToggleSyntaxDefaults(toggleSyntax = '', defaultVariablesText = '', out = {}) {
+    for (const rawLine of String(toggleSyntax || '').split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('//') || line.startsWith('#') || line.startsWith('=group') || line.startsWith('=divider')) {
+            continue;
+        }
+        const parts = line.split('=');
+        if (parts.length < 2) continue;
+        const key = (parts[0] || '').trim();
+        if (!key || key.startsWith('=')) continue;
+        const kind = (parts[2] || '').trim().toLowerCase();
+        if (kind === 'caption' || kind === 'group' || kind === 'groupend' || kind === 'divider') continue;
+        const defVal = (kind === 'text' || kind === 'textarea') ? '' : '0';
+        assignBothToggleKeys(out, key, defVal);
+    }
+    for (const rawLine of String(defaultVariablesText || '').split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#') || line.startsWith('//')) continue;
+        const eq = line.indexOf('=');
+        if (eq <= 0) continue;
+        assignBothToggleKeys(out, line.slice(0, eq).trim(), line.slice(eq + 1).trim());
+    }
+    return out;
 }
 
 function runRegexScripts(mode, text, scripts, cbsFn) {
@@ -200,29 +285,34 @@ function runRegexScripts(mode, text, scripts, cbsFn) {
     for (const item of matching) {
         const s = item.script;
         try {
-            const flagText = String(s.flag || 'g');
+            const flagText = s.ableFlag ? String(s.flag || 'g') : 'g';
+            const inHasCbs = Boolean(s.ableFlag && flagText.includes('<cbs>') && typeof cbsFn === 'function');
+            const inPattern = inHasCbs ? String(cbsFn(s.in)) : s.in;
+            if (!inPattern) continue;
+
             const strippedFlags = flagText.replace(/<[^>]+>/g, '');
             let regexFlags = strippedFlags.replace(/[^dgimsuvy]/g, '');
             if (!regexFlags && !flagText.includes('<no_g>')) regexFlags = 'g';
-            if (flagText.includes('<move_top>') || flagText.includes('<move_bottom>')) {
-                // tags stripped cleanly above
-            }
-            const re = new RegExp(s.in, regexFlags);
+            const re = new RegExp(inPattern, regexFlags);
             if (!re.test(cur)) continue;
             re.lastIndex = 0;
-            let outTemplate = String(s.out ?? '');
-            if (s.ableFlag && flagText.includes('<cbs>') && typeof cbsFn === 'function') {
-                outTemplate = String(cbsFn(outTemplate));
-            }
-            outTemplate = outTemplate.replace(/\\n/g, '\n');
+
+            const rawOut = String(s.out ?? '').replace(/\\n/g, '\n');
             cur = cur.replace(re, (...args) => {
                 const whole = args[0];
-                return outTemplate
-                    .replace(/\$&/g, whole)
-                    .replace(/\$(\d+)/g, (_, d) => {
-                        const n = Number(d);
-                        return args[n] !== undefined ? String(args[n]) : '';
-                    });
+                const caps = args.slice(1, -2);
+                const substituted = rawOut.replace(/\$(\$|&|\d{1,2})/g, (_, tok) => {
+                    if (tok === '$') return '$';
+                    if (tok === '&') return whole;
+                    const n = parseInt(tok, 10);
+                    if (n === 0) return whole;
+                    if (n >= 1 && n <= caps.length && caps[n - 1] !== undefined) return String(caps[n - 1]);
+                    return '';
+                });
+                if (substituted.includes('{{') && typeof cbsFn === 'function') {
+                    return String(cbsFn(substituted));
+                }
+                return substituted;
             });
         } catch (_) {}
     }
@@ -232,11 +322,12 @@ function runRegexScripts(mode, text, scripts, cbsFn) {
 function collectTriggerLuaEntries(charObj, modulesList) {
     const entries = [];
     const charLowLevel = Boolean(charObj && charObj.lowLevelAccess);
-    const pushFrom = (trList, sourceName, sourceId, lowLevelAccess) => {
+    const pushFrom = (trList, sourceName, sourceId, lowLevelAccess, sourceKind) => {
         if (!Array.isArray(trList)) return;
         for (let i = 0; i < trList.length; i += 1) {
             const tr = trList[i];
             if (!tr || !Array.isArray(tr.effect)) continue;
+            const effLow = Boolean(lowLevelAccess || tr.lowLevelAccess);
             for (let j = 0; j < tr.effect.length; j += 1) {
                 const ef = tr.effect[j];
                 if (ef && ef.type === 'triggerlua' && ef.code) {
@@ -246,20 +337,21 @@ function collectTriggerLuaEntries(charObj, modulesList) {
                         key: `${sourceId}:${i}:${j}:${hash}`,
                         sourceName,
                         sourceId,
+                        sourceKind,
                         code,
-                        lowLevelAccess: Boolean(lowLevelAccess),
+                        lowLevelAccess: effLow,
                     });
                 }
             }
         }
     };
     if (charObj && Array.isArray(charObj.triggerscript)) {
-        pushFrom(charObj.triggerscript, charObj.name || 'character', `char:${charObj.chaId || charObj.name || '0'}`, charLowLevel);
+        pushFrom(charObj.triggerscript, charObj.name || 'character', `char:${charObj.chaId || charObj.name || '0'}`, charLowLevel, 'bot');
     }
     for (const m of modulesList || []) {
         const trList = m && (Array.isArray(m.trigger) ? m.trigger : (Array.isArray(m.triggerscript) ? m.triggerscript : null));
         if (trList) {
-            pushFrom(trList, m.name || m.id || 'module', `mod:${m.id || m.name || '0'}`, Boolean(m.lowLevelAccess));
+            pushFrom(trList, m.name || m.id || 'module', `mod:${m.id || m.name || '0'}`, Boolean(m.lowLevelAccess), 'module');
         }
     }
     return entries;
@@ -270,15 +362,20 @@ function normalizePromptMessagesFromLua(promptJson) {
     try {
         arr = typeof promptJson === 'string' ? JSON.parse(promptJson) : promptJson;
     } catch (_) {
-        arr = [];
+        const s = String(promptJson ?? '').trim();
+        return s ? [{ role: 'user', content: s }] : [];
+    }
+    if (typeof arr === 'string') {
+        const s = arr.trim();
+        return s ? [{ role: 'user', content: s }] : [];
     }
     if (!Array.isArray(arr)) return [];
     const out = [];
     for (const m of arr) {
         if (!m || typeof m !== 'object') continue;
         const r = String(m.role || 'user').toLowerCase();
-        const role = (r === 'char' || r === 'model' || r === 'assistant') ? 'assistant'
-            : (r === 'system' ? 'system' : 'user');
+        const role = (r === 'char' || r === 'bot' || r === 'model' || r === 'assistant') ? 'assistant'
+            : ((r === 'system' || r === 'sys') ? 'system' : 'user');
         out.push({
             role,
             content: typeof m.content === 'string' ? m.content : String(m.data ?? m.content ?? ''),
@@ -287,13 +384,27 @@ function normalizePromptMessagesFromLua(promptJson) {
     return out;
 }
 
+function luaOptionsObjToArray(val) {
+    if (Array.isArray(val)) return val.map((x) => String(x ?? ''));
+    if (val && typeof val === 'object') {
+        return Object.keys(val)
+            .map((k) => ({ k, n: Number(k) }))
+            .filter((x) => Number.isInteger(x.n) && x.n >= 1)
+            .sort((a, b) => a.n - b.n)
+            .map((x) => String(val[x.k] ?? ''));
+    }
+    return [];
+}
+
 function createModuleAdapter({
     hostRpc = null,
     getBackendConfig = () => ({}),
+    getToggleContext = () => ({}),
     runLLM = null,
     imageProvider = null,
     evalCbs = (s) => String(s ?? ''),
     onTriggerNotice = () => {},
+    onActivity = () => () => {},
 } = {}) {
     const MAX_ENGINES = 24;
     const engineCache = new Map(); // entryKey -> { engine, lastUsed, allowLowLevelRef }
@@ -309,7 +420,19 @@ function createModuleAdapter({
         stopSending: false,
         needsDisplayRefresh: false,
         syncToSharedTurn: null,
+        promptState: null,
     };
+
+    const emitActivity = () => () => {};
+
+    async function withModActivity(kind, name, phase, fn) {
+        const done = emitActivity(kind, name, phase);
+        try {
+            return await fn();
+        } finally {
+            done();
+        }
+    }
 
     const isRpcConnected = () => Boolean(hostRpc && typeof hostRpc.isConnected === 'function' && hostRpc.isConnected());
 
@@ -327,7 +450,7 @@ function createModuleAdapter({
         return out;
     }
 
-    function buildCbsContext() {
+    function buildCbsContext(msgIndex = undefined, lastMsgId = undefined) {
         const cVars = {};
         if (activeCtx.chatObj && activeCtx.chatObj.scriptstate && typeof activeCtx.chatObj.scriptstate === 'object') {
             for (const [k, v] of Object.entries(activeCtx.chatObj.scriptstate)) {
@@ -335,17 +458,38 @@ function createModuleAdapter({
                 if (clean) cVars[clean] = String(v ?? '');
             }
         }
+        const rawMsgs = activeCtx.chatObj && Array.isArray(activeCtx.chatObj.message) ? activeCtx.chatObj.message : [];
+        const chatList = rawMsgs.map((m) => ({
+            role: m && m.role === 'user' ? 'user' : 'assistant',
+            content: String((m && (m.data ?? m.content ?? m.text ?? m.raw)) ?? ''),
+        }));
+        const effLast = lastMsgId !== undefined ? lastMsgId : Math.max(0, chatList.length - 1);
+        const effIdx = msgIndex !== undefined ? msgIndex : effLast;
         return {
             charName: String((activeCtx.charObj && activeCtx.charObj.name) || 'Character'),
-            personaName: 'User',
+            personaName: String(activeCtx.personaName || 'User'),
             chatVars: cVars,
             globalVars: { ...(activeCtx.globalVars || {}) },
+            chatList,
+            chatIndex: effIdx,
+            lastMessageId: effLast,
         };
     }
 
-    function runCbs(text) {
+    function runCbs(text, msgIndex = undefined, lastMsgId = undefined) {
         try {
-            return String(evalCbs(String(text ?? ''), buildCbsContext()));
+            const ctx = buildCbsContext(msgIndex, lastMsgId);
+            const result = String(evalCbs(String(text ?? ''), ctx));
+            if (activeCtx.chatObj && ctx.chatVars && typeof ctx.chatVars === 'object') {
+                if (!activeCtx.chatObj.scriptstate || typeof activeCtx.chatObj.scriptstate !== 'object') {
+                    activeCtx.chatObj.scriptstate = {};
+                }
+                for (const [k, v] of Object.entries(ctx.chatVars)) {
+                    const keyName = k.startsWith('$') ? k : `$${k}`;
+                    activeCtx.chatObj.scriptstate[keyName] = String(v ?? '');
+                }
+            }
+            return result;
         } catch (_) {
             return String(text ?? '');
         }
@@ -353,24 +497,43 @@ function createModuleAdapter({
 
     function computeGlobalVars(dbGlobals = {}) {
         const out = {};
+        const tCtx = typeof getToggleContext === 'function' ? (getToggleContext() || {}) : {};
+        if (tCtx.presetToggleSyntax || tCtx.presetDefaultVariables) {
+            applyToggleSyntaxDefaults(tCtx.presetToggleSyntax || '', tCtx.presetDefaultVariables || '', out);
+        }
+        for (const m of activeCtx.modules || []) {
+            if (m && m.customModuleToggle) applyToggleSyntaxDefaults(m.customModuleToggle, '', out);
+        }
+        if (activeCtx.charObj && activeCtx.charObj.customModuleToggle) {
+            applyToggleSyntaxDefaults(activeCtx.charObj.customModuleToggle, '', out);
+        }
         if (dbGlobals && typeof dbGlobals === 'object') {
             for (const [k, v] of Object.entries(dbGlobals)) {
-                if (v !== undefined && v !== null) out[String(k)] = String(v);
+                if (v !== undefined && v !== null) assignBothToggleKeys(out, k, v);
+            }
+        }
+        if (tCtx.globalToggleValues && typeof tCtx.globalToggleValues === 'object') {
+            for (const [k, v] of Object.entries(tCtx.globalToggleValues)) {
+                if (v !== undefined && v !== null) assignBothToggleKeys(out, k, v);
             }
         }
         const cfg = typeof getBackendConfig === 'function' ? getBackendConfig() : {};
         if (cfg && cfg.remoteToggleValues && typeof cfg.remoteToggleValues === 'object') {
             for (const [k, v] of Object.entries(cfg.remoteToggleValues)) {
-                if (k && v !== undefined && v !== null) {
-                    const fk = k.startsWith('toggle_') ? k : `toggle_${k}`;
-                    out[fk] = String(v);
-                    out[k.startsWith('toggle_') ? k.slice(7) : k] = String(v);
-                }
+                if (k && v !== undefined && v !== null) assignBothToggleKeys(out, k, v);
             }
         }
-        if (activeCtx.chatObj && activeCtx.chatObj.useLocallySetGlobalVariables && activeCtx.chatObj.GLGlobalVariables) {
-            for (const [k, v] of Object.entries(activeCtx.chatObj.GLGlobalVariables)) {
-                if (k && v !== undefined && v !== null) out[String(k)] = String(v);
+        const isLocal = Boolean((activeCtx.chatObj && activeCtx.chatObj.useLocallySetGlobalVariables) || tCtx.useLocal);
+        if (isLocal) {
+            if (tCtx.localToggleValues && typeof tCtx.localToggleValues === 'object') {
+                for (const [k, v] of Object.entries(tCtx.localToggleValues)) {
+                    if (k && v !== undefined && v !== null) assignBothToggleKeys(out, k, v);
+                }
+            }
+            if (activeCtx.chatObj && activeCtx.chatObj.GLGlobalVariables) {
+                for (const [k, v] of Object.entries(activeCtx.chatObj.GLGlobalVariables)) {
+                    if (k && v !== undefined && v !== null) assignBothToggleKeys(out, k, v);
+                }
             }
         }
         return out;
@@ -470,6 +633,7 @@ function createModuleAdapter({
 
         // Character & chat metadata
         engine.global.set('getName', () => String((activeCtx.charObj && activeCtx.charObj.name) || 'Character'));
+        engine.global.set('getPersonaName', () => String((activeCtx.personaName) || 'User'));
         engine.global.set('setName', (_id, val) => {
             if (activeCtx.charObj) activeCtx.charObj.name = String(val ?? '');
         });
@@ -487,7 +651,7 @@ function createModuleAdapter({
             for (let i = msgs.length - 1; i >= 0; i -= 1) {
                 if (msgs[i] && msgs[i].role === 'char') return String(msgs[i].data || '');
             }
-            return '';
+            return String((activeCtx.charObj && activeCtx.charObj.firstMessage) || '');
         });
         engine.global.set('getUserLastMessage', () => {
             const msgs = (activeCtx.chatObj && Array.isArray(activeCtx.chatObj.message)) ? activeCtx.chatObj.message : [];
@@ -501,6 +665,29 @@ function createModuleAdapter({
         engine.global.set('getChatLength', () => {
             const msgs = (activeCtx.chatObj && Array.isArray(activeCtx.chatObj.message)) ? activeCtx.chatObj.message : [];
             return msgs.length;
+        });
+        engine.global.set('getChatData', (_id, index) => {
+            const msgs = (activeCtx.chatObj && Array.isArray(activeCtx.chatObj.message)) ? activeCtx.chatObj.message : [];
+            let idx = Number(index);
+            if (idx < 0) idx = msgs.length + idx;
+            return (msgs[idx] && msgs[idx].data) ? String(msgs[idx].data) : '';
+        });
+        engine.global.set('getChatRole', (_id, index) => {
+            const msgs = (activeCtx.chatObj && Array.isArray(activeCtx.chatObj.message)) ? activeCtx.chatObj.message : [];
+            let idx = Number(index);
+            if (idx < 0) idx = msgs.length + idx;
+            return (msgs[idx] && msgs[idx].role) ? String(msgs[idx].role) : '';
+        });
+        engine.global.set('getRecentChatsMain', (_id, count) => {
+            const msgs = (activeCtx.chatObj && Array.isArray(activeCtx.chatObj.message)) ? activeCtx.chatObj.message : [];
+            const n = Math.max(0, Math.floor(Number(count) || 0));
+            const slice = n > 0 ? msgs.slice(-n) : [];
+            return JSON.stringify(slice.map((m) => ({
+                role: m.role === 'user' ? 'user' : 'char',
+                data: String(m.data || ''),
+                time: m.time || Date.now(),
+                chatId: m.chatId || '',
+            })));
         });
         engine.global.set('getFullChatMain', () => {
             const msgs = (activeCtx.chatObj && Array.isArray(activeCtx.chatObj.message)) ? activeCtx.chatObj.message : [];
@@ -673,9 +860,57 @@ function createModuleAdapter({
         engine.global.set('alertError', (_id, msg) => {
             onTriggerNotice({ kind: 'alert_error', title: entry.sourceName, message: String(msg ?? '') });
         });
-        engine.global.set('alertConfirm', async () => true);
-        engine.global.set('alertInput', async () => '');
-        engine.global.set('alertSelect', async () => '0');
+        engine.global.set('alertConfirm', async (_id, msg) => {
+            const ps = activeCtx.promptState;
+            if (!ps || !ps.active) return true;
+            if (ps.cursor < ps.answers.length) {
+                return ps.answers[ps.cursor++] === '0';
+            }
+            ps.pause = {
+                kind: 'prompt_select',
+                message: String(msg ?? '계속할까요?'),
+                options: ['확인', '취소'],
+                trigger: ps.triggerName,
+                charIndex: activeCtx.charIndex,
+                chatIndex: activeCtx.chatIndex,
+                answersSoFar: ps.answers.slice(),
+            };
+            throw new Error('__RS_LUA_PROMPT_PAUSE__');
+        });
+        engine.global.set('alertInput', async (_id, msg) => {
+            const ps = activeCtx.promptState;
+            if (!ps || !ps.active) return '';
+            if (ps.cursor < ps.answers.length) {
+                return String(ps.answers[ps.cursor++] ?? '');
+            }
+            ps.pause = {
+                kind: 'prompt_input',
+                message: String(msg ?? '값을 입력하세요'),
+                options: [],
+                trigger: ps.triggerName,
+                charIndex: activeCtx.charIndex,
+                chatIndex: activeCtx.chatIndex,
+                answersSoFar: ps.answers.slice(),
+            };
+            throw new Error('__RS_LUA_PROMPT_PAUSE__');
+        });
+        engine.global.set('alertSelect', async (_id, options, msg) => {
+            const ps = activeCtx.promptState;
+            if (!ps || !ps.active) return '0';
+            if (ps.cursor < ps.answers.length) {
+                return String(ps.answers[ps.cursor++] ?? '0');
+            }
+            ps.pause = {
+                kind: 'prompt_select',
+                message: String(msg ?? '항목을 선택하세요'),
+                options: luaOptionsObjToArray(options),
+                trigger: ps.triggerName,
+                charIndex: activeCtx.charIndex,
+                chatIndex: activeCtx.chatIndex,
+                answersSoFar: ps.answers.slice(),
+            };
+            throw new Error('__RS_LUA_PROMPT_PAUSE__');
+        });
 
         // Low-level LLM & Image Generation APIs
         engine.global.set('LLMMain', async (_id, promptJson, _useMM, optionsJson) => {
@@ -685,22 +920,24 @@ function createModuleAdapter({
             if (typeof runLLM !== 'function') {
                 return JSON.stringify({ success: false, result: 'LLM runner unavailable' });
             }
-            try {
-                let opts = {};
-                try { opts = optionsJson ? JSON.parse(optionsJson) : {}; } catch (_) {}
-                const messages = normalizePromptMessagesFromLua(promptJson);
-                const r = await runLLM({
-                    mode: 'model',
-                    messages,
-                    ...(opts && typeof opts === 'object' ? opts : {}),
-                }, `module:${entry.sourceName}`);
-                if (r && r.type === 'success') {
-                    return JSON.stringify({ success: true, result: String(r.result ?? r.content ?? '') });
+            return await withModActivity(entry.sourceKind === 'bot' ? 'bot_module' : 'module', entry.sourceName, '메인 LLM 호출', async () => {
+                try {
+                    let opts = {};
+                    try { opts = optionsJson ? JSON.parse(optionsJson) : {}; } catch (_) {}
+                    const messages = normalizePromptMessagesFromLua(promptJson);
+                    const r = await runLLM({
+                        mode: 'model',
+                        messages,
+                        ...(opts && typeof opts === 'object' ? opts : {}),
+                    }, `module:${entry.sourceName}`);
+                    if (r && r.type === 'success') {
+                        return JSON.stringify({ success: true, result: String(r.result ?? r.content ?? '') });
+                    }
+                    return JSON.stringify({ success: false, result: String((r && r.result) || 'LLM failed') });
+                } catch (e) {
+                    return JSON.stringify({ success: false, result: e && e.message ? e.message : String(e) });
                 }
-                return JSON.stringify({ success: false, result: String((r && r.result) || 'LLM failed') });
-            } catch (e) {
-                return JSON.stringify({ success: false, result: e && e.message ? e.message : String(e) });
-            }
+            });
         });
 
         engine.global.set('axLLMMain', async (_id, promptJson, _useMM, optionsJson) => {
@@ -710,23 +947,25 @@ function createModuleAdapter({
             if (typeof runLLM !== 'function') {
                 return JSON.stringify({ success: false, result: 'LLM runner unavailable' });
             }
-            try {
-                let opts = {};
-                try { opts = optionsJson ? JSON.parse(optionsJson) : {}; } catch (_) {}
-                const messages = normalizePromptMessagesFromLua(promptJson);
-                const mode = (opts && typeof opts.mode === 'string' && opts.mode) ? opts.mode : 'otherAx';
-                const r = await runLLM({
-                    mode,
-                    messages,
-                    ...(opts && typeof opts === 'object' ? opts : {}),
-                }, `module:${entry.sourceName}:ax`);
-                if (r && r.type === 'success') {
-                    return JSON.stringify({ success: true, result: String(r.result ?? r.content ?? '') });
+            return await withModActivity(entry.sourceKind === 'bot' ? 'bot_module' : 'module', entry.sourceName, '보조 LLM 호출', async () => {
+                try {
+                    let opts = {};
+                    try { opts = optionsJson ? JSON.parse(optionsJson) : {}; } catch (_) {}
+                    const messages = normalizePromptMessagesFromLua(promptJson);
+                    const mode = (opts && typeof opts.mode === 'string' && opts.mode) ? opts.mode : 'otherAx';
+                    const r = await runLLM({
+                        mode,
+                        messages,
+                        ...(opts && typeof opts === 'object' ? opts : {}),
+                    }, `module:${entry.sourceName}:ax`);
+                    if (r && r.type === 'success') {
+                        return JSON.stringify({ success: true, result: String(r.result ?? r.content ?? '') });
+                    }
+                    return JSON.stringify({ success: false, result: String((r && r.result) || 'axLLM failed') });
+                } catch (e) {
+                    return JSON.stringify({ success: false, result: e && e.message ? e.message : String(e) });
                 }
-                return JSON.stringify({ success: false, result: String((r && r.result) || 'axLLM failed') });
-            } catch (e) {
-                return JSON.stringify({ success: false, result: e && e.message ? e.message : String(e) });
-            }
+            });
         });
 
         engine.global.set('simpleLLMMain', async (_id, promptStr) => {
@@ -736,18 +975,20 @@ function createModuleAdapter({
             if (typeof runLLM !== 'function') {
                 return JSON.stringify({ success: false, result: 'LLM runner unavailable' });
             }
-            try {
-                const r = await runLLM({
-                    mode: 'otherAx',
-                    messages: [{ role: 'user', content: String(promptStr ?? '') }],
-                }, `module:${entry.sourceName}:simple`);
-                if (r && r.type === 'success') {
-                    return JSON.stringify({ success: true, result: String(r.result ?? r.content ?? '') });
+            return await withModActivity(entry.sourceKind === 'bot' ? 'bot_module' : 'module', entry.sourceName, '간이 LLM 호출', async () => {
+                try {
+                    const r = await runLLM({
+                        mode: 'otherAx',
+                        messages: [{ role: 'user', content: String(promptStr ?? '') }],
+                    }, `module:${entry.sourceName}:simple`);
+                    if (r && r.type === 'success') {
+                        return JSON.stringify({ success: true, result: String(r.result ?? r.content ?? '') });
+                    }
+                    return JSON.stringify({ success: false, result: String((r && r.result) || 'simpleLLM failed') });
+                } catch (e) {
+                    return JSON.stringify({ success: false, result: e && e.message ? e.message : String(e) });
                 }
-                return JSON.stringify({ success: false, result: String((r && r.result) || 'simpleLLM failed') });
-            } catch (e) {
-                return JSON.stringify({ success: false, result: e && e.message ? e.message : String(e) });
-            }
+            });
         });
 
         engine.global.set('generateImage', async (_id, positive, negative, optionsArg) => {
@@ -763,17 +1004,19 @@ function createModuleAdapter({
             } else if (optionsArg && typeof optionsArg === 'object') {
                 opts = optionsArg;
             }
-            try {
-                const res = await imageProvider.generateInlay({
-                    positive: String(positive || ''),
-                    negative: String(negative || ''),
-                    options: opts,
-                    charObj: activeCtx.charObj,
-                });
-                return res.inlayToken;
-            } catch (e) {
-                return `Error: ${e && e.message ? e.message : String(e)}`;
-            }
+            return await withModActivity(entry.sourceKind === 'bot' ? 'bot_module' : 'module', entry.sourceName, '삽화 생성', async () => {
+                try {
+                    const res = await imageProvider.generateInlay({
+                        positive: String(positive || ''),
+                        negative: String(negative || ''),
+                        options: opts,
+                        charObj: activeCtx.charObj,
+                    });
+                    return res.inlayToken;
+                } catch (e) {
+                    return `Error: ${e && e.message ? e.message : String(e)}`;
+                }
+            });
         });
 
         await engine.doString(LUA_PREAMBLE);
@@ -794,11 +1037,14 @@ function createModuleAdapter({
         }
     }
 
-    async function prepareTurn({ charIndex, chatIndex, charObj, chatObj, modulesOverride = null, globalVarsOverride = null, onSyncBack = null } = {}) {
+    async function prepareTurn({ charIndex, chatIndex, charObj, chatObj, modulesOverride = null, globalVarsOverride = null, onSyncBack = null, personaName = 'User' } = {}) {
         const modPayload = Array.isArray(modulesOverride)
             ? { modules: modulesOverride, globalChatVariables: globalVarsOverride || {} }
             : await loadActiveModulesForTurn(charIndex, chatIndex);
 
+        if (charObj && modPayload && modPayload.charLowLevelAccess && charObj.lowLevelAccess === undefined) {
+            charObj.lowLevelAccess = true;
+        }
         activeCtx = {
             active: true,
             charIndex: Number(charIndex),
@@ -807,9 +1053,11 @@ function createModuleAdapter({
             chatObj: chatObj || null,
             modules: Array.isArray(modPayload.modules) ? modPayload.modules : [],
             globalVars: {},
+            personaName: String((charObj && charObj.personaName) || personaName || 'User'),
             stopSending: false,
             needsDisplayRefresh: false,
             syncToSharedTurn: onSyncBack,
+            promptState: null,
         };
         activeCtx.globalVars = computeGlobalVars(globalVarsOverride || modPayload.globalChatVariables || {});
         return activeCtx;
@@ -870,10 +1118,18 @@ function createModuleAdapter({
                     callArgs = [triggerId, key, payload];
                 }
 
-                let ret = await runThreadCall(engine, (t) => {
-                    t.lua.lua_getglobal(t.address, '__rsCallTrigger');
-                }, [luaFnName, ...callArgs]);
-                if (ret && typeof ret.then === 'function') ret = await ret;
+                let ret = await withModActivity(
+                    entry.sourceKind === 'bot' ? 'bot_module' : 'module',
+                    entry.sourceName,
+                    luaFnName,
+                    async () => {
+                        let r = await runThreadCall(engine, (t) => {
+                            t.lua.lua_getglobal(t.address, '__rsCallTrigger');
+                        }, [luaFnName, ...callArgs]);
+                        if (r && typeof r.then === 'function') r = await r;
+                        return r;
+                    }
+                );
 
                 commitCtxSync();
                 if (mode === 'onButtonClick' && ret !== undefined && ret !== null) {
@@ -905,13 +1161,20 @@ function createModuleAdapter({
 
         // 1) Custom regex scripts
         if (regexMode && scripts.length) {
-            if (phase === 'editRequest' && Array.isArray(current)) {
-                current = current.map((m) => ({
-                    ...m,
-                    content: runRegexScripts(regexMode, String((m && m.content) ?? ''), scripts, runCbs),
-                }));
-            } else if (typeof current === 'string') {
-                current = runRegexScripts(regexMode, current, scripts, runCbs);
+            const hasMatchingRegex = scripts.some((s) => s && s.type === regexMode && s.in);
+            const runRegex = () => {
+                if (phase === 'editRequest' && Array.isArray(current)) {
+                    const lastId = Math.max(0, current.length - 1);
+                    current = current.map((m, mIdx) => ({
+                        ...m,
+                        content: runRegexScripts(regexMode, String((m && m.content) ?? ''), scripts, (t) => runCbs(t, mIdx, lastId)),
+                    }));
+                } else if (typeof current === 'string') {
+                    current = runRegexScripts(regexMode, current, scripts, runCbs);
+                }
+            };
+            if (hasMatchingRegex) {
+                await withModActivity('module', '정규식 스크립트', phase, async () => runRegex());
             }
         }
 
@@ -933,9 +1196,25 @@ function createModuleAdapter({
             const prevLL = holder.allowLowLevel;
             holder.allowLowLevel = false; // RisuAI sets lowLevelAccess = false for edit hooks
             try {
-                const res = await runThreadCall(engine, (t) => {
-                    t.lua.lua_getglobal(t.address, '__rsRunEditHandlers');
-                }, [phase, triggerId, current, meta || {}]);
+                let hasHandlers = false;
+                try {
+                    const check = await runThreadCall(engine, (t) => {
+                        t.lua.lua_getglobal(t.address, '__rsHasEditHandler');
+                    }, [phase]);
+                    hasHandlers = Boolean(check);
+                } catch (_) {
+                    hasHandlers = true;
+                }
+                if (!hasHandlers) continue;
+
+                const res = await withModActivity(
+                    entry.sourceKind === 'bot' ? 'bot_module' : 'module',
+                    entry.sourceName,
+                    phase,
+                    async () => await runThreadCall(engine, (t) => {
+                        t.lua.lua_getglobal(t.address, '__rsRunEditHandlers');
+                    }, [phase, triggerId, current, meta || {}])
+                );
                 if (res !== undefined && res !== null) {
                     if (phase === 'editRequest') {
                         if (Array.isArray(res)) {
@@ -962,6 +1241,134 @@ function createModuleAdapter({
             }
         }
         return current;
+    }
+
+    async function runManualTrigger({
+        charIndex,
+        chatIndex,
+        charObj,
+        chatObj,
+        modulesOverride = null,
+        triggerName = '',
+        promptAnswers = [],
+    } = {}) {
+        const target = String(triggerName || '').trim();
+        if (!target) return { handled: false, pause: null, chatObj, charObj };
+        const wasActive = activeCtx.active;
+        await prepareTurn({ charIndex, chatIndex, charObj, chatObj, modulesOverride });
+        activeCtx.promptState = {
+            active: true,
+            cursor: 0,
+            answers: Array.isArray(promptAnswers) ? promptAnswers.slice() : [],
+            triggerName: target,
+            pause: null,
+        };
+        let handled = false;
+        try {
+            // Layer 1: Non-Lua manual triggers (e.g. setvar/v2SetVar for greeting toggles / bot menus)
+            const trigSources = [];
+            if (activeCtx.charObj && Array.isArray(activeCtx.charObj.triggerscript)) {
+                trigSources.push({ name: activeCtx.charObj.name || 'character', kind: 'bot_module', list: activeCtx.charObj.triggerscript });
+            }
+            for (const m of activeCtx.modules || []) {
+                const trList = m && (Array.isArray(m.trigger) ? m.trigger : (Array.isArray(m.triggerscript) ? m.triggerscript : null));
+                if (trList) trigSources.push({ name: m.name || m.id || 'module', kind: 'module', list: trList });
+            }
+            for (const src of trigSources) {
+                for (const tr of src.list) {
+                    if (!tr || tr.type !== 'manual') continue;
+                    if (tr.comment !== target && tr.id !== target) continue;
+                    let applied = false;
+                    if (!activeCtx.chatObj) continue;
+                    if (!activeCtx.chatObj.scriptstate || typeof activeCtx.chatObj.scriptstate !== 'object') {
+                        activeCtx.chatObj.scriptstate = {};
+                    }
+                    for (const ef of tr.effect || []) {
+                        if (!ef) continue;
+                        if ((ef.type === 'setvar' || ef.type === 'v2SetVar') && ef.var) {
+                            const key = String(ef.var).startsWith('$') ? String(ef.var).slice(1) : String(ef.var);
+                            if (ef.operator === '+=') {
+                                activeCtx.chatObj.scriptstate['$' + key] = String((Number(activeCtx.chatObj.scriptstate['$' + key]) || 0) + (Number(ef.value) || 0));
+                            } else if (ef.operator === '-=') {
+                                activeCtx.chatObj.scriptstate['$' + key] = String((Number(activeCtx.chatObj.scriptstate['$' + key]) || 0) - (Number(ef.value) || 0));
+                            } else {
+                                activeCtx.chatObj.scriptstate['$' + key] = String(ef.value ?? '');
+                            }
+                            applied = true;
+                        }
+                    }
+                    if (applied) {
+                        await withModActivity(src.kind, src.name, `메뉴: ${target}`, async () => {});
+                        commitCtxSync();
+                        handled = true;
+                        return {
+                            handled: true,
+                            pause: null,
+                            chatObj: activeCtx.chatObj,
+                            charObj: activeCtx.charObj,
+                        };
+                    }
+                }
+            }
+
+            // Layer 2: Lua trigger functions named `target`
+            const entries = collectTriggerLuaEntries(activeCtx.charObj, activeCtx.modules);
+            const triggerId = `rs_${activeCtx.charIndex}_${activeCtx.chatIndex}`;
+            for (const entry of entries) {
+                let holder;
+                try {
+                    holder = await createOrGetEngine(entry);
+                } catch (err) {
+                    console.warn(`[Module:${entry.sourceName}] compile error:`, err.message);
+                    continue;
+                }
+                const { engine } = holder;
+                const prevLL = holder.allowLowLevel;
+                holder.allowLowLevel = Boolean(entry.lowLevelAccess);
+                try {
+                    engine.global.lua.lua_getglobal(engine.global.address, target);
+                    const tType = engine.global.lua.lua_type(engine.global.address, -1);
+                    engine.global.pop();
+                    if (tType !== 6 /* LUA_TFUNCTION */) continue;
+
+                    handled = true;
+                    await withModActivity(
+                        entry.sourceKind === 'bot' ? 'bot_module' : 'module',
+                        entry.sourceName,
+                        `트리거: ${target}`,
+                        async () => {
+                            let r = await runThreadCall(engine, (t) => {
+                                t.lua.lua_getglobal(t.address, '__rsCallTrigger');
+                            }, [target, triggerId]);
+                            if (r && typeof r.then === 'function') r = await r;
+                        }
+                    );
+                    commitCtxSync();
+                    break;
+                } catch (err) {
+                    if (activeCtx.promptState && activeCtx.promptState.pause) {
+                        return {
+                            handled: true,
+                            pause: activeCtx.promptState.pause,
+                            chatObj: activeCtx.chatObj,
+                            charObj: activeCtx.charObj,
+                        };
+                    }
+                    console.warn(`[Module:${entry.sourceName}] manual trigger ${target} error:`, err.message);
+                } finally {
+                    holder.allowLowLevel = prevLL;
+                }
+            }
+            return {
+                handled,
+                pause: (activeCtx.promptState && activeCtx.promptState.pause) || null,
+                chatObj: activeCtx.chatObj,
+                charObj: activeCtx.charObj,
+            };
+        } finally {
+            activeCtx.promptState = null;
+            if (!wasActive) endTurn();
+        }
     }
 
     async function runInteraction({ charIndex, chatIndex, charObj, chatObj, modulesOverride = null, kind = 'button', code = '', key = '', formValues = {} } = {}) {
@@ -993,6 +1400,7 @@ function createModuleAdapter({
         endTurn,
         runTriggerMode,
         runEditPhase,
+        runManualTrigger,
         runInteraction,
         dispose,
         _debug: { engineCache },

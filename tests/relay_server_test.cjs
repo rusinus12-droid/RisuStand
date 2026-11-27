@@ -1142,6 +1142,120 @@ test('direct remote chat applies Leave preset + remote toggles & supports custom
     }
 });
 
+test('remote preset auto-registers own toggles and activates/shows presetToggles only while parent remote preset is active', async () => {
+    const tok = 'tok-preset-lifecycle';
+    const server = relay.createRelayServer({
+        token: tok,
+        configOverride: {
+            activeProfileId: 'off',
+            directPresetId: 'bundled:leave',
+            remoteToggleValues: {},
+            presetToggles: [],
+            profiles: [],
+        },
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+
+    try {
+        const hdrs = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+
+        // 1) Initial config with bundled:leave & empty presetToggles -> Leave toggle entry auto-registered & enabled
+        const cfg0 = JSON.parse((await requestHttp(port, { path: '/api/router/config', headers: hdrs })).body);
+        const leave0 = (cfg0.presetToggles || []).find((pt) => pt.id === 'preset-leave-r1.1');
+        assert.ok(leave0, 'Bundled Leave toggles must auto-register without manual install');
+        assert.equal(leave0.parentPresetId, 'bundled:leave');
+        assert.equal(leave0.enabled, true);
+
+        // 2) Upload Custom Preset A with its own customPromptTemplateToggle -> auto-registered & enabled, Leave auto-disabled
+        const upA = JSON.parse((await requestHttp(port, {
+            method: 'POST',
+            path: '/api/presets/custom',
+            headers: hdrs,
+            body: JSON.stringify({
+                filename: 'AlphaPreset.json',
+                jsonObject: {
+                    name: 'Alpha Own-Toggle Preset',
+                    customPromptTemplateToggle: 'alpha_mode=알파 모드=select=끄기,켜기',
+                    promptTemplate: [{ type: 'plain', role: 'system', text: 'Alpha {{#if {{? {{getglobalvar::toggle_alpha_mode}}=1}}}}ON{{/if}}' }],
+                },
+            }),
+        })).body);
+        assert.equal(upA.ok, true);
+        const idA = upA.preset.id;
+        const ptIdA = `pt-${upA.preset.customId}`;
+        const alphaOnUpload = upA.config.presetToggles.find((pt) => pt.id === ptIdA);
+        const leaveAfterA = upA.config.presetToggles.find((pt) => pt.id === 'preset-leave-r1.1');
+        assert.ok(alphaOnUpload && alphaOnUpload.enabled === true && alphaOnUpload.parentPresetId === idA);
+        assert.ok(leaveAfterA && leaveAfterA.enabled === false, 'Inactive Leave preset toggles must be disabled when replaced');
+
+        // 3) Upload Custom Preset B without own toggles -> both Leave and Alpha auto-disabled
+        const upB = JSON.parse((await requestHttp(port, {
+            method: 'POST',
+            path: '/api/presets/custom',
+            headers: hdrs,
+            body: JSON.stringify({
+                filename: 'BetaNoToggle.json',
+                jsonObject: {
+                    name: 'Beta Module-Driven Preset',
+                    customPromptTemplateToggle: '',
+                    promptTemplate: [{ type: 'plain', role: 'system', text: 'Beta base' }],
+                },
+            }),
+        })).body);
+        assert.equal(upB.ok, true);
+        const idB = upB.preset.id;
+        assert.equal(upB.config.directPresetId, idB);
+        assert.equal(upB.config.presetToggles.find((pt) => pt.id === ptIdA).enabled, false);
+        assert.equal(upB.config.presetToggles.find((pt) => pt.id === 'preset-leave-r1.1').enabled, false);
+
+        // 4) Switch direct preset back to Alpha -> Alpha re-enabled, Leave remains disabled
+        const swA = JSON.parse((await requestHttp(port, {
+            method: 'POST',
+            path: '/api/presets/direct',
+            headers: hdrs,
+            body: JSON.stringify({ directPresetId: idA }),
+        })).body);
+        assert.equal(swA.directPresetId, idA);
+        assert.equal(swA.presetToggles.find((pt) => pt.id === ptIdA).enabled, true);
+        assert.equal(swA.presetToggles.find((pt) => pt.id === 'preset-leave-r1.1').enabled, false);
+
+        // 5) Switch direct preset to off -> all parent-bound preset toggles disabled
+        const swOff = JSON.parse((await requestHttp(port, {
+            method: 'POST',
+            path: '/api/presets/direct',
+            headers: hdrs,
+            body: JSON.stringify({ directPresetId: 'off' }),
+        })).body);
+        assert.equal(swOff.directPresetId, 'off');
+        assert.equal(swOff.presetToggles.find((pt) => pt.id === ptIdA).enabled, false);
+        assert.equal(swOff.presetToggles.find((pt) => pt.id === 'preset-leave-r1.1').enabled, false);
+
+        // 6) Switch back to bundled:leave -> Leave re-enabled, Alpha stays disabled
+        const swLeave = JSON.parse((await requestHttp(port, {
+            method: 'POST',
+            path: '/api/presets/direct',
+            headers: hdrs,
+            body: JSON.stringify({ directPresetId: 'bundled:leave' }),
+        })).body);
+        assert.equal(swLeave.directPresetId, 'bundled:leave');
+        assert.equal(swLeave.presetToggles.find((pt) => pt.id === 'preset-leave-r1.1').enabled, true);
+        assert.equal(swLeave.presetToggles.find((pt) => pt.id === ptIdA).enabled, false);
+
+        // 7) Verify Web UI client bindings (#leavePresetBar, #ptParentPreset, renderCustomToggles(true) on preset switch, valid JS)
+        const html = await requestHttp(port, { path: '/' });
+        assert.equal(html.status, 200);
+        assert.ok(html.body.includes('id="leavePresetBar"'));
+        assert.ok(html.body.includes('id="ptParentPreset"'));
+        assert.ok(html.body.includes("if (parentId && parentId !== curDirectId) return false;"));
+        const scriptMatch = html.body.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(scriptMatch);
+        new vm.Script(scriptMatch[1], { filename: 'webapp-parent-toggle-lifecycle.js' });
+    } finally {
+        await new Promise((r) => server.close(r));
+    }
+});
+
 test('Cheongwon High School regression: large lorebooks (>6k), character sheet scanDepth, @@depth postEverything, {{#when}}, and replaceGlobalNote', async () => {
     const capturedPayloads = [];
     const upstream = http.createServer((req, res) => {
@@ -1493,6 +1607,234 @@ test('lorebook inspector GET /api/lorebook, per-entry exclude & pin, Author Note
         assert.equal(edRes.status, 200);
         const stAfterEdit = JSON.parse((await requestHttp(port, { path: '/api/state', headers: hdrs })).body);
         assert.equal(stAfterEdit.snapshot.messages[0].raw, 'EDITED_GREETING_TEXT');
+    } finally {
+        await new Promise((r) => server.close(r));
+        await new Promise((r) => upstream.close(r));
+    }
+});
+
+test('Cache Guard monitors proxy narrative lanes, excludes Hayaku/Flashback/translate/errors, detects prefix breaks & serves analysis UI', async () => {
+    // 1) Multi-provider usage mapping checks
+    const antU = relay.mapUsageToOpenAI({ input_tokens: 120, cache_read_input_tokens: 800, cache_creation_input_tokens: 80, output_tokens: 40 });
+    assert.equal(antU.prompt_tokens, 1000);
+    assert.equal(antU.cached_tokens, 800);
+    assert.equal(antU.cache_creation_tokens, 80);
+
+    const oaiU = relay.mapUsageToOpenAI({ prompt_tokens: 2000, completion_tokens: 100, prompt_tokens_details: { cached_tokens: 1800 } });
+    assert.equal(oaiU.prompt_tokens, 2000);
+    assert.equal(oaiU.cached_tokens, 1800);
+
+    const gemU = relay.mapUsageToOpenAI({ promptTokenCount: 1500, candidatesTokenCount: 50, cachedContentTokenCount: 1200 });
+    assert.equal(gemU.prompt_tokens, 1500);
+    assert.equal(gemU.cached_tokens, 1200);
+
+    const dsU = relay.mapUsageToOpenAI({ prompt_tokens: 1000, completion_tokens: 50, prompt_cache_hit_tokens: 900, prompt_cache_miss_tokens: 100 });
+    assert.equal(dsU.cached_tokens, 900);
+
+    // 2) End-to-end proxy + translate + Hayaku/Flashback exclusion + Bot A/B lane separation
+    const upstream = http.createServer(async (req, res) => {
+        const chunks = [];
+        for await (const c of req) chunks.push(c);
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        const joined = (body.messages || []).map((m) => String(m.content || '')).join('\n');
+        if (joined.includes('FORCE_PROXY_ERR')) {
+            res.writeHead(429, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: { message: 'Rate limited' } }));
+            return;
+        }
+        if (body.stream) {
+            res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+            res.write('data: {"id":"c1","model":"gpt-4o","choices":[{"delta":{"content":"Streamed narrative reply."}}]}\n\n');
+            res.write('data: {"id":"c1","model":"gpt-4o","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":2000,"completion_tokens":30,"total_tokens":2030,"prompt_tokens_details":{"cached_tokens":1800}}}\n\n');
+            res.write('data: [DONE]\n\n');
+            res.end();
+            return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            id: 'chatcmpl-cg',
+            model: 'gpt-4o',
+            choices: [{ message: { role: 'assistant', content: 'Ok reply' } }],
+            usage: { prompt_tokens: 1500, completion_tokens: 20, total_tokens: 1520, prompt_tokens_details: { cached_tokens: 0 } },
+        }));
+    });
+    await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+    const upPort = upstream.address().port;
+
+    const tok = 'cache-guard-token-77';
+    const server = relay.createRelayServer({
+        token: tok,
+        configOverride: {
+            activeProfileId: 'cg-p1',
+            presetToggles: [],
+            profiles: [{
+                id: 'cg-p1',
+                name: 'CGMock',
+                provider: 'custom',
+                providerType: 'openai_compat',
+                baseUrl: `http://127.0.0.1:${upPort}/v1/chat/completions`,
+                apiKey: 'sk-cg-secret-1111',
+                model: 'gpt-4o',
+                temperature: '',
+                maxTokens: '',
+                overrideMode: 'off',
+                systemOverride: '',
+            }],
+            translator: {
+                useActiveProfile: true,
+                targetLang: 'Korean',
+                autoTranslateOutput: false,
+                autoTranslateInput: false,
+            },
+        },
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+
+    const botASysHead = 'Character Alice is an archivist in an ancient clockwork observatory in New Avalon who catalogs celestial maps and forbidden mechanical scriptures every night. '.repeat(2);
+    const botASysBase = botASysHead + 'She always speaks calmly and wears brass spectacles.';
+    const botASysMutated = botASysHead + 'She suddenly speaks frantically because an unexpected lorebook block altered the system prompt!';
+    const botBSys = 'Character Bob is a deep-sea submarine engineer exploring Europa trenches with sonar drones and pressure suits.';
+
+    try {
+        const authHdr = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+        const proxyHdr = { Authorization: `Bearer ${tok}`, 'Content-Type': 'application/json' };
+
+        await requestHttp(port, { method: 'DELETE', path: '/api/logs', headers: authHdr });
+
+        const postProxy = (messages, stream = false) => requestHttp(port, {
+            method: 'POST',
+            path: '/v1/chat/completions',
+            headers: proxyHdr,
+            body: JSON.stringify({ model: 'risustand-router', stream, messages }),
+        });
+
+        // Turn A1 (baseline for Bot A)
+        assert.equal((await postProxy([
+            { role: 'system', content: botASysBase },
+            { role: 'user', content: 'Alice, open the star ledger on desk 4.' },
+        ])).status, 200);
+
+        // Interleaved Hayaku summary request via proxy (MUST be excluded)
+        assert.equal((await postProxy([
+            { role: 'system', content: '[Hayaku] Summarize the following conversation concisely into bullet notes.' },
+            { role: 'user', content: 'Alice opened the ledger and checked the brass astrolabe.' },
+        ])).status, 200);
+
+        // Interleaved Flashback Memory retrieval via proxy (MUST be excluded)
+        assert.equal((await postProxy([
+            { role: 'system', content: 'FLASHBACK Memory retrieval helper. Extract relevant memories for the upcoming turn.' },
+            { role: 'user', content: 'Query: clockwork observatory' },
+        ])).status, 200);
+
+        // Bot B Turn 1 (MUST form Group #2 without affecting Bot A)
+        assert.equal((await postProxy([
+            { role: 'system', content: botBSys },
+            { role: 'user', content: 'Bob, check the hull seal at 4000 meters.' },
+        ])).status, 200);
+
+        // Error request via proxy (MUST be excluded)
+        assert.equal((await postProxy([
+            { role: 'system', content: botASysBase },
+            { role: 'user', content: 'FORCE_PROXY_ERR' },
+        ])).status, 502);
+
+        // Translator call via /api/translate (MUST be excluded)
+        assert.equal((await requestHttp(port, {
+            method: 'POST',
+            path: '/api/translate',
+            headers: authHdr,
+            body: JSON.stringify({ text: 'The stars align tonight.', direction: 'to_target' }),
+        })).status, 200);
+
+        // Turn A2 (stream passthrough, prefix matches A1 100%, KV hit 90%)
+        assert.equal((await postProxy([
+            { role: 'system', content: botASysBase },
+            { role: 'user', content: 'Alice, open the star ledger on desk 4.' },
+            { role: 'assistant', content: 'She opens the leather-bound ledger carefully.' },
+            { role: 'user', content: 'Read the constellation entry for October.' },
+        ], true)).status, 200);
+
+        // Turn A3 (Bot A anchor matches, system prompt mutated mid-chat -> cacheBroken: true!)
+        assert.equal((await postProxy([
+            { role: 'system', content: botASysMutated },
+            { role: 'user', content: 'Alice, open the star ledger on desk 4.' },
+            { role: 'assistant', content: 'She opens the leather-bound ledger carefully.' },
+            { role: 'user', content: 'Read the constellation entry for October.' },
+            { role: 'assistant', content: 'The October chart shows a faint comet.' },
+            { role: 'user', content: 'Trace its orbital trajectory.' },
+        ])).status, 200);
+
+        const logsRes = JSON.parse((await requestHttp(port, { path: '/api/logs', headers: authHdr })).body);
+        assert.equal(logsRes.logs.length, 8);
+        assert.equal(logsRes.summary.narrativeCount, 4);
+        assert.equal(logsRes.summary.excludedCount, 4);
+        assert.equal(logsRes.summary.laneCount, 2);
+        assert.equal(logsRes.summary.brokenCount, 1);
+        assert.equal(logsRes.summary.intactCount, 1);
+        assert.equal(logsRes.summary.baselineCount, 2);
+
+        // Newest-first indices: 0=A3, 1=A2, 2=Translate, 3=Err, 4=B1, 5=Flashback, 6=Hayaku, 7=A1
+        const [logA3, logA2, logTrans, logErr, logB1, logFlash, logHayaku, logA1] = logsRes.logs;
+
+        assert.equal(logA1.cacheGuard.eligible, true);
+        assert.equal(logA1.cacheGuard.verdict, 'baseline');
+        assert.equal(logA1.cacheGuard.turnIndex, 1);
+
+        assert.equal(logHayaku.cacheGuard.eligible, false);
+        assert.equal(logHayaku.cacheGuard.excludedReason, 'hayaku');
+
+        assert.equal(logFlash.cacheGuard.eligible, false);
+        assert.equal(logFlash.cacheGuard.excludedReason, 'flashback');
+
+        assert.equal(logErr.cacheGuard.eligible, false);
+        assert.equal(logErr.cacheGuard.excludedReason, 'http_error');
+
+        assert.equal(logTrans.cacheGuard.eligible, false);
+        assert.equal(logTrans.cacheGuard.excludedReason, 'translate');
+
+        assert.equal(logB1.cacheGuard.eligible, true);
+        assert.equal(logB1.cacheGuard.verdict, 'baseline');
+        assert.notEqual(logB1.cacheGuard.laneId, logA1.cacheGuard.laneId);
+
+        assert.equal(logA2.cacheGuard.eligible, true);
+        assert.equal(logA2.cacheGuard.laneId, logA1.cacheGuard.laneId);
+        assert.equal(logA2.cacheGuard.prevLogId, logA1.id);
+        assert.equal(logA2.cacheGuard.turnIndex, 2);
+        assert.equal(logA2.cacheGuard.prefixMatchPct, 100);
+        assert.equal(logA2.cacheGuard.cacheBroken, false);
+        assert.equal(logA2.cacheGuard.verdict, 'ok');
+        assert.equal(logA2.cacheGuard.serverHitPct, 90);
+
+        assert.equal(logA3.cacheGuard.eligible, true);
+        assert.equal(logA3.cacheGuard.laneId, logA1.cacheGuard.laneId);
+        assert.equal(logA3.cacheGuard.prevLogId, logA2.id);
+        assert.equal(logA3.cacheGuard.turnIndex, 3);
+        assert.equal(logA3.cacheGuard.cacheBroken, true);
+        assert.equal(logA3.cacheGuard.verdict, 'broken');
+        assert.ok(logA3.cacheGuard.prefixMatchPct < 98);
+
+        // Detail endpoint returns segmentMap & firstDiff without leaking internal raw buffers
+        const detailA3Res = JSON.parse((await requestHttp(port, {
+            path: `/api/logs/${encodeURIComponent(logA3.id)}`,
+            headers: authHdr,
+        })).body);
+        assert.ok(detailA3Res.log.cacheGuard.firstDiff);
+        assert.ok(detailA3Res.log.cacheGuard.firstDiff.currSnippet.includes('unexpected lorebook block') || detailA3Res.log.cacheGuard.firstDiff.currSnippet.includes('frantically'));
+        assert.ok(Array.isArray(detailA3Res.log.cacheGuard.segmentMap));
+        assert.equal(detailA3Res.log._cgRawBody, undefined);
+
+        // Web UI compiles & contains Cache Guard markers
+        const html = await requestHttp(port, { path: '/' });
+        assert.equal(html.status, 200);
+        for (const marker of ['reqLogCgSummary', 'reqLogGroupToggle', 'data-log-filter="narrative"', 'data-log-filter="broken"', 'renderReqLogCacheTabHtml', 'buildCacheGuardSummaryHtml']) {
+            assert.ok(html.body.includes(marker), `Expected Cache Guard UI marker: ${marker}`);
+        }
+        const scriptMatch = html.body.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(scriptMatch);
+        new vm.Script(scriptMatch[1], { filename: 'webapp-cacheguard-inline.js' });
+
+        await requestHttp(port, { method: 'DELETE', path: '/api/logs', headers: authHdr });
     } finally {
         await new Promise((r) => server.close(r));
         await new Promise((r) => upstream.close(r));

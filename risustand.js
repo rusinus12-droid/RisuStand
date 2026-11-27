@@ -4037,8 +4037,7 @@
                 if (mId) {
                     pos += mId[0].length;
                     if (mId[0] === 'true') return 1;
-                    if (mId[0] === 'false') return 0;
-                    if (mId[0] === 'null' || mId[0] === 'undefined') return '';
+                    if (mId[0] === 'false' || mId[0] === 'null' || mId[0] === 'undefined') return 0;
                     return mId[0];
                 }
                 return 0;
@@ -4079,14 +4078,14 @@
                 let left = parseAdd();
                 while (true) {
                     const rest = peek();
-                    const m = rest.match(/^(===|!==|==|!=|>=|<=|>|<)/);
+                    const m = rest.match(/^(===|!==|==|!=|>=|<=|=|>|<)/);
                     if (!m) break;
                     pos += m[1].length;
                     const right = parseAdd();
                     const op = m[1];
                     const bothNum = (typeof left === 'number' || (typeof left === 'string' && left.trim() !== '' && Number.isFinite(Number(left))))
                         && (typeof right === 'number' || (typeof right === 'string' && right.trim() !== '' && Number.isFinite(Number(right))));
-                    if (op === '==' || op === '===') left = (String(left) === String(right) || (bothNum && Number(left) === Number(right))) ? 1 : 0;
+                    if (op === '=' || op === '==' || op === '===') left = (String(left) === String(right) || (bothNum && Number(left) === Number(right))) ? 1 : 0;
                     else if (op === '!=' || op === '!==') left = (String(left) !== String(right) && !(bothNum && Number(left) === Number(right))) ? 1 : 0;
                     else if (op === '>') left = Number(left) > Number(right) ? 1 : 0;
                     else if (op === '<') left = Number(left) < Number(right) ? 1 : 0;
@@ -4228,9 +4227,9 @@
                 const inner = str.slice(openAt + 2, closeAt);
                 const trimmed = inner.trim();
 
-                if (/^#(?:when|if|if_pure|each|func)(?:[\s:]|$)/i.test(trimmed)) {
+                if (/^#(?:when|if|if_pure|each|func|escape)(?:[\s:]|$)/i.test(trimmed)) {
                     blockDepth += 1;
-                } else if (/^\/(?:when|if|if_pure|each|func)?\s*$/i.test(trimmed)) {
+                } else if (trimmed.startsWith('/') && !trimmed.startsWith('//')) {
                     blockDepth -= 1;
                     if (blockDepth === 0) {
                         branches.push({ cond: curCond, body: str.slice(segStart, openAt) });
@@ -4332,7 +4331,7 @@
 
         function evalCBS(input, ctx, depth = 0) {
             const str = String(input ?? '');
-            if (!str || depth > 24 || !str.includes('{{')) return str;
+            if (!str || depth > 200 || !str.includes('{{')) return str;
 
             let out = '';
             let pos = 0;
@@ -4453,7 +4452,13 @@
                 }
 
                 const parts = splitTopLevel(rawInner, '::');
-                const cmd = (parts[0] || '').trim().toLowerCase();
+                let cmd = (parts[0] || '').trim().toLowerCase();
+                let effectiveParts = parts;
+                if (parts.length === 1 && cmd.includes(':')) {
+                    const colonIdx = rawInner.indexOf(':');
+                    cmd = rawInner.slice(0, colonIdx).trim().toLowerCase();
+                    effectiveParts = [cmd, rawInner.slice(colonIdx + 1)];
+                }
 
                 if (cmd === 'user') {
                     out += ctx.userName || 'User';
@@ -4461,10 +4466,72 @@
                     out += ctx.charName || 'Character';
                 } else if (cmd === 'br' || cmd === 'newline') {
                     out += '\n';
+                } else if (cmd === 'blank' || cmd === 'comment' || cmd === 'hidden_key' || cmd === 'hiddenkey' || cmd.startsWith('//')) {
+                    // hidden / non-prose
                 } else if (cmd === 'chat_index') {
                     out += String(ctx.chatIndex ?? 0);
                 } else if (cmd === 'lastmessageid') {
                     out += String(ctx.lastMessageId ?? 0);
+                } else if (cmd === 'previous_chat_log' || cmd === 'previouschatlog') {
+                    const idx = Number(evalCBS(effectiveParts[1] || '', ctx, depth + 1).trim());
+                    if (Array.isArray(ctx.chatList) && Number.isInteger(idx) && idx >= 0 && idx < ctx.chatList.length) {
+                        out += String((ctx.chatList[idx] && ctx.chatList[idx].content) ?? '');
+                    }
+                } else if (cmd === 'array' || cmd === 'makearray' || cmd === 'a') {
+                    out += JSON.stringify(effectiveParts.slice(1).map((p) => evalCBS(p, ctx, depth + 1)));
+                } else if (cmd === 'length') {
+                    const valStr = evalCBS(effectiveParts[1] || '', ctx, depth + 1);
+                    const tr = valStr.trim();
+                    let lenOut = null;
+                    if (tr.startsWith('[')) {
+                        try {
+                            const parsed = JSON.parse(tr);
+                            if (Array.isArray(parsed)) lenOut = String(parsed.length);
+                        } catch (_) {}
+                    }
+                    out += lenOut !== null ? lenOut : String(valStr.length);
+                } else if (cmd === 'contains') {
+                    const hay = evalCBS(effectiveParts[1] || '', ctx, depth + 1);
+                    const needle = evalCBS(effectiveParts[2] || '', ctx, depth + 1);
+                    out += hay.includes(needle) ? '1' : '0';
+                } else if (cmd === 'replace') {
+                    const srcText = evalCBS(effectiveParts[1] || '', ctx, depth + 1);
+                    const fromStr = evalCBS(effectiveParts[2] || '', ctx, depth + 1);
+                    const toStr = evalCBS(effectiveParts[3] || '', ctx, depth + 1);
+                    out += srcText.split(fromStr).join(toStr);
+                } else if (cmd === 'ruby') {
+                    const baseTxt = evalCBS(effectiveParts[1] || '', ctx, depth + 1);
+                    const rtTxt = evalCBS(effectiveParts[2] || '', ctx, depth + 1);
+                    out += `<ruby>${baseTxt}<rt>${rtTxt}</rt></ruby>`;
+                } else if (cmd === 'random') {
+                    let choices = effectiveParts.slice(1).map((p) => evalCBS(p, ctx, depth + 1));
+                    if (choices.length === 1) {
+                        if (choices[0].includes(':')) choices = choices[0].split(':');
+                        else if (choices[0].includes(',')) choices = choices[0].split(',');
+                    }
+                    if (choices.length) out += String(choices[Math.floor(Math.random() * choices.length)] ?? '');
+                } else if (cmd === 'roll') {
+                    const spec = evalCBS(effectiveParts[1] || '20', ctx, depth + 1).trim();
+                    const dm = spec.match(/^(\d+)d(\d+)$/i);
+                    if (dm) {
+                        const cnt = Math.min(100, Math.max(1, Number(dm[1]) || 1));
+                        const sides = Math.max(1, Number(dm[2]) || 20);
+                        let total = 0;
+                        for (let ri = 0; ri < cnt; ri += 1) total += 1 + Math.floor(Math.random() * sides);
+                        out += String(total);
+                    } else {
+                        const sides = Math.max(1, Number(spec) || 20);
+                        out += String(1 + Math.floor(Math.random() * sides));
+                    }
+                } else if (cmd === 'u' || cmd === 'unicode') {
+                    const cp = parseInt(evalCBS(effectiveParts[1] || '', ctx, depth + 1).trim(), 16);
+                    if (Number.isFinite(cp) && cp >= 0 && cp <= 0x10FFFF) out += String.fromCodePoint(cp);
+                } else if (cmd === 'time') {
+                    const d = new Date();
+                    const pad = (n) => String(n).padStart(2, '0');
+                    const fmt = evalCBS(effectiveParts[1] || 'HH:mm:ss', ctx, depth + 1).trim() || 'HH:mm:ss';
+                    const tMap = { YYYY: String(d.getFullYear()), YY: String(d.getFullYear()).slice(-2), MM: pad(d.getMonth() + 1), DD: pad(d.getDate()), HH: pad(d.getHours()), mm: pad(d.getMinutes()), ss: pad(d.getSeconds()) };
+                    out += fmt.replace(/YYYY|YY|MM|DD|HH|mm|ss/g, (tk) => tMap[tk] ?? tk);
                 } else if (cmd === 'slot') {
                     const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
                     const slots = ctx.slots || {};
@@ -4483,8 +4550,6 @@
                     if (trig) {
                         out += `<button type="button" class="risu-cbs-btn" risu-trigger="${escapeHtml(trig)}">${escapeHtml(lbl || trig)}</button>`;
                     }
-                } else if (cmd === 'comment' || cmd === 'hidden_key' || cmd.startsWith('//')) {
-                    // hidden / non-prose
                 } else if (cmd === 'getvar' || cmd === 'getchatvar') {
                     const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
                     out += Object.prototype.hasOwnProperty.call(ctx.vars, k) ? String(ctx.vars[k]) : 'null';
@@ -4692,6 +4757,7 @@
                 const hasCbsFlag = rawFlag.includes('<cbs>');
                 const jsFlags = rawFlag.replace(/<[^>]+>/g, '').replace(/[^gimsu]/g, '') || 'g';
                 const patternStr = hasCbsFlag ? evalCBS(rawIn, ctx) : rawIn;
+                if (!patternStr) continue;
 
                 try {
                     const rx = new RegExp(patternStr, jsFlags);
@@ -5241,6 +5307,24 @@
             return { catalog, sig };
         }
     
+        function ensureStableChatAndMessageIds(charObj, charIdx, chatObj, chatIdx) {
+            if (!chatObj || typeof chatObj !== 'object') return chatObj;
+            const cidOwner = String((charObj && charObj.chaId) || charIdx || 0).replace(/[^a-zA-Z0-9_-]/g, '_');
+            if (!chatObj.id || !String(chatObj.id).trim()) {
+                chatObj.id = `rs-chat-${cidOwner}-${Math.max(0, Number(chatIdx) || 0)}`;
+            }
+            if (Array.isArray(chatObj.message)) {
+                const baseId = String(chatObj.id);
+                for (let i = 0; i < chatObj.message.length; i++) {
+                    const m = chatObj.message[i];
+                    if (m && typeof m === 'object' && (!m.chatId || !String(m.chatId).trim())) {
+                        m.chatId = `rs-msg-${baseId}-${i}`;
+                    }
+                }
+            }
+            return chatObj;
+        }
+
         async function buildSnapshot(forceFull = false) {
             const pcCharIdx = await risuai.getCurrentCharacterIndex();
             const pcChatIdx = pcCharIdx >= 0 ? await risuai.getCurrentChatIndex() : -1;
@@ -5290,6 +5374,7 @@
             }
     
             const chatObj = chats[viewChatIndex] || { name: 'Chat 1', message: [] };
+            ensureStableChatAndMessageIds(charObj, viewCharIndex, chatObj, viewChatIndex);
             const allMsgs = Array.isArray(chatObj.message) ? chatObj.message : [];
             const startOffset = Math.max(0, allMsgs.length - 36);
             const recent = allMsgs.slice(startOffset);
@@ -5555,6 +5640,7 @@
                     charContext: {
                         charId: String((charObj && charObj.chaId) || charObj.name || viewCharIndex),
                         name: charObj.name || 'Character',
+                        lowLevelAccess: Boolean(charObj && charObj.lowLevelAccess),
                         desc: String(charObj.desc || '').slice(0, 20000),
                         personality: String(charObj.personality || '').slice(0, 4000),
                         scenario: String(charObj.scenario || '').slice(0, 4000),
@@ -7868,9 +7954,55 @@
         }
     
         let cachedLocalPluginStore = null;
+        let cachedPcPluginsList = null;
+        let cachedPcPluginsAt = 0;
+        const PC_PLUGINS_CACHE_TTL_MS = 60000;
         let hostRpcSupported = false;
         let rpcLoopRunning = false;
         let rpcLoopNonce = 0;
+
+        function computePluginScriptSig(script) {
+            const s = String(script || '');
+            const len = s.length;
+            let h1 = 0x811c9dc5;
+            const step = Math.max(1, Math.floor(len / 4096));
+            for (let i = 0; i < len; i += step) {
+                h1 ^= s.charCodeAt(i);
+                h1 = Math.imul(h1, 0x01000193) >>> 0;
+            }
+            return `${len}:${h1.toString(16)}`;
+        }
+
+        async function loadPcPluginsSnapshot(forceRefresh = false) {
+            if (!forceRefresh && cachedPcPluginsList && (Date.now() - cachedPcPluginsAt < PC_PLUGINS_CACHE_TTL_MS)) {
+                return cachedPcPluginsList;
+            }
+            const db = await risuai.getDatabase(['plugins']);
+            if (db === null || db === undefined) {
+                throw new Error('PC RisuAI에서 데이터베이스 접근 권한(db)이 거부되었거나 대기 중입니다. PC RisuAI 창에 권한 허용 팝업이 떠 있는지 확인해 주세요.');
+            }
+            const raw = Array.isArray(db.plugins) ? db.plugins : [];
+            const list = raw
+                .filter((p) => p && p.name && p.name !== 'risustand' && typeof p.script === 'string')
+                .map((p) => {
+                    const script = String(p.script);
+                    return {
+                        name: String(p.name),
+                        displayName: String(p.displayName || p.name),
+                        version: String(p.version || '3.0'),
+                        versionOfPlugin: String(p.versionOfPlugin || ''),
+                        script,
+                        scriptLen: script.length,
+                        scriptSig: computePluginScriptSig(script),
+                        realArg: (p.realArg && typeof p.realArg === 'object') ? p.realArg : {},
+                        enabled: p.enabled !== false,
+                        allowedIPC: Array.isArray(p.allowedIPC) ? p.allowedIPC : [],
+                    };
+                });
+            cachedPcPluginsList = list;
+            cachedPcPluginsAt = Date.now();
+            return list;
+        }
 
         async function getSharedLocalPluginStore() {
             if (!cachedLocalPluginStore && typeof risuai.getLocalPluginStorage === 'function') {
@@ -7962,7 +8094,14 @@
                 return { charIndex, chatIndex, viewCharIndex, viewChatIndex };
             }
             if (kindOp === 'db.getCharacter') {
-                return await risuai.getCharacterFromIndex(Number(a[0]));
+                const cIdx = Number(a[0]);
+                const ch = await risuai.getCharacterFromIndex(cIdx);
+                if (ch && Array.isArray(ch.chats)) {
+                    for (let ci = 0; ci < ch.chats.length; ci++) {
+                        ensureStableChatAndMessageIds(ch, cIdx, ch.chats[ci], ci);
+                    }
+                }
+                return ch;
             }
             if (kindOp === 'db.setCharacter') {
                 await risuai.setCharacterToIndex(Number(a[0]), a[1]);
@@ -7973,7 +8112,13 @@
                 return true;
             }
             if (kindOp === 'db.getChat') {
-                return await risuai.getChatFromIndex(Number(a[0]), Number(a[1]));
+                const cIdx = Number(a[0]);
+                const chIdx = Number(a[1]);
+                const [ch, chat] = await Promise.all([
+                    risuai.getCharacterFromIndex(cIdx).catch(() => null),
+                    risuai.getChatFromIndex(cIdx, chIdx),
+                ]);
+                return ensureStableChatAndMessageIds(ch, cIdx, chat, chIdx);
             }
             if (kindOp === 'db.setChat') {
                 await risuai.setChatToIndex(Number(a[0]), Number(a[1]), a[2]);
@@ -8003,23 +8148,47 @@
                 setTimeout(() => pollOnce(true), 80);
                 return true;
             }
+            if (kindOp === 'db.listPluginsMeta') {
+                const list = await loadPcPluginsSnapshot(a[0] !== false);
+                return list.map(({ script, ...meta }) => meta);
+            }
+            if (kindOp === 'db.getPluginScriptChunk') {
+                const targetName = String(a[0] || '');
+                const offset = Math.max(0, Number(a[1]) || 0);
+                const maxChars = Math.max(65536, Math.min(2000000, Number(a[2]) || 1500000));
+                let list = await loadPcPluginsSnapshot(false);
+                let found = list.find((p) => p.name === targetName);
+                if (!found && offset === 0) {
+                    list = await loadPcPluginsSnapshot(true);
+                    found = list.find((p) => p.name === targetName);
+                }
+                if (!found) return null;
+                const chunk = found.script.slice(offset, offset + maxChars);
+                return {
+                    name: found.name,
+                    chunk,
+                    offset,
+                    totalLen: found.script.length,
+                    scriptSig: found.scriptSig,
+                    eof: (offset + chunk.length) >= found.script.length,
+                };
+            }
             if (kindOp === 'db.getPlugins') {
-                const db = await risuai.getDatabase(['plugins']);
-                const raw = (db && Array.isArray(db.plugins)) ? db.plugins : [];
-                return raw
-                    .filter((p) => p && p.name && p.name !== 'risustand' && typeof p.script === 'string')
-                    .map((p) => ({
-                        name: String(p.name),
-                        displayName: String(p.displayName || p.name),
-                        version: String(p.version || '3.0'),
-                        versionOfPlugin: String(p.versionOfPlugin || ''),
-                        script: String(p.script),
-                        realArg: (p.realArg && typeof p.realArg === 'object') ? p.realArg : {},
-                        enabled: p.enabled !== false,
-                        allowedIPC: Array.isArray(p.allowedIPC) ? p.allowedIPC : [],
-                    }));
+                const list = await loadPcPluginsSnapshot(true);
+                return list.map((p) => ({
+                    name: p.name,
+                    displayName: p.displayName,
+                    version: p.version,
+                    versionOfPlugin: p.versionOfPlugin,
+                    script: p.script,
+                    realArg: p.realArg,
+                    enabled: p.enabled,
+                    allowedIPC: p.allowedIPC,
+                }));
             }
             if (kindOp === 'db.reloadPcPlugins') {
+                cachedPcPluginsList = null;
+                cachedPcPluginsAt = 0;
                 if (typeof risuai.loadPlugins === 'function') await risuai.loadPlugins();
                 return true;
             }
@@ -8158,25 +8327,45 @@
 
         async function runHostRpcBatch(calls) {
             if (!Array.isArray(calls) || !calls.length || !cfg.enabled || !cfg.relayUrl || !cfg.token) return;
-            const results = await Promise.all(calls.map(async (c) => {
+            const results = [];
+            for (const c of calls) {
                 try {
                     const value = await executeHostRpcCall(c.op, c.args);
-                    return { id: c.id, ok: true, value };
+                    results.push({ id: c.id, ok: true, value });
                 } catch (err) {
-                    return { id: c.id, ok: false, error: err && err.message ? err.message : String(err) };
+                    results.push({ id: c.id, ok: false, error: err && err.message ? err.message : String(err) });
                 }
-            }));
+            }
+            const resEndpoint = cfg.relayUrl.replace(/\/+$/, '') + '/api/pc/rpc-result';
             try {
-                const resEndpoint = cfg.relayUrl.replace(/\/+$/, '') + '/api/pc/rpc-result';
-                await risuai.nativeFetch(resEndpoint, {
+                const postResp = await risuai.nativeFetch(resEndpoint, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                         'X-RisuStand-Token': cfg.token,
                     },
                     body: JSON.stringify({ results }),
+                    logFetch: false,
                 });
-            } catch (_) {}
+                if (!postResp || !postResp.ok) {
+                    throw new Error(`HTTP ${postResp ? postResp.status : 'unknown'}`);
+                }
+            } catch (postErr) {
+                try {
+                    const errMsg = `PC 브릿지 RPC 응답 전송 실패: ${postErr && postErr.message ? postErr.message : String(postErr)}`;
+                    await risuai.nativeFetch(resEndpoint, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-RisuStand-Token': cfg.token,
+                        },
+                        body: JSON.stringify({
+                            results: calls.map((c) => ({ id: c.id, ok: false, error: errMsg })),
+                        }),
+                        logFetch: false,
+                    });
+                } catch (_) {}
+            }
         }
 
         function startHostRpcLoop() {
@@ -8195,6 +8384,7 @@
                                     'X-RisuStand-Token': cfg.token,
                                 },
                                 body: JSON.stringify({ timeoutMs: 12000 }),
+                                logFetch: false,
                             });
                             if (!resp || !resp.ok) {
                                 await new Promise((r) => setTimeout(r, 1500));
@@ -8243,6 +8433,7 @@
                         snapshot: snapRes ? snapRes.snapshot : null,
                         triggerEvent,
                     }),
+                    logFetch: false,
                 });
     
                 if (!res || !res.ok) {

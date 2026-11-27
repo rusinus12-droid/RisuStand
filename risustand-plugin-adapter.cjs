@@ -245,17 +245,246 @@ function parseAttributesFromHtml(html) {
     return { tagName, attrs };
 }
 
-function createHeadlessMockDom() {
+function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null } = {}) {
+    const VOID_HTML_TAGS = new Set([
+        'area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input',
+        'link', 'meta', 'param', 'source', 'track', 'wbr',
+    ]);
+    const RAW_TEXT_TAGS = new Set(['style', 'script', 'textarea']);
+    const RAW_MOCK_EL = Symbol('rawMockEl');
+    const safeWrapperCache = new WeakMap();
+    const unwrapEl = (v) => (v && typeof v === 'object' && v[RAW_MOCK_EL] ? v[RAW_MOCK_EL] : v);
+    const mutationObservers = new Set();
+    let activePressEl = null;
+    let hoverEl = null;
+    let focusedEl = null;
+    let suppressSurfaceMutationNotify = false;
+    let pendingChildMutationTargets = new Set();
+    let childMutationFlushScheduled = false;
+    let surfaceMutationFlushScheduled = false;
+
+    function scheduleSurfaceMutationNotify(targetNode) {
+        if (suppressSurfaceMutationNotify || typeof onChatSurfaceMutated !== 'function') return;
+        const raw = unwrapEl(targetNode);
+        if (!raw || !chatScreen || (raw !== chatScreen && !chatScreen.contains(raw))) return;
+        if (surfaceMutationFlushScheduled) return;
+        surfaceMutationFlushScheduled = true;
+        queueMicrotask(() => {
+            surfaceMutationFlushScheduled = false;
+            try { onChatSurfaceMutated(); } catch (_) {}
+        });
+    }
+
+    function notifyChildListMutation(targetNode) {
+        const raw = unwrapEl(targetNode);
+        if (!raw) return;
+        if (mutationObservers.size > 0) {
+            pendingChildMutationTargets.add(raw);
+            if (!childMutationFlushScheduled) {
+                childMutationFlushScheduled = true;
+                queueMicrotask(() => {
+                    childMutationFlushScheduled = false;
+                    const changed = Array.from(pendingChildMutationTargets);
+                    pendingChildMutationTargets.clear();
+                    if (!changed.length || !mutationObservers.size) return;
+                    for (const obs of [...mutationObservers]) {
+                        const recs = [];
+                        for (const [obsNode, opts] of obs.targets.entries()) {
+                            for (const t of changed) {
+                                if (obsNode === t || (opts && opts.subtree && typeof obsNode.contains === 'function' && obsNode.contains(t))) {
+                                    recs.push({ type: 'childList', target: wrapSafeElement(t) || t });
+                                    break;
+                                }
+                            }
+                        }
+                        if (recs.length && typeof obs.cb === 'function') {
+                            try { obs.cb(recs, obs.api); } catch (_) {}
+                        }
+                    }
+                });
+            }
+        }
+        scheduleSurfaceMutationNotify(raw);
+    }
+
+    function decodeHtmlEntities(str) {
+        return String(str ?? '').replace(/&(#x?[0-9a-fA-F]+|amp|lt|gt|quot|#39|apos|nbsp);/g, (m, code) => {
+            if (code === 'amp') return '&';
+            if (code === 'lt') return '<';
+            if (code === 'gt') return '>';
+            if (code === 'quot') return '"';
+            if (code === '#39' || code === 'apos') return "'";
+            if (code === 'nbsp') return '\u00a0';
+            if (code.startsWith('#x') || code.startsWith('#X')) {
+                const cp = parseInt(code.slice(2), 16);
+                return Number.isFinite(cp) ? String.fromCodePoint(cp) : m;
+            }
+            if (code.startsWith('#')) {
+                const cp = parseInt(code.slice(1), 10);
+                return Number.isFinite(cp) ? String.fromCodePoint(cp) : m;
+            }
+            return m;
+        });
+    }
+
+    function escapeHtmlAttr(v) {
+        return String(v ?? '').replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+    }
+
+    function escapeHtmlText(v) {
+        return String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function splitSelectorTopLevel(str, delimiter = ',') {
+        const out = [];
+        let start = 0;
+        let pDepth = 0;
+        let bDepth = 0;
+        let quote = '';
+        const text = String(str || '');
+        for (let i = 0; i < text.length; i += 1) {
+            const c = text[i];
+            if (quote) {
+                if (c === '\\') { i += 1; continue; }
+                if (c === quote) quote = '';
+                continue;
+            }
+            if (c === '"' || c === "'") { quote = c; continue; }
+            if (c === '(') pDepth += 1;
+            else if (c === ')' && pDepth > 0) pDepth -= 1;
+            else if (c === '[') bDepth += 1;
+            else if (c === ']' && bDepth > 0) bDepth -= 1;
+            else if (c === delimiter && pDepth === 0 && bDepth === 0) {
+                out.push(text.slice(start, i));
+                start = i + 1;
+            }
+        }
+        out.push(text.slice(start));
+        return out;
+    }
+
+    function findBalancedClose(str, openIdx, openCh = '(', closeCh = ')') {
+        let depth = 0;
+        let quote = '';
+        for (let i = openIdx; i < str.length; i += 1) {
+            const c = str[i];
+            if (quote) {
+                if (c === '\\') { i += 1; continue; }
+                if (c === quote) quote = '';
+                continue;
+            }
+            if (c === '"' || c === "'") { quote = c; continue; }
+            if (c === openCh) depth += 1;
+            else if (c === closeCh) {
+                depth -= 1;
+                if (depth === 0) return i;
+            }
+        }
+        return -1;
+    }
+
+    function tokenizeSelectorChain(chainStr) {
+        const steps = [];
+        let s = String(chainStr || '').trim();
+        let nextComb = ' ';
+        let i = 0;
+        while (i < s.length) {
+            while (i < s.length && /\s/.test(s[i])) i += 1;
+            if (i >= s.length) break;
+            if (s[i] === '>') {
+                nextComb = '>';
+                i += 1;
+                while (i < s.length && /\s/.test(s[i])) i += 1;
+                if (i >= s.length) break;
+            }
+            const start = i;
+            let pDepth = 0;
+            let bDepth = 0;
+            let quote = '';
+            while (i < s.length) {
+                const c = s[i];
+                if (quote) {
+                    if (c === '\\') { i += 2; continue; }
+                    if (c === quote) quote = '';
+                    i += 1;
+                    continue;
+                }
+                if (c === '"' || c === "'") { quote = c; i += 1; continue; }
+                if (c === '(') { pDepth += 1; i += 1; continue; }
+                if (c === ')' && pDepth > 0) { pDepth -= 1; i += 1; continue; }
+                if (c === '[') { bDepth += 1; i += 1; continue; }
+                if (c === ']' && bDepth > 0) { bDepth -= 1; i += 1; continue; }
+                if (pDepth === 0 && bDepth === 0 && (c === '>' || /\s/.test(c))) break;
+                i += 1;
+            }
+            const part = s.slice(start, i).trim();
+            if (part) {
+                steps.push({ comb: nextComb, sel: part });
+                nextComb = ' ';
+            }
+        }
+        return steps;
+    }
+
+    function matchRelativeHas(anchorEl, hasSelectorList) {
+        const chains = splitSelectorTopLevel(hasSelectorList, ',').map((s) => s.trim()).filter(Boolean);
+        for (const rawChain of chains) {
+            const trimmed = rawChain.trim();
+            const directOnly = trimmed.startsWith('>');
+            const steps = tokenizeSelectorChain(directOnly ? trimmed.slice(1).trim() : trimmed);
+            if (!steps.length) continue;
+            if (directOnly) steps[0].comb = '>';
+            const candidates = collectMatchingElements(anchorEl, '');
+            const walkDesc = (node) => {
+                for (const c of node.children || []) {
+                    candidates.push(c);
+                    walkDesc(c);
+                }
+            };
+            walkDesc(anchorEl);
+            for (const cand of candidates) {
+                if (!matchSimpleSelector(cand, steps[steps.length - 1].sel)) continue;
+                let cur = cand;
+                let ok = true;
+                for (let idx = steps.length - 1; idx >= 1; idx -= 1) {
+                    const step = steps[idx];
+                    const prevSel = steps[idx - 1].sel;
+                    if (step.comb === '>') {
+                        cur = cur.parentElement;
+                        if (!cur || !anchorEl.contains(cur) || !matchSimpleSelector(cur, prevSel)) { ok = false; break; }
+                    } else {
+                        cur = cur.parentElement;
+                        while (cur && anchorEl.contains(cur) && !matchSimpleSelector(cur, prevSel)) {
+                            cur = cur.parentElement;
+                        }
+                        if (!cur || !anchorEl.contains(cur)) { ok = false; break; }
+                    }
+                }
+                if (!ok) continue;
+                if (steps[0].comb === '>') {
+                    if (cur.parentElement === anchorEl) return true;
+                } else if (cur !== anchorEl && anchorEl.contains(cur)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     function matchSimpleSelector(el, token) {
         if (!el || el.nodeType !== 1 || !token) return false;
         let rest = token.trim();
         if (!rest) return false;
         if (rest === '*') return true;
 
-        const tagMatch = rest.match(/^([a-zA-Z0-9_-]+)/);
-        if (tagMatch) {
-            if (el.tagName !== tagMatch[1].toUpperCase()) return false;
-            rest = rest.slice(tagMatch[1].length);
+        if (rest.startsWith('*')) {
+            rest = rest.slice(1);
+        } else {
+            const tagMatch = rest.match(/^([a-zA-Z0-9_-]+)/);
+            if (tagMatch) {
+                if (el.tagName !== tagMatch[1].toUpperCase()) return false;
+                rest = rest.slice(tagMatch[1].length);
+            }
         }
 
         while (rest.length > 0) {
@@ -268,7 +497,10 @@ function createHeadlessMockDom() {
                 if (!m || !el.classList || !el.classList.contains(m[1])) return false;
                 rest = rest.slice(m[0].length);
             } else if (rest.startsWith('[')) {
-                const m = rest.match(/^\[([a-zA-Z0-9_:-]+)(?:\s*([*^$|~]?=)\s*(?:"([^"]*)"|'([^']*)'|([^\]]*)))?\]/);
+                const closeIdx = findBalancedClose(rest, 0, '[', ']');
+                if (closeIdx < 0) return false;
+                const expr = rest.slice(1, closeIdx);
+                const m = expr.match(/^([a-zA-Z0-9_:-]+)(?:\s*([*^$|~]?=)\s*(?:"([^"]*)"|'([^']*)'|([\s\S]*)))?$/);
                 if (!m) return false;
                 const aName = m[1];
                 const op = m[2] || '';
@@ -279,7 +511,49 @@ function createHeadlessMockDom() {
                 if (op === '*=' && !actual.includes(expected)) return false;
                 if (op === '^=' && !actual.startsWith(expected)) return false;
                 if (op === '$=' && !actual.endsWith(expected)) return false;
-                rest = rest.slice(m[0].length);
+                if (op === '~=' && !String(actual).split(/\s+/).includes(expected)) return false;
+                if (op === '|=' && actual !== expected && !actual.startsWith(`${expected}-`)) return false;
+                rest = rest.slice(closeIdx + 1);
+            } else if (rest.startsWith(':')) {
+                const pm = rest.match(/^::?([a-zA-Z0-9_-]+)/);
+                if (!pm) return false;
+                const pName = pm[1].toLowerCase();
+                let consumed = pm[0].length;
+                let inner = null;
+                if (rest[consumed] === '(') {
+                    const closeIdx = findBalancedClose(rest, consumed, '(', ')');
+                    if (closeIdx < 0) return false;
+                    inner = rest.slice(consumed + 1, closeIdx);
+                    consumed = closeIdx + 1;
+                }
+                rest = rest.slice(consumed);
+                if (pName === 'is' || pName === 'where') {
+                    if (!inner || !matchesSelector(el, inner)) return false;
+                } else if (pName === 'not') {
+                    if (!inner || matchesSelector(el, inner)) return false;
+                } else if (pName === 'has') {
+                    if (!inner || !matchRelativeHas(el, inner)) return false;
+                } else if (pName === 'active') {
+                    if (!activePressEl || (el !== activePressEl && !el.contains(activePressEl))) return false;
+                } else if (pName === 'hover') {
+                    if (!hoverEl || (el !== hoverEl && !el.contains(hoverEl))) return false;
+                } else if (pName === 'focus' || pName === 'focus-visible') {
+                    if (el !== focusedEl) return false;
+                } else if (pName === 'disabled') {
+                    if (!el.disabled && !el.hasAttribute('disabled')) return false;
+                } else if (pName === 'checked') {
+                    if (!el.checked) return false;
+                } else if (pName === 'empty') {
+                    if ((el.childNodes || []).some((c) => c.nodeType === 1 || (c.nodeType === 3 && c.textContent))) return false;
+                } else if (pName === 'first-child') {
+                    const siblings = el.parentNode ? (el.parentNode.children || []) : [];
+                    if (siblings[0] !== el) return false;
+                } else if (pName === 'last-child') {
+                    const siblings = el.parentNode ? (el.parentNode.children || []) : [];
+                    if (siblings[siblings.length - 1] !== el) return false;
+                } else {
+                    return false;
+                }
             } else {
                 return false;
             }
@@ -288,23 +562,202 @@ function createHeadlessMockDom() {
     }
 
     function matchSingleChain(el, chainStr) {
-        const parts = String(chainStr || '').trim().split(/\s+/).filter(Boolean);
-        if (!parts.length) return false;
-        if (!matchSimpleSelector(el, parts[parts.length - 1])) return false;
-        let cur = el.parentNode;
-        for (let i = parts.length - 2; i >= 0; i -= 1) {
-            while (cur && !matchSimpleSelector(cur, parts[i])) {
-                cur = cur.parentNode;
+        const steps = tokenizeSelectorChain(chainStr);
+        if (!steps.length) return false;
+        if (!matchSimpleSelector(el, steps[steps.length - 1].sel)) return false;
+        let cur = el;
+        for (let i = steps.length - 1; i >= 1; i -= 1) {
+            const step = steps[i];
+            const parentSel = steps[i - 1].sel;
+            if (step.comb === '>') {
+                cur = cur.parentElement;
+                if (!cur || !matchSimpleSelector(cur, parentSel)) return false;
+            } else {
+                cur = cur.parentElement;
+                while (cur && !matchSimpleSelector(cur, parentSel)) {
+                    cur = cur.parentElement;
+                }
+                if (!cur) return false;
             }
-            if (!cur) return false;
-            cur = cur.parentNode;
         }
         return true;
     }
 
     function matchesSelector(el, selectorList) {
-        const chains = String(selectorList || '').split(',').map((s) => s.trim()).filter(Boolean);
+        if (!selectorList) return false;
+        const chains = splitSelectorTopLevel(selectorList, ',').map((s) => s.trim()).filter(Boolean);
         return chains.some((ch) => matchSingleChain(el, ch));
+    }
+
+    function collectMatchingElements(rootNode, selectorList) {
+        const out = [];
+        if (!rootNode || !selectorList) return out;
+        const walk = (node) => {
+            for (const c of node.childNodes || []) {
+                if (c && c.nodeType === 1) {
+                    if (matchesSelector(c, selectorList)) out.push(c);
+                    walk(c);
+                }
+            }
+        };
+        walk(rootNode);
+        return out;
+    }
+
+    function makeSafeNodeList(arr) {
+        const list = Array.isArray(arr) ? arr : [];
+        const target = {
+            async length() { return list.length; },
+            async at(i) {
+                const idx = Number(i);
+                return Number.isInteger(idx) && idx >= 0 && idx < list.length ? list[idx] : undefined;
+            },
+            item(i) {
+                const idx = Number(i);
+                return Number.isInteger(idx) && idx >= 0 && idx < list.length ? list[idx] : null;
+            },
+            forEach(fn, thisArg) { list.forEach(fn, thisArg); },
+            map(fn, thisArg) { return list.map(fn, thisArg); },
+            filter(fn, thisArg) { return list.filter(fn, thisArg); },
+            some(fn, thisArg) { return list.some(fn, thisArg); },
+            [Symbol.iterator]() { return list[Symbol.iterator](); },
+        };
+        for (let i = 0; i < list.length; i += 1) target[i] = list[i];
+        return target;
+    }
+
+    class AttrMap extends Map {
+        get length() { return this.size; }
+        *[Symbol.iterator]() {
+            for (const [name, value] of this.entries()) {
+                yield { name, value };
+            }
+        }
+    }
+
+    class MockTextNode {
+        constructor(text = '') {
+            this.nodeType = 3;
+            this.nodeName = '#text';
+            this.parentNode = null;
+            this.parentElement = null;
+            this._data = String(text ?? '');
+        }
+        get data() { return this._data; }
+        set data(v) { this._data = String(v ?? ''); }
+        get textContent() { return this._data; }
+        set textContent(v) { this._data = String(v ?? ''); }
+        remove() {
+            if (this.parentNode && typeof this.parentNode.removeChild === 'function') {
+                this.parentNode.removeChild(this);
+            }
+        }
+        replaceWith(...nodes) {
+            if (this.parentNode && typeof this.parentNode._replaceChildWithMany === 'function') {
+                this.parentNode._replaceChildWithMany(this, nodes);
+            }
+        }
+        cloneNode() { return new MockTextNode(this._data); }
+    }
+
+    function parseHtmlAttributesIntoElement(el, rawAttrStr) {
+        if (!rawAttrStr) return;
+        const rx = /([a-zA-Z0-9_:@.-]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+        let m;
+        while ((m = rx.exec(rawAttrStr)) !== null) {
+            const k = m[1];
+            const rawVal = m[2] !== undefined ? m[2] : (m[3] !== undefined ? m[3] : (m[4] !== undefined ? m[4] : ''));
+            el.setAttribute(k, decodeHtmlEntities(rawVal));
+        }
+    }
+
+    function parseHtmlFragmentToNodes(rawHtml) {
+        const root = new MockElement('#fragment');
+        root.nodeType = 11;
+        const stack = [root];
+        const html = String(rawHtml ?? '');
+        let i = 0;
+        const appendNodeToCur = (node) => {
+            const parent = stack[stack.length - 1];
+            if (parent.tagName === 'TEMPLATE' && parent.content) parent.content.appendChild(node);
+            else parent.appendChild(node);
+        };
+        while (i < html.length) {
+            const lt = html.indexOf('<', i);
+            if (lt < 0) {
+                const txt = decodeHtmlEntities(html.slice(i));
+                if (txt) appendNodeToCur(new MockTextNode(txt));
+                break;
+            }
+            if (lt > i) {
+                const txt = decodeHtmlEntities(html.slice(i, lt));
+                if (txt) appendNodeToCur(new MockTextNode(txt));
+            }
+            if (html.startsWith('<!--', lt)) {
+                const endComment = html.indexOf('-->', lt + 4);
+                i = endComment >= 0 ? endComment + 3 : html.length;
+                continue;
+            }
+            // Scan tag end accounting for quoted attribute values containing '>'
+            let gt = -1;
+            let q = '';
+            for (let j = lt + 1; j < html.length; j += 1) {
+                const ch = html[j];
+                if (q) {
+                    if (ch === q) q = '';
+                } else if (ch === '"' || ch === "'") {
+                    q = ch;
+                } else if (ch === '>') {
+                    gt = j;
+                    break;
+                }
+            }
+            if (gt < 0) {
+                appendNodeToCur(new MockTextNode(decodeHtmlEntities(html.slice(lt))));
+                break;
+            }
+            const tagBody = html.slice(lt + 1, gt);
+            i = gt + 1;
+            const closeMatch = tagBody.match(/^\/\s*([a-zA-Z0-9_-]+)/);
+            if (closeMatch) {
+                const closeTag = closeMatch[1].toUpperCase();
+                for (let k = stack.length - 1; k >= 1; k -= 1) {
+                    if (stack[k].tagName === closeTag) {
+                        stack.length = k;
+                        break;
+                    }
+                }
+                continue;
+            }
+            const openMatch = tagBody.match(/^([a-zA-Z0-9_-]+)([\s\S]*)$/);
+            if (!openMatch) continue;
+            const tagNameLower = openMatch[1].toLowerCase();
+            let restAttrs = openMatch[2] || '';
+            let explicitSelfClose = false;
+            if (/\/\s*$/.test(restAttrs)) {
+                explicitSelfClose = true;
+                restAttrs = restAttrs.replace(/\/\s*$/, '');
+            }
+            const el = new MockElement(tagNameLower);
+            parseHtmlAttributesIntoElement(el, restAttrs);
+            appendNodeToCur(el);
+
+            if (RAW_TEXT_TAGS.has(tagNameLower) && !explicitSelfClose) {
+                const endRx = new RegExp(`<\\/\\s*${tagNameLower}\\s*>`, 'i');
+                const slice = html.slice(i);
+                const endM = endRx.exec(slice);
+                if (endM) {
+                    const rawContent = slice.slice(0, endM.index);
+                    if (rawContent) el.appendChild(new MockTextNode(rawContent));
+                    i += endM.index + endM[0].length;
+                }
+                continue;
+            }
+            if (!explicitSelfClose && !VOID_HTML_TAGS.has(tagNameLower)) {
+                stack.push(el);
+            }
+        }
+        return [...root.childNodes];
     }
 
     const listeners = new Map();
@@ -315,34 +768,69 @@ function createHeadlessMockDom() {
         constructor(tagName = 'div') {
             this.tagName = String(tagName || 'div').toUpperCase();
             this.nodeName = this.tagName;
-            this.nodeType = 1;
+            this.nodeType = this.tagName === '#DOCUMENT-FRAGMENT' || this.tagName === '#FRAGMENT' ? 11 : 1;
             this.id = '';
             this.className = '';
-            this.style = new Proxy({}, { set: () => true, get: () => '' });
+            this._styleMap = Object.create(null);
+            this._styleRaw = '';
+            this.style = new Proxy(this._styleMap, {
+                set: (tgt, prop, val) => {
+                    const k = String(prop);
+                    if (k === 'cssText') {
+                        void this.setStyleAttribute(val);
+                        return true;
+                    }
+                    if (val === null || val === undefined || val === '') delete tgt[k];
+                    else tgt[k] = String(val);
+                    this._syncStyleAttr();
+                    return true;
+                },
+                get: (tgt, prop) => {
+                    if (prop === 'cssText') return this._styleRaw;
+                    return typeof prop === 'string' && Object.prototype.hasOwnProperty.call(tgt, prop) ? tgt[prop] : '';
+                },
+            });
             this.dataset = {};
-            this.attributes = new Map();
-            this.children = [];
-            this.childNodes = this.children;
+            this.attributes = new AttrMap();
+            this.childNodes = [];
             this.parentNode = null;
             this.parentElement = null;
-            this._innerHTML = '';
             this._outerHTMLOverride = '';
-            this._textContent = '';
-            this._rect = { top: 0, left: 0, right: 800, bottom: 600, width: 800, height: 600 };
+            this._rect = { top: 16, left: 16, right: 240, bottom: 64, width: 224, height: 48 };
             this.value = '';
             this.checked = false;
             this.disabled = false;
+            if (this.tagName === 'TEMPLATE') {
+                this.content = new MockElement('#document-fragment');
+            }
             const self = this;
             this.classList = {
                 add: (...cls) => {
                     const set = new Set(String(self.className || '').split(/\s+/).filter(Boolean));
-                    for (const c of cls) set.add(String(c));
-                    self.className = Array.from(set).join(' ');
+                    let changed = false;
+                    for (const c of cls) {
+                        if (c && !set.has(String(c))) {
+                            set.add(String(c));
+                            changed = true;
+                        }
+                    }
+                    const next = Array.from(set).join(' ');
+                    self.className = next;
+                    if (next) self.attributes.set('class', next);
+                    else self.attributes.delete('class');
+                    if (changed) scheduleSurfaceMutationNotify(self);
                 },
                 remove: (...cls) => {
                     const set = new Set(String(self.className || '').split(/\s+/).filter(Boolean));
-                    for (const c of cls) set.delete(String(c));
-                    self.className = Array.from(set).join(' ');
+                    let changed = false;
+                    for (const c of cls) {
+                        if (set.delete(String(c))) changed = true;
+                    }
+                    const next = Array.from(set).join(' ');
+                    self.className = next;
+                    if (next) self.attributes.set('class', next);
+                    else self.attributes.delete('class');
+                    if (changed) scheduleSurfaceMutationNotify(self);
                 },
                 contains: (c) => String(self.className || '').split(/\s+/).includes(String(c)),
                 toggle: (c, force) => {
@@ -354,73 +842,293 @@ function createHeadlessMockDom() {
                 },
             };
         }
-        get innerHTML() { return this._innerHTML; }
-        set innerHTML(v) { this._innerHTML = String(v ?? ''); }
+        get children() {
+            return this.childNodes.filter((c) => c && c.nodeType === 1);
+        }
+        get firstElementChild() {
+            const kids = this.children;
+            return kids.length ? kids[0] : null;
+        }
+        get lastElementChild() {
+            const kids = this.children;
+            return kids.length ? kids[kids.length - 1] : null;
+        }
+        _syncStyleAttr() {
+            const parts = [];
+            for (const [k, v] of Object.entries(this._styleMap)) {
+                const cssProp = k.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`);
+                parts.push(`${cssProp}:${v}`);
+            }
+            const next = parts.join('; ');
+            this._styleRaw = next;
+            if (next) this.attributes.set('style', next);
+            else this.attributes.delete('style');
+        }
+        _clearChildNodes() {
+            const target = (this.tagName === 'TEMPLATE' && this.content) ? this.content : this;
+            const hadChildren = target.childNodes.length > 0;
+            for (const ch of target.childNodes) {
+                if (ch && typeof ch === 'object') {
+                    ch.parentNode = null;
+                    ch.parentElement = null;
+                }
+            }
+            target.childNodes.length = 0;
+            if (hadChildren) notifyChildListMutation(this);
+        }
+        _replaceChildWithMany(oldCh, rawNodes) {
+            const rawOld = unwrapEl(oldCh);
+            const idx = this.childNodes.indexOf(rawOld);
+            if (idx < 0) return;
+            rawOld.parentNode = null;
+            rawOld.parentElement = null;
+            const list = [];
+            for (const rawItem of rawNodes) {
+                if (rawItem === null || rawItem === undefined) continue;
+                const unwrapped = unwrapEl(rawItem);
+                const node = typeof unwrapped === 'string' ? new MockTextNode(unwrapped) : unwrapped;
+                if (node && typeof node === 'object') {
+                    if (node.nodeType === 11 && Array.isArray(node.childNodes)) {
+                        for (const sub of [...node.childNodes]) {
+                            sub.parentNode = this;
+                            sub.parentElement = this.nodeType === 1 ? this : null;
+                            list.push(sub);
+                        }
+                        node.childNodes.length = 0;
+                    } else {
+                        if (node.parentNode && node.parentNode !== this && typeof node.parentNode.removeChild === 'function') {
+                            node.parentNode.removeChild(node);
+                        }
+                        node.parentNode = this;
+                        node.parentElement = this.nodeType === 1 ? this : null;
+                        list.push(node);
+                    }
+                }
+            }
+            this.childNodes.splice(idx, 1, ...list);
+            notifyChildListMutation(this);
+        }
+        get innerHTML() {
+            const list = (this.tagName === 'TEMPLATE' && this.content) ? this.content.childNodes : this.childNodes;
+            const rawTag = this.tagName.toLowerCase();
+            const isRaw = RAW_TEXT_TAGS.has(rawTag);
+            return list.map((c) => {
+                if (!c) return '';
+                if (c.nodeType === 1) return c.outerHTML;
+                if (c.nodeType === 3) return isRaw ? String(c.textContent || '') : escapeHtmlText(c.textContent || '');
+                return '';
+            }).join('');
+        }
+        set innerHTML(v) {
+            this._outerHTMLOverride = '';
+            this._clearChildNodes();
+            const parsed = parseHtmlFragmentToNodes(v);
+            const target = (this.tagName === 'TEMPLATE' && this.content) ? this.content : this;
+            for (const n of parsed) target.appendChild(n);
+            if (typeof onToastText === 'function' && (this.hasAttribute('data-am-toast-region') || this.hasAttribute('data-plugin-chat-panel'))) {
+                const msgEl = this.querySelector('.x-risu-am-runtime-toast__message') || this.querySelector('.mscs-preview');
+                const detEl = this.querySelector('.x-risu-am-runtime-toast__detail');
+                const msg = msgEl ? String(msgEl.textContent || '').trim() : '';
+                const det = detEl ? String(detEl.textContent || '').trim() : '';
+                const combined = det ? `${msg} · ${det}` : msg;
+                if (combined) {
+                    try { onToastText(combined); } catch (_) {}
+                }
+            }
+        }
         get outerHTML() {
             if (this._outerHTMLOverride) return this._outerHTMLOverride;
             const tag = this.tagName.toLowerCase();
             const attrPairs = [];
-            if (this.id && !this.attributes.has('id')) attrPairs.push(`id="${this.id}"`);
-            if (this.className && !this.attributes.has('class')) attrPairs.push(`class="${this.className}"`);
+            if (this.id && !this.attributes.has('id')) attrPairs.push(`id="${escapeHtmlAttr(this.id)}"`);
+            if (this.className && !this.attributes.has('class')) attrPairs.push(`class="${escapeHtmlAttr(this.className)}"`);
             for (const [k, v] of this.attributes.entries()) {
-                const escaped = String(v).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+                const escaped = escapeHtmlAttr(v);
                 attrPairs.push(v === '' ? `${k}=""` : `${k}="${escaped}"`);
             }
             const open = attrPairs.length ? `<${tag} ${attrPairs.join(' ')}>` : `<${tag}>`;
-            return `${open}${this._innerHTML || this._textContent || ''}</${tag}>`;
+            if (VOID_HTML_TAGS.has(tag)) return open;
+            const bodyHtml = this.innerHTML;
+            return `${open}${bodyHtml}</${tag}>`;
         }
-        get textContent() { return this._textContent; }
-        set textContent(v) { this._textContent = String(v ?? ''); }
-        async setInnerHTML(v) { this._innerHTML = String(v ?? ''); }
-        async getInnerHTML() { return this._innerHTML; }
+        get textContent() {
+            const list = (this.tagName === 'TEMPLATE' && this.content) ? this.content.childNodes : this.childNodes;
+            return list.map((c) => (c && typeof c.textContent === 'string' ? c.textContent : '')).join('');
+        }
+        set textContent(v) {
+            this._outerHTMLOverride = '';
+            this._clearChildNodes();
+            const s = String(v ?? '');
+            if (s !== '') {
+                const target = (this.tagName === 'TEMPLATE' && this.content) ? this.content : this;
+                target.appendChild(new MockTextNode(s));
+            }
+        }
+        async innerText() { return this.textContent; }
+        async setInnerText(v) { this.textContent = v; }
+        async setInnerHTML(v) { this.innerHTML = v; }
+        async getInnerHTML() { return this.innerHTML; }
         async getOuterHTML() { return this.outerHTML; }
-        async setOuterHTML(v) { this._outerHTMLOverride = String(v ?? ''); }
-        async setTextContent(v) { this._textContent = String(v ?? ''); }
-        async getTextContent() { return this._textContent; }
-        async setStyle() {}
-        async getStyle() { return ''; }
-        async setClassName(v) { this.className = String(v ?? ''); }
+        async setOuterHTML(v) {
+            const raw = String(v ?? '');
+            this._outerHTMLOverride = '';
+            if (this.parentNode && typeof this.parentNode._replaceChildWithMany === 'function') {
+                const nodes = parseHtmlFragmentToNodes(raw);
+                this.parentNode._replaceChildWithMany(this, nodes);
+            } else {
+                this._outerHTMLOverride = raw;
+            }
+        }
+        async setTextContent(v) { this.textContent = v; }
+        async getTextContent() { return this.textContent; }
+        async setStyle(prop, val) { this.style[String(prop || '')] = String(val ?? ''); }
+        async getStyle(prop) { return this.style[String(prop || '')] || ''; }
+        async getStyleAttribute() { return this.attributes.has('style') ? this.attributes.get('style') : this._styleRaw; }
+        async setStyleAttribute(val) {
+            const raw = String(val ?? '');
+            this._styleRaw = raw;
+            for (const k of Object.keys(this._styleMap)) delete this._styleMap[k];
+            for (const decl of raw.split(';')) {
+                const idx = decl.indexOf(':');
+                if (idx <= 0) continue;
+                const k = decl.slice(0, idx).trim();
+                const v = decl.slice(idx + 1).trim();
+                if (k) this._styleMap[k] = v;
+            }
+            if (raw) this.attributes.set('style', raw);
+            else this.attributes.delete('style');
+        }
+        async setClassName(v) {
+            const next = String(v ?? '');
+            this.className = next;
+            if (next) this.attributes.set('class', next);
+            else this.attributes.delete('class');
+        }
         async getClassName() { return this.className; }
-        async addClass(c) { this.classList.add(c); }
-        async removeClass(c) { this.classList.remove(c); }
+        async addClass(...cls) { this.classList.add(...cls); }
+        async removeClass(...cls) { this.classList.remove(...cls); }
         async hasClass(c) { return this.classList.contains(c); }
+        async getChildren() { return this.children; }
+        async getParent() { return this.parentElement; }
+        async clientHeight() { return (await this.getBoundingClientRect()).height || 0; }
+        async clientWidth() { return (await this.getBoundingClientRect()).width || 0; }
+        async clientTop() { return (await this.getBoundingClientRect()).top || 0; }
+        async clientLeft() { return (await this.getBoundingClientRect()).left || 0; }
+        hasAttribute(k) { return this.attributes.has(String(k)); }
+        matches(sel) { return matchesSelector(this, sel); }
         setAttribute(k, v) {
             const key = String(k);
             const val = String(v ?? '');
+            const prev = this.attributes.has(key) ? this.attributes.get(key) : null;
             this.attributes.set(key, val);
             if (key === 'id') this.id = val;
             if (key === 'class') this.className = val;
+            if (key === 'disabled') this.disabled = val !== 'false';
+            if (key === 'checked') this.checked = val !== 'false';
+            if (key === 'value') this.value = val;
+            if (key === 'style') void this.setStyleAttribute(val);
             if (key.startsWith('data-')) this.dataset[attrNameToDatasetKey(key)] = val;
+            if (prev !== val && (key.startsWith('x-am-') || key.startsWith('data-am-') || key === 'class')) {
+                scheduleSurfaceMutationNotify(this);
+            }
         }
         getAttribute(k) { return this.attributes.has(String(k)) ? this.attributes.get(String(k)) : null; }
         removeAttribute(k) {
             const key = String(k);
+            const had = this.attributes.has(key);
             this.attributes.delete(key);
+            if (key === 'id') this.id = '';
+            if (key === 'class') this.className = '';
+            if (key === 'disabled') this.disabled = false;
+            if (key === 'checked') this.checked = false;
+            if (key === 'style') void this.setStyleAttribute('');
             if (key.startsWith('data-')) delete this.dataset[attrNameToDatasetKey(key)];
-        }
-        appendChild(ch) {
-            if (ch && typeof ch === 'object') {
-                ch.parentNode = this;
-                ch.parentElement = this;
-                this.children.push(ch);
-            }
-            return ch;
-        }
-        prepend(ch) {
-            if (ch && typeof ch === 'object') {
-                ch.parentNode = this;
-                ch.parentElement = this;
-                this.children.unshift(ch);
+            if (had && (key.startsWith('x-am-') || key.startsWith('data-am-') || key === 'class')) {
+                scheduleSurfaceMutationNotify(this);
             }
         }
-        removeChild(ch) {
-            const idx = this.children.indexOf(ch);
+        appendChild(chRaw) {
+            const ch = unwrapEl(chRaw);
+            if (ch && typeof ch === 'object') {
+                if (ch.nodeType === 11 && Array.isArray(ch.childNodes)) {
+                    for (const sub of [...ch.childNodes]) this.appendChild(sub);
+                    return chRaw;
+                }
+                if (ch.parentNode && ch.parentNode !== this && typeof ch.parentNode.removeChild === 'function') {
+                    ch.parentNode.removeChild(ch);
+                }
+                ch.parentNode = this;
+                ch.parentElement = this.nodeType === 1 ? this : null;
+                this.childNodes.push(ch);
+                notifyChildListMutation(this);
+            }
+            return chRaw;
+        }
+        append(...items) {
+            for (const ch of items) {
+                if (ch === null || ch === undefined) continue;
+                const unwrapped = unwrapEl(ch);
+                this.appendChild(typeof unwrapped === 'string' ? new MockTextNode(unwrapped) : unwrapped);
+            }
+        }
+        prepend(...items) {
+            let added = false;
+            for (let i = items.length - 1; i >= 0; i -= 1) {
+                const raw = unwrapEl(items[i]);
+                if (raw === null || raw === undefined) continue;
+                const ch = typeof raw === 'string' ? new MockTextNode(raw) : raw;
+                if (ch && typeof ch === 'object') {
+                    if (ch.parentNode && ch.parentNode !== this && typeof ch.parentNode.removeChild === 'function') {
+                        ch.parentNode.removeChild(ch);
+                    }
+                    ch.parentNode = this;
+                    ch.parentElement = this.nodeType === 1 ? this : null;
+                    this.childNodes.unshift(ch);
+                    added = true;
+                }
+            }
+            if (added) notifyChildListMutation(this);
+        }
+        removeChild(chRaw) {
+            const ch = unwrapEl(chRaw);
+            const idx = this.childNodes.indexOf(ch);
             if (idx >= 0) {
-                this.children.splice(idx, 1);
+                this.childNodes.splice(idx, 1);
                 ch.parentNode = null;
                 ch.parentElement = null;
+                notifyChildListMutation(this);
             }
-            return ch;
+            return chRaw;
+        }
+        replaceChild(newCh, oldCh) {
+            const rawOld = unwrapEl(oldCh);
+            const rawNew = unwrapEl(newCh);
+            const idx = this.childNodes.indexOf(rawOld);
+            if (idx >= 0 && rawNew && typeof rawNew === 'object') {
+                this._replaceChildWithMany(rawOld, [rawNew]);
+            }
+            return oldCh;
+        }
+        replaceWith(...nodes) {
+            if (this.parentNode && typeof this.parentNode._replaceChildWithMany === 'function') {
+                this.parentNode._replaceChildWithMany(this, nodes.map(unwrapEl));
+            }
+        }
+        cloneNode(deep = false) {
+            const c = new MockElement(this.tagName);
+            c.id = this.id;
+            c.className = this.className;
+            c.disabled = this.disabled;
+            c.checked = this.checked;
+            c.value = this.value;
+            for (const [k, v] of this.attributes.entries()) c.attributes.set(k, v);
+            void c.setStyleAttribute(this._styleRaw);
+            if (deep) {
+                for (const ch of this.childNodes) {
+                    if (ch && typeof ch.cloneNode === 'function') c.appendChild(ch.cloneNode(true));
+                }
+            }
+            return c;
         }
         remove() {
             if (this.parentNode && typeof this.parentNode.removeChild === 'function') {
@@ -428,42 +1136,23 @@ function createHeadlessMockDom() {
             }
         }
         contains(target) {
-            if (target === this) return true;
-            return this.children.some((c) => typeof c.contains === 'function' && c.contains(target));
+            const t = unwrapEl(target);
+            if (t === this) return true;
+            return this.childNodes.some((c) => typeof c.contains === 'function' && c.contains(t));
         }
         closest(sel) {
             let cur = this;
             while (cur && cur.nodeType === 1) {
                 if (matchesSelector(cur, sel)) return cur;
-                cur = cur.parentNode;
+                cur = cur.parentElement;
             }
             return null;
         }
         querySelector(sel) {
-            const walk = (node) => {
-                for (const c of node.children || []) {
-                    if (c.nodeType === 1) {
-                        if (matchesSelector(c, sel)) return c;
-                        const sub = walk(c);
-                        if (sub) return sub;
-                    }
-                }
-                return null;
-            };
-            return walk(this);
+            return collectMatchingElements(this, sel)[0] || null;
         }
         querySelectorAll(sel) {
-            const out = [];
-            const walk = (node) => {
-                for (const c of node.children || []) {
-                    if (c.nodeType === 1) {
-                        if (matchesSelector(c, sel)) out.push(c);
-                        walk(c);
-                    }
-                }
-            };
-            walk(this);
-            return out;
+            return makeSafeNodeList(collectMatchingElements(this, sel));
         }
         addEventListener(ev, fn) {
             if (typeof fn !== 'function') return '';
@@ -494,25 +1183,32 @@ function createHeadlessMockDom() {
             }
             return true;
         }
-        focus() {}
-        blur() {}
+        focus() { focusedEl = this; }
+        blur() { if (focusedEl === this) focusedEl = null; }
         async click() {
             const rect = await this.getBoundingClientRect();
             const x = (rect.left || 0) + Math.min(10, Math.floor((rect.width || 20) / 2));
             const y = (rect.top || 0) + Math.min(10, Math.floor((rect.height || 20) / 2));
             await dispatchSurfaceClick(this, x, y);
         }
-        getBoundingClientRect() { return { ...this._rect }; }
+        getBoundingClientRect() {
+            if (this.hasAttribute('data-am-floating-viewport')) {
+                return { top: 0, left: 0, right: 1024, bottom: 900, width: 1024, height: 900 };
+            }
+            return { ...this._rect };
+        }
     }
 
     const head = new MockElement('head');
     const body = new MockElement('body');
+    body._rect = { top: 0, left: 0, right: 1024, bottom: 900, width: 1024, height: 900 };
     const chatScreen = new MockElement('div');
     chatScreen.className = 'default-chat-screen rs-chat-surface';
     chatScreen._rect = { top: 0, left: 0, right: 1024, bottom: 900, width: 1024, height: 900 };
     body.appendChild(chatScreen);
 
     const documentElement = new MockElement('html');
+    documentElement._rect = { top: 0, left: 0, right: 1024, bottom: 900, width: 1024, height: 900 };
     documentElement.appendChild(head);
     documentElement.appendChild(body);
 
@@ -524,35 +1220,177 @@ function createHeadlessMockDom() {
     }
 
     async function dispatchSurfaceClick(targetEl, x = 24, y = 24) {
-        const makeEv = (type) => ({
-            type,
-            clientX: x,
-            clientY: y,
-            pageX: x,
-            pageY: y,
-            button: 0,
-            buttons: type === 'mousedown' ? 1 : 0,
-            target: targetEl,
-            currentTarget: documentElement,
-            defaultPrevented: false,
-            preventDefault() { this.defaultPrevented = true; },
-            stopPropagation() {},
-            stopImmediatePropagation() {},
-        });
-        const downEv = makeEv('mousedown');
-        await dispatchDocListeners('mousedown', downEv);
-        if (targetEl && typeof targetEl.dispatchEvent === 'function') {
-            await targetEl.dispatchEvent(downEv);
+        const rawTarget = unwrapEl(targetEl);
+        const isolateRect = Boolean(
+            rawTarget
+            && rawTarget.nodeType === 1
+            && rawTarget !== chatScreen
+            && rawTarget !== body
+            && rawTarget !== documentElement
+        );
+        const savedRect = isolateRect && rawTarget._rect ? { ...rawTarget._rect } : null;
+        if (isolateRect) {
+            rawTarget._rect = { top: 14000, left: 400, right: 448, bottom: 14048, width: 48, height: 48 };
         }
-        const clickEv = makeEv('click');
-        await dispatchDocListeners('click', clickEv);
-        if (targetEl && typeof targetEl.dispatchEvent === 'function') {
-            await targetEl.dispatchEvent(clickEv);
+        let clickX = isolateRect ? 424 : Number(x);
+        let clickY = isolateRect ? 14024 : Number(y);
+        if (!isolateRect && rawTarget && typeof rawTarget.getBoundingClientRect === 'function') {
+            const rect = await rawTarget.getBoundingClientRect();
+            if (rect && rect.width > 0 && rect.height > 0) {
+                const inside = Number.isFinite(clickX) && Number.isFinite(clickY)
+                    && clickX >= rect.left && clickX <= rect.right
+                    && clickY >= rect.top && clickY <= rect.bottom;
+                if (!inside) {
+                    clickX = rect.left + Math.max(2, Math.floor(rect.width / 2));
+                    clickY = rect.top + Math.max(2, Math.floor(rect.height / 2));
+                }
+            }
         }
-        return true;
+        if (!Number.isFinite(clickX)) clickX = 24;
+        if (!Number.isFinite(clickY)) clickY = 24;
+
+        const makeEv = (type) => {
+            const ev = {
+                type,
+                clientX: clickX,
+                clientY: clickY,
+                pageX: clickX,
+                pageY: clickY,
+                button: 0,
+                buttons: type === 'mousedown' ? 1 : 0,
+                target: rawTarget,
+                currentTarget: documentElement,
+                defaultPrevented: false,
+                propagationStopped: false,
+                preventDefault() { this.defaultPrevented = true; },
+                stopPropagation() { this.propagationStopped = true; },
+                stopImmediatePropagation() { this.propagationStopped = true; },
+            };
+            return ev;
+        };
+
+        const dispatchBubble = async (ev) => {
+            let cur = rawTarget;
+            while (cur && cur.nodeType === 1 && !ev.propagationStopped) {
+                if (typeof cur.dispatchEvent === 'function') {
+                    await cur.dispatchEvent(ev);
+                }
+                cur = cur.parentElement;
+            }
+        };
+
+        activePressEl = rawTarget || null;
+        hoverEl = rawTarget || null;
+        focusedEl = rawTarget || null;
+        try {
+            const downEv = makeEv('mousedown');
+            await dispatchDocListeners('mousedown', downEv);
+            await dispatchBubble(downEv);
+            const clickEv = makeEv('click');
+            await dispatchDocListeners('click', clickEv);
+            await dispatchBubble(clickEv);
+            await new Promise((r) => setTimeout(r, 12));
+            return true;
+        } finally {
+            activePressEl = null;
+            if (isolateRect && savedRect) rawTarget._rect = savedRect;
+        }
     }
 
-    function mountSurfaceActionElement(actionHtml, dataset = {}) {
+    function matchElementByAttrs(roots, { selector = '', countNode = '', actionHtml = '', dataset = {} } = {}) {
+        if (countNode) {
+            const escVal = String(countNode).replace(/"/g, '\\"');
+            for (const r of roots) {
+                if (matchesSelector(r, `[data-am-count-node="${escVal}"]`)) return r;
+                const hit = collectMatchingElements(r, `[data-am-count-node="${escVal}"]`)[0];
+                if (hit) return hit;
+            }
+        }
+        if (selector) {
+            for (const r of roots) {
+                if (matchesSelector(r, selector)) return r;
+                const hit = collectMatchingElements(r, selector)[0];
+                if (hit) return hit;
+            }
+        }
+        const parsed = parseAttributesFromHtml(actionHtml);
+        const matchAttrs = new Map(parsed.attrs.entries());
+        if (dataset && typeof dataset === 'object') {
+            for (const [k, v] of Object.entries(dataset)) {
+                const attrName = k.startsWith('data-')
+                    ? k
+                    : `data-${k.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`)}`;
+                if (!matchAttrs.has(attrName)) matchAttrs.set(attrName, String(v ?? ''));
+            }
+        }
+        const idAttr = matchAttrs.get('id');
+        if (idAttr) {
+            const escId = idAttr.replace(/[^a-zA-Z0-9_-]/g, '');
+            if (escId) {
+                for (const r of roots) {
+                    const hit = r.id === idAttr ? r : collectMatchingElements(r, `#${escId}`)[0];
+                    if (hit) return hit;
+                }
+            }
+        }
+        const significantKeys = [];
+        for (const [k, v] of matchAttrs.entries()) {
+            if (k === 'class' || k === 'style' || k === 'type' || k === 'aria-labelledby' || k === 'aria-label' || k === 'title' || k === 'x-am-busy') continue;
+            significantKeys.push([k, v]);
+        }
+        if (!significantKeys.length) return null;
+        let bestEl = null;
+        let bestScore = 0;
+        const allNodes = [];
+        for (const r of roots) {
+            allNodes.push(r);
+            const walk = (n) => {
+                for (const c of n.children || []) {
+                    allNodes.push(c);
+                    walk(c);
+                }
+            };
+            walk(r);
+        }
+        for (const el of allNodes) {
+            let score = 0;
+            let mismatch = false;
+            for (const [k, v] of significantKeys) {
+                if (!el.hasAttribute(k)) { mismatch = true; break; }
+                if (String(el.getAttribute(k) ?? '') !== String(v ?? '')) { mismatch = true; break; }
+                score += k.startsWith('data-am-') ? 4 : 2;
+            }
+            if (!mismatch && score > bestScore) {
+                if (parsed.tagName && el.tagName === parsed.tagName.toUpperCase()) score += 1;
+                bestScore = score;
+                bestEl = el;
+            }
+        }
+        return bestEl;
+    }
+
+    function findRootInteractiveElement(opts = {}) {
+        const roots = body.children.filter((ch) => ch !== chatScreen);
+        return matchElementByAttrs(roots, opts);
+    }
+
+    function findChatSurfaceInteractiveElement({ msgIndex = -1, chatId = '', actionHtml = '', dataset = {} } = {}) {
+        const cid = String(chatId || '').trim();
+        const mIdx = Number(msgIndex);
+        let scopeRoots = [];
+        if (cid) {
+            scopeRoots = chatScreen.children.filter((ch) => ch.getAttribute('data-chat-id') === cid);
+        }
+        if (!scopeRoots.length && Number.isInteger(mIdx) && mIdx >= 0) {
+            scopeRoots = chatScreen.children.filter((ch) => ch.getAttribute('data-chat-index') === String(mIdx));
+        }
+        if (!scopeRoots.length) {
+            scopeRoots = [chatScreen];
+        }
+        return matchElementByAttrs(scopeRoots, { actionHtml, dataset });
+    }
+
+    function mountSurfaceActionElement(actionHtml, dataset = {}, { msgIndex = -1, chatId = '' } = {}) {
         const parsed = parseAttributesFromHtml(actionHtml);
         const el = new MockElement(parsed.tagName || 'button');
         for (const [k, v] of parsed.attrs.entries()) {
@@ -566,21 +1404,241 @@ function createHeadlessMockDom() {
                 el.setAttribute(attrName, String(v ?? ''));
             }
         }
-        el._rect = { top: 10, left: 10, right: 180, bottom: 50, width: 170, height: 40 };
-        chatScreen.appendChild(el);
+        el._rect = { top: 14000, left: 400, right: 448, bottom: 14048, width: 48, height: 48 };
+        if (el.hasAttribute('data-am-illustration-action')) {
+            const row = new MockElement('div');
+            row.className = 'risu-chat';
+            if (chatId) row.setAttribute('data-chat-id', String(chatId));
+            if (Number.isInteger(Number(msgIndex)) && Number(msgIndex) >= 0) row.setAttribute('data-chat-index', String(msgIndex));
+            const textEl = new MockElement('div');
+            textEl.className = 'chattext';
+            const footer = new MockElement('div');
+            footer.className = 'x-risu-am-illustration-footer';
+            footer.appendChild(el);
+            textEl.appendChild(footer);
+            row.appendChild(textEl);
+            el._rsTempWrapper = row;
+            chatScreen.appendChild(row);
+        } else {
+            chatScreen.appendChild(el);
+        }
         return el;
+    }
+
+    function stripExistingAmFooter(htmlStr) {
+        return String(htmlStr || '').replace(/<div\b[^>]*class\s*=\s*(?:"[^"]*\bx-risu-am-illustration-footer\b[^"]*"|'[^']*\bx-risu-am-illustration-footer\b[^']*')[^>]*>[\s\S]*?<\/div>/gi, '');
+    }
+
+    function syncChatMessages(messages = []) {
+        const list = (Array.isArray(messages) ? messages : [])
+            .filter((m) => m && !m.isFirstMessage && Number(m.index) >= 0 && String(m.chatId || '').trim());
+        suppressSurfaceMutationNotify = true;
+        try {
+            const existingById = new Map();
+            for (const ch of chatScreen.children) {
+                if (ch.classList && ch.classList.contains('risu-chat')) {
+                    const cid = ch.getAttribute('data-chat-id') || '';
+                    if (cid) existingById.set(cid, ch);
+                }
+            }
+            const nextRows = [];
+            let structureChanged = false;
+            for (let i = 0; i < list.length; i += 1) {
+                const m = list[i];
+                const cid = String(m.chatId).trim();
+                const mIdx = Number(m.index);
+                const role = m.role === 'user' ? 'user' : 'char';
+                const bodySrc = stripExistingAmFooter(String(m.html || m.raw || m.text || ''));
+                const sig = `${role}:${mIdx}:${bodySrc}`;
+                let row = existingById.get(cid);
+                const rowRect = { top: 100 + i * 120, left: 16, right: 960, bottom: 100 + i * 120 + 96, width: 944, height: 96 };
+                if (row && row._rsSourceSig === sig && row.getAttribute('data-chat-index') === String(mIdx)) {
+                    row._rect = rowRect;
+                    nextRows.push(row);
+                    continue;
+                }
+                structureChanged = true;
+                if (!row) {
+                    row = new MockElement('div');
+                    row.className = 'risu-chat';
+                    row.setAttribute('data-chat-id', cid);
+                }
+                row.setAttribute('data-chat-index', String(mIdx));
+                row.setAttribute('data-role', role);
+                row._rsSourceSig = sig;
+                row._rect = rowRect;
+                let textEl = row.querySelector('.chattext');
+                if (!textEl) {
+                    row._clearChildNodes();
+                    textEl = new MockElement('div');
+                    textEl.className = 'chattext';
+                    row.appendChild(textEl);
+                }
+                textEl.innerHTML = bodySrc;
+                nextRows.push(row);
+            }
+            const curRows = chatScreen.children.filter((ch) => ch.classList && ch.classList.contains('risu-chat'));
+            if (!structureChanged && curRows.length === nextRows.length && curRows.every((r, idx) => r === nextRows[idx])) {
+                return false;
+            }
+            for (const oldRow of [...curRows]) {
+                if (!nextRows.includes(oldRow)) chatScreen.removeChild(oldRow);
+            }
+            for (let i = 0; i < nextRows.length; i += 1) {
+                const r = nextRows[i];
+                if (r.parentNode !== chatScreen) {
+                    chatScreen.appendChild(r);
+                } else {
+                    const curAtIdx = chatScreen.children[i];
+                    if (curAtIdx !== r) {
+                        chatScreen.removeChild(r);
+                        chatScreen.appendChild(r);
+                    }
+                }
+            }
+            return true;
+        } finally {
+            suppressSurfaceMutationNotify = false;
+        }
+    }
+
+    function extractChatSurfaceProjections() {
+        const footersByChatId = Object.create(null);
+        const footersByIndex = Object.create(null);
+        const bodyHtmlByChatId = Object.create(null);
+        for (const row of chatScreen.children) {
+            if (!row || !row.classList || !row.classList.contains('risu-chat')) continue;
+            const cid = row.getAttribute('data-chat-id') || '';
+            const mIdx = Number(row.getAttribute('data-chat-index') ?? -1);
+            const textEl = row.querySelector('.chattext');
+            const footer = (textEl && textEl.querySelector('.x-risu-am-illustration-footer')) || row.querySelector('.x-risu-am-illustration-footer');
+            if (footer) {
+                const fHtml = footer.outerHTML;
+                if (cid) footersByChatId[cid] = fHtml;
+                if (Number.isInteger(mIdx) && mIdx >= 0) footersByIndex[mIdx] = fHtml;
+            }
+            if (textEl && cid) {
+                const hasInjected = Boolean(
+                    textEl.querySelector('.x-risu-am-illustration-slot')
+                    || textEl.querySelector('.am-illustration-projection')
+                    || textEl.querySelector('.x-risu-am-illustration-projection')
+                    || textEl.querySelector('.am-chat-regenerate-action')
+                    || textEl.querySelector('.am-chat-history-edge-controls')
+                );
+                if (hasInjected) {
+                    const parts = [];
+                    for (const ch of textEl.childNodes) {
+                        if (!ch) continue;
+                        if (ch.nodeType === 1 && ch.classList && ch.classList.contains('x-risu-am-illustration-footer')) continue;
+                        if (ch.nodeType === 1) parts.push(ch.outerHTML);
+                        else if (ch.nodeType === 3) parts.push(escapeHtmlText(ch.textContent || ''));
+                    }
+                    bodyHtmlByChatId[cid] = parts.join('');
+                }
+            }
+        }
+        return { footersByChatId, footersByIndex, bodyHtmlByChatId };
+    }
+
+    function wrapSafeElement(rawEl) {
+        if (!rawEl || rawEl.nodeType !== 1) return null;
+        const cached = safeWrapperCache.get(rawEl);
+        if (cached) return cached;
+        const wrapper = {
+            [RAW_MOCK_EL]: rawEl,
+            get nodeType() { return rawEl.nodeType; },
+            get nodeName() { return rawEl.nodeName; },
+            get tagName() { return rawEl.tagName; },
+            get id() { return rawEl.id; },
+            get className() { return rawEl.className; },
+            getAttribute: async (k) => rawEl.getAttribute(k),
+            setAttribute: async (k, v) => { rawEl.setAttribute(k, v); },
+            removeAttribute: async (k) => { rawEl.removeAttribute(k); },
+            hasAttribute: async (k) => rawEl.hasAttribute(k),
+            appendChild: async (ch) => { rawEl.appendChild(unwrapEl(ch)); return wrapSafeElement(unwrapEl(ch)) || ch; },
+            removeChild: async (ch) => { rawEl.removeChild(unwrapEl(ch)); return ch; },
+            replaceChild: async (n, o) => { rawEl.replaceChild(unwrapEl(n), unwrapEl(o)); return o; },
+            replaceWith: async (...nodes) => { rawEl.replaceWith(...nodes.map(unwrapEl)); },
+            remove: async () => { rawEl.remove(); },
+            append: async (...items) => { rawEl.append(...items.map(unwrapEl)); },
+            prepend: async (...items) => { rawEl.prepend(...items.map(unwrapEl)); },
+            cloneNode: async (deep = false) => wrapSafeElement(rawEl.cloneNode(deep)),
+            querySelector: async (sel) => wrapSafeElement(rawEl.querySelector(sel)),
+            querySelectorAll: async (sel) => makeSafeNodeList(collectMatchingElements(rawEl, sel).map(wrapSafeElement).filter(Boolean)),
+            getChildren: async () => rawEl.children.map(wrapSafeElement).filter(Boolean),
+            getParent: async () => wrapSafeElement(rawEl.parentElement),
+            closest: async (sel) => wrapSafeElement(rawEl.closest(sel)),
+            matches: async (sel) => rawEl.matches(sel),
+            contains: async (t) => rawEl.contains(unwrapEl(t)),
+            getBoundingClientRect: async () => rawEl.getBoundingClientRect(),
+            clientHeight: async () => rawEl.clientHeight(),
+            clientWidth: async () => rawEl.clientWidth(),
+            clientTop: async () => rawEl.clientTop(),
+            clientLeft: async () => rawEl.clientLeft(),
+            getOuterHTML: async () => rawEl.outerHTML,
+            setOuterHTML: async (v) => rawEl.setOuterHTML(v),
+            getInnerHTML: async () => rawEl.innerHTML,
+            setInnerHTML: async (v) => { rawEl.innerHTML = v; },
+            getTextContent: async () => rawEl.textContent,
+            setTextContent: async (v) => { rawEl.textContent = v; },
+            innerText: async () => rawEl.textContent,
+            setInnerText: async (v) => { rawEl.textContent = v; },
+            getClassName: async () => rawEl.className,
+            setClassName: async (v) => rawEl.setClassName(v),
+            addClass: async (...cls) => rawEl.addClass(...cls),
+            removeClass: async (...cls) => rawEl.removeClass(...cls),
+            hasClass: async (c) => rawEl.hasClass(c),
+            getStyle: async (p) => rawEl.getStyle(p),
+            setStyle: async (p, v) => rawEl.setStyle(p, v),
+            getStyleAttribute: async () => rawEl.getStyleAttribute(),
+            setStyleAttribute: async (v) => rawEl.setStyleAttribute(v),
+            addEventListener: async (ev, fn, opts) => rawEl.addEventListener(ev, fn, opts),
+            removeEventListener: async (ev, idOrFn, opts) => rawEl.removeEventListener(ev, idOrFn, opts),
+            dispatchEvent: async (evObj) => rawEl.dispatchEvent(evObj),
+            focus: async () => rawEl.focus(),
+            blur: async () => rawEl.blur(),
+            click: async () => rawEl.click(),
+        };
+        safeWrapperCache.set(rawEl, wrapper);
+        return wrapper;
+    }
+
+    function createMutationObserver(cb) {
+        const rec = {
+            cb: typeof cb === 'function' ? cb : () => {},
+            targets: new Map(),
+            api: null,
+        };
+        const api = {
+            observe: async (target, opts = {}) => {
+                const raw = unwrapEl(target);
+                if (!raw || typeof raw !== 'object') return;
+                rec.targets.set(raw, {
+                    childList: opts && opts.childList !== false,
+                    subtree: Boolean(opts && opts.subtree),
+                });
+                mutationObservers.add(rec);
+            },
+            disconnect: async () => {
+                rec.targets.clear();
+                mutationObservers.delete(rec);
+            },
+            takeRecords: async () => [],
+        };
+        rec.api = api;
+        return api;
     }
 
     const doc = {
         nodeType: 9,
-        documentElement,
-        head,
-        body,
-        createElement: async (tag) => new MockElement(tag),
-        createTextNode: async (txt) => ({ nodeType: 3, textContent: String(txt ?? ''), data: String(txt ?? '') }),
-        getElementById: async (id) => documentElement.querySelector(`#${id}`),
-        querySelector: async (sel) => documentElement.querySelector(sel),
-        querySelectorAll: async (sel) => documentElement.querySelectorAll(sel),
+        documentElement: wrapSafeElement(documentElement),
+        head: wrapSafeElement(head),
+        body: wrapSafeElement(body),
+        createElement: async (tag) => wrapSafeElement(new MockElement(tag)),
+        createTextNode: async (txt) => new MockTextNode(txt),
+        getElementById: async (id) => wrapSafeElement(collectMatchingElements(documentElement, `#${String(id || '').replace(/[^a-zA-Z0-9_-]/g, '')}`)[0] || null),
+        querySelector: async (sel) => wrapSafeElement(collectMatchingElements(documentElement, sel)[0] || null),
+        querySelectorAll: async (sel) => makeSafeNodeList(collectMatchingElements(documentElement, sel).map(wrapSafeElement).filter(Boolean)),
         addEventListener: async (ev, fn, opts) => {
             const id = `doc-ev-${++seq}`;
             listeners.set(id, { ev: String(ev), fn, opts: opts || false });
@@ -594,12 +1652,15 @@ function createHeadlessMockDom() {
         },
     };
     const syncDoc = {
-        ...doc,
+        nodeType: 9,
+        documentElement,
+        head,
+        body,
         createElement: (tag) => new MockElement(tag),
-        createTextNode: (txt) => ({ nodeType: 3, textContent: String(txt ?? ''), data: String(txt ?? '') }),
-        getElementById: (id) => documentElement.querySelector(`#${id}`),
-        querySelector: (sel) => documentElement.querySelector(sel),
-        querySelectorAll: (sel) => documentElement.querySelectorAll(sel),
+        createTextNode: (txt) => new MockTextNode(txt),
+        getElementById: (id) => collectMatchingElements(documentElement, `#${String(id || '').replace(/[^a-zA-Z0-9_-]/g, '')}`)[0] || null,
+        querySelector: (sel) => collectMatchingElements(documentElement, sel)[0] || null,
+        querySelectorAll: (sel) => collectMatchingElements(documentElement, sel),
         addEventListener: (ev, fn, opts) => {
             const id = `doc-ev-${++seq}`;
             listeners.set(id, { ev: String(ev), fn, opts: opts || false });
@@ -615,10 +1676,19 @@ function createHeadlessMockDom() {
     return {
         asyncDoc: doc,
         syncDoc,
+        documentElement,
+        head,
+        body,
         MockElement,
         chatScreen,
         dispatchSurfaceClick,
+        findRootInteractiveElement,
+        findChatSurfaceInteractiveElement,
         mountSurfaceActionElement,
+        syncChatMessages,
+        extractChatSurfaceProjections,
+        createMutationObserver,
+        getObserverCount: () => mutationObservers.size,
         getListenerCount: () => listeners.size,
     };
 }
@@ -727,6 +1797,10 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
     if (!ep.getTextContent) ep.getTextContent = async function() { return this.textContent; };
     if (!ep.setStyle) ep.setStyle = async function(k, v) { this.style[k] = String(v ?? ''); };
     if (!ep.getStyle) ep.getStyle = async function(k) { return this.style[k] || ''; };
+    if (!ep.setStyleAttribute) ep.setStyleAttribute = async function(v) { this.setAttribute('style', String(v ?? '')); };
+    if (!ep.getStyleAttribute) ep.getStyleAttribute = async function() { return this.getAttribute('style') || ''; };
+    if (!ep.getChildren) ep.getChildren = async function() { return Array.from(this.children); };
+    if (!ep.getParent) ep.getParent = async function() { return this.parentElement; };
     if (!ep.setClassName) ep.setClassName = async function(v) { this.className = String(v ?? ''); };
     if (!ep.getClassName) ep.getClassName = async function() { return this.className; };
     if (!ep.addClass) ep.addClass = async function() { this.classList.add.apply(this.classList, arguments); };
@@ -1040,6 +2114,18 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
 </html>`;
 }
 
+function computePluginScriptSig(script) {
+    const s = String(script || '');
+    const len = s.length;
+    let h1 = 0x811c9dc5;
+    const step = Math.max(1, Math.floor(len / 4096));
+    for (let i = 0; i < len; i += step) {
+        h1 ^= s.charCodeAt(i);
+        h1 = Math.imul(h1, 0x01000193) >>> 0;
+    }
+    return `${len}:${h1.toString(16)}`;
+}
+
 function createPluginAdapter({
     pluginsPath,
     persistDisabled = false,
@@ -1048,6 +2134,9 @@ function createPluginAdapter({
     hostRpc = null,
     getFallbackSnapshot = () => null,
     runLLM = null,
+    onActivity = () => () => {},
+    onSurfaceMutated = null,
+    onDbMutated = null,
 } = {}) {
     let customPlugins = [];
     const pcPlugins = new Map(); // name -> { name, displayName, version, script, header, pcRealArg, pcEnabled, updatedAt }
@@ -1056,8 +2145,107 @@ function createPluginAdapter({
     const pluginChannels = new Map(); // `${pluginName}\0${channel}` -> { pluginName, callback }
     const providers = new Map(); // providerName -> { pluginName, fn, options }
     const pluginDoms = new Map(); // pluginName -> mockDom
+    const chatPanels = new Map(); // `${pluginName}::${panelId}` -> { id, pluginName, displayName, className, html }
     const guiIpcOutbox = []; // [{ seq, targetPlugin, channel, message, sender, at }]
     let guiIpcSeq = 0;
+    let activeHookFrame = null; // { stage, step, total, pluginName, explicit, handle }
+
+    function getPluginDisplayName(pluginName) {
+        const custom = customPlugins.find((p) => p && p.name === pluginName);
+        if (custom) return custom.displayName || pluginName;
+        const pc = pcPlugins.get(pluginName);
+        if (pc) return pc.displayName || pluginName;
+        return pluginName;
+    }
+
+    function decodeBasicEntities(s) {
+        return String(s ?? '')
+            .replace(/&amp;/g, '&')
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&quot;/g, '"')
+            .replace(/&#39;/g, "'")
+            .replace(/&nbsp;/g, ' ');
+    }
+
+    function extractCleanPanelStatusText(html) {
+        const raw = String(html || '');
+        if (!raw.trim()) return '';
+        const prevM = raw.match(/<span\b[^>]*class\s*=\s*["'][^"']*\bmscs-preview\b[^"']*["'][^>]*>([\s\S]*?)<\/span>/i);
+        if (prevM) {
+            const clean = decodeBasicEntities(prevM[1].replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
+            if (clean) return clean.slice(0, 100);
+        }
+        const stripped = decodeBasicEntities(
+            raw
+                .replace(/<style\b[\s\S]*?<\/style>/gi, ' ')
+                .replace(/<script\b[\s\S]*?<\/script>/gi, ' ')
+                .replace(/<button\b[\s\S]*?<\/button>/gi, ' ')
+                .replace(/<[^>]+>/g, ' ')
+        ).replace(/\s+/g, ' ').trim();
+        return stripped.slice(0, 100);
+    }
+
+    function inferFetchHookTask(parsedUrl, stage) {
+        const href = String(parsedUrl && parsedUrl.href ? parsedUrl.href : '').toLowerCase();
+        if (/embed(?:ding)?s?\b|\/v1\/embeddings/.test(href)) {
+            return stage === 'beforeRequest' ? '임베딩 벡터 회상 조회 중' : '임베딩 벡터 인덱싱·저장 중';
+        }
+        if (/rerank/.test(href)) return '기억 리랭킹 중';
+        if (/memory|recall|vector|retrieval|librarian|retrace/.test(href)) {
+            return stage === 'beforeRequest' ? '기억 스토리지 조회 중' : '기억 스토리지 저장 중';
+        }
+        if (/chat\/completions|generatecontent|\/v1\/messages|\/responses/.test(href)) {
+            return stage === 'beforeRequest' ? '보조 LLM 분석 요청 중' : '보조 LLM 후처리 요청 중';
+        }
+        if (/novelai|generate-image|\/prompt\b/.test(href)) return '삽화 생성 API 요청 중';
+        return `외부 API 통신 중 (${parsedUrl.hostname})`;
+    }
+
+    function updateHookTaskDetail(pluginName, detail, explicit = false) {
+        const f = activeHookFrame;
+        if (!f || f.pluginName !== pluginName) return;
+        const clean = String(detail || '').replace(/\s+/g, ' ').trim().slice(0, 100);
+        if (!clean) return;
+        if (!explicit && f.explicit) return;
+        if (explicit) f.explicit = true;
+        if (f.handle && typeof f.handle.update === 'function') {
+            try { f.handle.update({ phase: clean }); } catch (_) {}
+        }
+    }
+
+    async function runHookStepWithActivity({ stage, step, total, pluginName, initialTask }, fn) {
+        let handle = () => {};
+        if (typeof onActivity === 'function') {
+            try {
+                const ret = onActivity({
+                    kind: 'plugin_hook',
+                    stage: String(stage || ''),
+                    step: Number(step) || 1,
+                    total: Number(total) || 1,
+                    pluginName,
+                    name: getPluginDisplayName(pluginName),
+                    phase: String(initialTask || ''),
+                });
+                if (typeof ret === 'function') handle = ret;
+            } catch (_) {}
+        }
+        const prevFrame = activeHookFrame;
+        activeHookFrame = {
+            stage,
+            step,
+            total,
+            pluginName,
+            explicit: false,
+            handle,
+        };
+        try {
+            return await fn();
+        } finally {
+            activeHookFrame = prevFrame;
+            try { handle(); } catch (_) {}
+        }
+    }
     const hookState = {
         beforeRequest: [],
         afterRequest: [],
@@ -1073,6 +2261,8 @@ function createPluginAdapter({
     const fallbackLocalPlugin = new Map();
     const fallbackAssetStore = new Map();
     const fallbackInlayStore = new Map();
+    const fallbackCharCache = new Map();
+    let lastActiveLocation = { charIndex: -1, chatIndex: -1 };
 
     // Per-turn coherent cache (never acts as a separate persistent DB)
     let turnCache = {
@@ -1265,9 +2455,30 @@ function createPluginAdapter({
         return Array.from(fb.keys());
     }
 
+    function ensureStableChatAndMessageIds(charObj, charIdx, chatObj, chatIdx) {
+        if (!chatObj || typeof chatObj !== 'object') return chatObj;
+        const cidOwner = String((charObj && charObj.chaId) || charIdx || 0).replace(/[^a-zA-Z0-9_-]/g, '_');
+        if (!chatObj.id || !String(chatObj.id).trim()) {
+            chatObj.id = `rs-chat-${cidOwner}-${Math.max(0, Number(chatIdx) || 0)}`;
+        }
+        if (Array.isArray(chatObj.message)) {
+            const baseId = String(chatObj.id);
+            for (let i = 0; i < chatObj.message.length; i += 1) {
+                const m = chatObj.message[i];
+                if (m && typeof m === 'object' && (!m.chatId || !String(m.chatId).trim())) {
+                    m.chatId = `rs-msg-${baseId}-${i}`;
+                }
+            }
+        }
+        return chatObj;
+    }
+
     function buildSnapshotCharFallback(snap) {
         if (!snap || typeof snap !== 'object') return null;
         const ctx = snap.charContext && typeof snap.charContext === 'object' ? snap.charContext : {};
+        const cIdx = Math.max(0, Number(snap.charIndex) || 0);
+        const chIdx = Math.max(0, Number(snap.chatIndex) || 0);
+        const charId = String(ctx.charId || snap.charName || `char_${cIdx}`);
         const msgs = (Array.isArray(snap.messages) ? snap.messages : [])
             .filter((m) => m && !m.isFirstMessage && Number(m.index) >= 0)
             .map((m) => ({
@@ -1276,50 +2487,76 @@ function createPluginAdapter({
                 ...(m.chatId ? { chatId: String(m.chatId) } : {}),
             }));
         const chat = {
-            id: String(snap.chatUuid || snap.chatId || `chat_${snap.chatIndex ?? 0}`),
-            name: String(snap.chatName || 'Chat 1'),
+            id: String(snap.chatUuid || snap.chatId || `rs-chat-${charId.replace(/[^a-zA-Z0-9_-]/g, '_')}-${chIdx}`),
+            name: String(snap.chatName || `Chat ${chIdx + 1}`),
             note: String(ctx.note || ''),
             message: msgs,
             scriptstate: Object.fromEntries(Object.entries(snap.chatVariables || {}).map(([k, v]) => [`$${k}`, String(v ?? '')])),
             fmIndex: typeof snap.fmIndex === 'number' ? snap.fmIndex : -1,
         };
         const chats = [];
-        chats[Math.max(0, Number(snap.chatIndex) || 0)] = chat;
-        return {
-            chaId: String(ctx.charId || snap.charName || `char_${snap.charIndex ?? 0}`),
+        chats[chIdx] = chat;
+        const charObj = {
+            chaId: charId,
             name: String(ctx.name || snap.charName || 'Character'),
+            lowLevelAccess: Boolean(ctx.lowLevelAccess),
             desc: String(ctx.desc || ''),
             personality: String(ctx.personality || ''),
             scenario: String(ctx.scenario || ''),
             systemPrompt: String(ctx.systemPrompt || ''),
             replaceGlobalNote: String(ctx.replaceGlobalNote || ''),
-            chatPage: Math.max(0, Number(snap.chatIndex) || 0),
+            chatPage: chIdx,
             chats,
         };
+        ensureStableChatAndMessageIds(charObj, cIdx, chat, chIdx);
+        return charObj;
+    }
+
+    function getOrSeedFallbackChar(cIdx) {
+        const idx = Number(cIdx);
+        const snap = getFallbackSnapshot();
+        let cached = fallbackCharCache.get(idx) || null;
+        if (!cached) {
+            if (snap && Number(snap.charIndex) === idx) {
+                cached = buildSnapshotCharFallback(snap);
+                if (cached) fallbackCharCache.set(idx, cached);
+            }
+            return cached;
+        }
+        if (snap && Number(snap.charIndex) === idx) {
+            const fresh = buildSnapshotCharFallback(snap);
+            const chIdx = Math.max(0, Number(snap.chatIndex) || 0);
+            const freshChat = fresh && fresh.chats && fresh.chats[chIdx];
+            if (!Array.isArray(cached.chats)) cached.chats = [];
+            const prevChat = cached.chats[chIdx];
+            if (freshChat && (!prevChat || prevChat.id !== freshChat.id || (Array.isArray(freshChat.message) && freshChat.message.length > (Array.isArray(prevChat.message) ? prevChat.message.length : 0)))) {
+                cached.chats[chIdx] = freshChat;
+            }
+            if (cached.chats[chIdx]) ensureStableChatAndMessageIds(cached, idx, cached.chats[chIdx], chIdx);
+        }
+        return cached;
     }
 
     async function dbGetCurrentIndices() {
         if (turnCache.active && turnCache.charIndex >= 0) {
             return { charIndex: turnCache.charIndex, chatIndex: Math.max(0, turnCache.chatIndex) };
         }
+        const fallbackSnap = getFallbackSnapshot();
+        if (fallbackSnap && typeof fallbackSnap.charIndex === 'number' && fallbackSnap.charIndex >= 0) {
+            return { charIndex: fallbackSnap.charIndex, chatIndex: Math.max(0, Number(fallbackSnap.chatIndex) || 0) };
+        }
+        if (lastActiveLocation.charIndex >= 0) {
+            return { charIndex: lastActiveLocation.charIndex, chatIndex: Math.max(0, lastActiveLocation.chatIndex) };
+        }
         if (isRpcConnected()) {
             const idx = await hostRpc.invoke('db.getCurrentIndices', []);
             if (idx && typeof idx === 'object') {
-                const fallbackSnap = getFallbackSnapshot();
-                const cIdx = (fallbackSnap && typeof fallbackSnap.charIndex === 'number' && fallbackSnap.charIndex >= 0)
-                    ? fallbackSnap.charIndex
-                    : (typeof idx.viewCharIndex === 'number' && idx.viewCharIndex >= 0 ? idx.viewCharIndex : Number(idx.charIndex ?? 0));
-                const chIdx = (fallbackSnap && typeof fallbackSnap.chatIndex === 'number' && fallbackSnap.chatIndex >= 0)
-                    ? fallbackSnap.chatIndex
-                    : (typeof idx.viewChatIndex === 'number' && idx.viewChatIndex >= 0 ? idx.viewChatIndex : Number(idx.chatIndex ?? 0));
+                const cIdx = typeof idx.viewCharIndex === 'number' && idx.viewCharIndex >= 0 ? idx.viewCharIndex : Number(idx.charIndex ?? 0);
+                const chIdx = typeof idx.viewChatIndex === 'number' && idx.viewChatIndex >= 0 ? idx.viewChatIndex : Number(idx.chatIndex ?? 0);
                 return { charIndex: cIdx, chatIndex: Math.max(0, chIdx) };
             }
         }
-        const snap = getFallbackSnapshot();
-        return {
-            charIndex: snap && typeof snap.charIndex === 'number' && snap.charIndex >= 0 ? snap.charIndex : 0,
-            chatIndex: snap && typeof snap.chatIndex === 'number' && snap.chatIndex >= 0 ? snap.chatIndex : 0,
-        };
+        return { charIndex: 0, chatIndex: 0 };
     }
 
     async function dbGetCharacterFromIndex(idx) {
@@ -1330,28 +2567,47 @@ function createPluginAdapter({
             if (turnCache.chatObj && Array.isArray(copy.chats)) {
                 copy.chats[turnCache.chatIndex] = cloneJson(turnCache.chatObj);
             }
+            if (Array.isArray(copy.chats)) {
+                for (let ci = 0; ci < copy.chats.length; ci += 1) {
+                    ensureStableChatAndMessageIds(copy, cIdx, copy.chats[ci], ci);
+                }
+            }
             return copy;
         }
         if (isRpcConnected()) {
-            return await hostRpc.invoke('db.getCharacter', [cIdx]);
+            const ch = await hostRpc.invoke('db.getCharacter', [cIdx]);
+            if (ch && Array.isArray(ch.chats)) {
+                for (let ci = 0; ci < ch.chats.length; ci += 1) {
+                    ensureStableChatAndMessageIds(ch, cIdx, ch.chats[ci], ci);
+                }
+            }
+            return ch;
         }
-        const snap = getFallbackSnapshot();
-        if (snap && snap.charIndex === cIdx) return buildSnapshotCharFallback(snap);
-        return null;
+        const fb = getOrSeedFallbackChar(cIdx);
+        return fb ? cloneJson(fb) : null;
     }
 
     async function dbSetCharacterToIndex(idx, charObj) {
         const cIdx = Number(idx);
         if (Number.isNaN(cIdx) || cIdx < 0 || !charObj) return false;
         const copy = cloneJson(charObj);
+        if (Array.isArray(copy.chats)) {
+            for (let ci = 0; ci < copy.chats.length; ci += 1) {
+                ensureStableChatAndMessageIds(copy, cIdx, copy.chats[ci], ci);
+            }
+        }
         if (turnCache.active && turnCache.charIndex === cIdx) {
-            turnCache.charObj = copy;
+            turnCache.charObj = cloneJson(copy);
             if (Array.isArray(copy.chats) && copy.chats[turnCache.chatIndex]) {
                 turnCache.chatObj = cloneJson(copy.chats[turnCache.chatIndex]);
             }
         }
+        fallbackCharCache.set(cIdx, cloneJson(copy));
         if (isRpcConnected()) {
             await hostRpc.invoke('db.setCharacter', [cIdx, copy]);
+        }
+        if (typeof onDbMutated === 'function') {
+            try { onDbMutated({ charIndex: cIdx, charObj: copy }); } catch (_) {}
         }
         return true;
     }
@@ -1361,17 +2617,15 @@ function createPluginAdapter({
         const chi = Number(chIdx);
         if (Number.isNaN(ci) || ci < 0 || Number.isNaN(chi) || chi < 0) return null;
         if (turnCache.active && turnCache.charIndex === ci && turnCache.chatIndex === chi && turnCache.chatObj) {
-            return cloneJson(turnCache.chatObj);
+            return ensureStableChatAndMessageIds(turnCache.charObj, ci, cloneJson(turnCache.chatObj), chi);
         }
         if (isRpcConnected()) {
-            return await hostRpc.invoke('db.getChat', [ci, chi]);
+            const chat = await hostRpc.invoke('db.getChat', [ci, chi]);
+            return ensureStableChatAndMessageIds({ chaId: '' }, ci, chat, chi);
         }
-        const snap = getFallbackSnapshot();
-        if (snap && snap.charIndex === ci) {
-            const fb = buildSnapshotCharFallback(snap);
-            return (fb && fb.chats && fb.chats[chi]) || null;
-        }
-        return null;
+        const fb = getOrSeedFallbackChar(ci);
+        const chat = (fb && fb.chats && fb.chats[chi]) ? cloneJson(fb.chats[chi]) : null;
+        return ensureStableChatAndMessageIds(fb, ci, chat, chi);
     }
 
     async function dbSetChatToIndex(cIdx, chIdx, chatObj) {
@@ -1379,14 +2633,23 @@ function createPluginAdapter({
         const chi = Number(chIdx);
         if (Number.isNaN(ci) || ci < 0 || Number.isNaN(chi) || chi < 0 || !chatObj) return false;
         const copy = cloneJson(chatObj);
+        const cachedChar = fallbackCharCache.get(ci) || turnCache.charObj || null;
+        ensureStableChatAndMessageIds(cachedChar, ci, copy, chi);
         if (turnCache.active && turnCache.charIndex === ci && turnCache.chatIndex === chi) {
-            turnCache.chatObj = copy;
+            turnCache.chatObj = cloneJson(copy);
             if (turnCache.charObj && Array.isArray(turnCache.charObj.chats)) {
                 turnCache.charObj.chats[chi] = cloneJson(copy);
             }
         }
+        const fb = getOrSeedFallbackChar(ci) || { chaId: `char_${ci}`, name: 'Character', chats: [] };
+        if (!Array.isArray(fb.chats)) fb.chats = [];
+        fb.chats[chi] = cloneJson(copy);
+        fallbackCharCache.set(ci, fb);
         if (isRpcConnected()) {
             await hostRpc.invoke('db.setChat', [ci, chi, copy]);
+        }
+        if (typeof onDbMutated === 'function') {
+            try { onDbMutated({ charIndex: ci, chatIndex: chi, chatObj: copy }); } catch (_) {}
         }
         return true;
     }
@@ -1398,7 +2661,7 @@ function createPluginAdapter({
             out = (await hostRpc.invoke('db.getDatabase', [want])) || {};
         } else {
             const snap = getFallbackSnapshot();
-            const fbChar = buildSnapshotCharFallback(snap);
+            const fbChar = getOrSeedFallbackChar(snap && typeof snap.charIndex === 'number' ? snap.charIndex : 0) || buildSnapshotCharFallback(snap);
             out = {
                 characters: fbChar ? [fbChar] : [],
                 personas: snap && snap.charContext ? [{ name: snap.charContext.personaName || 'User', personaPrompt: snap.charContext.personaPrompt || '' }] : [],
@@ -1519,7 +2782,7 @@ function createPluginAdapter({
         return id;
     }
 
-    async function proxyFetchForPlugin(url, opts = {}, isRisuFetch = false) {
+    async function proxyFetchForPlugin(url, opts = {}, isRisuFetch = false, pluginName = '') {
         const parsed = checkUrlAllowed(url);
         const initOpts = opts && typeof opts === 'object' ? opts : {};
         const headers = {};
@@ -1536,6 +2799,9 @@ function createPluginAdapter({
             }
         }
         const method = String(initOpts.method || (body !== undefined && body !== null ? 'POST' : 'GET')).toUpperCase();
+        if (pluginName && activeHookFrame && activeHookFrame.pluginName === pluginName) {
+            updateHookTaskDetail(pluginName, inferFetchHookTask(parsed, activeHookFrame.stage), false);
+        }
         const resp = await fetch(parsed.toString(), {
             method,
             headers,
@@ -1770,8 +3036,50 @@ function createPluginAdapter({
                 return { id };
             },
             unregisterUIPart: async (id) => {
-                const idx = record.uiItems.findIndex((u) => u.id === String(id));
+                const targetId = String(id);
+                const idx = record.uiItems.findIndex((u) => u.id === targetId);
                 if (idx >= 0) record.uiItems.splice(idx, 1);
+                chatPanels.delete(`${pluginName}::${targetId}`);
+                try {
+                    const sec = sharedMockDom.body.querySelector(`section[data-plugin-chat-panel="${targetId}"]`);
+                    if (sec) sec.remove();
+                } catch (_) {}
+            },
+            setChatPanel: async (content, options = {}) => {
+                const opts = options && typeof options === 'object' ? options : {};
+                const panelId = String(opts.id || `${pluginName}:default`);
+                const key = `${pluginName}::${panelId}`;
+                const cleanSelector = `section[data-plugin-chat-panel="${panelId.replace(/"/g, '\\"')}"]`;
+                if (content === null || content === '') {
+                    chatPanels.delete(key);
+                    try {
+                        const existing = sharedMockDom.body.querySelector(cleanSelector);
+                        if (existing) existing.remove();
+                    } catch (_) {}
+                    return { id: panelId };
+                }
+                if (typeof content !== 'string') throw new Error('content must be a string or null');
+                const cls = typeof opts.className === 'string' ? opts.className : '';
+                chatPanels.set(key, {
+                    id: panelId,
+                    pluginName,
+                    displayName: getPluginDisplayName(pluginName),
+                    className: cls,
+                    html: content,
+                });
+                try {
+                    let sec = sharedMockDom.body.querySelector(cleanSelector);
+                    if (!sec) {
+                        sec = sharedMockDom.syncDoc.createElement('section');
+                        sec.setAttribute('data-plugin-chat-panel', panelId);
+                        if (cls) sec.setAttribute('class', cls);
+                        sharedMockDom.body.appendChild(sec);
+                    }
+                    sec.innerHTML = content;
+                } catch (_) {}
+                const statusTxt = extractCleanPanelStatusText(content);
+                if (statusTxt) updateHookTaskDetail(pluginName, statusTxt, true);
+                return { id: panelId };
             },
 
             addPluginChannelListener: async (channelName, cb) => {
@@ -1785,12 +3093,19 @@ function createPluginAdapter({
             },
             postPluginChannelMessage: (target, channel, msg) => postIpcMessage(getPluginEntry(pluginName) || entry, target, channel, msg),
 
-            nativeFetch: (url, opts) => proxyFetchForPlugin(url, opts, false),
-            risuFetch: (url, opts) => proxyFetchForPlugin(url, opts, true),
+            nativeFetch: (url, opts) => proxyFetchForPlugin(url, opts, false, pluginName),
+            risuFetch: (url, opts) => proxyFetchForPlugin(url, opts, true, pluginName),
 
             runLLMModel: async (req) => {
                 if (typeof runLLM !== 'function') {
                     return { type: 'fail', result: 'No LLM runner available in backend adapter' };
+                }
+                if (activeHookFrame && activeHookFrame.pluginName === pluginName) {
+                    const reqMode = String((req && req.mode) || 'model');
+                    const taskTxt = reqMode === 'otherAx'
+                        ? (activeHookFrame.stage === 'beforeRequest' ? '보조 모델(OtherAx) 분석 중' : '보조 모델(OtherAx) 후처리 중')
+                        : '모델 파이프라인 호출 중';
+                    updateHookTaskDetail(pluginName, taskTxt, false);
                 }
                 try {
                     return await runLLM(req || {}, pluginName, providers);
@@ -1828,7 +3143,7 @@ function createPluginAdapter({
             getRootDocument: async () => asyncDoc,
             getRootContainer: async () => asyncDoc.body,
             getPluginRoot: async () => asyncDoc.body,
-            createMutationObserver: async () => ({ observe: async () => {}, disconnect: async () => {}, takeRecords: async () => [] }),
+            createMutationObserver: async (cb) => sharedMockDom.createMutationObserver(cb),
             showContainer: async () => {},
             hideContainer: async () => {},
             getRuntimeInfo: async () => ({ apiVersion: '3.0', platform: 'risustand-backend', saveMethod: 'local' }),
@@ -1885,6 +3200,9 @@ function createPluginAdapter({
         if (!inst) return;
         activeHosts.delete(name);
         pluginDoms.delete(name);
+        for (const k of [...chatPanels.keys()]) {
+            if (k.startsWith(`${name}::`)) chatPanels.delete(k);
+        }
         for (const fn of [...inst.trackedUnloads].reverse()) {
             try { await fn(); } catch (_) {}
         }
@@ -1908,7 +3226,14 @@ function createPluginAdapter({
             providers: [],
             hooks: { replacers: [], scriptHandlers: [], chatListeners: [] },
         };
-        const sharedMockDom = createHeadlessMockDom();
+        const sharedMockDom = createHeadlessMockDom({
+            onToastText: (txt) => updateHookTaskDetail(name, txt, true),
+            onChatSurfaceMutated: () => {
+                if (typeof onSurfaceMutated === 'function') {
+                    try { onSurfaceMutated({ pluginName: name }); } catch (_) {}
+                }
+            },
+        });
         pluginDoms.set(name, sharedMockDom);
         const { api, trackedUnloads } = makePluginApiFor(entry, record, sharedMockDom);
         const timers = new Set();
@@ -1958,6 +3283,7 @@ function createPluginAdapter({
             TextDecoder,
             AbortController,
             AbortSignal,
+            DOMException: typeof DOMException !== 'undefined' ? DOMException : Error,
             Headers,
             Request,
             Response,
@@ -1968,7 +3294,7 @@ function createPluginAdapter({
             ArrayBuffer,
             atob: (b64) => Buffer.from(String(b64), 'base64').toString('binary'),
             btoa: (bin) => Buffer.from(String(bin), 'binary').toString('base64'),
-            fetch: (u, o) => proxyFetchForPlugin(u, o, false),
+            fetch: (u, o) => proxyFetchForPlugin(u, o, false, name),
             risuai: api,
             Risuai: api,
             RisuAI: api,
@@ -2022,12 +3348,69 @@ function createPluginAdapter({
         }
     }
 
+    const PLUGIN_SCRIPT_CHUNK_CHARS = 1500000;
+    let syncPcInFlight = null;
+
     // Boot any persisted custom/enabled plugins on startup (non-blocking if offline)
     void reconcileEnabledPlugins().catch(() => {});
 
-    async function syncPcPlugins() {
-        if (!isRpcConnected()) return listPlugins();
-        const rawList = await hostRpc.invoke('db.getPlugins', []);
+    async function fetchPcPluginListForSync() {
+        let metaList = null;
+        try {
+            metaList = await hostRpc.invoke('db.listPluginsMeta', [true], 30000);
+        } catch (err) {
+            const msg = err && err.message ? err.message : String(err);
+            if (!/Unsupported host RPC op/i.test(msg)) {
+                throw err;
+            }
+            return await hostRpc.invoke('db.getPlugins', [], 90000);
+        }
+        if (!Array.isArray(metaList)) return null;
+
+        const out = [];
+        for (const meta of metaList) {
+            if (!meta || !meta.name || meta.name === 'risustand') continue;
+            const pName = String(meta.name);
+            const expectedLen = Number(meta.scriptLen);
+            const expectedSig = typeof meta.scriptSig === 'string' ? meta.scriptSig : '';
+            const prev = pcPlugins.get(pName);
+
+            let script = '';
+            if (prev && typeof prev.script === 'string' && prev.script.length === expectedLen && expectedSig && computePluginScriptSig(prev.script) === expectedSig) {
+                script = prev.script;
+            } else if (expectedLen === 0) {
+                continue;
+            } else {
+                const parts = [];
+                let offset = 0;
+                const limitLen = Number.isFinite(expectedLen) && expectedLen > 0 ? expectedLen : Infinity;
+                while (offset < limitLen) {
+                    const part = await hostRpc.invoke('db.getPluginScriptChunk', [pName, offset, PLUGIN_SCRIPT_CHUNK_CHARS], 30000);
+                    if (!part || typeof part.chunk !== 'string') break;
+                    parts.push(part.chunk);
+                    if (!part.chunk.length) break;
+                    offset += part.chunk.length;
+                    if (part.eof || (typeof part.totalLen === 'number' && offset >= part.totalLen)) break;
+                }
+                script = parts.join('');
+            }
+            if (!script) continue;
+            out.push({ ...meta, script });
+        }
+        return out;
+    }
+
+    async function runSyncPcPlugins() {
+        let rawList;
+        try {
+            rawList = await fetchPcPluginListForSync();
+        } catch (err) {
+            const msg = err && err.message ? err.message : String(err);
+            if (/Host RPC timeout/i.test(msg)) {
+                throw new Error(`${msg} — 대용량 플러그인 전송이 지연되었거나 PC RisuAI에 DB 권한 허용 팝업이 대기 중일 수 있습니다. 릴레이 서버와 PC RisuAI의 RisuStand 플러그인을 최신 파일로 재적용한 뒤 다시 시도해 주세요.`);
+            }
+            throw err;
+        }
         if (!Array.isArray(rawList)) return listPlugins();
         const prevScripts = new Map();
         for (const [k, v] of pcPlugins.entries()) prevScripts.set(k, v.script);
@@ -2053,6 +3436,15 @@ function createPluginAdapter({
         }
         await reconcileEnabledPlugins();
         return listPlugins();
+    }
+
+    async function syncPcPlugins() {
+        if (!isRpcConnected()) return listPlugins();
+        if (syncPcInFlight) return syncPcInFlight;
+        syncPcInFlight = runSyncPcPlugins().finally(() => {
+            syncPcInFlight = null;
+        });
+        return syncPcInFlight;
     }
 
     async function addCustomPlugin({ filename = '', script = '', enabled = true } = {}) {
@@ -2180,14 +3572,15 @@ function createPluginAdapter({
                 hostRpc.invoke('db.getCharacter', [turnCache.charIndex]),
                 hostRpc.invoke('db.getChat', [turnCache.charIndex, turnCache.chatIndex]),
             ]);
-            turnCache.charObj = charObj ? cloneJson(charObj) : buildSnapshotCharFallback(fallbackSnap);
+            turnCache.charObj = charObj ? cloneJson(charObj) : cloneJson(getOrSeedFallbackChar(turnCache.charIndex));
             turnCache.chatObj = chatObj ? cloneJson(chatObj) : ((turnCache.charObj && turnCache.charObj.chats && turnCache.charObj.chats[turnCache.chatIndex]) || null);
         } else {
-            turnCache.charObj = buildSnapshotCharFallback(fallbackSnap);
+            const seeded = getOrSeedFallbackChar(turnCache.charIndex);
+            turnCache.charObj = seeded ? cloneJson(seeded) : null;
             turnCache.chatObj = (turnCache.charObj && turnCache.charObj.chats && turnCache.charObj.chats[turnCache.chatIndex]) || null;
         }
-        if (turnCache.chatObj && !turnCache.chatObj.id) {
-            turnCache.chatObj.id = crypto.randomUUID();
+        if (turnCache.chatObj) {
+            ensureStableChatAndMessageIds(turnCache.charObj, turnCache.charIndex, turnCache.chatObj, turnCache.chatIndex);
         }
         if (turnCache.charObj && turnCache.chatObj) {
             if (!Array.isArray(turnCache.charObj.chats)) turnCache.charObj.chats = [];
@@ -2265,30 +3658,44 @@ function createPluginAdapter({
 
     async function runBeforeRequest(messages, mode = 'model') {
         let msgs = Array.isArray(messages) ? messages.map((m) => ({ ...m })) : [];
-        if (hookState.editprocess.length) {
-            for (const h of [...hookState.editprocess]) {
-                try {
-                    for (let i = 0; i < msgs.length; i += 1) {
-                        const res = await h.fn(String(msgs[i].content ?? ''));
-                        if (typeof res === 'string') msgs[i].content = res;
+        const steps = [
+            ...hookState.editprocess.map((h) => ({ kind: 'editprocess', h })),
+            ...hookState.beforeRequest.map((h) => ({ kind: 'beforeRequest', h })),
+        ];
+        const total = steps.length;
+        for (let idx = 0; idx < total; idx += 1) {
+            const { kind, h } = steps[idx];
+            const initialTask = kind === 'editprocess' ? '요청 텍스트 전처리 중' : '프롬프트·컨텍스트 구성 중';
+            await runHookStepWithActivity({
+                stage: 'beforeRequest',
+                step: idx + 1,
+                total,
+                pluginName: h.pluginName,
+                initialTask,
+            }, async () => {
+                if (kind === 'editprocess') {
+                    try {
+                        for (let i = 0; i < msgs.length; i += 1) {
+                            const res = await h.fn(String(msgs[i].content ?? ''));
+                            if (typeof res === 'string') msgs[i].content = res;
+                        }
+                    } catch (e) {
+                        console.warn(`[Plugin:${h.pluginName}] editprocess error:`, e.message);
                     }
-                } catch (e) {
-                    console.warn(`[Plugin:${h.pluginName}] editprocess error:`, e.message);
+                } else {
+                    try {
+                        const inputCopy = msgs.map((m) => ({ ...m }));
+                        const res = await h.fn(inputCopy, mode);
+                        if (Array.isArray(res)) {
+                            msgs = res;
+                        } else if (res && typeof res === 'object' && Array.isArray(res.content)) {
+                            msgs = res.content;
+                        }
+                    } catch (e) {
+                        console.warn(`[Plugin:${h.pluginName}] beforeRequest error:`, e.message);
+                    }
                 }
-            }
-        }
-        for (const h of [...hookState.beforeRequest]) {
-            try {
-                const inputCopy = msgs.map((m) => ({ ...m }));
-                const res = await h.fn(inputCopy, mode);
-                if (Array.isArray(res)) {
-                    msgs = res;
-                } else if (res && typeof res === 'object' && Array.isArray(res.content)) {
-                    msgs = res.content;
-                }
-            } catch (e) {
-                console.warn(`[Plugin:${h.pluginName}] beforeRequest error:`, e.message);
-            }
+            });
         }
         return msgs;
     }
@@ -2310,21 +3717,37 @@ function createPluginAdapter({
 
     async function runAfterRequest(text, mode = 'model') {
         let out = String(text ?? '');
-        for (const h of [...hookState.afterRequest]) {
-            try {
-                const res = await h.fn(out, mode);
-                if (typeof res === 'string') out = res;
-            } catch (e) {
-                console.warn(`[Plugin:${h.pluginName}] afterRequest error:`, e.message);
-            }
-        }
-        for (const h of [...hookState.editoutput]) {
-            try {
-                const res = await h.fn(out);
-                if (typeof res === 'string') out = res;
-            } catch (e) {
-                console.warn(`[Plugin:${h.pluginName}] editoutput error:`, e.message);
-            }
+        const steps = [
+            ...hookState.afterRequest.map((h) => ({ kind: 'afterRequest', h })),
+            ...hookState.editoutput.map((h) => ({ kind: 'editoutput', h })),
+        ];
+        const total = steps.length;
+        for (let idx = 0; idx < total; idx += 1) {
+            const { kind, h } = steps[idx];
+            const initialTask = kind === 'editoutput' ? '응답 출력 정규화 중' : '응답 후처리·기억/상태 갱신 중';
+            await runHookStepWithActivity({
+                stage: 'afterRequest',
+                step: idx + 1,
+                total,
+                pluginName: h.pluginName,
+                initialTask,
+            }, async () => {
+                if (kind === 'afterRequest') {
+                    try {
+                        const res = await h.fn(out, mode);
+                        if (typeof res === 'string') out = res;
+                    } catch (e) {
+                        console.warn(`[Plugin:${h.pluginName}] afterRequest error:`, e.message);
+                    }
+                } else {
+                    try {
+                        const res = await h.fn(out);
+                        if (typeof res === 'string') out = res;
+                    } catch (e) {
+                        console.warn(`[Plugin:${h.pluginName}] editoutput error:`, e.message);
+                    }
+                }
+            });
         }
         return out;
     }
@@ -2375,32 +3798,257 @@ function createPluginAdapter({
             await hostRpc.invoke('db.setChat', [Number(charIndex), Number(chatIndex), cloneJson(turnCache.chatObj)]);
             return { committedViaRpc: true, messageIndex };
         }
+        if (turnCache.charObj) {
+            fallbackCharCache.set(Number(charIndex), cloneJson(turnCache.charObj));
+        }
         return { committedViaRpc: false, messageIndex };
     }
 
-    async function dispatchSurfaceAction({ charIndex, chatIndex, actionHtml = '', dataset = {} } = {}) {
+    async function dispatchSurfaceAction({ charIndex, chatIndex, msgIndex = -1, chatId = '', actionHtml = '', dataset = {} } = {}) {
+        const cIdx = Number(charIndex);
+        const chIdx = Number(chatIndex);
+        if (!Number.isNaN(cIdx) && !Number.isNaN(chIdx) && cIdx >= 0 && chIdx >= 0) {
+            lastActiveLocation = { charIndex: cIdx, chatIndex: chIdx };
+        }
+        const snap = getFallbackSnapshot();
+        const baseChatUuid = String((snap && (snap.chatUuid || snap.chatId)) || `rs-chat-${Math.max(0, cIdx)}-${Math.max(0, chIdx)}`);
+        const syncedMsgs = (snap && Array.isArray(snap.messages))
+            ? snap.messages.map((m) => (m && !m.isFirstMessage && Number(m.index) >= 0 && !m.chatId
+                ? { ...m, chatId: `rs-msg-${baseChatUuid}-${m.index}` }
+                : m))
+            : [];
+        const resolvedCid = String(chatId || '').trim()
+            || ((syncedMsgs.find((m) => m && Number(m.index) === Number(msgIndex)) || {}).chatId || '');
+        let dispatchedCount = 0;
+        let matchedLive = false;
+        for (const [pName, mockDom] of pluginDoms.entries()) {
+            if (!activeHosts.has(pName)) continue;
+            if (syncedMsgs.length && typeof mockDom.syncChatMessages === 'function') {
+                mockDom.syncChatMessages(syncedMsgs);
+            }
+            const liveEl = typeof mockDom.findChatSurfaceInteractiveElement === 'function'
+                ? mockDom.findChatSurfaceInteractiveElement({ msgIndex, chatId: resolvedCid, actionHtml, dataset })
+                : null;
+            if (liveEl) {
+                matchedLive = true;
+                await mockDom.dispatchSurfaceClick(liveEl, 24, 24);
+                dispatchedCount += 1;
+            } else {
+                const el = mockDom.mountSurfaceActionElement(actionHtml, dataset, { msgIndex, chatId: resolvedCid });
+                try {
+                    await mockDom.dispatchSurfaceClick(el, 24, 24);
+                    dispatchedCount += 1;
+                } finally {
+                    if (el && el._rsTempWrapper) el._rsTempWrapper.remove();
+                    else if (el) el.remove();
+                }
+            }
+        }
+        if (dispatchedCount > 0) {
+            await new Promise((r) => setTimeout(r, 40));
+        }
+        return { ok: true, dispatchedCount, matchedLive };
+    }
+
+    async function syncAndProjectChatSurface(baseSnap) {
+        const empty = { footersByChatId: {}, footersByIndex: {}, bodyHtmlByChatId: {}, assetPathsByName: {} };
+        if (!baseSnap || !Array.isArray(baseSnap.messages) || activeHosts.size === 0) {
+            return empty;
+        }
+        const cIdx = Number(baseSnap.charIndex ?? 0);
+        const chIdx = Number(baseSnap.chatIndex ?? 0);
+        if (cIdx >= 0 && chIdx >= 0) {
+            lastActiveLocation = { charIndex: cIdx, chatIndex: chIdx };
+        }
+        const charIdPart = String((baseSnap.charContext && baseSnap.charContext.charId) || baseSnap.charName || cIdx).replace(/[^a-zA-Z0-9_-]/g, '_');
+        const baseChatUuid = String(baseSnap.chatUuid || baseSnap.chatId || `rs-chat-${charIdPart}-${Math.max(0, chIdx)}`);
+        const msgsWithIds = baseSnap.messages.map((m) => {
+            if (!m || m.isFirstMessage || Number(m.index) < 0) return m;
+            return m.chatId ? m : { ...m, chatId: `rs-msg-${baseChatUuid}-${m.index}` };
+        });
+        const expectedCharIds = msgsWithIds
+            .filter((m) => m && !m.isFirstMessage && Number(m.index) >= 0 && m.role !== 'user' && m.chatId && String(m.raw || m.text || m.html || '').trim())
+            .map((m) => String(m.chatId));
+
+        let hasObservers = false;
+        for (const [pName, mockDom] of pluginDoms.entries()) {
+            if (!activeHosts.has(pName) || !mockDom) continue;
+            if (typeof mockDom.syncChatMessages === 'function') {
+                mockDom.syncChatMessages(msgsWithIds);
+            }
+            if (typeof mockDom.getObserverCount === 'function' && mockDom.getObserverCount() > 0) {
+                hasObservers = true;
+            }
+        }
+
+        const collectAll = () => {
+            const footersByChatId = Object.create(null);
+            const footersByIndex = Object.create(null);
+            const bodyHtmlByChatId = Object.create(null);
+            for (const [pName, mockDom] of pluginDoms.entries()) {
+                if (!activeHosts.has(pName) || !mockDom || typeof mockDom.extractChatSurfaceProjections !== 'function') continue;
+                const proj = mockDom.extractChatSurfaceProjections();
+                Object.assign(footersByChatId, proj.footersByChatId);
+                Object.assign(footersByIndex, proj.footersByIndex);
+                Object.assign(bodyHtmlByChatId, proj.bodyHtmlByChatId);
+            }
+            return { footersByChatId, footersByIndex, bodyHtmlByChatId };
+        };
+
+        let merged = collectAll();
+        if (hasObservers && expectedCharIds.length > 0) {
+            const allHaveFooters = () => expectedCharIds.every((cid) => Boolean(merged.footersByChatId[cid]));
+            for (let attempt = 0; attempt < 6 && !allHaveFooters(); attempt += 1) {
+                await new Promise((r) => setTimeout(r, 25));
+                merged = collectAll();
+            }
+        }
+
+        const assetPathsByName = Object.create(null);
+        const cachedChar = fallbackCharCache.get(cIdx) || (turnCache.active && turnCache.charIndex === cIdx ? turnCache.charObj : null);
+        if (cachedChar && Array.isArray(cachedChar.additionalAssets)) {
+            for (const entry of cachedChar.additionalAssets) {
+                if (Array.isArray(entry) && entry[0] && entry[1]) {
+                    assetPathsByName[String(entry[0])] = String(entry[1]);
+                } else if (entry && typeof entry === 'object' && entry.name && (entry.key || entry.path)) {
+                    assetPathsByName[String(entry.name)] = String(entry.key || entry.path);
+                }
+            }
+        }
+
+        return {
+            footersByChatId: merged.footersByChatId,
+            footersByIndex: merged.footersByIndex,
+            bodyHtmlByChatId: merged.bodyHtmlByChatId,
+            assetPathsByName,
+        };
+    }
+
+    async function dispatchRootWidgetClick({ pluginName, charIndex, chatIndex, selector = '', countNode = '', actionHtml = '', dataset = {}, x = 24, y = 24 } = {}) {
+        const pName = String(pluginName || '');
+        const mockDom = pluginDoms.get(pName);
+        if (!mockDom || !activeHosts.has(pName)) return { ok: false, dispatchedCount: 0 };
         const cIdx = Number(charIndex);
         const chIdx = Number(chatIndex);
         const needTempTurn = !turnCache.active && !Number.isNaN(cIdx) && !Number.isNaN(chIdx) && cIdx >= 0 && chIdx >= 0;
         if (needTempTurn) {
             await prepareTurn(cIdx, chIdx, getFallbackSnapshot());
         }
-        let dispatchedCount = 0;
         try {
-            for (const [pName, mockDom] of pluginDoms.entries()) {
-                if (!activeHosts.has(pName)) continue;
-                const el = mockDom.mountSurfaceActionElement(actionHtml, dataset);
-                try {
-                    await mockDom.dispatchSurfaceClick(el, 24, 24);
-                    dispatchedCount += 1;
-                } finally {
-                    el.remove();
-                }
+            const liveEl = typeof mockDom.findRootInteractiveElement === 'function'
+                ? mockDom.findRootInteractiveElement({ selector, countNode, actionHtml, dataset })
+                : null;
+            if (liveEl) {
+                await mockDom.dispatchSurfaceClick(liveEl, Number(x) || 24, Number(y) || 24);
+                await new Promise((r) => setTimeout(r, 35));
+                return { ok: true, dispatchedCount: 1, matchedLive: true };
             }
-            return { ok: true, dispatchedCount };
+            const el = mockDom.mountSurfaceActionElement(actionHtml, dataset);
+            try {
+                await mockDom.dispatchSurfaceClick(el, Number(x) || 24, Number(y) || 24);
+                await new Promise((r) => setTimeout(r, 25));
+                return { ok: true, dispatchedCount: 1, matchedLive: false };
+            } finally {
+                el.remove();
+            }
         } finally {
             if (needTempTurn) endTurn();
         }
+    }
+
+    async function prepareFloatingPopupWidgets({ charIndex = -1, chatIndex = -1 } = {}) {
+        for (const pName of activeHosts.keys()) {
+            const mockDom = pluginDoms.get(pName);
+            if (!mockDom || !mockDom.body) continue;
+            const sec = mockDom.body.querySelector('.x-risu-am-generation-count');
+            if (!sec) continue;
+            const xExp = sec.getAttribute('x-am-expanded');
+            const dExp = sec.getAttribute('data-am-expanded');
+            if (xExp !== 'true' && dExp !== 'true') {
+                const toggleBtn = sec.querySelector('[data-am-runtime-generation-count-action="toggle"]');
+                if (toggleBtn) {
+                    await dispatchRootWidgetClick({
+                        pluginName: pName,
+                        charIndex,
+                        chatIndex,
+                        selector: '[data-am-runtime-generation-count-action="toggle"]',
+                        countNode: toggleBtn.getAttribute('data-am-count-node') || '',
+                    });
+                }
+            }
+        }
+        return getFloatingUiState();
+    }
+
+    function getFloatingUiState() {
+        const buttons = [];
+        const rootWidgets = [];
+        for (const entry of getAllKnownEntries()) {
+            const inst = activeHosts.get(entry.name);
+            if (!inst) continue;
+            const uiItems = Array.isArray(inst.record && inst.record.uiItems) ? inst.record.uiItems : [];
+            const btnItems = uiItems.filter((u) => u && u.kind === 'button');
+            const pickItems = btnItems.length ? btnItems : (uiItems.length ? [uiItems[0]] : []);
+            const seenNames = new Set();
+            for (const u of pickItems) {
+                const dedupKey = `${u.iconType || 'none'}:${u.name || ''}:${u.icon || ''}`;
+                if (seenNames.has(dedupKey) && btnItems.length > 1) continue;
+                seenNames.add(dedupKey);
+                buttons.push({
+                    uid: `${entry.name}::${u.id}`,
+                    pluginName: entry.name,
+                    displayName: entry.displayName || entry.name,
+                    entryId: u.id,
+                    kind: u.kind || 'button',
+                    location: u.location || 'action',
+                    label: u.name || entry.displayName || entry.name,
+                    icon: u.icon || '',
+                    iconType: u.iconType || 'none',
+                });
+            }
+
+            const mockDom = pluginDoms.get(entry.name);
+            if (mockDom && mockDom.body) {
+                const body = mockDom.body;
+                const head = mockDom.head;
+                const styles = [];
+                for (const st of [...(head ? head.children : []), ...(body ? body.children : [])]) {
+                    if (st && st.tagName === 'STYLE') {
+                        const txt = st.textContent || st.innerHTML || '';
+                        if (txt) styles.push(txt);
+                    }
+                }
+                const blocks = [];
+                for (const ch of (body ? body.children : [])) {
+                    if (!ch || ch === mockDom.chatScreen || ch.tagName === 'STYLE' || ch.tagName === 'SCRIPT') continue;
+                    const stAttr = (ch.attributes && ch.attributes.get('style')) || '';
+                    if (/display\s*:\s*none/i.test(stAttr)) continue;
+                    if (typeof ch.hasAttribute === 'function' && (ch.hasAttribute('data-am-floating-viewport') || ch.hasAttribute('data-plugin-chat-panel'))) continue;
+                    const countReg = typeof ch.querySelector === 'function' ? ch.querySelector('[data-am-count-region]') : null;
+                    if (countReg && countReg.getAttribute('x-am-count-visible') === 'false') {
+                        const toastReg = typeof ch.querySelector === 'function' ? ch.querySelector('[data-am-toast-region]') : null;
+                        if (!toastReg || !(toastReg.innerHTML || '').trim()) continue;
+                    }
+                    const inner = ch.innerHTML || ch.textContent || '';
+                    if (!inner.trim() && !ch.children.length) continue;
+                    blocks.push(ch.outerHTML);
+                }
+                if (blocks.length) {
+                    rootWidgets.push({
+                        pluginName: entry.name,
+                        displayName: entry.displayName || entry.name,
+                        styles,
+                        html: blocks.join('\n'),
+                    });
+                }
+            }
+        }
+        const sig = crypto
+            .createHash('sha1')
+            .update(JSON.stringify({ buttons, rootWidgets }))
+            .digest('hex')
+            .slice(0, 12);
+        return { rev: sig, buttons, rootWidgets };
     }
 
     async function dispatchChatOutput({ charIndex, chatIndex, messageIndex }) {
@@ -2534,6 +4182,7 @@ function createPluginAdapter({
         pluginChannels.clear();
         providers.clear();
         pluginDoms.clear();
+        chatPanels.clear();
         guiIpcOutbox.length = 0;
         for (const k of Object.keys(hookState)) hookState[k].length = 0;
     }
@@ -2547,10 +4196,15 @@ function createPluginAdapter({
         updatePluginArgs,
         reconcileEnabledPlugins,
         hasEnabledPlugins,
+        hasActiveSurfacePlugins: () => activeHosts.size > 0,
         getRegisteredProviders: () => providers,
         getTurnContext,
         setTurnObjects,
         dispatchSurfaceAction,
+        syncAndProjectChatSurface,
+        dispatchRootWidgetClick,
+        prepareFloatingPopupWidgets,
+        getFloatingUiState,
         pollGuiIpc,
         prepareTurn,
         endTurn,

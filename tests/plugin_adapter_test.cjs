@@ -3,6 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const vm = require('node:vm');
 
@@ -1044,5 +1045,127 @@ test('PC-open bot (isPcActive=true) runs remote backend plugins exclusively (PC 
         if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
         await new Promise((r) => server.close(r));
         await new Promise((r) => upstream.close(r));
+    }
+});
+
+test('Backend Plugin Adapter: chunked multi-MB sync, scriptSig cache reuse, single-flight dedup, and legacy fallback', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rs-chunk-sync-'));
+    const cfg = { backendPlugins: {} };
+    const pad = '/* pad */\n'.repeat(340000); // ~3.4 MB -> forces 3 chunks at 1.5M chars/chunk
+    const makeBigScript = (tag) => `
+//@name big_lib_plugin
+//@display-name Big Lib Plugin
+//@api 3.0
+//@version 2.1.0
+//@arg mode string Mode
+${pad}
+globalThis.BIG_PLUGIN_TAG = ${JSON.stringify(tag)};
+`;
+    let currentScript = makeBigScript('v1');
+    let realArg = { mode: 'fast' };
+
+    const counts = { listMeta: 0, getChunk: 0, legacyGetPlugins: 0 };
+    let forceLegacy = false;
+    let delayFirstMetaMs = 0;
+
+    function scriptSig(s) {
+        let h1 = 0x811c9dc5;
+        const step = Math.max(1, Math.floor(s.length / 4096));
+        for (let i = 0; i < s.length; i += step) {
+            h1 ^= s.charCodeAt(i);
+            h1 = Math.imul(h1, 0x01000193) >>> 0;
+        }
+        return `${s.length}:${h1.toString(16)}`;
+    }
+
+    const mockRpc = {
+        isConnected: () => true,
+        invoke: async (op, args = []) => {
+            if (op === 'db.listPluginsMeta') {
+                counts.listMeta += 1;
+                if (delayFirstMetaMs > 0) {
+                    const ms = delayFirstMetaMs;
+                    delayFirstMetaMs = 0;
+                    await new Promise((r) => setTimeout(r, ms));
+                }
+                if (forceLegacy) throw new Error('Unsupported host RPC op: db.listPluginsMeta');
+                return [{
+                    name: 'big_lib_plugin',
+                    displayName: 'Big Lib Plugin',
+                    version: '3.0',
+                    versionOfPlugin: '2.1.0',
+                    scriptLen: currentScript.length,
+                    scriptSig: scriptSig(currentScript),
+                    realArg: { ...realArg },
+                    enabled: true,
+                    allowedIPC: [],
+                }];
+            }
+            if (op === 'db.getPluginScriptChunk') {
+                counts.getChunk += 1;
+                const [name, offset, maxChars] = args;
+                assert.equal(name, 'big_lib_plugin');
+                const chunk = currentScript.slice(offset, offset + maxChars);
+                return {
+                    name,
+                    chunk,
+                    offset,
+                    totalLen: currentScript.length,
+                    scriptSig: scriptSig(currentScript),
+                    eof: (offset + chunk.length) >= currentScript.length,
+                };
+            }
+            if (op === 'db.getPlugins') {
+                counts.legacyGetPlugins += 1;
+                return [{
+                    name: 'legacy_plugin',
+                    displayName: 'Legacy Plugin',
+                    version: '3.0',
+                    versionOfPlugin: '1.0.0',
+                    script: `//@name legacy_plugin\n//@api 3.0\nglobalThis.LEGACY = true;`,
+                    realArg: {},
+                    enabled: true,
+                    allowedIPC: [],
+                }];
+            }
+            throw new Error(`Unexpected RPC op: ${op}`);
+        },
+    };
+
+    const adapter = adapterMod.createPluginAdapter({
+        pluginsPath: path.join(tmpDir, 'plugins.json'),
+        persistDisabled: true,
+        getBackendConfig: () => cfg,
+        saveBackendConfig: () => {},
+        hostRpc: mockRpc,
+    });
+
+    try {
+        // 1) Concurrent calls deduplicate into a single in-flight sync & split >3.4MB script into >=3 chunks
+        delayFirstMetaMs = 40;
+        const [r1, r2] = await Promise.all([adapter.syncPcPlugins(), adapter.syncPcPlugins()]);
+        assert.equal(counts.listMeta, 1, 'concurrent syncPcPlugins() must share single-flight promise');
+        assert.equal(counts.getChunk, 3, '>3.4MB script must stream across 3 chunks of 1.5M chars');
+        const p1 = r1.find((p) => p.name === 'big_lib_plugin');
+        assert.ok(p1 && p1.hasScript);
+        assert.equal(r2.length, r1.length);
+        assert.equal(p1.argValues.mode, 'fast');
+
+        // 2) Second sync with unchanged scriptSig skips chunk transfers completely, yet picks up realArg changes
+        realArg = { mode: 'accurate' };
+        const beforeChunkCount = counts.getChunk;
+        const r3 = await adapter.syncPcPlugins();
+        assert.equal(counts.listMeta, 2);
+        assert.equal(counts.getChunk, beforeChunkCount, 'matching scriptSig must reuse cached script without re-fetching chunks');
+        assert.equal(r3.find((p) => p.name === 'big_lib_plugin').argValues.mode, 'accurate');
+
+        // 3) Legacy fallback when PC risustand.js lacks db.listPluginsMeta
+        forceLegacy = true;
+        const r4 = await adapter.syncPcPlugins();
+        assert.equal(counts.legacyGetPlugins, 1);
+        assert.ok(r4.some((p) => p.name === 'legacy_plugin'), 'must fall back to db.getPlugins on legacy PC client');
+    } finally {
+        await adapter.dispose();
+        fs.rmSync(tmpDir, { recursive: true, force: true });
     }
 });

@@ -323,31 +323,129 @@ function loadBundledLeavePreset() {
     }
 }
 
-function syncBundledLeavePresetToggles(presetToggles) {
-    if (!Array.isArray(presetToggles) || !presetToggles.length) return false;
+function syncBundledLeavePresetToggles(presetToggles, activeDirectId = 'bundled:leave') {
+    if (!Array.isArray(presetToggles)) return false;
     const leave = loadBundledLeavePreset();
-    if (!leave || !leave.toggleSyntax) return false;
+    if (!leave || !String(leave.toggleSyntax || '').trim()) return false;
     let changed = false;
-    for (const pt of presetToggles) {
-        if (!pt || pt.id !== LEAVE_PRESET_ID) continue;
-        const nextName = '🍃 ' + leave.name;
-        if (pt.syntax !== leave.toggleSyntax) {
-            pt.syntax = leave.toggleSyntax;
+    const nextName = '🍃 ' + leave.name;
+    const shouldEnable = activeDirectId === 'bundled:leave';
+    let entry = presetToggles.find((pt) => pt && pt.id === LEAVE_PRESET_ID);
+    if (!entry) {
+        entry = {
+            id: LEAVE_PRESET_ID,
+            parentPresetId: 'bundled:leave',
+            name: nextName,
+            enabled: shouldEnable,
+            syntax: leave.toggleSyntax,
+        };
+        presetToggles.unshift(entry);
+        return true;
+    }
+    if (entry.parentPresetId !== 'bundled:leave') {
+        entry.parentPresetId = 'bundled:leave';
+        changed = true;
+    }
+    if (entry.syntax !== leave.toggleSyntax) {
+        entry.syntax = leave.toggleSyntax;
+        changed = true;
+    }
+    if (entry.name !== nextName) {
+        entry.name = nextName;
+        changed = true;
+    }
+    if (entry.enabled !== shouldEnable) {
+        entry.enabled = shouldEnable;
+        changed = true;
+    }
+    return changed;
+}
+
+function syncDirectPresetToggles(cfg = config) {
+    if (!cfg || typeof cfg !== 'object') return false;
+    let changed = false;
+    if (!Array.isArray(cfg.presetToggles)) {
+        cfg.presetToggles = [];
+        changed = true;
+    }
+    const activeDirectId = (typeof cfg.directPresetId === 'string' && cfg.directPresetId.trim())
+        ? cfg.directPresetId.trim()
+        : 'bundled:leave';
+
+    if (syncBundledLeavePresetToggles(cfg.presetToggles, activeDirectId)) {
+        changed = true;
+    }
+
+    const customList = loadCustomPresets();
+    const validCustomIds = new Set(customList.map((p) => p && p.id).filter(Boolean));
+    const beforeLen = cfg.presetToggles.length;
+    cfg.presetToggles = cfg.presetToggles.filter((pt) => {
+        if (!pt || typeof pt !== 'object') return false;
+        if (typeof pt.parentPresetId === 'string' && pt.parentPresetId.startsWith('custom:')) {
+            return validCustomIds.has(pt.parentPresetId.slice(7));
+        }
+        return true;
+    });
+    if (cfg.presetToggles.length !== beforeLen) changed = true;
+
+    for (const cp of customList) {
+        if (!cp || !cp.id) continue;
+        const parentId = `custom:${cp.id}`;
+        const ptId = `pt-${cp.id}`;
+        const existingIdx = cfg.presetToggles.findIndex((pt) => pt && pt.id === ptId);
+        const syntaxStr = String(cp.customPromptTemplateToggle || '');
+        if (syntaxStr.trim() && cp.autoRegisterToggle !== false) {
+            const nextName = `📄 ${cp.name}`;
+            const shouldEnable = activeDirectId === parentId;
+            if (existingIdx < 0) {
+                cfg.presetToggles.unshift({
+                    id: ptId,
+                    parentPresetId: parentId,
+                    name: nextName,
+                    enabled: shouldEnable,
+                    syntax: syntaxStr,
+                });
+                changed = true;
+            } else {
+                const cur = cfg.presetToggles[existingIdx];
+                if (cur.parentPresetId !== parentId) { cur.parentPresetId = parentId; changed = true; }
+                if (cur.name !== nextName) { cur.name = nextName; changed = true; }
+                if (cur.syntax !== syntaxStr) { cur.syntax = syntaxStr; changed = true; }
+                if (cur.enabled !== shouldEnable) { cur.enabled = shouldEnable; changed = true; }
+            }
+        } else if (existingIdx >= 0 && !cfg.presetToggles[existingIdx].parentPresetId) {
+            cfg.presetToggles[existingIdx].parentPresetId = parentId;
             changed = true;
         }
-        if (pt.name !== nextName) {
-            pt.name = nextName;
-            changed = true;
+    }
+
+    for (const pt of cfg.presetToggles) {
+        if (!pt || typeof pt !== 'object') continue;
+        if (!pt.parentPresetId) {
+            if (pt.id === LEAVE_PRESET_ID) {
+                pt.parentPresetId = 'bundled:leave';
+                changed = true;
+            } else if (typeof pt.id === 'string' && pt.id.startsWith('pt-') && validCustomIds.has(pt.id.slice(3))) {
+                pt.parentPresetId = `custom:${pt.id.slice(3)}`;
+                changed = true;
+            }
+        }
+        if (pt.parentPresetId) {
+            const shouldEnable = pt.parentPresetId === activeDirectId;
+            if (pt.enabled !== shouldEnable) {
+                pt.enabled = shouldEnable;
+                changed = true;
+            }
         }
     }
     return changed;
 }
 
-if (syncBundledLeavePresetToggles(config.presetToggles)) {
+let customPresetsCache = null;
+
+if (syncDirectPresetToggles(config)) {
     saveConfig();
 }
-
-let customPresetsCache = null;
 
 function sanitizeUploadedPresetEntry(parsed, { id = '', filename = '' } = {}) {
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
@@ -389,6 +487,7 @@ function sanitizeUploadedPresetEntry(parsed, { id = '', filename = '' } = {}) {
         })),
         customPromptTemplateToggle: String(parsed.customPromptTemplateToggle || ''),
         templateDefaultVariables: String(parsed.templateDefaultVariables || ''),
+        autoRegisterToggle: parsed.autoRegisterToggle !== false,
         globalNote,
         mainPrompt,
         jailbreak,
@@ -854,20 +953,64 @@ async function rebuildDisplayedSnapshot(baseSnap = state.baseSnapshot, adapter =
         state.snapshot = baseSnap;
         return baseSnap;
     }
-    if (!adapter || typeof adapter.hasEditDisplayHandlers !== 'function' || !adapter.hasEditDisplayHandlers() || !Array.isArray(baseSnap.messages) || !baseSnap.messages.length) {
+    const hasEditDisplay = Boolean(adapter && typeof adapter.hasEditDisplayHandlers === 'function' && adapter.hasEditDisplayHandlers());
+    const hasSurface = Boolean(adapter && ((typeof adapter.hasActiveSurfacePlugins === 'function' && adapter.hasActiveSurfacePlugins()) || (typeof adapter.hasEnabledPlugins === 'function' && adapter.hasEnabledPlugins())));
+    if ((!hasEditDisplay && !hasSurface) || !Array.isArray(baseSnap.messages) || !baseSnap.messages.length) {
         state.snapshot = baseSnap;
         return baseSnap;
     }
+    const charIdPart = String((baseSnap.charContext && baseSnap.charContext.charId) || baseSnap.charName || baseSnap.charIndex || 0).replace(/[^a-zA-Z0-9_-]/g, '_');
+    const ensuredChatUuid = String(baseSnap.chatUuid || baseSnap.chatId || `rs-chat-${charIdPart}-${Math.max(0, Number(baseSnap.chatIndex) || 0)}`);
+    const preparedMessages = baseSnap.messages.map((m) => {
+        if (!m || typeof m !== 'object' || m.isFirstMessage || Number(m.index) < 0) return m;
+        if (m.chatId && String(m.chatId).trim()) return m;
+        return { ...m, chatId: `rs-msg-${ensuredChatUuid}-${m.index}` };
+    });
+    const surfaceProj = (hasSurface && typeof adapter.syncAndProjectChatSurface === 'function')
+        ? await adapter.syncAndProjectChatSurface({ ...baseSnap, chatUuid: ensuredChatUuid, messages: preparedMessages })
+        : null;
+
+    const resolveAdapterAssetUrl = async (rawToken, nextImages) => {
+        const tok = String(rawToken || '').trim();
+        if (!tok) return '';
+        const mappedPath = (surfaceProj && surfaceProj.assetPathsByName && surfaceProj.assetPathsByName[tok]) || '';
+        const tryPaths = /^assets\//i.test(tok)
+            ? [tok]
+            : (mappedPath ? [mappedPath, tok] : [tok]);
+        if (typeof adapter.readImage === 'function') {
+            for (const p of tryPaths) {
+                const bytes = await adapter.readImage(p);
+                if (bytes && bytes.length) {
+                    const dataUri = `data:image/png;base64,${Buffer.from(bytes).toString('base64')}`;
+                    const url = storeDataUriAsset(dataUri);
+                    if (url && !nextImages.includes(url)) nextImages.push(url);
+                    return url;
+                }
+            }
+        }
+        if (baseSnap.assetMap && typeof baseSnap.assetMap[tok] === 'string') {
+            return baseSnap.assetMap[tok];
+        }
+        return '';
+    };
+
     const nextMessages = [];
-    for (const m of baseSnap.messages) {
+    for (const m of preparedMessages) {
         if (!m || typeof m !== 'object') {
             nextMessages.push(m);
             continue;
         }
-        const baseHtml = String(m.html || m.raw || '');
-        let nextHtml = await adapter.runEditDisplay(baseHtml);
-        if (typeof nextHtml !== 'string' || nextHtml === baseHtml) {
-            nextMessages.push(m);
+        const mCid = String(m.chatId || '').trim();
+        const surfaceBodyHtml = (surfaceProj && surfaceProj.bodyHtmlByChatId && mCid && surfaceProj.bodyHtmlByChatId[mCid]) || '';
+        const rawFooter = (surfaceProj && ((mCid && surfaceProj.footersByChatId[mCid]) || (surfaceProj.footersByIndex && surfaceProj.footersByIndex[m.index]))) || '';
+        const pluginFooterHtml = rawFooter ? rawFooter.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '') : '';
+
+        const baseHtml = surfaceBodyHtml || String(m.html || m.raw || '');
+        let nextHtml = hasEditDisplay ? await adapter.runEditDisplay(baseHtml) : baseHtml;
+        if (typeof nextHtml !== 'string') nextHtml = baseHtml;
+        const hasTokens = /\{\{(?:inlay|inlayed|raw|img|asset|image)::/i.test(nextHtml) || /data:image\//i.test(nextHtml);
+        if (nextHtml === String(m.html || '') && !hasTokens && !surfaceBodyHtml) {
+            nextMessages.push(pluginFooterHtml ? { ...m, pluginFooterHtml } : m);
             continue;
         }
         nextHtml = nextHtml.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '');
@@ -883,18 +1026,19 @@ async function rebuildDisplayedSnapshot(baseSnap = state.baseSnapshot, adapter =
                 return '';
             });
         }
-        if (typeof adapter.readImage === 'function') {
-            nextHtml = await replaceAsync(nextHtml, /\{\{(?:raw|img|asset|image)::(assets\/[^}]+)\}\}/gi, async (_, rawPath) => {
-                const bytes = await adapter.readImage(String(rawPath || '').trim());
-                if (bytes && bytes.length) {
-                    const dataUri = `data:image/png;base64,${Buffer.from(bytes).toString('base64')}`;
-                    const url = storeDataUriAsset(dataUri);
-                    if (url && !nextImages.includes(url)) nextImages.push(url);
-                    return `<img class="msg-img" src="${url}" />`;
-                }
-                return '';
-            });
-        }
+        nextHtml = await replaceAsync(
+            nextHtml,
+            /(\bsrc\s*=\s*)(?:"\{\{(?:raw|img|asset|image)::([^}]+)\}\}"|'\{\{(?:raw|img|asset|image)::([^}]+)\}\}'|\{\{(?:raw|img|asset|image)::([^}]+)\}\})/gi,
+            async (_, prefix, d1, d2, d3) => {
+                const url = await resolveAdapterAssetUrl(d1 || d2 || d3, nextImages);
+                return url ? `${prefix}"${url}"` : `${prefix}""`;
+            }
+        );
+        nextHtml = await replaceAsync(nextHtml, /\{\{raw::([^}]+)\}\}/gi, async (_, rawTok) => await resolveAdapterAssetUrl(rawTok, nextImages));
+        nextHtml = await replaceAsync(nextHtml, /\{\{(?:img|asset|image)::([^}]+)\}\}/gi, async (_, rawTok) => {
+            const url = await resolveAdapterAssetUrl(rawTok, nextImages);
+            return url ? `<img class="msg-img" src="${url}" />` : '';
+        });
         nextHtml = nextHtml.replace(/<img\b([^>]*?)\bsrc\s*=\s*(?:"(data:image\/[^"]+)"|'(data:image\/[^']+)'|(data:image\/[^\s>]+))([^>]*)>/gi, (_, bAttr, d1, d2, d3, aAttr) => {
             const rawUri = d1 || d2 || d3 || '';
             const url = storeDataUriAsset(rawUri);
@@ -911,10 +1055,12 @@ async function rebuildDisplayedSnapshot(baseSnap = state.baseSnapshot, adapter =
             html: nextHtml,
             text: nextText,
             images: nextImages,
+            pluginFooterHtml,
         });
     }
     state.snapshot = {
         ...baseSnap,
+        chatUuid: ensuredChatUuid,
         messages: nextMessages,
     };
     return state.snapshot;
@@ -1232,26 +1378,139 @@ function createTimeoutSignal(timeoutMs, externalSignal) {
     return { signal: ctrl.signal, cleanup };
 }
 
+function mergeStreamUsage(prev, incoming) {
+    if (!incoming || typeof incoming !== 'object') return prev || null;
+    if (!prev || typeof prev !== 'object') return { ...incoming };
+    const merged = { ...prev, ...incoming };
+    if (prev.prompt_tokens_details || incoming.prompt_tokens_details) {
+        merged.prompt_tokens_details = {
+            ...(prev.prompt_tokens_details || {}),
+            ...(incoming.prompt_tokens_details || {}),
+        };
+    }
+    if (prev.input_tokens_details || incoming.input_tokens_details) {
+        merged.input_tokens_details = {
+            ...(prev.input_tokens_details || {}),
+            ...(incoming.input_tokens_details || {}),
+        };
+    }
+    if (prev.completion_tokens_details || incoming.completion_tokens_details) {
+        merged.completion_tokens_details = {
+            ...(prev.completion_tokens_details || {}),
+            ...(incoming.completion_tokens_details || {}),
+        };
+    }
+    if (prev.output_tokens_details || incoming.output_tokens_details) {
+        merged.output_tokens_details = {
+            ...(prev.output_tokens_details || {}),
+            ...(incoming.output_tokens_details || {}),
+        };
+    }
+    // Preserve non-zero Anthropic/OpenAI fields from earlier chunks (e.g. message_start vs message_delta)
+    for (const k of ['prompt_tokens', 'completion_tokens', 'total_tokens', 'input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens', 'prompt_cache_hit_tokens', 'prompt_cache_miss_tokens', 'promptTokenCount', 'candidatesTokenCount', 'cachedContentTokenCount', 'totalTokenCount', 'thoughtsTokenCount']) {
+        const pv = Number(prev[k] || 0);
+        const iv = Number(incoming[k] || 0);
+        if (pv > 0 && iv === 0 && (k !== 'output_tokens' && k !== 'completion_tokens')) {
+            merged[k] = pv;
+        }
+    }
+    return merged;
+}
+
 function mapUsageToOpenAI(usage) {
     if (!usage || typeof usage !== 'object') {
-        return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+        return {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            cached_tokens: 0,
+            cache_creation_tokens: 0,
+            reasoning_tokens: 0,
+            cache_reported: false,
+        };
     }
     if (typeof usage.prompt_tokens === 'number' || typeof usage.completion_tokens === 'number') {
-        const prompt = Number(usage.prompt_tokens || 0);
+        const deepSeekHit = Number(usage.prompt_cache_hit_tokens || 0);
+        const deepSeekMiss = Number(usage.prompt_cache_miss_tokens || 0);
+        const pDetails = (usage.prompt_tokens_details && typeof usage.prompt_tokens_details === 'object') ? usage.prompt_tokens_details : null;
+        const iDetails = (usage.input_tokens_details && typeof usage.input_tokens_details === 'object') ? usage.input_tokens_details : null;
+        const cDetails = (usage.completion_tokens_details && typeof usage.completion_tokens_details === 'object') ? usage.completion_tokens_details : null;
+        const cached = Number(
+            (pDetails && pDetails.cached_tokens) ??
+            (iDetails && iDetails.cached_tokens) ??
+            usage.cache_read_input_tokens ??
+            deepSeekHit ??
+            0
+        );
+        const cacheWrite = Number(
+            (pDetails && (pDetails.cache_write_tokens ?? pDetails.cached_creation_tokens)) ??
+            usage.cache_creation_input_tokens ??
+            0
+        );
+        const reasoning = Number((cDetails && cDetails.reasoning_tokens) ?? 0);
+        const prompt = Number(usage.prompt_tokens || (deepSeekHit + deepSeekMiss) || 0);
         const completion = Number(usage.completion_tokens || 0);
-        return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: Number(usage.total_tokens || (prompt + completion)) };
+        const cacheReported = Boolean(
+            (pDetails && ('cached_tokens' in pDetails)) ||
+            (iDetails && ('cached_tokens' in iDetails)) ||
+            ('prompt_cache_hit_tokens' in usage) ||
+            ('cache_read_input_tokens' in usage)
+        );
+        return {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: Number(usage.total_tokens || (prompt + completion)),
+            cached_tokens: cached,
+            cache_creation_tokens: cacheWrite,
+            reasoning_tokens: reasoning,
+            cache_reported: cacheReported,
+        };
     }
     if (typeof usage.input_tokens === 'number' || typeof usage.output_tokens === 'number') {
-        const prompt = Number(usage.input_tokens || 0);
+        const iDetails = (usage.input_tokens_details && typeof usage.input_tokens_details === 'object') ? usage.input_tokens_details : null;
+        const oDetails = (usage.output_tokens_details && typeof usage.output_tokens_details === 'object') ? usage.output_tokens_details : null;
+        const baseInput = Number(usage.input_tokens || 0);
+        const cached = Number(usage.cache_read_input_tokens ?? (iDetails && iDetails.cached_tokens) ?? 0);
+        const cacheWrite = Number(usage.cache_creation_input_tokens ?? 0);
+        const isAnthropicShape = ('cache_read_input_tokens' in usage) || ('cache_creation_input_tokens' in usage);
+        const prompt = isAnthropicShape ? (baseInput + cached + cacheWrite) : baseInput;
         const completion = Number(usage.output_tokens || 0);
-        return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion };
+        const reasoning = Number((oDetails && oDetails.reasoning_tokens) ?? 0);
+        const cacheReported = Boolean(isAnthropicShape || (iDetails && ('cached_tokens' in iDetails)));
+        return {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt + completion,
+            cached_tokens: cached,
+            cache_creation_tokens: cacheWrite,
+            reasoning_tokens: reasoning,
+            cache_reported: cacheReported,
+        };
     }
     if (typeof usage.promptTokenCount === 'number' || typeof usage.candidatesTokenCount === 'number') {
         const prompt = Number(usage.promptTokenCount || 0);
         const completion = Number(usage.candidatesTokenCount || 0);
-        return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: Number(usage.totalTokenCount || (prompt + completion)) };
+        const cached = Number(usage.cachedContentTokenCount || 0);
+        const reasoning = Number(usage.thoughtsTokenCount || 0);
+        return {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: Number(usage.totalTokenCount || (prompt + completion)),
+            cached_tokens: cached,
+            cache_creation_tokens: 0,
+            reasoning_tokens: reasoning,
+            cache_reported: ('cachedContentTokenCount' in usage),
+        };
     }
-    return { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 };
+    return {
+        prompt_tokens: 0,
+        completion_tokens: 0,
+        total_tokens: 0,
+        cached_tokens: 0,
+        cache_creation_tokens: 0,
+        reasoning_tokens: 0,
+        cache_reported: false,
+    };
 }
 
 const REQUEST_LOG_MAX = 40;
@@ -1333,6 +1592,919 @@ function safeJsonForLog(obj, maxLen) {
     }
 }
 
+// ===== Prompt Cache Guard Engine (An-chan logic adapted for RisuStand Remote Proxy) =====
+const CACHE_GUARD_PRICING_TABLE = [
+    { re: /claude[-_]?opus[-_.]?4(?:[._-]?[56])/i, in: 5.0, read: 0.5, write: 6.25, out: 25.0 },
+    { re: /claude[-_]?opus[-_.]?4/i, in: 15.0, read: 1.5, write: 18.75, out: 75.0 },
+    { re: /claude[-_.]?(?:3[._-]?[57][._-]?)?sonnet|claude[-_]?sonnet[-_.]?4/i, in: 3.0, read: 0.3, write: 3.75, out: 15.0 },
+    { re: /claude[-_.]?haiku[-_.]?4(?:[._-]?5)?/i, in: 1.0, read: 0.1, write: 1.25, out: 5.0 },
+    { re: /claude[-_.]?3[._-]?5[._-]?haiku/i, in: 0.8, read: 0.08, write: 1.0, out: 4.0 },
+    { re: /gpt-4\.1-mini/i, in: 0.4, read: 0.1, write: 0.4, out: 1.6 },
+    { re: /gpt-4\.1-nano/i, in: 0.1, read: 0.025, write: 0.1, out: 0.4 },
+    { re: /gpt-4\.1/i, in: 2.0, read: 0.5, write: 2.0, out: 8.0 },
+    { re: /gpt-4o-mini/i, in: 0.15, read: 0.075, write: 0.15, out: 0.6 },
+    { re: /gpt-4o/i, in: 2.5, read: 1.25, write: 2.5, out: 10.0 },
+    { re: /gpt-5/i, in: 1.25, read: 0.125, write: 1.25, out: 10.0 },
+    { re: /\bo[134](?:-mini|-pro)?\b/i, in: 2.0, read: 0.5, write: 2.0, out: 8.0 },
+    { re: /gemini[-_.]?2\.0[-_.]?flash/i, in: 0.1, read: 0.025, write: 0.1, out: 0.4 },
+    { re: /gemini[-_.]?(?:2\.5|3)[-_.]?flash/i, in: 0.3, read: 0.075, write: 0.3, out: 2.5 },
+    { re: /gemini[-_.]?(?:2\.5|3)[-_.]?pro/i, in: 1.25, read: 0.31, write: 1.25, out: 10.0 },
+    { re: /deepseek/i, in: 0.27, read: 0.07, write: 0.27, out: 1.1 },
+];
+
+function cgFnv1aHex(input) {
+    const str = String(input || '');
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) {
+        h ^= str.charCodeAt(i);
+        h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(16).padStart(8, '0');
+}
+
+function cgSampleHash(input) {
+    const str = String(input || '');
+    if (!str) return '00000000';
+    if (str.length <= 2048) return cgFnv1aHex(str);
+    const mid = Math.floor(str.length / 2);
+    const sample = str.slice(0, 512) + '|' + str.slice(mid - 256, mid + 256) + '|' + str.slice(-512) + '|' + str.length;
+    return cgFnv1aHex(sample);
+}
+
+function cgEstimateTokens(text) {
+    const str = String(text || '');
+    if (!str) return 0;
+    let nonAscii = 0;
+    for (let i = 0; i < str.length; i++) {
+        if (str.charCodeAt(i) > 127) nonAscii++;
+    }
+    const ascii = str.length - nonAscii;
+    return Math.max(1, Math.ceil(ascii / 3.8 + nonAscii / 1.4));
+}
+
+function cgGetMinCacheTokensForModel(model) {
+    const m = String(model || '').toLowerCase();
+    if (!m) return 1024;
+    if (m.includes('deepseek')) return 64;
+    if (m.includes('gemini-1.5')) return 32768;
+    if (m.includes('gemini')) return 1024;
+    if (m.includes('haiku')) return 2048;
+    if (m.includes('claude')) return 1024;
+    return 1024;
+}
+
+function cgGetPricingForModel(model) {
+    const m = String(model || '');
+    if (!m) return null;
+    for (const rule of CACHE_GUARD_PRICING_TABLE) {
+        if (rule.re.test(m)) return rule;
+    }
+    return null;
+}
+
+function cgEstimateTurnCost(model, usage) {
+    const pricing = cgGetPricingForModel(model);
+    if (!pricing || !usage) return null;
+    const promptTokens = Math.max(0, Number(usage.prompt_tokens || 0));
+    const completionTokens = Math.max(0, Number(usage.completion_tokens || 0));
+    const cachedTokens = Math.min(promptTokens, Math.max(0, Number(usage.cached_tokens || 0)));
+    const cacheWriteTokens = Math.max(0, Number(usage.cache_creation_tokens || 0));
+    const uncachedInput = Math.max(0, promptTokens - cachedTokens - cacheWriteTokens);
+    const inputCost = (uncachedInput / 1e6) * pricing.in + (cachedTokens / 1e6) * pricing.read + (cacheWriteTokens / 1e6) * pricing.write;
+    const outputCost = (completionTokens / 1e6) * pricing.out;
+    const cacheSavingsUsd = (cachedTokens / 1e6) * Math.max(0, pricing.in - pricing.read);
+    const writeOverheadUsd = (cacheWriteTokens / 1e6) * Math.max(0, pricing.write - pricing.in);
+    return {
+        totalUsd: Math.round((inputCost + outputCost) * 1e6) / 1e6,
+        cacheSavingsUsd: Math.round(cacheSavingsUsd * 1e6) / 1e6,
+        writeOverheadUsd: Math.round(writeOverheadUsd * 1e6) / 1e6,
+    };
+}
+
+function cgFlattenContent(content) {
+    let hasCacheControl = false;
+    let cacheControlType = '';
+    if (typeof content === 'string') {
+        return { text: content, hasCacheControl: false, cacheControlType: '' };
+    }
+    if (Array.isArray(content)) {
+        const parts = [];
+        for (const item of content) {
+            if (typeof item === 'string') {
+                parts.push(item);
+                continue;
+            }
+            if (!item || typeof item !== 'object') continue;
+            if (item.cache_control && typeof item.cache_control === 'object') {
+                hasCacheControl = true;
+                cacheControlType = String(item.cache_control.type || 'ephemeral');
+            }
+            if (typeof item.text === 'string') {
+                parts.push(item.text);
+            } else if (item.type === 'text' && item.text && typeof item.text.value === 'string') {
+                parts.push(item.text.value);
+            } else if (item.type === 'image_url') {
+                parts.push('[image_url]');
+            } else if (item.type === 'input_image' || item.inlineData) {
+                parts.push('[image]');
+            }
+        }
+        return { text: parts.join('\n'), hasCacheControl, cacheControlType };
+    }
+    if (content && typeof content === 'object') {
+        if (content.cache_control && typeof content.cache_control === 'object') {
+            hasCacheControl = true;
+            cacheControlType = String(content.cache_control.type || 'ephemeral');
+        }
+        if (Array.isArray(content.parts)) {
+            return cgFlattenContent(content.parts);
+        }
+        if (typeof content.text === 'string') {
+            return { text: content.text, hasCacheControl, cacheControlType };
+        }
+    }
+    return { text: content == null ? '' : String(content), hasCacheControl: false, cacheControlType: '' };
+}
+
+function cgIsNonChatMediaRequest(endpoint, rawBodyObj) {
+    const ep = String(endpoint || '').toLowerCase();
+    if (/\/(?:images\/(?:generations|edits|variations)|audio\/|embeddings\b|moderations\b|tts\b)/.test(ep)) {
+        return true;
+    }
+    if (rawBodyObj && typeof rawBodyObj === 'object') {
+        if (!Array.isArray(rawBodyObj.messages) && !Array.isArray(rawBodyObj.contents)) {
+            if (rawBodyObj.input !== undefined || rawBodyObj.prompt !== undefined || rawBodyObj.voice !== undefined) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+function cgClassifySegmentKind(role, sawChatTurn) {
+    const r = String(role || 'user').toLowerCase();
+    if (r === 'system' || r === 'developer') {
+        return sawChatTurn ? 'sys_tail' : 'system';
+    }
+    return 'chat';
+}
+
+function cgExtractRequestSegments(rawBodyObj, fallbackMessages, providerType) {
+    const rawItems = [];
+    const body = (rawBodyObj && typeof rawBodyObj === 'object') ? rawBodyObj : null;
+
+    if (body) {
+        // Anthropic `system` field or Gemini `systemInstruction`
+        if (body.system !== undefined && body.system !== null && body.system !== '') {
+            const flat = cgFlattenContent(body.system);
+            if (flat.text) {
+                rawItems.push({ role: 'system', text: flat.text, hasCacheControl: flat.hasCacheControl, cacheControlType: flat.cacheControlType });
+            }
+        } else if (body.systemInstruction !== undefined && body.systemInstruction !== null) {
+            const flat = cgFlattenContent(body.systemInstruction);
+            if (flat.text) {
+                rawItems.push({ role: 'system', text: flat.text, hasCacheControl: flat.hasCacheControl, cacheControlType: flat.cacheControlType });
+            }
+        }
+        if (Array.isArray(body.messages)) {
+            for (const m of body.messages) {
+                if (!m || typeof m !== 'object') continue;
+                const flat = cgFlattenContent(m.content);
+                const msgCC = m.cache_control && typeof m.cache_control === 'object';
+                rawItems.push({
+                    role: String(m.role || 'user').toLowerCase(),
+                    text: flat.text,
+                    hasCacheControl: Boolean(flat.hasCacheControl || msgCC),
+                    cacheControlType: flat.cacheControlType || (msgCC ? String(m.cache_control.type || 'ephemeral') : ''),
+                });
+            }
+        } else if (Array.isArray(body.contents)) {
+            for (const c of body.contents) {
+                if (!c || typeof c !== 'object') continue;
+                const flat = cgFlattenContent(c.parts || c.content || '');
+                rawItems.push({
+                    role: String(c.role || 'user').toLowerCase(),
+                    text: flat.text,
+                    hasCacheControl: flat.hasCacheControl,
+                    cacheControlType: flat.cacheControlType,
+                });
+            }
+        }
+    }
+
+    if (rawItems.length === 0 && Array.isArray(fallbackMessages)) {
+        for (const m of fallbackMessages) {
+            if (!m || typeof m !== 'object') continue;
+            const flat = cgFlattenContent(m.content);
+            rawItems.push({
+                role: String(m.role || 'user').toLowerCase(),
+                text: flat.text,
+                hasCacheControl: flat.hasCacheControl,
+                cacheControlType: flat.cacheControlType,
+            });
+        }
+    }
+
+    let sawChatTurn = false;
+    let lastCacheBreakpointSegIdx = -1;
+    const segments = rawItems.map((item, idx) => {
+        const text = String(item.text || '');
+        const kind = cgClassifySegmentKind(item.role, sawChatTurn);
+        if (kind === 'chat') sawChatTurn = true;
+        if (item.hasCacheControl) lastCacheBreakpointSegIdx = idx;
+        return {
+            idx,
+            role: item.role,
+            kind,
+            text,
+            len: text.length,
+            tokens: cgEstimateTokens(text),
+            hash: cgSampleHash(text),
+            exactHash: cgFnv1aHex(text),
+            preview: text.replace(/\s+/g, ' ').trim().slice(0, 100),
+            hasCacheControl: Boolean(item.hasCacheControl),
+            cacheControlType: item.cacheControlType || '',
+        };
+    });
+
+    return { segments, lastCacheBreakpointSegIdx, providerType: providerType || 'openai_compat' };
+}
+
+function detectAuxiliaryOrSubRequest({ source, endpoint, ok, status, rawBodyObj, segments }) {
+    if (source !== 'proxy' && source !== 'direct_chat' && source !== 'direct_reroll') {
+        return {
+            eligible: false,
+            excludedReason: source === 'translate' ? 'translate' : 'non_narrative_source',
+            excludedLabel: source === 'translate' ? '번역 요청' : `비서사 출처 (${source || 'llm'})`,
+        };
+    }
+    if (!ok || (status > 0 && (status < 200 || status >= 300))) {
+        return {
+            eligible: false,
+            excludedReason: 'http_error',
+            excludedLabel: '오류 응답 (집계 제외)',
+        };
+    }
+    if (cgIsNonChatMediaRequest(endpoint, rawBodyObj)) {
+        return {
+            eligible: false,
+            excludedReason: 'non_chat_media',
+            excludedLabel: '미디어/임베딩 요청',
+        };
+    }
+    const segs = Array.isArray(segments) ? segments : [];
+    if (segs.length === 0) {
+        return {
+            eligible: false,
+            excludedReason: 'empty_messages',
+            excludedLabel: '빈 프롬프트',
+        };
+    }
+
+    const sysSegs = segs.filter((s) => s.kind === 'system');
+    const chatSegs = segs.filter((s) => s.kind === 'chat');
+    const sysProbe = sysSegs.map((s) => s.text.slice(0, 3500)).join('\n');
+    const shortTurnProbe = chatSegs.length <= 2
+        ? segs.map((s) => s.text.slice(0, 2500)).join('\n')
+        : segs.map((s) => s.text.slice(0, 400)).join('\n');
+    const probeText = sysProbe + '\n' + shortTurnProbe;
+
+    // 1) Hayaku / HypaMemory / SupaMemory / Summary requests
+    if (
+        /\[?\s*hayaku\b|<hayaku\b|##\s*hayaku|hayaku_|하야쿠|서사\s*요약|\[?\s*hypamemory|HypaV[23]|\[?\s*supamemory|장기\s*기억\s*요약/i.test(probeText) ||
+        (/^(?:\s|[\r\n])*(?:you are (?:a|an) )?(?:helpful )?(?:ai |assistant )?(?:that |whose job is to )?summariz/im.test(sysProbe) && chatSegs.length <= 3) ||
+        (/(?:summarize the following (?:conversation|chat|story|roleplay|events|messages)|write a concise summary of (?:the )?(?:story|conversation|roleplay)|다음\s*(?:대화|서사|내용)(?:을|를)\s*요약)/i.test(shortTurnProbe) && chatSegs.length <= 3)
+    ) {
+        return {
+            eligible: false,
+            excludedReason: 'hayaku',
+            excludedLabel: '하야쿠 / 요약 보조 요청',
+        };
+    }
+
+    // 2) Flashback Memory requests
+    if (
+        /FLASHBACK\s*Memory|flashback_memory|\[?\s*flashback\b|<flashback\b|##\s*flashback|플래시백|회상\s*메모리/i.test(probeText) ||
+        (/(?:extract relevant memor|select relevant (?:past )?memor|retrieve relevant memor|memory retrieval|기억\s*검색|회상\s*추출)/i.test(shortTurnProbe) && chatSegs.length <= 3)
+    ) {
+        return {
+            eligible: false,
+            excludedReason: 'flashback',
+            excludedLabel: '플래시백 / 기억 검색 요청',
+        };
+    }
+
+    // 3) Translator prompts sent through proxy
+    if (
+        /(?:<translate_request|\[translation\]|translation_only|translate the following (?:text|dialogue|passage) (?:to|into)|다음\s*(?:문장|텍스트)(?:을|를)\s*(?:한국어|영어|일본어)로\s*번역)/i.test(shortTurnProbe) &&
+        chatSegs.length <= 2
+    ) {
+        return {
+            eligible: false,
+            excludedReason: 'translator_prompt',
+            excludedLabel: '번역 보조 요청',
+        };
+    }
+
+    // 4) Other auxiliary plugins/modules (Lightboard/LBDATA, LIBRA, RETRACE, Asset Maid, Hanurai, status window updaters)
+    if (
+        /(?:\[LBDATA|<lb-|StatusPanel|\[StatusPanel\]|AssetMaid|asset\s*maid|hanurai|generate\s+(?:an?\s+)?(?:image\s+generation|danbooru|stable\s*diffusion|novelai)\s+prompt|삽화\s*프롬프트\s*생성|상태창\s*업데이트)/i.test(probeText)
+    ) {
+        return {
+            eligible: false,
+            excludedReason: 'plugin_aux',
+            excludedLabel: '플러그인/모듈 보조 요청',
+        };
+    }
+
+    return {
+        eligible: true,
+        excludedReason: '',
+        excludedLabel: '',
+    };
+}
+
+function buildLaneSignature(entry, segInfo) {
+    const namespace = entry.source === 'proxy' ? 'proxy' : 'direct';
+    const segs = segInfo && Array.isArray(segInfo.segments) ? segInfo.segments : [];
+    const sysSegs = segs.filter((s) => s.kind === 'system');
+    const chatSegs = segs.filter((s) => s.kind === 'chat');
+    const sysAll = sysSegs.map((s) => s.text).join('\n\n');
+    const systemHash = sysAll ? cgFnv1aHex(sysAll) : 'none';
+    const sysHeadHash = sysAll ? cgSampleHash(sysAll.slice(0, 512)) : '';
+    const midStart = sysAll.length > 512 ? Math.max(0, Math.floor(sysAll.length / 2) - 256) : 0;
+    const sysMidHash = sysAll.length > 512 ? cgSampleHash(sysAll.slice(midStart, midStart + 512)) : '';
+    const sysTailHash = sysAll.length > 256 ? cgSampleHash(sysAll.slice(-512)) : '';
+    const sysAnchor512 = sysAll.length >= 48 ? cgFnv1aHex(sysAll.slice(0, 512)) : '';
+    const sysAnchor2048 = sysAll.length >= 256 ? cgFnv1aHex(sysAll.slice(0, 2048)) : '';
+    const convSegHashes = chatSegs.filter((s) => s.len >= 24).map((s) => s.exactHash);
+    const substantialConvHashes = chatSegs.filter((s) => s.len >= 80).map((s) => s.exactHash);
+    const sysPreview = sysAll.replace(/\s+/g, ' ').trim().slice(0, 80);
+    return {
+        namespace,
+        systemHash,
+        sysHeadHash,
+        sysMidHash,
+        sysTailHash,
+        sysAnchor512,
+        sysAnchor2048,
+        convSegHashes,
+        substantialConvHashes,
+        sysPreview,
+    };
+}
+
+function findMatchingMainLane(lanes, sig) {
+    let bestLane = null;
+    let bestScore = 0;
+    for (const lane of lanes) {
+        if (lane.namespace !== sig.namespace) continue;
+        let score = 0;
+        // Tier 1: exact system hash match
+        if (sig.systemHash !== 'none' && lane.systemHash === sig.systemHash) {
+            score = 100;
+        } else {
+            // Tier 2: partial system anchors (tolerates lorebook insertions / dynamic toggles)
+            if (sig.sysAnchor2048 && lane.sysAnchor2048 === sig.sysAnchor2048) {
+                score = Math.max(score, 90);
+            } else if (sig.sysAnchor512 && lane.sysAnchor512 === sig.sysAnchor512) {
+                score = Math.max(score, 80);
+            } else {
+                let partialHits = 0;
+                if (sig.sysHeadHash && lane.sysHeadHash === sig.sysHeadHash) partialHits++;
+                if (sig.sysMidHash && lane.sysMidHash === sig.sysMidHash) partialHits++;
+                if (sig.sysTailHash && lane.sysTailHash === sig.sysTailHash) partialHits++;
+                if (partialHits >= 2) score = Math.max(score, 75);
+            }
+            // Tier 3: shared conversation segment hashes
+            if (sig.convSegHashes.length > 0 && lane.recentConvHashSet.size > 0) {
+                let overlap = 0;
+                for (const h of sig.convSegHashes) {
+                    if (lane.recentConvHashSet.has(h)) overlap++;
+                }
+                const substantialOverlap = sig.substantialConvHashes.filter((h) => lane.recentConvHashSet.has(h)).length;
+                const anchorsConflict = Boolean(sig.sysAnchor512 && lane.sysAnchor512 && sig.sysAnchor512 !== lane.sysAnchor512);
+                if (overlap >= 2 || (!anchorsConflict && substantialOverlap >= 1 && overlap >= 1)) {
+                    score = Math.max(score, 60 + Math.min(20, overlap));
+                }
+            }
+        }
+        if (score > bestScore || (score > 0 && score === bestScore && lane.lastTurnSeq > bestLane.lastTurnSeq)) {
+            bestScore = score;
+            bestLane = lane;
+        }
+    }
+    return bestLane;
+}
+
+function cgSnippetAround(text, offset, radius = 90) {
+    const s = String(text || '');
+    if (!s) return '';
+    const start = Math.max(0, offset - radius);
+    const end = Math.min(s.length, offset + radius);
+    return (start > 0 ? '...' : '') + s.slice(start, end) + (end < s.length ? '...' : '');
+}
+
+function cgFindFirstCharDiff(a, b) {
+    const sa = String(a || '');
+    const sb = String(b || '');
+    const lim = Math.min(sa.length, sb.length);
+    for (let i = 0; i < lim; i++) {
+        if (sa.charCodeAt(i) !== sb.charCodeAt(i)) return i;
+    }
+    if (sa.length !== sb.length) return lim;
+    return -1;
+}
+
+function cgLooksDynamicMemoryOrPluginDiff(prevSnippet, currSnippet) {
+    const combined = `${prevSnippet || ''}\n${currSnippet || ''}`;
+    return /(?:\[LBDATA|<lb-|StatusPanel|Hayaku|Flashback|currentTime|currentDate|\[?Time:|\[?Turn[:\s]|\[?Day\s+\d+|HP:|MP:|호감도|affection)/i.test(combined);
+}
+
+function cgLooksDynamicMacroDiff(prevSnippet, currSnippet) {
+    const combined = `${prevSnippet || ''}\n${currSnippet || ''}`;
+    return /(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}:\d{2}(?::\d{2})?|{{\s*(?:time|date|random|roll|pick|idle_duration)\b)/i.test(combined);
+}
+
+function identifyLorebookCulprit(prevSnippet, currSnippet, loreEntries) {
+    if (!Array.isArray(loreEntries) || !loreEntries.length) return null;
+    const prevClean = String(prevSnippet || '').trim();
+    const currClean = String(currSnippet || '').trim();
+    for (const entry of loreEntries) {
+        if (!entry || typeof entry !== 'object') continue;
+        const name = String(entry.comment || entry.key || '').trim();
+        const content = String(entry.content || '').trim();
+        if (!content || content.length < 16) continue;
+        const needle = content.slice(0, Math.min(64, content.length));
+        const inCurr = currClean.includes(needle) || (currClean.length >= 24 && content.includes(currClean.slice(0, 48)));
+        const inPrev = prevClean.includes(needle) || (prevClean.length >= 24 && content.includes(prevClean.slice(0, 48)));
+        if (inCurr && !inPrev) {
+            return { action: 'injected', name: name || '이름 없는 로어북' };
+        }
+        if (inPrev && !inCurr) {
+            return { action: 'removed', name: name || '이름 없는 로어북' };
+        }
+        if (inCurr && inPrev) {
+            return { action: 'modified', name: name || '이름 없는 로어북' };
+        }
+    }
+    return null;
+}
+
+function buildSegmentMap(segs, diffSegIdx) {
+    const list = Array.isArray(segs) ? segs : [];
+    const totalTokens = Math.max(1, list.reduce((acc, s) => acc + Math.max(1, Number(s.tokens || 0)), 0));
+    return list.map((s) => ({
+        idx: s.idx,
+        role: s.role,
+        kind: s.kind,
+        tokens: s.tokens,
+        pct: Math.round((Math.max(1, Number(s.tokens || 0)) / totalTokens) * 1000) / 10,
+        status: diffSegIdx < 0 ? 'cached' : (s.idx < diffSegIdx ? 'cached' : (s.idx === diffSegIdx ? 'changed' : 'after')),
+        hasCacheControl: Boolean(s.hasCacheControl),
+        preview: s.preview,
+    }));
+}
+
+function computePrefixDiff(prevTurn, currTurn, options = {}) {
+    const prevSegs = (prevTurn && prevTurn.segments) || [];
+    const currSegs = (currTurn && currTurn.segments) || [];
+    const prevTotalChars = Math.max(1, prevSegs.reduce((acc, s) => acc + s.len, 0));
+    let matchedChars = 0;
+    let diffSegIdx = -1;
+    let diffOffset = 0;
+
+    for (let i = 0; i < prevSegs.length; i++) {
+        const p = prevSegs[i];
+        const c = currSegs[i];
+        if (c && p.role === c.role && p.exactHash === c.exactHash) {
+            matchedChars += p.len;
+            continue;
+        }
+        diffSegIdx = i;
+        if (c) {
+            diffOffset = cgFindFirstCharDiff(p.text, c.text);
+            if (diffOffset > 0) matchedChars += diffOffset;
+        } else {
+            diffOffset = 0;
+        }
+        break;
+    }
+
+    const prefixMatchPct = Math.max(0, Math.min(100, Math.round((matchedChars / prevTotalChars) * 1000) / 10));
+    const segmentMap = buildSegmentMap(currSegs, diffSegIdx);
+
+    if (prevTurn.model && currTurn.model && prevTurn.model !== currTurn.model) {
+        return {
+            prefixMatchPct,
+            diffSegIdx,
+            afterBreakpoint: false,
+            tailShiftOnly: false,
+            causeCode: 'model_changed',
+            causeLabel: `모델 변경 (${prevTurn.model} → ${currTurn.model})`,
+            culpritLorebook: null,
+            firstDiff: {
+                segIdx: diffSegIdx,
+                role: diffSegIdx >= 0 ? (prevSegs[diffSegIdx]?.role || 'system') : 'system',
+                offset: diffOffset,
+                prevSnippet: `${prevTurn.model}`,
+                currSnippet: `${currTurn.model}`,
+            },
+            segmentMap,
+        };
+    }
+
+    if (diffSegIdx < 0) {
+        return {
+            prefixMatchPct: 100,
+            diffSegIdx: -1,
+            afterBreakpoint: false,
+            tailShiftOnly: false,
+            causeCode: 'intact',
+            causeLabel: '프리픽스 100% 일치',
+            culpritLorebook: null,
+            firstDiff: null,
+            segmentMap,
+        };
+    }
+
+    const pSeg = prevSegs[diffSegIdx];
+    const cSeg = currSegs[diffSegIdx];
+    const prevSnippet = cgSnippetAround(pSeg ? pSeg.text : '', diffOffset);
+    const currSnippet = cgSnippetAround(cSeg ? cSeg.text : '', diffOffset);
+    const afterBreakpoint = Boolean(currTurn.lastCacheBreakpointSegIdx >= 0 && diffSegIdx > currTurn.lastCacheBreakpointSegIdx);
+    const tailShiftOnly = Boolean(
+        diffSegIdx === prevSegs.length - 1 &&
+        pSeg &&
+        pSeg.kind === 'sys_tail' &&
+        currSegs.length > prevSegs.length &&
+        currSegs[currSegs.length - 1] &&
+        currSegs[currSegs.length - 1].exactHash === pSeg.exactHash
+    );
+    const lorebookMatch = identifyLorebookCulprit(
+        pSeg ? pSeg.text.slice(Math.max(0, diffOffset - 120), diffOffset + 400) : '',
+        cSeg ? cSeg.text.slice(Math.max(0, diffOffset - 120), diffOffset + 400) : '',
+        options.loreEntries
+    );
+
+    let causeCode = 'prefix_changed';
+    let causeLabel = '프리픽스 변경';
+    if (afterBreakpoint) {
+        causeCode = 'after_breakpoint';
+        causeLabel = '캐시 브레이크포인트 이후 변경 (상위 캐시 유지)';
+    } else if (tailShiftOnly) {
+        causeCode = 'tail_post_history_shift';
+        causeLabel = '후미 시스템/탈옥 블록 위치 이동 (정상 턴 증가)';
+    } else if (lorebookMatch) {
+        causeCode = `lorebook_${lorebookMatch.action}`;
+        const actKo = lorebookMatch.action === 'injected' ? '삽입' : (lorebookMatch.action === 'removed' ? '제거' : '수정');
+        causeLabel = `로어북 ${actKo}: ${lorebookMatch.name}`;
+    } else if (cgLooksDynamicMemoryOrPluginDiff(prevSnippet, currSnippet)) {
+        causeCode = 'dynamic_memory_or_plugin';
+        causeLabel = '동적 상태창/플러그인 블록 변동';
+    } else if (cgLooksDynamicMacroDiff(prevSnippet, currSnippet)) {
+        causeCode = 'dynamic_macro';
+        causeLabel = '동적 매크로/시간값 변동';
+    } else if (pSeg && pSeg.kind === 'system') {
+        causeCode = 'system_modified';
+        causeLabel = '시스템 프롬프트 변경';
+    } else {
+        causeCode = 'history_modified';
+        causeLabel = `이전 대화 세그먼트 변경 (#${diffSegIdx + 1})`;
+    }
+
+    return {
+        prefixMatchPct,
+        diffSegIdx,
+        afterBreakpoint,
+        tailShiftOnly,
+        causeCode,
+        causeLabel,
+        culpritLorebook: lorebookMatch,
+        firstDiff: {
+            segIdx: diffSegIdx,
+            role: pSeg ? pSeg.role : (cSeg ? cSeg.role : 'unknown'),
+            kind: pSeg ? pSeg.kind : (cSeg ? cSeg.kind : 'chat'),
+            offset: diffOffset,
+            prevSnippet,
+            currSnippet,
+        },
+        segmentMap,
+    };
+}
+
+function buildCacheGuardSessionSummary(logs) {
+    const list = Array.isArray(logs) ? logs : [];
+    let totalRequests = list.length;
+    let narrativeCount = 0;
+    let excludedCount = 0;
+    let brokenCount = 0;
+    let intactCount = 0;
+    let baselineCount = 0;
+    let totalPromptTokens = 0;
+    let totalCachedTokens = 0;
+    let reportedPromptTokens = 0;
+    let totalSavingsUsd = 0;
+    let estimatedLossUsd = 0;
+    const laneIds = new Set();
+    const laneStatsMap = new Map();
+
+    for (const item of list) {
+        const cg = item && item.cacheGuard;
+        if (!cg) continue;
+        if (!cg.eligible) {
+            excludedCount++;
+            continue;
+        }
+        narrativeCount++;
+        laneIds.add(cg.laneId);
+        if (!laneStatsMap.has(cg.laneId)) {
+            laneStatsMap.set(cg.laneId, {
+                laneId: cg.laneId,
+                laneLabel: cg.laneLabel,
+                namespace: cg.namespace,
+                turns: 0,
+                broken: 0,
+                sysPreview: cg.lanePreview || '',
+            });
+        }
+        const ls = laneStatsMap.get(cg.laneId);
+        ls.turns++;
+        if (cg.verdict === 'baseline') baselineCount++;
+        else if (cg.cacheBroken) {
+            brokenCount++;
+            ls.broken++;
+        } else {
+            intactCount++;
+        }
+        totalPromptTokens += Number(cg.promptTokens || 0);
+        if (cg.serverHitPct !== null && cg.serverHitPct !== undefined) {
+            reportedPromptTokens += Number(cg.promptTokens || 0);
+            totalCachedTokens += Number(cg.cachedTokens || 0);
+        }
+        if (cg.cost && typeof cg.cost.cacheSavingsUsd === 'number') {
+            totalSavingsUsd += cg.cost.cacheSavingsUsd;
+        }
+        if (cg.cacheBroken && cg.prevCost && typeof cg.prevCost.cacheSavingsUsd === 'number') {
+            estimatedLossUsd += cg.prevCost.cacheSavingsUsd;
+        }
+    }
+
+    return {
+        totalRequests,
+        narrativeCount,
+        excludedCount,
+        laneCount: laneIds.size,
+        baselineCount,
+        intactCount,
+        brokenCount,
+        avgServerHitPct: reportedPromptTokens > 0 ? Math.round((totalCachedTokens / reportedPromptTokens) * 1000) / 10 : null,
+        totalPromptTokens,
+        totalCachedTokens,
+        totalSavingsUsd: Math.round(totalSavingsUsd * 1e6) / 1e6,
+        estimatedLossUsd: Math.round(estimatedLossUsd * 1e6) / 1e6,
+        lanes: Array.from(laneStatsMap.values()),
+    };
+}
+
+function recomputeRequestLogsCacheGuard(logs, options = {}) {
+    const list = Array.isArray(logs) ? logs : requestLogs;
+    const loreEntries = options.loreEntries !== undefined
+        ? options.loreEntries
+        : (typeof state !== 'undefined' && state && state.baseSnapshot && state.baseSnapshot.charContext
+            ? state.baseSnapshot.charContext.loreEntries
+            : []);
+
+    // Process oldest -> newest because list is newest-first
+    const chronological = [...list].reverse();
+    const lanes = [];
+    let nextLaneSeq = 0;
+
+    for (const item of chronological) {
+        if (!item || typeof item !== 'object') continue;
+        let bodyObj = item._cgRawBody || null;
+        if (!bodyObj && item.requestJson) {
+            try { bodyObj = JSON.parse(item.requestJson); } catch (_) { bodyObj = null; }
+        }
+        const segInfo = cgExtractRequestSegments(bodyObj, item.messages, item.providerType);
+        const cls = detectAuxiliaryOrSubRequest({
+            source: item.source,
+            endpoint: item.endpoint,
+            ok: item.ok,
+            status: item.status,
+            rawBodyObj: bodyObj,
+            segments: segInfo.segments,
+        });
+
+        if (!cls.eligible) {
+            item._cgInternal = null;
+            item.cacheGuard = {
+                eligible: false,
+                excludedReason: cls.excludedReason,
+                excludedLabel: cls.excludedLabel,
+            };
+            continue;
+        }
+
+        const usage = item.usage || {};
+        const estPromptTokens = segInfo.segments.reduce((acc, s) => acc + s.tokens, 0);
+        const promptTokens = Number(usage.prompt_tokens || 0) || estPromptTokens;
+        const cachedTokens = Number(usage.cached_tokens || 0);
+        const cacheCreationTokens = Number(usage.cache_creation_tokens || 0);
+        const cacheReported = Boolean(usage.cache_reported || cachedTokens > 0 || cacheCreationTokens > 0);
+        const serverHitPct = (cacheReported && promptTokens > 0)
+            ? Math.round((Math.min(promptTokens, cachedTokens) / promptTokens) * 1000) / 10
+            : null;
+        const minCacheTokens = cgGetMinCacheTokensForModel(item.model);
+        const belowMinCacheTokens = promptTokens > 0 && promptTokens < minCacheTokens;
+
+        const sig = buildLaneSignature(item, segInfo);
+        let lane = findMatchingMainLane(lanes, sig);
+        if (!lane) {
+            nextLaneSeq++;
+            lane = {
+                laneId: `${sig.namespace}-lane-${nextLaneSeq}`,
+                laneNumber: nextLaneSeq,
+                laneLabel: `그룹 #${nextLaneSeq}`,
+                namespace: sig.namespace,
+                systemHash: sig.systemHash,
+                sysHeadHash: sig.sysHeadHash,
+                sysMidHash: sig.sysMidHash,
+                sysTailHash: sig.sysTailHash,
+                sysAnchor512: sig.sysAnchor512,
+                sysAnchor2048: sig.sysAnchor2048,
+                sysPreview: sig.sysPreview,
+                recentConvHashSet: new Set(sig.convSegHashes),
+                lastTurnSeq: 0,
+                turns: [],
+            };
+            lanes.push(lane);
+        } else {
+            // Update rolling hash set for multi-turn continuity
+            for (const h of sig.convSegHashes) lane.recentConvHashSet.add(h);
+            if (lane.systemHash === 'none' && sig.systemHash !== 'none') lane.systemHash = sig.systemHash;
+            if (!lane.sysAnchor512 && sig.sysAnchor512) lane.sysAnchor512 = sig.sysAnchor512;
+            if (!lane.sysAnchor2048 && sig.sysAnchor2048) lane.sysAnchor2048 = sig.sysAnchor2048;
+        }
+
+        const prevTurn = lane.turns.length > 0 ? lane.turns[lane.turns.length - 1] : null;
+        const turnIndex = lane.turns.length + 1;
+        lane.lastTurnSeq++;
+
+        const cost = cgEstimateTurnCost(item.model, {
+            prompt_tokens: promptTokens,
+            completion_tokens: Number(usage.completion_tokens || 0),
+            cached_tokens: cachedTokens,
+            cache_creation_tokens: cacheCreationTokens,
+        });
+
+        let cacheGuard;
+        if (!prevTurn) {
+            cacheGuard = {
+                eligible: true,
+                namespace: sig.namespace,
+                laneId: lane.laneId,
+                laneNumber: lane.laneNumber,
+                laneLabel: lane.laneLabel,
+                lanePreview: lane.sysPreview,
+                turnIndex,
+                prevLogId: null,
+                verdict: 'baseline',
+                verdictLabel: '기준선 (첫 턴)',
+                cacheBroken: false,
+                prefixMatchPct: null,
+                serverHitPct,
+                cachedTokens,
+                cacheCreationTokens,
+                promptTokens,
+                minCacheTokens,
+                belowMinCacheTokens,
+                causeCode: 'baseline',
+                causeLabel: '그룹의 첫 서사 요청입니다.',
+                afterBreakpoint: false,
+                tailShiftOnly: false,
+                culpritLorebook: null,
+                firstDiff: null,
+                segmentMap: buildSegmentMap(segInfo.segments, -1),
+                cost,
+                prevCost: null,
+            };
+        } else {
+            const diff = computePrefixDiff(prevTurn, {
+                model: item.model,
+                segments: segInfo.segments,
+                lastCacheBreakpointSegIdx: segInfo.lastCacheBreakpointSegIdx,
+            }, { loreEntries });
+
+            const structuralBreak = diff.causeCode === 'model_changed' ||
+                (diff.prefixMatchPct < 98 && !diff.afterBreakpoint && !diff.tailShiftOnly);
+            const serverMissOnIntact = !structuralBreak &&
+                !belowMinCacheTokens &&
+                cacheReported &&
+                cachedTokens === 0 &&
+                (prevTurn.cachedTokens > 0 || prevTurn.cacheCreationTokens > 0 || (serverHitPct === 0 && prevTurn.promptTokens >= minCacheTokens));
+            const cacheBroken = Boolean(structuralBreak || serverMissOnIntact);
+
+            let verdict = 'ok';
+            let verdictLabel = '캐시 유지';
+            let causeCode = diff.causeCode;
+            let causeLabel = diff.causeLabel;
+            if (cacheBroken) {
+                verdict = 'broken';
+                verdictLabel = '캐시 깨짐';
+                if (serverMissOnIntact && !structuralBreak) {
+                    causeCode = 'server_cache_miss';
+                    causeLabel = '프리픽스 동일하나 서버 KV 캐시 미스 (TTL 만료 또는 라우팅 변경)';
+                }
+            } else if (serverHitPct !== null && serverHitPct > 0) {
+                verdictLabel = `캐시 적중 ${serverHitPct}%`;
+            }
+
+            cacheGuard = {
+                eligible: true,
+                namespace: sig.namespace,
+                laneId: lane.laneId,
+                laneNumber: lane.laneNumber,
+                laneLabel: lane.laneLabel,
+                lanePreview: lane.sysPreview,
+                turnIndex,
+                prevLogId: prevTurn.logId,
+                verdict,
+                verdictLabel,
+                cacheBroken,
+                prefixMatchPct: diff.prefixMatchPct,
+                serverHitPct,
+                cachedTokens,
+                cacheCreationTokens,
+                promptTokens,
+                minCacheTokens,
+                belowMinCacheTokens,
+                causeCode,
+                causeLabel,
+                afterBreakpoint: diff.afterBreakpoint,
+                tailShiftOnly: diff.tailShiftOnly,
+                culpritLorebook: diff.culpritLorebook,
+                firstDiff: diff.firstDiff,
+                segmentMap: diff.segmentMap,
+                cost,
+                prevCost: prevTurn.cost || null,
+            };
+        }
+
+        item._cgInternal = null;
+        item.cacheGuard = cacheGuard;
+        lane.turns.push({
+            logId: item.id,
+            model: item.model,
+            segments: segInfo.segments,
+            lastCacheBreakpointSegIdx: segInfo.lastCacheBreakpointSegIdx,
+            promptTokens,
+            cachedTokens,
+            cacheCreationTokens,
+            cost,
+        });
+    }
+
+    return buildCacheGuardSessionSummary(list);
+}
+
+function summarizeCacheGuardForList(cg) {
+    if (!cg || typeof cg !== 'object') return null;
+    if (!cg.eligible) {
+        return {
+            eligible: false,
+            excludedReason: cg.excludedReason || '',
+            excludedLabel: cg.excludedLabel || '',
+        };
+    }
+    return {
+        eligible: true,
+        namespace: cg.namespace,
+        laneId: cg.laneId,
+        laneNumber: cg.laneNumber,
+        laneLabel: cg.laneLabel,
+        turnIndex: cg.turnIndex,
+        prevLogId: cg.prevLogId,
+        verdict: cg.verdict,
+        verdictLabel: cg.verdictLabel,
+        cacheBroken: Boolean(cg.cacheBroken),
+        prefixMatchPct: cg.prefixMatchPct,
+        serverHitPct: cg.serverHitPct,
+        cachedTokens: cg.cachedTokens,
+        promptTokens: cg.promptTokens,
+        belowMinCacheTokens: Boolean(cg.belowMinCacheTokens),
+        causeCode: cg.causeCode,
+        causeLabel: cg.causeLabel,
+        cost: cg.cost,
+    };
+}
+
+function serializeRequestLogDetail(entry) {
+    if (!entry || typeof entry !== 'object') return entry;
+    const { _cgRawBody: _omitBody, _cgRawUsage: _omitUsage, _cgInternal: _omitInternal, ...rest } = entry;
+    return rest;
+}
+
 function recordRequestLog(entry) {
     const item = {
         id: `req-${++requestLogSeq}-${crypto.randomBytes(3).toString('hex')}`,
@@ -1347,18 +2519,22 @@ function recordRequestLog(entry) {
         ok: Boolean(entry.ok),
         durationMs: Math.max(0, Number(entry.durationMs || 0)),
         msgCount: Math.max(0, Number(entry.msgCount || 0)),
-        usage: entry.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        usage: entry.usage || mapUsageToOpenAI(null),
         headers: entry.headers || {},
         messages: Array.isArray(entry.messages) ? entry.messages : [],
+        _cgRawBody: entry.rawBodyObj && typeof entry.rawBodyObj === 'object' ? entry.rawBodyObj : null,
+        _cgRawUsage: entry.rawUsageObj && typeof entry.rawUsageObj === 'object' ? entry.rawUsageObj : null,
         requestJson: entry.requestJson || '',
         responseText: entry.responseText || '',
         responseJson: entry.responseJson || '',
         error: entry.error || '',
+        cacheGuard: null,
     };
     requestLogs.unshift(item);
     if (requestLogs.length > REQUEST_LOG_MAX) {
         requestLogs.length = REQUEST_LOG_MAX;
     }
+    recomputeRequestLogsCacheGuard(requestLogs);
     return item;
 }
 
@@ -1381,6 +2557,7 @@ function summarizeRequestLog(entry) {
         usage: entry.usage,
         error: entry.error,
         responsePreview,
+        cacheGuard: summarizeCacheGuardForList(entry.cacheGuard),
     };
 }
 
@@ -1458,6 +2635,8 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
                 usage: mapUsageToOpenAI(data.usage || null),
                 headers: sanitizeLogHeaders(logHeaders),
                 messages: sanitizeLogMessages(messages),
+                rawBodyObj: body,
+                rawUsageObj: data.usage || null,
                 requestJson: safeJsonForLog(body, REQUEST_LOG_BODY_CHAR_LIMIT),
                 responseText: truncateLogText(out, REQUEST_LOG_RESP_CHAR_LIMIT),
                 responseJson: safeJsonForLog(data, REQUEST_LOG_RESP_CHAR_LIMIT),
@@ -1514,6 +2693,8 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
                 usage: mapUsageToOpenAI(data.usageMetadata || null),
                 headers: sanitizeLogHeaders(logHeaders),
                 messages: sanitizeLogMessages(messages),
+                rawBodyObj: body,
+                rawUsageObj: data.usageMetadata || null,
                 requestJson: safeJsonForLog(body, REQUEST_LOG_BODY_CHAR_LIMIT),
                 responseText: truncateLogText(out, REQUEST_LOG_RESP_CHAR_LIMIT),
                 responseJson: safeJsonForLog(data, REQUEST_LOG_RESP_CHAR_LIMIT),
@@ -1572,6 +2753,8 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
             usage: mapUsageToOpenAI(data.usage || null),
             headers: sanitizeLogHeaders(headers),
             messages: sanitizeLogMessages(messages),
+            rawBodyObj: body,
+            rawUsageObj: data.usage || null,
             requestJson: safeJsonForLog(body, REQUEST_LOG_BODY_CHAR_LIMIT),
             responseText: truncateLogText(out, REQUEST_LOG_RESP_CHAR_LIMIT),
             responseJson: safeJsonForLog(data, REQUEST_LOG_RESP_CHAR_LIMIT),
@@ -1590,9 +2773,11 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
             ok: false,
             durationMs: Date.now() - startedAt,
             msgCount: Array.isArray(messages) ? messages.length : 0,
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            usage: mapUsageToOpenAI(null),
             headers: sanitizeLogHeaders(logHeaders),
             messages: sanitizeLogMessages(messages),
+            rawBodyObj: logBodyObj,
+            rawUsageObj: null,
             requestJson: logBodyObj ? safeJsonForLog(logBodyObj, REQUEST_LOG_BODY_CHAR_LIMIT) : '',
             responseText: '',
             responseJson: logRespData ? safeJsonForLog(logRespData, REQUEST_LOG_RESP_CHAR_LIMIT) : '',
@@ -1687,9 +2872,11 @@ async function handleOpenAIProxy(req, res) {
                         ok: false,
                         durationMs: Date.now() - startedAt,
                         msgCount: Array.isArray(messages) ? messages.length : 0,
-                        usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+                        usage: mapUsageToOpenAI(null),
                         headers: sanitizeLogHeaders(headers),
                         messages: sanitizeLogMessages(messages),
+                        rawBodyObj: upBody,
+                        rawUsageObj: null,
                         requestJson: safeJsonForLog(upBody, REQUEST_LOG_BODY_CHAR_LIMIT),
                         responseText: truncateLogText(errText, REQUEST_LOG_RESP_CHAR_LIMIT),
                         responseJson: '',
@@ -1717,7 +2904,8 @@ async function handleOpenAIProxy(req, res) {
                     try {
                         const parsed = JSON.parse(payload);
                         if (parsed.model) streamModel = parsed.model;
-                        if (parsed.usage) streamUsage = parsed.usage;
+                        const uObj = parsed.usage || parsed.usageMetadata || (parsed.message && parsed.message.usage) || null;
+                        if (uObj) streamUsage = mergeStreamUsage(streamUsage, uObj);
                         const choice = Array.isArray(parsed.choices) ? parsed.choices[0] : null;
                         const delta = choice && choice.delta ? choice.delta : null;
                         const piece = delta ? (delta.content || delta.reasoning_content || '') : '';
@@ -1779,6 +2967,8 @@ async function handleOpenAIProxy(req, res) {
                         usage: mapUsageToOpenAI(streamUsage),
                         headers: sanitizeLogHeaders(headers),
                         messages: sanitizeLogMessages(messages),
+                        rawBodyObj: upBody,
+                        rawUsageObj: streamUsage,
                         requestJson: safeJsonForLog(upBody, REQUEST_LOG_BODY_CHAR_LIMIT),
                         responseText: respFull,
                         responseJson: '',
@@ -1993,7 +3183,7 @@ function findMatchingCbsIfEnd(str, startIdx) {
         const tagInner = str.slice(openIdx + 2, closeIdx).trim();
         if (/^#(?:if(?:_pure)?|when|each|func|pure(?:_?display)?|escape)(?:[\s:]|$)/i.test(tagInner)) {
             blockDepth += 1;
-        } else if (/^\/(?:if(?:_pure)?|when|each|func|pure(?:_?display)?|escape)?\s*$/i.test(tagInner)) {
+        } else if (tagInner.startsWith('/') && !tagInner.startsWith('//')) {
             if (blockDepth === 0) {
                 return { elseStart, elseEnd, endStart: openIdx, endClose: closeIdx };
             }
@@ -2018,7 +3208,7 @@ function findMatchingCbsBlockEnd(str, startIdx) {
         const tagInner = str.slice(openIdx + 2, closeIdx).trim();
         if (/^#(?:if(?:_pure)?|when|each|func|pure(?:_?display)?|escape)(?:[\s:]|$)/i.test(tagInner)) {
             blockDepth += 1;
-        } else if (/^\/(?:if(?:_pure)?|when|each|func|pure(?:_?display)?|escape)?\s*$/i.test(tagInner)) {
+        } else if (tagInner.startsWith('/') && !tagInner.startsWith('//')) {
             if (blockDepth === 0) {
                 return { endStart: openIdx, endClose: closeIdx };
             }
@@ -2065,8 +3255,7 @@ function evalSimpleCbsExpr(expr) {
         if (mId) {
             pos += mId[0].length;
             if (mId[0] === 'true') return 1;
-            if (mId[0] === 'false') return 0;
-            if (mId[0] === 'null' || mId[0] === 'undefined') return '';
+            if (mId[0] === 'false' || mId[0] === 'null' || mId[0] === 'undefined') return 0;
             return mId[0];
         }
         return 0;
@@ -2107,13 +3296,13 @@ function evalSimpleCbsExpr(expr) {
         let left = parseAdd();
         while (true) {
             const rest = peek();
-            const m = rest.match(/^(===|!==|==|!=|>=|<=|>|<)/);
+            const m = rest.match(/^(===|!==|==|!=|>=|<=|=|>|<)/);
             if (!m) break;
             pos += m[1].length;
             const right = parseAdd();
             const op = m[1];
             const bothNum = isNum(left) && isNum(right);
-            if (op === '==' || op === '===') left = (String(left) === String(right) || (bothNum && Number(left) === Number(right))) ? 1 : 0;
+            if (op === '=' || op === '==' || op === '===') left = (String(left) === String(right) || (bothNum && Number(left) === Number(right))) ? 1 : 0;
             else if (op === '!=' || op === '!==') left = (String(left) !== String(right) && !(bothNum && Number(left) === Number(right))) ? 1 : 0;
             else if (op === '>') left = Number(left) > Number(right) ? 1 : 0;
             else if (op === '<') left = Number(left) < Number(right) ? 1 : 0;
@@ -2265,11 +3454,74 @@ function evalCbsWhenCondition(condExpr, ctx, depth) {
     return false;
 }
 
+function parsePresetEachHeader(argStr) {
+    const src = String(argStr || '');
+    const topParts = splitCbsTopLevelArgs(src);
+    if (topParts.length >= 2) {
+        return {
+            iterExpr: topParts.slice(0, -1).join('::').trim(),
+            slotName: topParts[topParts.length - 1].trim(),
+        };
+    }
+    let depth = 0;
+    let lastWsStart = -1;
+    let lastWsEnd = -1;
+    let i = 0;
+    while (i < src.length) {
+        if (src[i] === '{' && src[i + 1] === '{') {
+            depth += 1;
+            i += 2;
+            continue;
+        }
+        if (src[i] === '}' && src[i + 1] === '}') {
+            depth = Math.max(0, depth - 1);
+            i += 2;
+            continue;
+        }
+        if (depth === 0 && /\s/.test(src[i])) {
+            const start = i;
+            while (i < src.length && /\s/.test(src[i])) i += 1;
+            if (i < src.length) {
+                lastWsStart = start;
+                lastWsEnd = i;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    if (lastWsStart >= 0) {
+        return {
+            iterExpr: src.slice(0, lastWsStart).trim(),
+            slotName: src.slice(lastWsEnd).trim(),
+        };
+    }
+    return { iterExpr: src.trim(), slotName: '' };
+}
+
+function formatCbsDateTime(fmt = '', dateObj = new Date()) {
+    const d = dateObj instanceof Date ? dateObj : new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const map = {
+        YYYY: String(d.getFullYear()),
+        YY: String(d.getFullYear()).slice(-2),
+        MM: pad(d.getMonth() + 1),
+        DD: pad(d.getDate()),
+        HH: pad(d.getHours()),
+        mm: pad(d.getMinutes()),
+        ss: pad(d.getSeconds()),
+        ddd: days[d.getDay()],
+    };
+    const template = String(fmt || '').trim() || 'HH:mm:ss';
+    return template.replace(/YYYY|YY|MM|DD|HH|mm|ss|ddd/g, (tok) => map[tok] ?? tok);
+}
+
 function evalPresetCbs(input, ctx = {}, depth = 0) {
     const str = String(input ?? '');
-    if (!str.includes('{{') || depth > 24) return str;
+    if (!str.includes('{{') || depth > 200) return str;
     if (ctx && typeof ctx === 'object') {
         if (!ctx.functions) ctx.functions = new Map();
+        if (!ctx.slots) ctx.slots = {};
         if (!ctx.tempVars) ctx.tempVars = {};
         if (!ctx.chatVars) ctx.chatVars = {};
         if (!ctx.globalVars) ctx.globalVars = {};
@@ -2296,6 +3548,19 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
             continue;
         }
 
+        const escapeMatch = trimmed.match(/^#escape(?:[\s:]|$)/i);
+        if (escapeMatch) {
+            const bounds = findMatchingCbsBlockEnd(str, closeIdx + 2);
+            if (!bounds) {
+                out += str.slice(openIdx, closeIdx + 2);
+                pos = closeIdx + 2;
+                continue;
+            }
+            out += str.slice(closeIdx + 2, bounds.endStart);
+            pos = bounds.endClose + 2;
+            continue;
+        }
+
         const funcMatch = trimmed.match(/^#func(?:(?:\s+|::)([\s\S]*))?$/i);
         if (funcMatch) {
             const bounds = findMatchingCbsBlockEnd(str, closeIdx + 2);
@@ -2309,6 +3574,53 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
             if (funcName && ctx && ctx.functions) {
                 const rawBody = str.slice(closeIdx + 2, bounds.endStart).trim();
                 ctx.functions.set(funcName, { data: rawBody, params: headerTokens.slice(1) });
+            }
+            pos = bounds.endClose + 2;
+            continue;
+        }
+
+        const eachMatch = trimmed.match(/^#each(?:\s+|::)([\s\S]*)$/i);
+        if (eachMatch) {
+            const bounds = findMatchingCbsBlockEnd(str, closeIdx + 2);
+            if (!bounds) {
+                out += str.slice(openIdx, closeIdx + 2);
+                pos = closeIdx + 2;
+                continue;
+            }
+            const { iterExpr, slotName } = parsePresetEachHeader(eachMatch[1]);
+            const rawList = evalPresetCbs(iterExpr, ctx, depth + 1).trim();
+            let arr = [];
+            if (rawList.startsWith('[')) {
+                try {
+                    const parsedArr = JSON.parse(rawList);
+                    if (Array.isArray(parsedArr)) arr = parsedArr;
+                } catch (_) {}
+            } else if (/^-?\d+$/.test(rawList)) {
+                const n = Number(rawList);
+                const emptyChat = Array.isArray(ctx.chatList) && ctx.chatList.length === 0;
+                if (n >= 0 && !(emptyChat && n === 0)) {
+                    const limitCount = Math.min(n + 1, 5000);
+                    arr = Array.from({ length: limitCount }, (_, idx) => String(idx));
+                }
+            } else if (rawList) {
+                arr = rawList.split('::').filter(Boolean);
+            }
+            let bodyToRender = str.slice(closeIdx + 2, bounds.endStart);
+            if (bodyToRender.startsWith('\r\n')) bodyToRender = bodyToRender.slice(2);
+            else if (bodyToRender.startsWith('\n')) bodyToRender = bodyToRender.slice(1);
+
+            const slots = ctx.slots || (ctx.slots = {});
+            const hadPrev = slotName && Object.prototype.hasOwnProperty.call(slots, slotName);
+            const prevVal = hadPrev ? slots[slotName] : undefined;
+            const limit = Math.min(arr.length, 20000);
+            for (let i = 0; i < limit; i += 1) {
+                if (slotName) slots[slotName] = String(arr[i] ?? '');
+                const iterOut = evalPresetCbs(bodyToRender, ctx, depth + 1);
+                if (/\S/.test(iterOut)) out += iterOut;
+            }
+            if (slotName) {
+                if (hadPrev) slots[slotName] = prevVal;
+                else delete slots[slotName];
             }
             pos = bounds.endClose + 2;
             continue;
@@ -2364,8 +3676,14 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
 
         const parts = splitCbsTopLevelArgs(inner);
         const rawCmd = parts[0] || '';
-        const cmd = (rawCmd.includes('{{') ? evalPresetCbs(rawCmd, ctx, depth + 1) : rawCmd).trim().toLowerCase();
-        const args = parts.slice(1).map((a) => evalPresetCbs(a, ctx, depth + 1));
+        const evalRawCmd = rawCmd.includes('{{') ? evalPresetCbs(rawCmd, ctx, depth + 1) : rawCmd;
+        let cmd = evalRawCmd.trim().toLowerCase();
+        let args = parts.slice(1).map((a) => evalPresetCbs(a, ctx, depth + 1));
+        if (parts.length === 1 && cmd.includes(':')) {
+            const colonIdx = evalRawCmd.indexOf(':');
+            cmd = evalRawCmd.slice(0, colonIdx).trim().toLowerCase();
+            args = [evalPresetCbs(evalRawCmd.slice(colonIdx + 1), ctx, depth + 1)];
+        }
 
         const gVars = (ctx && ctx.globalVars) || {};
         const cVars = (ctx && ctx.chatVars) || {};
@@ -2377,7 +3695,7 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
             else if (k && !k.startsWith('toggle_') && Object.prototype.hasOwnProperty.call(gVars, `toggle_${k}`)) {
                 replaced = String(gVars[`toggle_${k}`] ?? '');
             } else {
-                replaced = '';
+                replaced = 'null';
             }
         } else if (cmd === 'getvar' || cmd === 'getchatvar') {
             const k = (args[0] || '').trim();
@@ -2407,6 +3725,81 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
             const k = (args[0] || '').trim();
             if (k && ctx && ctx.tempVars) ctx.tempVars[k] = String(args.slice(1).join('::'));
             replaced = '';
+        } else if (cmd === 'slot') {
+            const k = (args[0] || '').trim();
+            const slots = (ctx && ctx.slots) || {};
+            if (k && Object.prototype.hasOwnProperty.call(slots, k)) replaced = String(slots[k] ?? '');
+            else if (!k) {
+                const first = Object.values(slots)[0];
+                replaced = first !== undefined ? String(first) : '';
+            } else replaced = '';
+        } else if (cmd === 'array' || cmd === 'makearray' || cmd === 'a') {
+            replaced = JSON.stringify(args.map((x) => String(x ?? '')));
+        } else if (cmd === 'length') {
+            const valStr = String(args[0] ?? '');
+            const trimmedVal = valStr.trim();
+            if (trimmedVal.startsWith('[')) {
+                try {
+                    const parsed = JSON.parse(trimmedVal);
+                    if (Array.isArray(parsed)) replaced = String(parsed.length);
+                } catch (_) {}
+            }
+            if (replaced === null) replaced = String(valStr.length);
+        } else if (cmd === 'chat_index' || cmd === 'chatindex') {
+            const fallbackIdx = Array.isArray(ctx.chatList) ? Math.max(0, ctx.chatList.length - 1) : 0;
+            replaced = String(ctx.chatIndex !== undefined ? ctx.chatIndex : (ctx.lastMessageId !== undefined ? ctx.lastMessageId : fallbackIdx));
+        } else if (cmd === 'lastmessageid') {
+            const fallbackLast = Array.isArray(ctx.chatList) ? Math.max(0, ctx.chatList.length - 1) : 0;
+            replaced = String(ctx.lastMessageId !== undefined ? ctx.lastMessageId : fallbackLast);
+        } else if (cmd === 'previous_chat_log' || cmd === 'previouschatlog') {
+            const idx = Number((args[0] || '').trim());
+            replaced = (Array.isArray(ctx.chatList) && Number.isInteger(idx) && idx >= 0 && idx < ctx.chatList.length)
+                ? String((ctx.chatList[idx] && ctx.chatList[idx].content) ?? '')
+                : '';
+        } else if (cmd === 'position') {
+            const posKey = String(args[0] || '').trim();
+            const ptMap = (ctx && ctx.ptPositions && typeof ctx.ptPositions === 'object') ? ctx.ptPositions : {};
+            const list = ptMap[posKey] || ptMap[`pt_${posKey}`] || ptMap[posKey.replace(/^pt_/, '')] || [];
+            replaced = Array.isArray(list) ? list.filter(Boolean).join('\n\n') : '';
+        } else if (cmd === 'random') {
+            let choices = args;
+            if (choices.length === 1) {
+                const one = String(choices[0] ?? '');
+                if (one.includes(':')) choices = one.split(':');
+                else if (one.includes(',')) choices = one.split(',');
+            }
+            replaced = choices.length ? String(choices[Math.floor(Math.random() * choices.length)] ?? '') : '';
+        } else if (cmd === 'roll') {
+            const spec = String(args[0] || '20').trim();
+            const dm = spec.match(/^(\d+)d(\d+)$/i);
+            if (dm) {
+                const cnt = Math.min(100, Math.max(1, Number(dm[1]) || 1));
+                const sides = Math.max(1, Number(dm[2]) || 20);
+                let total = 0;
+                for (let ri = 0; ri < cnt; ri += 1) total += 1 + Math.floor(Math.random() * sides);
+                replaced = String(total);
+            } else {
+                const sides = Math.max(1, Number(spec) || 20);
+                replaced = String(1 + Math.floor(Math.random() * sides));
+            }
+        } else if (cmd === 'time') {
+            replaced = formatCbsDateTime(args[0] || 'HH:mm:ss', new Date());
+        } else if (cmd === 'date') {
+            replaced = formatCbsDateTime(args[0] || 'YYYY-MM-DD', new Date());
+        } else if (cmd === 'idle_duration' || cmd === 'idleduration') {
+            if (Number.isFinite(ctx.lastUserMessageTime) && ctx.lastUserMessageTime > 0) {
+                const secs = Math.max(0, Math.floor((Date.now() - ctx.lastUserMessageTime) / 1000));
+                if (secs < 60) replaced = `${secs}s`;
+                else if (secs < 3600) replaced = `${Math.floor(secs / 60)}m`;
+                else replaced = `${Math.floor(secs / 3600)}h`;
+            } else {
+                replaced = '0s';
+            }
+        } else if (cmd === 'ruby') {
+            replaced = `<ruby>${String(args[0] ?? '')}<rt>${String(args[1] ?? '')}</rt></ruby>`;
+        } else if (cmd === 'u' || cmd === 'unicode') {
+            const cp = parseInt(String(args[0] || '').trim(), 16);
+            replaced = (Number.isFinite(cp) && cp >= 0 && cp <= 0x10FFFF) ? String.fromCodePoint(cp) : '';
         } else if (cmd === 'calc') {
             replaced = evalSimpleCbsExpr(args.join('::'));
         } else if (cmd === 'call') {
@@ -2441,9 +3834,9 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
         } else if (cmd === 'all') {
             replaced = (args.length > 0 && args.every(isCbsTruthy)) ? '1' : '0';
         } else if (cmd === 'and') {
-            replaced = (isCbsTruthy(args[0]) && isCbsTruthy(args[1])) ? '1' : '0';
+            replaced = (args.length > 0 && args.every(isCbsTruthy)) ? '1' : '0';
         } else if (cmd === 'or') {
-            replaced = (isCbsTruthy(args[0]) || isCbsTruthy(args[1])) ? '1' : '0';
+            replaced = args.some(isCbsTruthy) ? '1' : '0';
         } else if (cmd === 'not') {
             replaced = isCbsTruthy(args[0]) ? '0' : '1';
         } else if (cmd === 'greater') {
@@ -2834,6 +4227,7 @@ function evaluateLorebookEntries({
         scenario: [],
         depthEntries: [],
         postEverything: [],
+        ptPositions: {},
     };
     const postAssistant = [];
     for (const item of accepted) {
@@ -2847,6 +4241,14 @@ function evaluateLorebookEntries({
             else buckets.postEverything.push(item);
         } else if ((p === 'depth' && item.depth > 0) || p === 'reverse_depth') {
             buckets.depthEntries.push(item);
+        } else if (p && p.startsWith('pt_')) {
+            const shortKey = p.slice(3);
+            if (!Array.isArray(buckets.ptPositions[p])) buckets.ptPositions[p] = [];
+            buckets.ptPositions[p].push(item.content);
+            if (shortKey) {
+                if (!Array.isArray(buckets.ptPositions[shortKey])) buckets.ptPositions[shortKey] = [];
+                buckets.ptPositions[shortKey].push(item.content);
+            }
         } else {
             buckets.normal.push(item);
         }
@@ -2870,11 +4272,21 @@ function buildDirectPromptMessages({
         ? s.charContext
         : { name: s.charName || 'Character' };
 
+    const effDirectId = !preset
+        ? 'off'
+        : (preset.id === LEAVE_PRESET_ID
+            ? 'bundled:leave'
+            : (preset.id ? `custom:${preset.id}` : ((config && typeof config.directPresetId === 'string' && config.directPresetId) || 'off')));
+    const manualPresetToggleSyntax = (Array.isArray(config && config.presetToggles) ? config.presetToggles : [])
+        .filter((pt) => pt && pt.enabled !== false && pt.syntax && (!pt.parentPresetId || pt.parentPresetId === effDirectId))
+        .map((pt) => pt.syntax)
+        .join('\n');
     const modToggleSyntax = (Array.isArray(s.customToggleBlocks) ? s.customToggleBlocks : [])
         .map((b) => (b && b.syntax) || '')
         .filter(Boolean)
         .join('\n');
     const combinedToggleSyntax = [
+        manualPresetToggleSyntax,
         modToggleSyntax,
         (preset && (preset.toggleSyntax || preset.customPromptTemplateToggle)) || '',
     ].filter(Boolean).join('\n');
@@ -2896,13 +4308,31 @@ function buildDirectPromptMessages({
         }
     }
 
+    const chatList = (Array.isArray(historyMessages) ? historyMessages : []).map((m) => ({
+        role: m && m.role === 'user' ? 'user' : 'assistant',
+        content: String((m && (m.raw || m.text)) || ''),
+        ...(m && m.chatId ? { memo: String(m.chatId) } : {}),
+    }));
+    if (userText) {
+        chatList.push({
+            role: 'user',
+            content: String(userText),
+            ...(stagedUserChatId ? { memo: String(stagedUserChatId) } : {}),
+        });
+    }
+
     const baseCtx = {
         globalVars,
         chatVars,
         tempVars: {},
+        slots: {},
         functions: new Map(),
         callArgs: null,
         callStack: 0,
+        chatList,
+        lastMessageId: chatList.length > 0 ? chatList.length - 1 : 0,
+        chatIndex: chatList.length > 0 ? chatList.length - 1 : 0,
+        ptPositions: {},
         charName: String(rawCtx.name || s.charName || 'Character'),
         personaName: String(rawCtx.personaName || 'User'),
         personaPrompt: '',
@@ -2929,19 +4359,6 @@ function buildDirectPromptMessages({
         return evalField(chosen);
     };
 
-    const chatList = (Array.isArray(historyMessages) ? historyMessages : []).map((m) => ({
-        role: m && m.role === 'user' ? 'user' : 'assistant',
-        content: String((m && (m.raw || m.text)) || ''),
-        ...(m && m.chatId ? { memo: String(m.chatId) } : {}),
-    }));
-    if (userText) {
-        chatList.push({
-            role: 'user',
-            content: String(userText),
-            ...(stagedUserChatId ? { memo: String(stagedUserChatId) } : {}),
-        });
-    }
-
     const loreBuckets = Array.isArray(rawCtx.loreEntries)
         ? evaluateLorebookEntries({
             loreEntries: rawCtx.loreEntries,
@@ -2966,7 +4383,9 @@ function buildDirectPromptMessages({
             scenario: [],
             depthEntries: [],
             postEverything: [],
+            ptPositions: {},
         };
+    baseCtx.ptPositions = loreBuckets.ptPositions || {};
 
     if (rawCtx.depthPrompt && typeof rawCtx.depthPrompt === 'object' && rawCtx.depthPrompt.prompt) {
         const dpText = evalField(rawCtx.depthPrompt.prompt);
@@ -3044,6 +4463,8 @@ function buildDirectPromptMessages({
         return content;
     };
 
+    const resolveItemRole = (item, fallback = 'system') => mapRole((item && (item.role || item.role2)) || fallback);
+
     const msgs = [];
     let sawChatBlock = false;
     let emittedPostEverything = false;
@@ -3055,40 +4476,42 @@ function buildDirectPromptMessages({
         if (type === 'plain') {
             if (item.type2 === 'globalNote') {
                 const gn = resolveGlobalNote(item.text);
-                if (gn) msgs.push({ role: mapRole(item.role), content: gn });
+                if (gn) msgs.push({ role: resolveItemRole(item), content: gn });
                 continue;
             }
             let rawText = item.text !== undefined ? String(item.text) : '';
             if (!rawText && item.type2 === 'main') rawText = baseCtx.mainPrompt;
             const evaluated = cleanPresetPromptText(evalPresetCbs(rawText, baseCtx));
-            if (evaluated) msgs.push({ role: mapRole(item.role), content: evaluated });
+            if (evaluated) msgs.push({ role: resolveItemRole(item), content: evaluated });
             continue;
         }
         if (type === 'jailbreak') {
             const rawText = item.text !== undefined ? String(item.text) : baseCtx.jailbreak;
             const evaluated = cleanPresetPromptText(evalPresetCbs(rawText, baseCtx));
-            if (evaluated) msgs.push({ role: mapRole(item.role), content: evaluated });
+            if (evaluated) msgs.push({ role: resolveItemRole(item), content: evaluated });
             continue;
         }
         if (type === 'persona') {
-            if (rawCtx.personaName || baseCtx.personaPrompt) {
-                const rawPersona = (item.innerFormat && String(item.innerFormat).includes('{{slot}}'))
-                    ? baseCtx.personaPrompt
-                    : `[User Persona: ${baseCtx.personaName}]\n${baseCtx.personaPrompt}`;
+            if (item.innerFormat && String(item.innerFormat).includes('{{slot}}')) {
+                const slotVal = cleanPresetPromptText(baseCtx.personaPrompt || (rawCtx.personaName ? `[User: ${baseCtx.personaName}]` : ''));
+                const body = cleanPresetPromptText(evalPresetCbs(String(item.innerFormat).replace(/\{\{slot\}\}/gi, slotVal), baseCtx));
+                if (body) msgs.push({ role: resolveItemRole(item), content: body });
+            } else if (rawCtx.personaName || baseCtx.personaPrompt) {
+                const rawPersona = `[User Persona: ${baseCtx.personaName}]\n${baseCtx.personaPrompt}`;
                 const body = applyInnerFormat(item, cleanPresetPromptText(rawPersona));
-                if (body) msgs.push({ role: 'system', content: body });
+                if (body) msgs.push({ role: resolveItemRole(item), content: body });
             }
             continue;
         }
         if (type === 'description') {
             const body = applyInnerFormat(item, buildDescText());
-            if (body) msgs.push({ role: 'system', content: body });
+            if (body) msgs.push({ role: resolveItemRole(item), content: body });
             continue;
         }
         if (type === 'lorebook') {
             if (normalLoreText) {
                 const body = applyInnerFormat(item, cleanPresetPromptText(`[World / Module Lorebook]\n${normalLoreText}`));
-                if (body) msgs.push({ role: 'system', content: body });
+                if (body) msgs.push({ role: resolveItemRole(item), content: body });
             }
             continue;
         }
@@ -3100,7 +4523,7 @@ function buildDirectPromptMessages({
             }
             if (memoryText) bodyParts.push(memoryText);
             const body = applyInnerFormat(item, cleanPresetPromptText(bodyParts.join('\n\n')));
-            if (body) msgs.push({ role: mapRole(item.role), content: body });
+            if (body) msgs.push({ role: resolveItemRole(item), content: body });
             continue;
         }
         if (type === 'authornote') {
@@ -3109,7 +4532,7 @@ function buildDirectPromptMessages({
                     ? baseCtx.note
                     : `[Author's Note]\n${baseCtx.note}`;
                 const body = applyInnerFormat(item, cleanPresetPromptText(rawNote));
-                if (body) msgs.push({ role: 'system', content: body });
+                if (body) msgs.push({ role: resolveItemRole(item), content: body });
             }
             continue;
         }
@@ -3204,6 +4627,14 @@ async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = st
         if (adapter) {
             await adapter.prepareTurn(charIndex, chatIndex, snap);
             const tCtx0 = adapter.getTurnContext();
+            if (tCtx0.chatObj && snap) {
+                if (snap.useLocallySetGlobalVariables !== undefined) {
+                    tCtx0.chatObj.useLocallySetGlobalVariables = Boolean(snap.useLocallySetGlobalVariables);
+                }
+                if (tCtx0.chatObj.useLocallySetGlobalVariables && snap.localToggleValues && typeof snap.localToggleValues === 'object') {
+                    tCtx0.chatObj.GLGlobalVariables = { ...(tCtx0.chatObj.GLGlobalVariables || {}), ...snap.localToggleValues };
+                }
+            }
             if (modAdapter) {
                 await modAdapter.prepareTurn({
                     charIndex,
@@ -3357,6 +4788,14 @@ async function runDirectRemoteReroll(charIndex, chatIndex, msgIndex, snapView = 
         if (adapter) {
             await adapter.prepareTurn(charIndex, chatIndex, snap);
             const tCtx0 = adapter.getTurnContext();
+            if (tCtx0.chatObj && snap) {
+                if (snap.useLocallySetGlobalVariables !== undefined) {
+                    tCtx0.chatObj.useLocallySetGlobalVariables = Boolean(snap.useLocallySetGlobalVariables);
+                }
+                if (tCtx0.chatObj.useLocallySetGlobalVariables && snap.localToggleValues && typeof snap.localToggleValues === 'object') {
+                    tCtx0.chatObj.GLGlobalVariables = { ...(tCtx0.chatObj.GLGlobalVariables || {}), ...snap.localToggleValues };
+                }
+            }
             if (modAdapter) {
                 await modAdapter.prepareTurn({
                     charIndex,
@@ -3561,7 +5000,10 @@ function renderWebApp() {
   header {
     grid-area: header; position: relative; z-index: 30;
     display:flex; align-items:center; justify-content:space-between; gap:8px;
-    padding: calc(8px + env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) 8px max(12px, env(safe-area-inset-left));
+    height: calc(54px + env(safe-area-inset-top));
+    min-height: calc(54px + env(safe-area-inset-top));
+    max-height: calc(54px + env(safe-area-inset-top));
+    padding: env(safe-area-inset-top) max(12px, env(safe-area-inset-right)) 0 max(12px, env(safe-area-inset-left));
     border-bottom:1px solid var(--border); background: var(--header-bg);
     -webkit-backdrop-filter: saturate(160%) blur(14px); backdrop-filter: saturate(160%) blur(14px);
   }
@@ -3569,8 +5011,38 @@ function renderWebApp() {
   .h-left:active { background: var(--accent-soft); }
   .dot { width:8px; height:8px; border-radius:50%; background:#9ca3af; flex-shrink:0; box-shadow: 0 0 0 3px color-mix(in srgb, #9ca3af 22%, transparent); }
   .dot.on { background:#22c55e; box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.22); }
-  .h-title { font-weight:700; font-size:15px; letter-spacing:-0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-  .h-sub { font-size:11.5px; color:var(--sub); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-top:1px; }
+  .h-title { font-weight:700; font-size:15px; line-height:20px; letter-spacing:-0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .h-sub-row {
+    display:flex; align-items:center; gap:6px;
+    height:18px; min-height:18px; max-height:18px;
+    min-width:0; overflow:hidden; white-space:nowrap; margin-top:1px;
+  }
+  .h-sub { font-size:11.5px; line-height:18px; color:var(--sub); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; flex-shrink:1; }
+  .hdr-act-bar {
+    display:inline-flex; align-items:center; gap:4px; flex-wrap:nowrap;
+    height:18px; min-width:0; max-width:65%; flex-shrink:0; overflow:hidden;
+  }
+  .hdr-act-bar:empty { display:none; }
+  .hdr-act-pill {
+    display:inline-flex; align-items:center; gap:4px; height:16px; padding:0 7px; border-radius:999px;
+    font-size:10.5px; font-weight:700; line-height:1; letter-spacing:-0.01em;
+    background:color-mix(in srgb, var(--accent) 14%, var(--surface));
+    color:var(--text); border:1px solid color-mix(in srgb, var(--accent) 36%, var(--border));
+    max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+  }
+  .hdr-act-pill.recent {
+    background:color-mix(in srgb, var(--ok) 12%, var(--surface));
+    border-color:color-mix(in srgb, var(--ok) 32%, var(--border));
+    color:var(--sub);
+  }
+  .hdr-act-dot {
+    width:6px; height:6px; border-radius:50%; background:var(--accent); flex-shrink:0;
+    animation: rsPulseDot 1.1s ease-in-out infinite;
+  }
+  @keyframes rsPulseDot {
+    0%, 100% { opacity:1; transform:scale(1); }
+    50% { opacity:0.4; transform:scale(0.75); }
+  }
   .h-right { display:flex; align-items:center; gap:6px; flex-shrink:0; }
 
   .pill {
@@ -3588,8 +5060,8 @@ function renderWebApp() {
 
   /* ===== Reading / Display Settings Popover ===== */
   .read-bar {
-    position:absolute; top: calc(100% + 8px); right: max(10px, env(safe-area-inset-right));
-    width: min(380px, calc(100vw - 20px));
+    position:fixed; top: calc(58px + env(safe-area-inset-top)); right: max(10px, env(safe-area-inset-right)); z-index: 165;
+    width: min(380px, calc(100vw - 20px)); max-height: calc(100dvh - 80px); overflow-y: auto;
     display:flex; flex-direction:column; gap:14px; padding:16px;
     background: var(--elev); border:1px solid var(--border); border-radius: 18px;
     box-shadow: var(--shadow);
@@ -3886,11 +5358,11 @@ function renderWebApp() {
   #bookBotOverlay [data-rs-bot-fab="1"] {
     position:fixed !important; top:106px !important; right:12px !important; z-index:25 !important;
     display:flex !important; flex-direction:column !important; align-items:center !important; gap:10px !important;
-    margin:0 !important; padding:0 !important;
-    transition: transform 0.22s ease, opacity 0.2s ease;
+    margin:0 !important; padding:0 !important; will-change: transform, opacity;
+    transition: transform 0.11s cubic-bezier(0.2, 0.9, 0.3, 1), opacity 0.09s ease;
   }
   #bookBotOverlay.bot-menu-collapsed [data-rs-bot-fab="1"] {
-    opacity:0 !important; pointer-events:none !important; transform:translateX(90px) !important;
+    opacity:0 !important; pointer-events:none !important; transform:translate3d(72px, 0, 0) !important;
   }
   #botMenuFab {
     position:fixed; right:12px; top:62px; z-index:35;
@@ -3898,8 +5370,8 @@ function renderWebApp() {
     box-sizing:border-box; height:34px; min-height:34px; min-width:48px; padding:0 12px; margin:0;
     border-radius:999px; border:1px solid var(--border); background:var(--elev); color:var(--text);
     font-size:12px; font-weight:700; line-height:1; letter-spacing:-0.01em; white-space:nowrap;
-    cursor:pointer; box-shadow:var(--shadow-sm); opacity:0.78;
-    transition: opacity 0.18s ease, background 0.18s ease, border-color 0.18s ease, border-radius 0.18s ease, padding 0.18s ease, width 0.18s ease;
+    cursor:pointer; box-shadow:var(--shadow-sm); opacity:0.84;
+    transition: opacity 0.1s ease, background 0.1s ease, border-color 0.1s ease;
     -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px);
   }
   #botMenuFab .bmf-ic {
@@ -4037,6 +5509,54 @@ function renderWebApp() {
   }
   .req-log-meta-item b { display:block; font-size:11px; color:var(--sub); margin-bottom:2px; }
   .req-log-meta-item span { word-break:break-all; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .cg-summary-bar {
+    display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin-bottom:8px;
+    padding:8px 10px; border-radius:12px; border:1px solid var(--border); background:var(--surface);
+    font-size:11.5px; color:var(--sub);
+  }
+  .cg-stat {
+    display:inline-flex; align-items:center; gap:4px; padding:3px 8px; border-radius:999px;
+    border:1px solid var(--border); background:var(--bg); color:var(--text); font-weight:700;
+  }
+  .cg-stat.ok { border-color:color-mix(in srgb, #34d399 45%, var(--border)); color:#34d399; }
+  .cg-stat.brk { border-color:color-mix(in srgb, var(--danger) 50%, var(--border)); background:color-mix(in srgb, var(--danger) 10%, transparent); color:var(--danger); }
+  .req-log-badge.cg-lane { border-color:color-mix(in srgb, #60a5fa 45%, var(--border)); color:#60a5fa; background:color-mix(in srgb, #60a5fa 10%, transparent); }
+  .req-log-badge.cg-ok { border-color:color-mix(in srgb, #34d399 45%, var(--border)); color:#34d399; background:color-mix(in srgb, #34d399 10%, transparent); }
+  .req-log-badge.cg-brk { border-color:color-mix(in srgb, var(--danger) 55%, var(--border)); color:var(--danger); background:color-mix(in srgb, var(--danger) 14%, transparent); font-weight:800; }
+  .req-log-badge.cg-excl { border-color:var(--border); color:var(--sub); background:var(--surface); opacity:0.85; }
+  .cg-lane-hdr {
+    font-size:11.5px; font-weight:800; color:var(--sub); padding:6px 4px 2px; margin-top:4px;
+    border-bottom:1px dashed var(--border); display:flex; align-items:center; justify-content:space-between; gap:8px;
+  }
+  .cg-banner {
+    padding:12px 14px; border-radius:12px; border:1px solid var(--border); background:var(--surface);
+    display:flex; flex-direction:column; gap:6px;
+  }
+  .cg-banner.ok { border-color:color-mix(in srgb, #34d399 50%, var(--border)); background:color-mix(in srgb, #34d399 8%, var(--surface)); }
+  .cg-banner.broken { border-color:color-mix(in srgb, var(--danger) 55%, var(--border)); background:color-mix(in srgb, var(--danger) 10%, var(--surface)); }
+  .cg-banner.baseline { border-color:color-mix(in srgb, #60a5fa 45%, var(--border)); background:color-mix(in srgb, #60a5fa 8%, var(--surface)); }
+  .cg-segmap-bar {
+    display:flex; width:100%; height:18px; border-radius:8px; overflow:hidden;
+    border:1px solid var(--border); background:var(--bg); gap:1px;
+  }
+  .cg-seg { min-width:3px; height:100%; position:relative; }
+  .cg-seg.cached { background:#34d399; }
+  .cg-seg.changed { background:var(--danger); }
+  .cg-seg.after { background:color-mix(in srgb, var(--sub) 35%, var(--surface)); }
+  .cg-seg-list { display:flex; flex-direction:column; gap:5px; }
+  .cg-seg-item {
+    display:flex; align-items:center; gap:8px; font-size:12px; padding:6px 9px;
+    border-radius:9px; border:1px solid var(--border); background:var(--bg);
+  }
+  .cg-diff-box { display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:10px; }
+  .cg-diff-col { border:1px solid var(--border); border-radius:12px; background:var(--surface); overflow:hidden; }
+  .cg-diff-head { padding:7px 11px; font-size:11.5px; font-weight:800; border-bottom:1px solid var(--border); color:var(--sub); }
+  .cg-diff-pre {
+    margin:0; padding:10px 12px; font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size:12px; line-height:1.55; white-space:pre-wrap; word-break:break-word; user-select:text;
+  }
+  .cg-diff-hi-del { background:color-mix(in srgb, var(--danger) 28%, transparent); color:var(--danger); font-weight:700; border-radius:3px; padding:0 2px; }
+  .cg-diff-hi-add { background:color-mix(in srgb, #34d399 25%, transparent); color:#34d399; font-weight:700; border-radius:3px; padding:0 2px; }
 
   /* ===== Dedicated Message Edit Modal ===== */
   #msgEditModal {
@@ -4160,9 +5680,221 @@ function renderWebApp() {
     padding:10px 12px; display:flex; flex-direction:column; gap:8px;
   }
   .scene-slot-thumbs { display:flex; gap:8px; flex-wrap:wrap; }
+  .scene-thumb-wrap {
+    position:relative; display:inline-flex; align-items:center; justify-content:center;
+    width:88px; height:88px; border-radius:10px; overflow:hidden;
+    border:1px solid var(--border); background:var(--surface); cursor:pointer;
+  }
   .scene-slot-thumb {
-    width:88px; height:88px; object-fit:cover; border-radius:10px;
-    border:1px solid var(--border); background:var(--surface);
+    width:88px; height:88px; object-fit:cover; display:block;
+    transition:filter 0.2s ease, transform 0.2s ease;
+  }
+  .scene-thumb-veil {
+    display:none; position:absolute; inset:0; align-items:center; justify-content:center;
+    background:rgba(0,0,0,0.34); color:#fff; font-size:11px; font-weight:700; pointer-events:none;
+  }
+  body.asset-blur .scene-thumb-wrap:not(.revealed) .scene-slot-thumb { filter:blur(18px) brightness(0.68); transform:scale(1.08); }
+  body.asset-blur .scene-thumb-wrap:not(.revealed) .scene-thumb-veil { display:flex; }
+  body.asset-hide .scene-slot-thumbs, body.asset-hide .scene-thumb-wrap { display:none !important; }
+  .scene-stealth-note {
+    font-size:12px; color:var(--sub); padding:6px 10px; border-radius:8px;
+    background:var(--surface); border:1px dashed var(--border);
+  }
+
+  /* ===== Plugin Floating Control Popup (Menu-triggered) ===== */
+  #pluginFloatingModal {
+    position:fixed; inset:0; z-index:169; background:rgba(0,0,0,0.64);
+    -webkit-backdrop-filter:blur(5px); backdrop-filter:blur(5px);
+    display:flex; align-items:center; justify-content:center; padding:12px;
+  }
+  .plg-float-dialog {
+    width:min(700px, 96vw); max-height:min(84dvh, 720px);
+    background:var(--elev); color:var(--text);
+    border:1px solid var(--border); border-radius:18px; box-shadow:var(--shadow);
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  .plg-float-head {
+    display:flex; align-items:center; justify-content:space-between; gap:8px;
+    padding:12px 16px; border-bottom:1px solid var(--border); background:var(--surface); flex-shrink:0;
+  }
+  .plg-float-body {
+    flex:1; min-height:140px; overflow-y:auto; overflow-x:hidden; padding:14px 16px;
+    display:flex; flex-direction:column; gap:12px;
+  }
+  .rs-pfm-card {
+    border:1px solid var(--border); border-radius:14px; background:var(--bg);
+    padding:12px; display:flex; flex-direction:column; gap:10px;
+  }
+  .rs-pfm-card-head {
+    display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
+  }
+  .rs-pfm-stage {
+    position:relative; display:flex; flex-direction:column; gap:8px; min-width:0;
+  }
+  .rs-pfm-stage [x-am-root-host],
+  .rs-pfm-stage .x-risu-am-generation-count {
+    position:relative !important; inset:auto !important; right:auto !important; bottom:auto !important;
+    left:auto !important; top:auto !important; width:100% !important; min-height:42px !important;
+    display:flex !important; flex-wrap:wrap !important; align-items:center !important; justify-content:flex-end !important;
+    gap:6px !important; padding-top:0 !important; pointer-events:auto !important;
+  }
+  .rs-pfm-stage .x-risu-am-generation-count__panel-anchor {
+    position:relative !important; inset:auto !important; display:contents !important;
+  }
+  .rs-pfm-stage .x-risu-am-generation-count:is([data-am-expanded="true"]:not([x-am-expanded="false"]), [x-am-expanded="true"]) .x-risu-am-generation-count__panel {
+    display:flex !important; position:relative !important; inset:auto !important; right:auto !important; bottom:auto !important;
+    width:auto !important; max-width:100% !important; margin:0 !important; padding:4px !important;
+    opacity:1 !important; pointer-events:auto !important; transform:none !important; overflow:visible !important;
+  }
+  .rs-pfm-stage .x-risu-am-generation-count:is([data-am-expanded="true"]:not([x-am-expanded="false"]), [x-am-expanded="true"]) .x-risu-am-generation-count__panel::before {
+    content:""; position:absolute; inset:0; z-index:0; border-radius:inherit; background:rgba(33, 29, 32, .86); pointer-events:none;
+  }
+  .rs-pfm-stage .x-risu-am-generation-count__scene-menu[x-am-menu-open="true"],
+  .rs-pfm-stage .x-risu-am-generation-count__scene-menu[data-am-menu-open="true"] {
+    display:block !important; visibility:visible !important; position:relative !important;
+    left:auto !important; right:auto !important; top:auto !important; bottom:auto !important;
+    margin-top:6px !important; z-index:25 !important; max-width:100% !important;
+  }
+  .rs-pfm-stage .x-risu-am-generation-count__scene-menu[x-am-menu-open="false"],
+  .rs-pfm-stage .x-risu-am-generation-count__scene-menu[hidden] { display:none !important; }
+  .rs-pfm-stage .x-risu-am-runtime-toast-stack {
+    position:relative !important; inset:auto !important; width:100% !important; max-height:240px !important;
+  }
+  .rs-pfm-stage button, .rs-pfm-stage [role="button"], .rs-pfm-stage [data-am-runtime-generation-count-action] {
+    pointer-events:auto !important; cursor:pointer;
+  }
+  body.asset-hide #pluginFloatingModal img { display:none !important; }
+  body.asset-blur #pluginFloatingModal img { filter:blur(14px); }
+
+  /* ===== Asset Maid Per-Message Manual Illustration Footer & Chat Projections ===== */
+  @keyframes x-risu-am-spin { to { transform: rotate(360deg); } }
+  .rs-am-footer-host { display:block; margin-top:8px; }
+  .rs-am-footer-host .x-risu-am-illustration-footer,
+  .rs-bot-html .x-risu-am-illustration-footer {
+    --am-footer-control-bg:rgba(13,10,12,.42);
+    --am-footer-shell-bg:rgba(33,29,32,.86);
+    --am-footer-fg:#f1e5cf;
+    --am-footer-hover:#fff5df;
+    --am-footer-retry-icon:#c95f63;
+    position:relative; display:inline-flex; align-items:center; justify-content:flex-start; gap:4px;
+    width:max-content; max-width:100%; min-height:40px; padding:4px; border-radius:8px;
+    background:var(--am-footer-shell-bg); color:var(--am-footer-fg);
+    font:600 12px/1.2 system-ui,-apple-system,sans-serif; box-sizing:border-box;
+    box-shadow:0 2px 10px rgba(0,0,0,0.22);
+  }
+  .rs-am-footer-host .x-risu-am-illustration-footer button,
+  .rs-bot-html .x-risu-am-illustration-footer button {
+    all:unset; display:inline-grid; flex:0 0 auto; width:32px; height:32px; place-items:center;
+    box-sizing:border-box; border:0; border-radius:8px; background:var(--am-footer-control-bg);
+    color:var(--am-footer-fg); cursor:pointer; user-select:none; transition:background .14s ease, color .14s ease;
+  }
+  .rs-am-footer-host .x-risu-am-illustration-footer button:hover,
+  .rs-bot-html .x-risu-am-illustration-footer button:hover {
+    background:rgba(241,229,207,0.16); color:var(--am-footer-hover);
+  }
+  .rs-am-footer-host .x-risu-am-illustration-footer__generate svg,
+  .rs-bot-html .x-risu-am-illustration-footer__generate svg {
+    display:block; width:18px; height:18px; fill:none; stroke:currentColor; stroke-width:1.8;
+    stroke-linecap:round; stroke-linejoin:round; pointer-events:none;
+  }
+  .rs-am-footer-host .x-risu-am-illustration-footer__generate svg.x-risu-am-illustration-footer__retry-icon,
+  .rs-bot-html .x-risu-am-illustration-footer__generate svg.x-risu-am-illustration-footer__retry-icon {
+    stroke:var(--am-footer-retry-icon);
+  }
+  .rs-am-footer-host .x-risu-am-illustration-footer.is-generating .x-risu-am-illustration-footer__generate svg,
+  .rs-am-footer-host .x-risu-am-illustration-footer__generate[x-am-busy="true"] svg,
+  .rs-bot-html .x-risu-am-illustration-footer.is-generating .x-risu-am-illustration-footer__generate svg,
+  .rs-bot-html .x-risu-am-illustration-footer__generate[x-am-busy="true"] svg { display:none; }
+  .rs-am-footer-host .x-risu-am-illustration-footer.is-generating .x-risu-am-illustration-footer__generate::before,
+  .rs-am-footer-host .x-risu-am-illustration-footer__generate[x-am-busy="true"]::before,
+  .rs-bot-html .x-risu-am-illustration-footer.is-generating .x-risu-am-illustration-footer__generate::before,
+  .rs-bot-html .x-risu-am-illustration-footer__generate[x-am-busy="true"]::before {
+    content:""; display:block; width:14px; height:14px; box-sizing:border-box;
+    border:2px solid currentColor; border-right-color:transparent; border-radius:999px;
+    animation:x-risu-am-spin .8s linear infinite;
+  }
+  .rs-am-footer-host .x-risu-am-illustration-revision-controls,
+  .rs-bot-html .x-risu-am-illustration-revision-controls {
+    display:inline-flex; align-items:center; gap:2px; border-radius:8px; background:var(--am-footer-control-bg); padding:0 2px;
+  }
+  .rs-am-footer-host .x-risu-am-illustration-revision-count,
+  .rs-bot-html .x-risu-am-illustration-revision-count {
+    font-size:11px; color:var(--am-footer-fg); padding:0 5px; font-variant-numeric:tabular-nums;
+  }
+  .rs-am-footer-host .x-risu-am-illustration-empty,
+  .rs-bot-html .x-risu-am-illustration-empty {
+    font-size:11px; color:#bca98c; padding:0 6px;
+  }
+  .rs-bot-html .am-illustration-projection,
+  .rs-bot-html .x-risu-am-illustration-projection,
+  .rs-bot-html .x-risu-am-illustration-slot {
+    position:relative; display:block; margin:12px auto; max-width:100%; text-align:center;
+  }
+  .rs-bot-html .am-image,
+  .rs-bot-html .x-risu-am-image,
+  .rs-bot-html .am-generated-image,
+  .rs-bot-html .x-risu-am-generated-image {
+    display:inline-flex; justify-content:center; align-items:center; max-width:min(100%, 420px); margin:6px auto;
+  }
+  .rs-bot-html .am-image__media,
+  .rs-bot-html .x-risu-am-image__media,
+  .rs-bot-html .am-generated-image__img,
+  .rs-bot-html .x-risu-am-generated-image__img {
+    display:block; max-width:100%; height:auto; border-radius:10px;
+  }
+  .rs-bot-html .am-illustration-history-sources,
+  .rs-bot-html .x-risu-am-illustration-history-sources,
+  .rs-bot-html .am-illustration-history-bank,
+  .rs-bot-html .am-native-asset-suppression,
+  .rs-bot-html .x-risu-am-native-asset-suppression { display:none !important; }
+  .rs-bot-html .am-chat-history-edge-controls,
+  .rs-bot-html .x-risu-am-chat-history-edge-controls {
+    display:inline-flex; align-items:center; gap:4px; margin-top:4px;
+    background:rgba(33,29,32,.78); color:#f1e5cf; padding:3px 6px; border-radius:999px; font-size:11px;
+  }
+  .rs-bot-html .am-chat-history-edge-controls button,
+  .rs-bot-html .x-risu-am-chat-history-edge-controls button {
+    border:0; background:rgba(13,10,12,.5); color:#f1e5cf; border-radius:999px; width:22px; height:22px; cursor:pointer;
+  }
+  body.asset-hide .rs-bot-html .am-illustration-projection,
+  body.asset-hide .rs-bot-html .x-risu-am-illustration-projection,
+  body.asset-hide .rs-bot-html .x-risu-am-illustration-slot,
+  body.asset-hide .rs-bot-html .am-generated-image { display:none !important; }
+  body.asset-blur .rs-bot-html .am-illustration-projection img:not(.revealed),
+  body.asset-blur .rs-bot-html .x-risu-am-illustration-projection img:not(.revealed) {
+    filter:blur(22px) brightness(0.65); transition:filter 0.2s ease; cursor:pointer;
+  }
+
+  /* ===== RisuStand Floating Mini-Bar & Zen Mode ===== */
+  #rsMiniBar {
+    position:fixed; z-index:46; left:50%; top:calc(14px + env(safe-area-inset-top)); transform:translateX(-50%);
+    display:inline-flex; align-items:center; gap:5px; border-radius:999px;
+    background:color-mix(in srgb, var(--elev) 90%, transparent); color:var(--text);
+    border:1px solid var(--border); box-shadow:0 4px 16px rgba(0,0,0,0.28);
+    -webkit-backdrop-filter:blur(14px); backdrop-filter:blur(14px);
+    user-select:none; touch-action:none; max-width:calc(100vw - 16px); overflow-x:auto; scrollbar-width:none;
+  }
+  #rsMiniBar::-webkit-scrollbar { display:none; }
+  #rsMiniBar.minimized { padding:4px 10px; font-size:12px; font-weight:700; opacity:0.8; cursor:grab; }
+  #rsMiniBar.expanded { padding:5px 10px; font-size:12px; font-weight:600; }
+  .rs-mb-handle {
+    display:inline-flex; align-items:center; gap:4px; padding:2px 6px;
+    cursor:grab; white-space:nowrap; opacity:0.9; font-weight:700; font-size:11.5px;
+  }
+  .rs-mb-pill {
+    border:1px solid var(--border); background:var(--surface); color:var(--text);
+    border-radius:999px; padding:4px 9px; font-size:11.5px; font-weight:600;
+    cursor:pointer; white-space:nowrap; display:inline-flex; align-items:center; gap:3px;
+  }
+  .rs-mb-pill:hover { border-color:var(--accent); }
+  .rs-mb-pill.active { background:var(--accent); color:var(--on-accent); border-color:var(--accent); }
+  body:not(.tab-chat-active) #rsMiniBar,
+  body:not(.rs-zen-mode) #rsMiniBar { display:none !important; }
+  body.rs-zen-mode header, body.rs-zen-mode nav.tabbar { display:none !important; }
+  body.rs-zen-mode #app {
+    grid-template-columns:minmax(0, 1fr) !important;
+    grid-template-rows:minmax(0, 1fr) auto !important;
+    grid-template-areas:"main" "composer" !important;
   }
 
   /* ===== Composer (capsule) ===== */
@@ -4314,16 +6046,16 @@ function renderWebApp() {
   @media (max-width: 600px) {
     .book-columns, [data-theme^="epub-1p"] .msg-wrap.char .msg-bubble { text-align:left !important; }
   }
-  @media (max-width: 380px) {
-    .h-right { gap:4px; }
-    .icon-pill { width:34px; height:34px; }
+  @media (max-width: 410px) {
+    .h-right { gap:3px; }
+    .icon-pill { width:32px; height:32px; font-size:14px; }
     .composer .pill { padding:0 8px; }
     .param-grid { grid-template-columns: 1fr 1fr; }
   }
   /* Landscape phones: reclaim vertical space */
   @media (max-height: 500px) and (orientation: landscape) {
-    header { padding-top: calc(4px + env(safe-area-inset-top)); padding-bottom:4px; }
-    .h-sub { display:none; }
+    header { height: calc(42px + env(safe-area-inset-top)); min-height: calc(42px + env(safe-area-inset-top)); max-height: calc(42px + env(safe-area-inset-top)); }
+    .h-sub-row { display:none; }
     .tab-btn { min-height:40px; flex-direction:row; gap:6px; font-size:12px; }
     .tab-btn .ic { padding:3px 10px; }
     .composer { margin-bottom:6px; }
@@ -4369,11 +6101,13 @@ function renderWebApp() {
 <div id="toast" role="status" aria-live="polite"></div>
 <div id="botBgHost" class="rs-bg-host rs-bot-html"></div>
 <div id="bookBotOverlay" class="bot-menu-collapsed"></div>
-<button id="botMenuFab" type="button" style="display:none;" title="봇 메뉴 펼치기 / 접기">☰ 메뉴</button>
+<div id="rsMiniBar" class="minimized" style="display:none;" aria-label="리스스탠드 플로팅 미니바"></div>
+<button id="botMenuFab" type="button" style="display:none;" title="봇 메뉴 펼치기 / 접기"><span class="bmf-ic">☰</span><span class="bmf-lb">메뉴</span></button>
 <div id="triggerModal" style="display:none;" role="dialog" aria-modal="true"></div>
 <div id="reqLogModal" style="display:none;" role="dialog" aria-modal="true" aria-label="리퀘스트 로그"></div>
 <div id="msgEditModal" style="display:none;" role="dialog" aria-modal="true" aria-label="메시지 수정"></div>
 <div id="pluginGuiModal" style="display:none;" role="dialog" aria-modal="true" aria-label="플러그인 GUI"></div>
+<div id="pluginFloatingModal" style="display:none;" role="dialog" aria-modal="true" aria-label="플러그인 플로팅 컨트롤"></div>
 <div id="sceneCtrlModal" style="display:none;" role="dialog" aria-modal="true" aria-label="장면·삽화 제어함"></div>
 
 <div id="login">
@@ -4391,9 +6125,12 @@ function renderWebApp() {
   <header>
     <div class="h-left" onclick="switchTab('bots')" style="cursor:pointer;" title="봇/채팅방 목록">
       <span class="dot" id="pcDot"></span>
-      <div style="min-width:0;">
+      <div style="min-width:0; flex:1;">
         <div class="h-title" id="hdrChar">연결 중...</div>
-        <div class="h-sub" id="hdrSub">-</div>
+        <div class="h-sub-row">
+          <div class="h-sub" id="hdrSub">-</div>
+          <div class="hdr-act-bar" id="hdrActivityBar" onclick="event.stopPropagation()"></div>
+        </div>
       </div>
     </div>
     <div class="h-right">
@@ -4401,10 +6138,12 @@ function renderWebApp() {
       <button class="pill icon-pill" id="reqLogQuickBtn" title="리퀘스트 로그 보기" aria-label="리퀘스트 로그">📜</button>
       <button class="pill icon-pill" id="assetCycleBtn" title="에셋 표시 / 가리기 / 감추기" aria-label="에셋 표시 모드">🖼️</button>
       <button class="pill icon-pill" id="autoTrBtn" title="응답 자동 번역" aria-label="응답 자동 번역">🌐</button>
+      <button class="pill icon-pill" id="zenModeBtn" title="집중 모드 (상·하단바 숨김 + 플로팅 미니바)" aria-label="집중 모드">🧘</button>
       <button class="pill icon-pill" id="readBarToggle" title="테마·글꼴·에셋 설정" aria-label="화면 설정" aria-expanded="false" style="font-weight:800;">Aa</button>
     </div>
+  </header>
 
-    <div class="read-bar" id="readBar" role="dialog" aria-label="화면 설정">
+  <div class="read-bar" id="readBar" role="dialog" aria-label="화면 설정">
       <div class="rb-sec">
         <div class="rb-label">테마</div>
         <div class="theme-grid" id="themeGrid">
@@ -4446,11 +6185,14 @@ function renderWebApp() {
         <div class="rb-label">봇 정규식 UI (HTML)</div>
         <button class="pill" id="richHtmlBtn" style="align-self:flex-start;">✨ 봇 정규식 UI: 켜짐</button>
       </div>
+      <div class="rb-sec">
+        <div class="rb-label">플로팅 도구</div>
+        <button class="pill" id="openPlgFloatingBtn" type="button" style="align-self:flex-start;">🎛️ 플러그인 플로팅 컨트롤</button>
+      </div>
       <div class="rb-sec" style="border-top:1px solid var(--border); padding-top:10px;">
         <button class="btn sec" id="logoutBtn" style="width:100%;">🔒 로그아웃 / 토큰 변경</button>
       </div>
-    </div>
-  </header>
+  </div>
 
   <!-- TAB 1: CHAT / EPUB READER -->
   <section class="panel active" id="tab-chat"></section>
@@ -4484,21 +6226,22 @@ function renderWebApp() {
           <span id="localToggleBadge" class="badge">로컬 토글</span>
         </span>
       </h3>
-      <div class="leave-preset-bar">
+      <div class="leave-preset-bar" id="leavePresetBar">
         <div class="leave-preset-info">
           <b>🍃 Leave · 방랑 사서의 서가 r1.1</b>
           <span>내장 AI 프리셋 토글 · RisuAI 임포트 RISUP · 가이드</span>
         </div>
         <div class="leave-preset-btns">
-          <button type="button" class="pill" onclick="installBundledLeaveToggle()">🍃 Leave r1.1 토글 등록</button>
+          <button type="button" class="pill" onclick="installBundledLeaveToggle()">🔄 Leave 토글 동기화</button>
           <button type="button" class="pill" onclick="downloadLeavePreset()">⬇️ RISUP 받기</button>
           <button type="button" class="pill" onclick="openLeavePresetGuide()">📖 가이드</button>
         </div>
       </div>
       <div id="presetToggleAdder" style="display:none; margin-bottom:12px; padding:12px; border-radius:12px; background:var(--bg); border:1px solid var(--border);">
         <div style="font-size:11.5px; color:var(--sub); line-height:1.5; margin-bottom:6px;">
-          RisuAI 보안 정책상 프롬프트 프리셋 토글은 플러그인이 직접 읽을 수 없습니다. PC RisuAI 프리셋 설정의 <b>커스텀 토글</b> 텍스트를 아래에 한 번만 붙여넣어 두면, 모든 체크박스·드롭다운이 로컬 토글로 즉시 연동됩니다.
+          원격 프롬으로 등록된 프리셋의 자체 토글은 선택 시 <b>자동 등록·연동</b>됩니다. 수동으로 추가할 때는 아래에 커스텀 토글 텍스트를 붙여넣고 필요 시 부모 원격 프롬을 지정하세요.
         </div>
+        <select class="f-inp" id="ptParentPreset" style="margin-bottom:6px;"></select>
         <input class="f-inp" id="ptName" placeholder="프리셋 이름 (예: Leave · 방랑 사서의 서가 r1.1)" style="margin-bottom:6px;" />
         <textarea class="f-inp" id="ptSyntax" rows="5" placeholder="RisuAI 프리셋의 커스텀 토글 텍스트를 그대로 붙여넣기..."></textarea>
         <div class="btn-row">
@@ -4797,13 +6540,17 @@ function renderWebApp() {
         </div>
       </div>
       <div class="hint" style="margin-bottom:8px;">
-        PC RisuAI 프록시(<code>/v1/chat/completions</code>), 원격 직접 채팅/리롤, 번역기에서 나간 최근 40건의 요청·응답 로그를 서버 메모리에 보관합니다. API 키와 인증 토큰은 자동 마스킹됩니다.
+        PC RisuAI 프록시(<code>/v1/chat/completions</code>), 원격 직접 채팅/리롤, 번역기에서 나간 최근 40건의 요청·응답 로그를 서버 메모리에 보관합니다. 같은 서사 요청만 그룹화해 프롬프트 캐싱 깨짐 여부를 실시간 감시하며, 하야쿠·플래시백·보조 호출은 자동 제외됩니다.
       </div>
+      <div id="reqLogCgSummary" class="cg-summary-bar" style="display:none;"></div>
       <div class="req-log-filters" id="reqLogFilters">
         <button type="button" class="pill active" data-log-filter="all">전체</button>
         <button type="button" class="pill" data-log-filter="proxy">프록시</button>
         <button type="button" class="pill" data-log-filter="direct">원격 채팅/리롤</button>
         <button type="button" class="pill" data-log-filter="translate">번역</button>
+        <button type="button" class="pill" data-log-filter="narrative">🛡️ 서사 감시</button>
+        <button type="button" class="pill" data-log-filter="broken">⚠️ 캐시 깨짐</button>
+        <button type="button" class="pill" id="reqLogGroupToggle">📂 그룹별 보기</button>
       </div>
       <div id="reqLogList" class="req-log-list"><div style="font-size:12.5px; color:var(--sub);">아직 기록된 요청이 없습니다.</div></div>
     </div>
@@ -4867,8 +6614,16 @@ function renderWebApp() {
     lh: Number(localStorage.getItem('rs_lh')) || 1.75,
     assetMode: localStorage.getItem('rs_asset_mode') || (localStorage.getItem('rs_stealth') === '1' ? 'hide' : 'show'),
     richHtml: localStorage.getItem('rs_rich_html') !== '0',
+    zenMode: localStorage.getItem('rs_zen_mode') === '1',
   };
   const openToggleGroups = new Set();
+  let latestPluginFloatingUi = { rev: '', buttons: [], rootWidgets: [] };
+  let lastFloatingModalSig = '';
+  // ===== RisuStand Floating Mini-Bar state (initialized before initial applyUiPrefs()) =====
+  let rsMiniBarMinimized = localStorage.getItem('rs_minibar_min') !== '0';
+  let rsMiniBarAutoTimer = null;
+  let rsMiniBarDrag = null;
+  let lastRsMiniBarSig = '';
 
   function isBookMode() {
     return uiPref.theme === 'epub-2p-day' || uiPref.theme === 'epub-2p-night';
@@ -4881,6 +6636,7 @@ function renderWebApp() {
     document.documentElement.style.setProperty('--lh', String(uiPref.lh));
     document.body.classList.toggle('asset-blur', uiPref.assetMode === 'blur');
     document.body.classList.toggle('asset-hide', uiPref.assetMode === 'hide');
+    document.body.classList.toggle('rs-zen-mode', Boolean(uiPref.zenMode));
     document.querySelectorAll('.theme-chip').forEach((c) => c.classList.toggle('active', c.getAttribute('data-theme-key') === uiPref.theme));
     document.body.classList.toggle('book-mode', isBookMode());
     const bgCol = getComputedStyle(document.documentElement).getPropertyValue('--bg').trim();
@@ -4900,12 +6656,41 @@ function renderWebApp() {
       rhb.textContent = '✨ 봇 정규식 UI: ' + (uiPref.richHtml ? '켜짐' : '꺼짐');
       rhb.className = 'pill' + (uiPref.richHtml ? ' active' : '');
     }
+    const zmb = document.getElementById('zenModeBtn');
+    if (zmb) {
+      zmb.className = 'pill icon-pill' + (uiPref.zenMode ? ' active' : '');
+      zmb.setAttribute('aria-pressed', uiPref.zenMode ? 'true' : 'false');
+    }
     localStorage.setItem('rs_theme', uiPref.theme);
     localStorage.setItem('rs_font', uiPref.font);
     localStorage.setItem('rs_fsize', String(uiPref.fsize));
     localStorage.setItem('rs_lh', String(uiPref.lh));
     localStorage.setItem('rs_asset_mode', uiPref.assetMode);
     localStorage.setItem('rs_rich_html', uiPref.richHtml ? '1' : '0');
+    localStorage.setItem('rs_zen_mode', uiPref.zenMode ? '1' : '0');
+    if (typeof renderRsMiniBar === 'function') renderRsMiniBar();
+  }
+  function setZenMode(nextZen) {
+    uiPref.zenMode = Boolean(nextZen);
+    if (typeof setReadBar === 'function') setReadBar(false);
+    if (uiPref.zenMode) {
+      rsMiniBarMinimized = false;
+      try { localStorage.setItem('rs_minibar_min', '0'); } catch (_) {}
+      applyUiPrefs();
+      if (typeof scheduleRsMiniBarAutoMin === 'function') scheduleRsMiniBarAutoMin();
+      toast('집중 모드 켜짐 (플로팅 미니바로 제어·해제)');
+    } else {
+      if (typeof clearRsMiniBarTimer === 'function') clearRsMiniBarTimer();
+      applyUiPrefs();
+      toast('집중 모드 꺼짐');
+    }
+    if (isBookMode() && typeof layoutBookSpreads === 'function') {
+      requestAnimationFrame(() => layoutBookSpreads(false));
+    }
+  }
+  const zenModeBtn = document.getElementById('zenModeBtn');
+  if (zenModeBtn) {
+    zenModeBtn.onclick = () => setZenMode(!uiPref.zenMode);
   }
   document.getElementById('richHtmlBtn').onclick = () => {
     uiPref.richHtml = !uiPref.richHtml;
@@ -4918,6 +6703,11 @@ function renderWebApp() {
     uiPref.assetMode = mode;
     applyUiPrefs();
     if (lastState) applyState(lastState);
+    if (typeof isPluginFloatingModalOpen === 'function' && isPluginFloatingModalOpen()) renderPluginFloatingModal(true);
+    const scm = document.getElementById('sceneCtrlModal');
+    if (scm && scm.style.display === 'flex' && typeof openSceneCtrlModal === 'function') {
+      openSceneCtrlModal();
+    }
     const labels = { show: '에셋 표시', blur: '에셋 가리기 (터치 시 확인)', hide: '에셋 완전 감추기 (스텔스)' };
     toast(labels[mode] || mode);
   };
@@ -5215,7 +7005,7 @@ function renderWebApp() {
     return out;
   }
 
-  function sanitizeBotNode(node) {
+  function sanitizeBotNode(node, scopeSel = '.rs-bot-html') {
     const kids = Array.from(node.childNodes || []);
     for (const ch of kids) {
       if (ch.nodeType === 8) {
@@ -5235,7 +7025,7 @@ function renderWebApp() {
         ch.removeAttribute('enctype');
       }
       if (tag === 'style') {
-        ch.textContent = scopeBotCss(sanitizeBotCss(ch.textContent || ''));
+        ch.textContent = scopeBotCss(sanitizeBotCss(ch.textContent || ''), scopeSel);
         continue;
       }
       const attrs = Array.from(ch.attributes || []);
@@ -5262,7 +7052,22 @@ function renderWebApp() {
         if (!ch.getAttribute('loading')) ch.setAttribute('loading', 'lazy');
         if (!ch.getAttribute('decoding')) ch.setAttribute('decoding', 'async');
       }
-      sanitizeBotNode(ch);
+      sanitizeBotNode(ch, scopeSel);
+    }
+  }
+
+  function sanitizePluginWidgetHtml(rawHtml, scopeSel, assetMap) {
+    const withAssets = resolveAssetTokens(rawHtml || '', assetMap);
+    if (!withAssets) return '';
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString('<div id="__rs_root">' + withAssets + '</div>', 'text/html');
+      const root = doc.getElementById('__rs_root');
+      if (!root) return esc(withAssets);
+      sanitizeBotNode(root, scopeSel);
+      return root.innerHTML;
+    } catch (_) {
+      return esc(withAssets);
     }
   }
 
@@ -5297,14 +7102,42 @@ function renderWebApp() {
     }
   }
 
+  function stripBotFixedMenuNodes(container) {
+    if (!container) return;
+    container.querySelectorAll('input[type="checkbox"], input[type="radio"], .buttons-container, .side-panel, .overlay, .floating').forEach((n) => n.remove());
+  }
+
+  function containerHasBotFixedMenu(container) {
+    if (!container) return false;
+    let hasFixed = false;
+    container.querySelectorAll('style').forEach((st) => {
+      if (/position\\s*:\\s*fixed/i.test(st.textContent || '')) hasFixed = true;
+    });
+    if (!hasFixed) {
+      for (const ch of Array.from(container.children || [])) {
+        const tag = (ch.tagName || '').toLowerCase();
+        if (tag === 'div' && /(?:buttons-container|side-panel|overlay|floating)/i.test(ch.className || '')) {
+          const stAttr = ch.getAttribute('style') || '';
+          if (/position\\s*:\\s*fixed/i.test(stAttr) || /(?:buttons-container|floating)/i.test(ch.className || '')) {
+            hasFixed = true;
+            break;
+          }
+        }
+      }
+    }
+    return hasFixed;
+  }
+
   function syncBotBackground(bgHtml, assetMap) {
     const host = document.getElementById('botBgHost');
     if (!host) return;
     const raw = uiPref.richHtml ? String(bgHtml || '') : '';
     const sig = raw ? (hashStr(raw) + ':' + Object.keys(assetMap || {}).length) : '';
-    if (sig === lastBgHtmlSig) return;
-    lastBgHtmlSig = sig;
-    host.innerHTML = raw ? renderBotRichHtml(raw, assetMap) : '';
+    if (sig !== lastBgHtmlSig) {
+      lastBgHtmlSig = sig;
+      host.innerHTML = raw ? renderBotRichHtml(raw, assetMap) : '';
+    }
+    stripBotFixedMenuNodes(host);
   }
 
   let activeModalKeyHandler = null;
@@ -5375,21 +7208,31 @@ function renderWebApp() {
     const baseAnswers = Array.isArray(ev.answersSoFar) ? ev.answersSoFar.slice() : [];
     const sendAnswer = async (ans) => {
       closeTriggerModal();
-      await api('/api/command', {
-        method: 'POST',
-        body: JSON.stringify({
-          type: 'run_trigger',
-          payload: {
+      try {
+        const res = await api('/api/triggers/run', {
+          method: 'POST',
+          body: JSON.stringify({
             charIndex: ev.charIndex,
             chatIndex: ev.chatIndex,
             trigger: ev.trigger,
             promptAnswers: baseAnswers.concat([String(ans)]),
-          },
-        }),
-      });
-      toast('적용 중...');
-      setTimeout(pollState, 300);
-      setTimeout(pollState, 850);
+          }),
+        });
+        toast('적용 중...');
+        if (res && res.pause) { showTriggerModal(res.pause); return; }
+        if (res && res.triggerEvent && res.triggerEvent.id && res.triggerEvent.id !== lastHandledTriggerEventId) {
+          lastHandledTriggerEventId = res.triggerEvent.id;
+          if (res.triggerEvent.kind === 'notice' || res.triggerEvent.kind === 'alert_error') showTriggerModal(res.triggerEvent);
+        }
+        if (res && res.snapshot && lastState) {
+          if (typeof res.snapshotVersion === 'number') knownSnapshotVer = res.snapshotVersion;
+          applyState({ ...lastState, snapshot: res.snapshot, snapshotVersion: res.snapshotVersion ?? lastState.snapshotVersion });
+        } else {
+          setTimeout(pollState, 220);
+        }
+      } catch (err) {
+        toast('적용 오류: ' + (err && err.message ? err.message : '실패'));
+      }
     };
 
     if (ev.kind === 'prompt_select') {
@@ -5485,6 +7328,7 @@ function renderWebApp() {
   function logoutToLogin(reason) {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     if (updPolling) { clearInterval(updPolling); updPolling = null; }
+    if (typeof disconnectActivityStream === 'function') disconnectActivityStream();
     isStatePolling = false;
     knownCatalogVer = -1;
     knownSnapshotVer = -1;
@@ -5520,6 +7364,95 @@ function renderWebApp() {
     if (tab === 'modules') { renderModules(); refreshUpdateStatus(); }
   }
 
+  let activityAbortCtrl = null;
+  let activityRetryTimer = null;
+  let lastActivitySig = '';
+  let lastActivitySeq = -1;
+  function renderHdrActivity(actData) {
+    const bar = document.getElementById('hdrActivityBar');
+    if (!bar) return;
+    if (actData && typeof actData.seq === 'number') {
+      if (actData.seq < lastActivitySeq) return;
+      lastActivitySeq = actData.seq;
+    }
+    const active = Array.isArray(actData && actData.active) ? actData.active : [];
+    const recent = Array.isArray(actData && actData.recent) ? actData.recent : [];
+    const sig = JSON.stringify([
+      active.map((x) => [x.kind, x.stage, x.step, x.total, x.name, x.phase]),
+      recent.map((x) => [x.kind, x.stage, x.step, x.total, x.name, x.phase]),
+    ]);
+    if (sig === lastActivitySig) return;
+    lastActivitySig = sig;
+    if (!active.length && !recent.length) {
+      bar.innerHTML = '';
+      bar.removeAttribute('title');
+      return;
+    }
+    const fmtActive = (item) => {
+      const stageTag = item.stage
+        ? ('[' + item.stage + (item.total > 0 ? ' ' + item.step + '/' + item.total : '') + '] ')
+        : '';
+      return stageTag + item.name + (item.phase ? ' · ' + item.phase : '');
+    };
+    const fmtRecent = (item) => {
+      const stageTag = item.stage ? (item.stage + ' 완료 · ') : '';
+      return stageTag + item.name;
+    };
+    if (active.length) {
+      const first = active[0];
+      const txt = fmtActive(first) + (active.length > 1 ? ' +' + (active.length - 1) : '');
+      bar.title = active.map(fmtActive).join('\\n');
+      bar.innerHTML = '<span class="hdr-act-pill"><span class="hdr-act-dot"></span><span>' + esc(txt) + '</span></span>';
+    } else {
+      const latest = recent[recent.length - 1];
+      const txt = fmtRecent(latest);
+      bar.title = recent.map(fmtRecent).join('\\n');
+      bar.innerHTML = '<span class="hdr-act-pill recent"><span>✓</span><span>' + esc(txt) + '</span></span>';
+    }
+  }
+  function disconnectActivityStream() {
+    if (activityRetryTimer) { clearTimeout(activityRetryTimer); activityRetryTimer = null; }
+    if (activityAbortCtrl) { try { activityAbortCtrl.abort(); } catch (_) {} activityAbortCtrl = null; }
+    lastActivitySig = '';
+    lastActivitySeq = -1;
+    const bar = document.getElementById('hdrActivityBar');
+    if (bar) { bar.innerHTML = ''; bar.removeAttribute('title'); }
+  }
+  async function connectActivityStream() {
+    disconnectActivityStream();
+    if (!token) return;
+    const ctrl = new AbortController();
+    activityAbortCtrl = ctrl;
+    try {
+      const resp = await fetch('/api/activity/stream', {
+        headers: { 'X-RisuStand-Token': token },
+        signal: ctrl.signal,
+      });
+      if (!resp.ok || !resp.body) throw new Error('SSE HTTP ' + resp.status);
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (activityAbortCtrl === ctrl) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let nlIdx;
+        while ((nlIdx = buf.indexOf('\\n')) >= 0) {
+          const line = buf.slice(0, nlIdx).trim();
+          buf = buf.slice(nlIdx + 1);
+          if (line.startsWith('data:')) {
+            try { renderHdrActivity(JSON.parse(line.slice(5).trim())); } catch (_) {}
+          }
+        }
+      }
+    } catch (_) {}
+    if (activityAbortCtrl === ctrl && token) {
+      activityRetryTimer = setTimeout(() => {
+        if (activityAbortCtrl === ctrl) connectActivityStream();
+      }, 2500);
+    }
+  }
+
   async function tryLogin(t) {
     token = t.trim();
     knownCatalogVer = -1;
@@ -5533,6 +7466,7 @@ function renderWebApp() {
       document.getElementById('app').style.display = 'grid';
       await loadRouterConfig();
       applyState(st);
+      connectActivityStream();
       if (pollTimer) clearInterval(pollTimer);
       pollTimer = setInterval(pollState, 2000);
     } catch (e) {
@@ -5630,6 +7564,14 @@ function renderWebApp() {
 
   function applyState(st) {
     lastState = st;
+    if (st.runtimeActivity) renderHdrActivity(st.runtimeActivity);
+    if (st.pluginFloatingUi) {
+      latestPluginFloatingUi = st.pluginFloatingUi;
+      if (typeof renderRsMiniBar === 'function') renderRsMiniBar(false);
+      if (typeof isPluginFloatingModalOpen === 'function' && isPluginFloatingModalOpen()) {
+        renderPluginFloatingModal(false);
+      }
+    }
     const snap = st.snapshot || {};
     syncLeaveHudVisibility(snap);
     document.getElementById('pcDot').className = 'dot' + (st.pcConnected ? ' on' : '');
@@ -5686,7 +7628,7 @@ function renderWebApp() {
         }
       }
     }
-    const msgDigest = hashStr(msgs.map((m) => m.index + ':' + (m.text || '') + ':' + (m.html || '') + ':' + (m.swipeCount || 1) + ':' + (m.swipeIndex || 0) + ':' + (m.images ? m.images.length : 0)).join('\\x01'));
+    const msgDigest = hashStr(msgs.map((m) => m.index + ':' + (m.text || '') + ':' + (m.html || '') + ':' + (m.pluginFooterHtml || '') + ':' + (m.swipeCount || 1) + ':' + (m.swipeIndex || 0) + ':' + (m.images ? m.images.length : 0)).join('\\x01'));
     const sig = JSON.stringify([snap.charIndex, snap.chatIndex, snap.fmIndex, snap.firstMessageCount, snap.greetingControls || [], snap.backgroundHtml || '', hashStr(snap.botWidgetHtml || ''), Object.keys(snap.assetMap || {}).length, msgs.length, msgDigest, uiPref.theme, uiPref.assetMode, uiPref.richHtml]);
     if (sig !== lastChatRenderSig) {
       lastChatRenderSig = sig;
@@ -5729,15 +7671,14 @@ function renderWebApp() {
     const controls = [];
     try {
       const doc = new DOMParser().parseFromString('<div>' + raw + '</div>', 'text/html');
-      doc.querySelectorAll('[data-am-illustration-action], [data-am-chat-history-action], [data-am-chat-regenerate-action], [data-am-manual-generate-action]').forEach((el) => {
+      doc.querySelectorAll('[data-am-chat-history-action], [data-am-chat-regenerate-action], [data-am-manual-generate-action]').forEach((el) => {
         const ds = {};
         for (const a of Array.from(el.attributes || [])) {
           if (a.name.startsWith('data-')) ds[a.name] = a.value;
         }
         let label = (el.textContent || '').replace(/\\s+/g, ' ').trim();
         if (!label) {
-          if (ds['data-am-illustration-action']) label = '✨ 삽화 생성';
-          else if (ds['data-am-chat-regenerate-action']) label = '↻ 삽화 재생성';
+          if (ds['data-am-chat-regenerate-action']) label = '↻ 삽화 재생성';
           else if (ds['data-am-chat-history-action'] === 'previous') label = '◀ 이전 삽화';
           else if (ds['data-am-chat-history-action'] === 'next') label = '다음 삽화 ▶';
           else if (ds['data-am-manual-generate-action']) label = '🎨 수동 생성';
@@ -5751,6 +7692,11 @@ function renderWebApp() {
       });
     } catch (_) {}
     return controls;
+  }
+
+  function renderPluginFooterHostHtml(m, assetMap) {
+    if (!m || !m.pluginFooterHtml) return '';
+    return '<div class="rs-am-footer-host">' + sanitizePluginWidgetHtml(m.pluginFooterHtml, '.rs-am-footer-host', assetMap || {}) + '</div>';
   }
 
   function renderPluginBubbleBarHtml(m) {
@@ -5808,9 +7754,10 @@ function renderWebApp() {
         ? esc(trText)
         : (useRich ? '<div class="rs-bot-html">' + renderBotRichHtml(m.html, snap.assetMap) + '</div>' : renderInlineBody(m.text, m.images));
       const isLatestChar = m.index >= 0 && !isUser && (m.index === lastIdx || (lastIdx < 0 && mi === msgs.length - 1));
-      out += '<div class="' + (isUser ? 'book-user-block' : 'book-char-block') + '">';
+      out += '<div class="' + (isUser ? 'book-user-block' : 'book-char-block') + '" data-msg-idx="' + m.index + '" data-chat-id="' + esc(m.chatId || '') + '">';
       out += '<div class="book-turn-tag">' + esc(isUser ? '나' : displayBotName(snap.charName)) + '</div>';
       out += '<div>' + bodyHtml + '</div>';
+      out += renderPluginFooterHostHtml(m, snap.assetMap);
       out += renderMsgActionBarHtml(m, snap, key, showTr, isLatestChar, true);
       out += '</div>';
     }
@@ -6115,6 +8062,9 @@ function renderWebApp() {
     }
   }
 
+  let lastBotOverlaySig = '';
+  let cachedBotFabWidth = 0;
+
   function syncBotMenuVisibility() {
     const overlay = document.getElementById('bookBotOverlay');
     const fab = document.getElementById('botMenuFab');
@@ -6125,24 +8075,30 @@ function renderWebApp() {
       if (botMenuAutoTimer) { clearTimeout(botMenuAutoTimer); botMenuAutoTimer = null; }
       return;
     }
-    if (fabCol.offsetWidth >= 42 && fabCol.offsetWidth <= 72) {
-      fab.style.setProperty('--bot-fab-w', fabCol.offsetWidth + 'px');
-    } else {
-      fab.style.removeProperty('--bot-fab-w');
+    if (!cachedBotFabWidth) {
+      const w = fabCol.offsetWidth;
+      if (w >= 42 && w <= 72) cachedBotFabWidth = w;
     }
+    if (cachedBotFabWidth) fab.style.setProperty('--bot-fab-w', cachedBotFabWidth + 'px');
+    else fab.style.removeProperty('--bot-fab-w');
+
     fab.style.display = 'inline-flex';
     overlay.classList.toggle('bot-menu-collapsed', !botMenuExpanded);
     fab.classList.toggle('expanded', botMenuExpanded);
-    fab.innerHTML = botMenuExpanded
-      ? '<span class="bmf-ic">▸</span><span class="bmf-lb">접기</span>'
-      : '<span class="bmf-ic">☰</span><span class="bmf-lb">메뉴</span>';
+    const icEl = fab.querySelector('.bmf-ic');
+    const lbEl = fab.querySelector('.bmf-lb');
+    if (icEl && lbEl) {
+      icEl.textContent = botMenuExpanded ? '▸' : '☰';
+      lbEl.textContent = botMenuExpanded ? '접기' : '메뉴';
+    }
   }
 
   function scheduleBotMenuAutoHide() {
     if (botMenuAutoTimer) { clearTimeout(botMenuAutoTimer); botMenuAutoTimer = null; }
   }
 
-  document.getElementById('botMenuFab').onclick = () => {
+  document.getElementById('botMenuFab').onclick = (e) => {
+    if (e) e.stopPropagation();
     botMenuExpanded = !botMenuExpanded;
     syncBotMenuVisibility();
     if (botMenuExpanded) scheduleBotMenuAutoHide();
@@ -6152,80 +8108,79 @@ function renderWebApp() {
   function hoistBotFixedWidgets(rootEl) {
     const overlay = document.getElementById('bookBotOverlay');
     if (!overlay || !rootEl) return;
-    overlay.innerHTML = '';
-
-    const extractFixedFromContainer = (container) => {
-      if (!container) return;
-      let hasFixed = false;
-      container.querySelectorAll('style').forEach((st) => {
-        if (/position\\s*:\\s*fixed/i.test(st.textContent || '')) hasFixed = true;
-      });
-      if (!hasFixed) {
-        for (const ch of Array.from(container.children)) {
-          const tag = (ch.tagName || '').toLowerCase();
-          if (tag === 'div' && /(?:buttons-container|side-panel|overlay|floating)/i.test(ch.className || '')) {
-            const stAttr = ch.getAttribute('style') || '';
-            if (/position\\s*:\\s*fixed/i.test(stAttr) || /(?:buttons-container|floating)/i.test(ch.className || '')) {
-              hasFixed = true;
-              break;
-            }
-          }
-        }
-      }
-      if (!hasFixed) return;
-      const hostWrap = document.createElement('div');
-      hostWrap.className = 'rs-bot-html';
-      let moved = false;
-      for (const ch of Array.from(container.children)) {
-        const tag = (ch.tagName || '').toLowerCase();
-        if (tag === 'style' && /position\\s*:\\s*fixed/i.test(ch.textContent || '')) {
-          hostWrap.appendChild(ch.cloneNode(true));
-        } else if (
-          (tag === 'input' && (ch.type === 'checkbox' || ch.type === 'radio')) ||
-          (tag === 'div' && /(?:buttons-container|side-panel|overlay|floating)/i.test(ch.className || ''))
-        ) {
-          if (tag === 'div' && /(?:buttons-container|floating)/i.test(ch.className || '')) {
-            ch.setAttribute('data-rs-bot-fab', '1');
-          }
-          hostWrap.appendChild(ch);
-          moved = true;
-        }
-      }
-      if (moved) overlay.appendChild(hostWrap);
-    };
-
-    rootEl.querySelectorAll('.rs-bot-html').forEach(extractFixedFromContainer);
 
     const snap = (lastState && lastState.snapshot) || null;
-    if (uiPref.richHtml && snap && !overlay.querySelector('[data-rs-bot-fab="1"]')) {
-      if (snap.botWidgetHtml) {
-        const tmp = document.createElement('div');
-        tmp.className = 'rs-bot-html';
-        tmp.innerHTML = renderBotRichHtml(snap.botWidgetHtml, snap.assetMap);
-        extractFixedFromContainer(tmp);
-      }
-      if (!overlay.querySelector('[data-rs-bot-fab="1"]') && snap.backgroundHtml && /(?:buttons-container|side-panel|floating)/i.test(snap.backgroundHtml)) {
-        const bgHost = document.getElementById('botBgHost');
-        if (bgHost) {
-          bgHost.querySelectorAll('input[type="checkbox"], input[type="radio"], .buttons-container, .side-panel, .overlay, .floating').forEach((n) => n.remove());
+    const hasInlineFixed = Boolean(rootEl.querySelector('.rs-bot-html .buttons-container, .rs-bot-html .side-panel, .rs-bot-html .floating'));
+    const nextOverlaySig = JSON.stringify([
+      snap ? snap.charIndex : -1,
+      snap ? snap.chatIndex : -1,
+      Boolean(uiPref.richHtml),
+      snap && snap.botWidgetHtml ? hashStr(snap.botWidgetHtml) : '',
+      snap && snap.backgroundHtml ? hashStr(snap.backgroundHtml) : '',
+      hasInlineFixed ? lastChatRenderSig : '',
+    ]);
+
+    if (nextOverlaySig !== lastBotOverlaySig || (hasInlineFixed && !overlay.children.length)) {
+      lastBotOverlaySig = nextOverlaySig;
+      cachedBotFabWidth = 0;
+      overlay.innerHTML = '';
+
+      const extractFixedFromContainer = (container) => {
+        if (!container || !containerHasBotFixedMenu(container)) return;
+        const hostWrap = document.createElement('div');
+        hostWrap.className = 'rs-bot-html';
+        let moved = false;
+        for (const ch of Array.from(container.children)) {
+          const tag = (ch.tagName || '').toLowerCase();
+          if (tag === 'style' && /position\\s*:\\s*fixed/i.test(ch.textContent || '')) {
+            hostWrap.appendChild(ch.cloneNode(true));
+          } else if (
+            (tag === 'input' && (ch.type === 'checkbox' || ch.type === 'radio')) ||
+            (tag === 'div' && /(?:buttons-container|side-panel|overlay|floating)/i.test(ch.className || ''))
+          ) {
+            if (tag === 'div' && /(?:buttons-container|floating)/i.test(ch.className || '')) {
+              ch.setAttribute('data-rs-bot-fab', '1');
+            }
+            hostWrap.appendChild(ch);
+            moved = true;
+          }
         }
-        const tmpBg = document.createElement('div');
-        tmpBg.className = 'rs-bot-html';
-        tmpBg.innerHTML = renderBotRichHtml(snap.backgroundHtml, snap.assetMap);
-        extractFixedFromContainer(tmpBg);
+        if (moved) overlay.appendChild(hostWrap);
+      };
+
+      const matchedContainers = Array.from(rootEl.querySelectorAll('.rs-bot-html')).filter(containerHasBotFixedMenu);
+      if (matchedContainers.length > 0) {
+        const winner = matchedContainers[matchedContainers.length - 1];
+        extractFixedFromContainer(winner);
+      }
+
+      if (uiPref.richHtml && snap && !overlay.querySelector('[data-rs-bot-fab="1"]')) {
+        if (snap.botWidgetHtml) {
+          const tmp = document.createElement('div');
+          tmp.className = 'rs-bot-html';
+          tmp.innerHTML = renderBotRichHtml(snap.botWidgetHtml, snap.assetMap);
+          extractFixedFromContainer(tmp);
+        }
+        if (!overlay.querySelector('[data-rs-bot-fab="1"]') && snap.backgroundHtml && /(?:buttons-container|side-panel|floating)/i.test(snap.backgroundHtml)) {
+          const tmpBg = document.createElement('div');
+          tmpBg.className = 'rs-bot-html';
+          tmpBg.innerHTML = renderBotRichHtml(snap.backgroundHtml, snap.assetMap);
+          extractFixedFromContainer(tmpBg);
+        }
       }
     }
 
-    let mayHaveFixedCover = Boolean(rootEl.querySelector('.rs-bot-html [style*="fixed" i]'));
-    if (!mayHaveFixedCover) {
-      rootEl.querySelectorAll('.rs-bot-html style').forEach((st) => {
-        if (/position\\s*:\\s*fixed/i.test(st.textContent || '')) mayHaveFixedCover = true;
-      });
-    }
-    if (mayHaveFixedCover && typeof window.getComputedStyle === 'function') {
+    // Never allow duplicate un-collapsed bot menu copies to remain inside chat bubbles or background host
+    rootEl.querySelectorAll('.rs-bot-html').forEach((c) => {
+      if (containerHasBotFixedMenu(c)) stripBotFixedMenuNodes(c);
+    });
+    stripBotFixedMenuNodes(document.getElementById('botBgHost'));
+
+    const fixedStyleEls = rootEl.querySelectorAll('.rs-bot-html [style*="fixed" i]');
+    if (fixedStyleEls.length && typeof window.getComputedStyle === 'function') {
       const vw = window.innerWidth || 0;
       const vh = window.innerHeight || 0;
-      rootEl.querySelectorAll('.rs-bot-html *').forEach((el) => {
+      fixedStyleEls.forEach((el) => {
         const cs = window.getComputedStyle(el);
         if (cs && cs.position === 'fixed') {
           const rect = el.getBoundingClientRect();
@@ -6243,13 +8198,11 @@ function renderWebApp() {
 
   function renderChat() {
     const box = document.getElementById('tab-chat');
-    const overlay = document.getElementById('bookBotOverlay');
     const snap = (lastState && lastState.snapshot) || {};
     const msgs = snap.messages || [];
     const checkedBotIds = captureCheckedBotIds();
 
     if (isBookMode()) {
-      if (overlay) overlay.innerHTML = '';
       const singleInit = window.innerWidth < 700;
       box.innerHTML =
         '<div class="book-shell">' +
@@ -6421,7 +8374,6 @@ function renderWebApp() {
     }
 
     // Standard Scroll Mode (Gemini / Claude / ChatGPT / EPUB 1p / Glass / Sakura / Moss)
-    if (overlay) overlay.innerHTML = '';
     const prevScrollTop = box.scrollTop;
     const nearBottom = box.scrollHeight - prevScrollTop - box.clientHeight < 140;
     const autoTr = Boolean(routerCfg && routerCfg.translator && routerCfg.translator.autoTranslateOutput);
@@ -6442,9 +8394,9 @@ function renderWebApp() {
           ? '<div class="rs-bot-html">' + renderBotRichHtml(m.html, snap.assetMap) + '</div>'
           : renderInlineBody(m.text, m.images);
         const isLatestChar = m.index >= 0 && !isUser && (m.index === lastIdx || (lastIdx < 0 && mi === msgs.length - 1));
-        html += '<div class="msg-wrap ' + (isUser ? 'user' : 'char') + '">';
+        html += '<div class="msg-wrap ' + (isUser ? 'user' : 'char') + '" data-msg-idx="' + m.index + '" data-chat-id="' + esc(m.chatId || '') + '">';
         html += '<div class="msg-role">' + esc(isUser ? '나' : displayBotName(snap.charName)) + '</div>';
-        html += '<div class="msg-bubble">' + bodyHtml + '</div>';
+        html += '<div class="msg-bubble">' + bodyHtml + renderPluginFooterHostHtml(m, snap.assetMap) + '</div>';
         if (showTr && trText) html += '<div class="tr-box">' + esc(trText) + '</div>';
         html += renderMsgActionBarHtml(m, snap, key, showTr, isLatestChar, false);
         html += '</div>';
@@ -6468,7 +8420,7 @@ function renderWebApp() {
     if (botMenuExpanded) scheduleBotMenuAutoHide();
   });
 
-  async function dispatchPluginSurfaceAction(msgIndex, actionHtml, dataset) {
+  async function dispatchPluginSurfaceAction(msgIndex, actionHtml, dataset, chatId = '') {
     const snap = lastState && lastState.snapshot;
     if (!snap || snap.charIndex < 0) return;
     toast('플러그인 액션 실행 중...');
@@ -6479,12 +8431,15 @@ function renderWebApp() {
           charIndex: snap.charIndex,
           chatIndex: snap.chatIndex,
           msgIndex: Number(msgIndex ?? -1),
+          chatId: String(chatId || ''),
           actionHtml: String(actionHtml || ''),
           dataset: dataset || {},
         }),
       });
-      setTimeout(pollState, 300);
-      setTimeout(pollState, 1200);
+      setTimeout(pollState, 250);
+      setTimeout(pollState, 1000);
+      setTimeout(pollState, 2500);
+      setTimeout(pollState, 5000);
     } catch (err) {
       toast('액션 오류: ' + (err && err.message ? err.message : '실패'));
     }
@@ -6538,11 +8493,20 @@ function renderWebApp() {
     if (amEl) {
       e.preventDefault();
       e.stopPropagation();
+      const msgWrap = amEl.closest ? amEl.closest('[data-msg-idx]') : null;
+      const msgIdx = msgWrap ? Number(msgWrap.getAttribute('data-msg-idx')) : -1;
+      const chatId = (msgWrap && msgWrap.getAttribute('data-chat-id')) || '';
+      const clickedOuterHtml = amEl.outerHTML;
       const ds = {};
       for (const a of Array.from(amEl.attributes || [])) {
         if (a.name.startsWith('data-')) ds[a.name] = a.value;
       }
-      await dispatchPluginSurfaceAction(-1, amEl.outerHTML, ds);
+      if (amEl.getAttribute('data-am-illustration-action') === 'generate') {
+        amEl.setAttribute('x-am-busy', 'true');
+        const footerEl = amEl.closest ? amEl.closest('.x-risu-am-illustration-footer') : null;
+        if (footerEl) footerEl.classList.add('is-generating');
+      }
+      await dispatchPluginSurfaceAction(msgIdx, clickedOuterHtml, ds, chatId);
       return true;
     }
     const trigEl = e.target.closest('[risu-trigger]');
@@ -6554,17 +8518,30 @@ function renderWebApp() {
       const trig = trigEl.getAttribute('risu-trigger');
       if (!trig) return true;
       if (/^setFirst\\d+$/i.test(trig)) { bookAnchorMode = 'manual'; bookSpreadIdx = 0; bookDesiredSpreadIdx = 0; }
-      await api('/api/command', {
-        method: 'POST',
-        body: JSON.stringify({
-          type: 'run_trigger',
-          payload: { charIndex: snap.charIndex, chatIndex: snap.chatIndex, trigger: trig, promptAnswers: [] },
-        }),
-      });
-      toast('메뉴 실행 중...');
-      setTimeout(pollState, 350);
-      setTimeout(pollState, 900);
-      setTimeout(pollState, 1600);
+      try {
+        const res = await api('/api/triggers/run', {
+          method: 'POST',
+          body: JSON.stringify({ charIndex: snap.charIndex, chatIndex: snap.chatIndex, trigger: trig, promptAnswers: [] }),
+        });
+        toast('메뉴 실행됨');
+        if (res && res.pause) {
+          showTriggerModal(res.pause);
+          return true;
+        }
+        if (res && res.triggerEvent && res.triggerEvent.id && res.triggerEvent.id !== lastHandledTriggerEventId) {
+          lastHandledTriggerEventId = res.triggerEvent.id;
+          if (res.triggerEvent.kind === 'notice' || res.triggerEvent.kind === 'alert_error') showTriggerModal(res.triggerEvent);
+        }
+        if (res && res.snapshot && lastState) {
+          if (typeof res.snapshotVersion === 'number') knownSnapshotVer = res.snapshotVersion;
+          applyState({ ...lastState, snapshot: res.snapshot, snapshotVersion: res.snapshotVersion ?? lastState.snapshotVersion });
+        } else {
+          setTimeout(pollState, 220);
+          setTimeout(pollState, 900);
+        }
+      } catch (err) {
+        toast('메뉴 실행 오류: ' + (err && err.message ? err.message : '실패'));
+      }
       return true;
     }
     const btnEl = e.target.closest('[risu-btn]');
@@ -7013,21 +8990,24 @@ function renderWebApp() {
     const items = [];
     const lines = String(template).split('\\n');
     for (const rawLine of lines) {
-      const line = rawLine.replace(/\\r$/, '');
+      const line = rawLine.replace(/\\r$/, '').trim();
+      if (!line || line.startsWith('//') || line.startsWith('#')) continue;
       const parts = line.split('=');
-      const key = parts[0] || '';
+      const key = (parts[0] || '').trim();
       const value = parts[1] || '';
-      const type = parts[2] || '';
+      const rawType = (parts[2] || '').trim();
+      const typeLower = rawType.toLowerCase();
       const option = parts.slice(3).join('=');
-      if (type === 'group' || type === 'groupEnd' || type === 'divider') {
-        items.push({ key, value, type, children: [] });
-      } else if (type === 'caption' && value) {
-        items.push({ key, value, type });
-      } else if (key && value) {
+      if (typeLower === 'group' || typeLower === 'groupend' || typeLower === 'divider') {
+        const normType = typeLower === 'groupend' ? 'groupEnd' : typeLower;
+        items.push({ key, value, type: normType, children: [] });
+      } else if (typeLower === 'caption' && value) {
+        items.push({ key, value, type: 'caption' });
+      } else if (key && !key.startsWith('=') && value) {
         items.push({
           key,
           value,
-          type: (type === 'select' || type === 'text' || type === 'textarea') ? type : 'check',
+          type: (typeLower === 'select' || typeLower === 'text' || typeLower === 'textarea') ? typeLower : 'check',
           options: option ? option.split(',') : [],
         });
       }
@@ -7094,10 +9074,25 @@ function renderWebApp() {
   let optimisticUseLocal = null;
   const optimisticVars = {};
 
+  function populatePtParentSelect(defaultVal) {
+    const sel = document.getElementById('ptParentPreset');
+    if (!sel) return;
+    const list = (routerCfg && Array.isArray(routerCfg.directPresets)) ? routerCfg.directPresets.filter((p) => p && p.id && p.id !== 'off') : [];
+    const activeDp = (routerCfg && typeof routerCfg.directPresetId === 'string') ? routerCfg.directPresetId : 'bundled:leave';
+    const targetVal = defaultVal !== undefined ? defaultVal : (activeDp !== 'off' ? activeDp : '');
+    let opts = '<option value="">원격 프롬 연결 안 함 (PC 네이티브 · 항상 노출)</option>';
+    list.forEach((p) => {
+      opts += '<option value="' + esc(p.id) + '">' + esc('부모 원격 프롬: ' + p.name) + '</option>';
+    });
+    sel.innerHTML = opts;
+    sel.value = (targetVal && list.some((p) => p.id === targetVal)) ? targetVal : '';
+  }
+
   window.togglePresetAdder = (forceState) => {
     const el = document.getElementById('presetToggleAdder');
     const show = forceState !== undefined ? forceState : (el.style.display === 'none');
     el.style.display = show ? 'block' : 'none';
+    if (show) populatePtParentSelect();
   };
 
   window.savePresetToggle = async () => {
@@ -7106,13 +9101,22 @@ function renderWebApp() {
     if (!syntax) return toast('커스텀 토글 텍스트를 붙여넣어 주세요.');
     if (!routerCfg) routerCfg = await api('/api/router/config');
     if (!Array.isArray(routerCfg.presetToggles)) routerCfg.presetToggles = [];
-    routerCfg.presetToggles.push({ id: 'pt-' + Date.now(), name, enabled: true, syntax });
+    const parentEl = document.getElementById('ptParentPreset');
+    const parentPresetId = parentEl ? String(parentEl.value || '').trim() : '';
+    const activeDp = (routerCfg && typeof routerCfg.directPresetId === 'string') ? routerCfg.directPresetId : 'bundled:leave';
+    routerCfg.presetToggles.push({
+      id: 'pt-' + Date.now(),
+      name,
+      enabled: !parentPresetId || parentPresetId === activeDp,
+      syntax,
+      ...(parentPresetId ? { parentPresetId } : {}),
+    });
     routerCfg = await api('/api/router/config', { method: 'POST', body: JSON.stringify(routerCfg) });
     document.getElementById('ptName').value = '';
     document.getElementById('ptSyntax').value = '';
     togglePresetAdder(false);
     renderCustomToggles(true);
-    toast('프리셋 토글 등록됨');
+    toast(parentPresetId ? '프리셋 토글 등록됨 (선택한 원격 프롬 활성 시에만 노출)' : '프리셋 토글 등록됨');
   };
 
   window.deletePresetToggle = async (id) => {
@@ -7130,10 +9134,12 @@ function renderWebApp() {
       if (!data || !data.toggleSyntax) return toast('내장 Leave 프리셋을 찾을 수 없습니다.');
       if (!routerCfg) routerCfg = await api('/api/router/config');
       if (!Array.isArray(routerCfg.presetToggles)) routerCfg.presetToggles = [];
+      const activeDp = (routerCfg && typeof routerCfg.directPresetId === 'string') ? routerCfg.directPresetId : 'bundled:leave';
       const entry = {
         id: data.id || 'preset-leave-r1.1',
+        parentPresetId: 'bundled:leave',
         name: '🍃 ' + (data.name || 'Leave · 방랑 사서의 서가 r1.1'),
-        enabled: true,
+        enabled: activeDp === 'bundled:leave',
         syntax: data.toggleSyntax,
       };
       const idx = routerCfg.presetToggles.findIndex((x) => x && x.id === entry.id);
@@ -7141,7 +9147,7 @@ function renderWebApp() {
       else routerCfg.presetToggles.unshift(entry);
       routerCfg = await api('/api/router/config', { method: 'POST', body: JSON.stringify(routerCfg) });
       renderCustomToggles(true);
-      toast('🍃 Leave r1.1 프리셋 토글이 등록되었습니다');
+      toast('🍃 Leave r1.1 프리셋 토글이 동기화되었습니다');
     } catch (e) {
       toast('Leave 토글 등록 오류: ' + (e && e.message ? e.message : '실패'));
     }
@@ -7180,10 +9186,56 @@ function renderWebApp() {
     }
   };
 
+  function extractToggleKeys(items) {
+    const keys = [];
+    for (const it of items || []) {
+      if (!it) continue;
+      if (it.type === 'group' && Array.isArray(it.children)) {
+        keys.push(...extractToggleKeys(it.children));
+      } else if (it.key && it.type !== 'divider' && it.type !== 'caption' && it.type !== 'groupEnd') {
+        keys.push(String(it.key).trim());
+      }
+    }
+    return keys;
+  }
+
   function renderCustomToggles(force = false) {
     const snap = (lastState && lastState.snapshot) || {};
     const modBlocks = (snap.customToggleBlocks || []).map((b) => ({ source: b.source, syntax: b.syntax, isPreset: false }));
-    const presetBlocks = ((routerCfg && routerCfg.presetToggles) || []).filter((p) => p.enabled !== false).map((p) => ({ id: p.id, source: p.name, syntax: p.syntax, isPreset: true }));
+    const modKeySet = new Set();
+    for (const mb of modBlocks) {
+      for (const k of extractToggleKeys(parseToggleSyntax(mb.syntax))) modKeySet.add(k);
+    }
+    const curDirectId = (routerCfg && routerCfg.directPresetId) || 'bundled:leave';
+    const leaveBarEl = document.getElementById('leavePresetBar');
+    if (leaveBarEl) leaveBarEl.style.display = curDirectId === 'bundled:leave' ? '' : 'none';
+    const knownCustomToggleIds = new Set(
+      ((routerCfg && routerCfg.directPresets) || [])
+        .filter((dp) => dp && dp.customId)
+        .map((dp) => 'pt-' + dp.customId)
+    );
+    const presetBlocks = ((routerCfg && routerCfg.presetToggles) || [])
+      .filter((p) => {
+        if (!p || p.enabled === false) return false;
+        const parentId = p.parentPresetId || (p.id === 'preset-leave-r1.1' ? 'bundled:leave' : (knownCustomToggleIds.has(p.id) ? ('custom:' + p.id.slice(3)) : ''));
+        if (parentId && parentId !== curDirectId) return false;
+        if (parentId && modKeySet.size > 0) {
+          const pKeys = extractToggleKeys(parseToggleSyntax(p.syntax));
+          if (pKeys.length > 0) {
+            const overlap = pKeys.filter((k) => modKeySet.has(k)).length;
+            if (overlap * 2 >= pKeys.length) return false;
+          }
+        }
+        return true;
+      })
+      .map((p) => ({
+        id: p.id,
+        source: p.name,
+        syntax: p.syntax,
+        isPreset: true,
+        isAutoManaged: Boolean(p.id === 'preset-leave-r1.1' || knownCustomToggleIds.has(p.id)),
+        parentPresetId: p.parentPresetId || '',
+      }));
     const blocks = [...presetBlocks, ...modBlocks];
 
     const chatKey = (snap.charIndex ?? -1) + ':' + (snap.chatIndex ?? -1);
@@ -7202,7 +9254,7 @@ function renderWebApp() {
       : { ...(snap.globalToggleValues || {}), ...remoteGlobals };
     const vals = { ...baseVals, ...(now < optimisticUntil ? optimisticVars : {}) };
     syncLeaveHudVisibility({ ...snap, useLocallySetGlobalVariables: useLocal, localToggleValues: { ...(snap.localToggleValues || {}), ...(now < optimisticUntil ? optimisticVars : {}) } });
-    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, useLocal, vals, blocks.map((b) => (b.id || '') + ':' + b.source + ':' + b.syntax.length), Array.from(openToggleGroups)]);
+    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, curDirectId, useLocal, vals, blocks.map((b) => (b.id || '') + ':' + b.source + ':' + b.syntax.length), Array.from(openToggleGroups)]);
     if (!force && sig === lastToggleRenderSig) return;
 
     const body = document.getElementById('customToggleBody');
@@ -7228,7 +9280,7 @@ function renderWebApp() {
     };
 
     if (!blocks.length) {
-      body.innerHTML = '<div style="color:var(--sub); font-size:12.5px;">표시할 토글이 없습니다. 프리셋 토글은 우측 상단 <b>+ 프리셋 토글</b>로 한 번만 등록해 주세요.</div>';
+      body.innerHTML = '<div style="color:var(--sub); font-size:12.5px;">표시할 토글이 없습니다. 자체 토글이 내장된 원격 프롬은 선택 시 자동 등록되며, 별도 토글은 우측 상단 <b>+ 프리셋 토글</b>로 추가할 수 있습니다.</div>';
       return;
     }
     let html = '';
@@ -7239,7 +9291,11 @@ function renderWebApp() {
       html += '<div style="margin-bottom:10px;">';
       html += '<div style="display:flex; align-items:center; justify-content:space-between; font-size:12px; font-weight:700; color:var(--accent); margin-bottom:4px;">';
       html += '<span>' + (b.isPreset ? '📘 ' : '🌿 ') + esc(b.source) + '</span>';
-      if (b.isPreset) html += '<button class="act-btn" data-del-preset="' + esc(b.id) + '">삭제</button>';
+      if (b.isPreset) {
+        html += b.isAutoManaged
+          ? '<span class="badge">원격 프롬 자동 연동</span>'
+          : '<button class="act-btn" data-del-preset="' + esc(b.id) + '">삭제</button>';
+      }
       html += '</div>';
       html += renderToggleItemsHtml(parsed, vals, blockKey);
       html += '</div>';
@@ -7832,9 +9888,11 @@ function renderWebApp() {
       if (dpHint) {
         dpHint.innerHTML = dpSel.value === 'off'
           ? '<code>원격 라우팅</code>에서는 <b>다른 RisuAI 플러그인은 동작하지 않습니다</b>. 현재 원격 직접 요청(원격채팅·원격리롤)에 최소 시스템 프롬프트만 전송합니다. RisuAI 프리셋을 입히려면 목록에서 프리셋을 선택하거나 업로드하세요.'
-          : 'PC에서 <code>risuai.sendChat()</code>을 쓸 수 없는 상태(<code>원격 라우팅</code>)에서는 DB 직접 반영으로 동작하므로 <b>다른 RisuAI 플러그인은 동작하지 않습니다</b>. 대신 <b>원격 직접 요청(원격채팅 · 원격리롤)</b>에 이 프리셋과 <b>[🧩 모듈/설정]</b> 탭 토글을 실시간 CBS로 반영합니다. (다른 플러그인까지 쓰려면 PC RisuAI에서 해당 봇을 열어 <b>PC 활성</b> 상태로 사용해 주세요.)';
+          : '자체 토글이 내장된 프리셋(Leave 등)을 원격 프롬으로 선택하면 <b>[🧩 모듈/설정]</b>의 프리셋 토글이 자동으로 등록·활성화되며, 다른 원격 프롬으로 바꾸면 이전 프롬 토글은 자동으로 숨김·비활성화됩니다. <b>원격 직접 요청(원격채팅 · 원격리롤)</b>에 이 프리셋과 토글이 실시간 CBS로 반영됩니다.';
       }
     }
+    const adderEl = document.getElementById('presetToggleAdder');
+    if (adderEl && adderEl.style.display !== 'none') populatePtParentSelect();
   }
   const directPresetSelEl = document.getElementById('directPresetSel');
   if (directPresetSelEl) {
@@ -7845,6 +9903,7 @@ function renderWebApp() {
           body: JSON.stringify({ directPresetId: directPresetSelEl.value }),
         });
         renderRouterUI();
+        renderCustomToggles(true);
         toast('원격 직접 요청 프리셋 변경됨');
       } catch (e) {
         toast('프리셋 변경 실패: ' + (e && e.message ? e.message : '오류'));
@@ -8240,7 +10299,9 @@ function renderWebApp() {
 
   // ---------- Request Log Viewer ----------
   let reqLogsCache = [];
+  let reqLogSummaryCache = null;
   let reqLogFilter = 'all';
+  let reqLogGroupByLane = false;
   let reqLogModalOpen = false;
   let reqLogActiveDetail = null;
   let reqLogDetailLoading = false;
@@ -8268,12 +10329,76 @@ function renderWebApp() {
     return Math.round(n) + 'ms';
   }
 
+  function formatUsd(val) {
+    if (val === null || val === undefined || Number.isNaN(Number(val))) return '-';
+    return '$' + Number(val).toFixed(4);
+  }
+
+  function buildCacheGuardSummaryHtml(summary) {
+    if (!summary || !summary.totalRequests) return '';
+    const avgHit = summary.avgServerHitPct !== null && summary.avgServerHitPct !== undefined ? (summary.avgServerHitPct + '%') : '미보고';
+    return (
+      '<span class="cg-stat">🛡️ 서사 ' + Number(summary.narrativeCount || 0) + '건</span>' +
+      '<span class="cg-stat">📂 그룹 ' + Number(summary.laneCount || 0) + '개</span>' +
+      '<span class="cg-stat ' + (summary.brokenCount > 0 ? 'brk' : 'ok') + '">⚠️ 깨짐 ' + Number(summary.brokenCount || 0) + '건</span>' +
+      '<span class="cg-stat">🚫 보조/제외 ' + Number(summary.excludedCount || 0) + '건</span>' +
+      '<span class="cg-stat">⚡ 평균 KV 적중 ' + esc(avgHit) + '</span>' +
+      (summary.totalSavingsUsd > 0 ? '<span class="cg-stat ok">💰 절감 ' + esc(formatUsd(summary.totalSavingsUsd)) + '</span>' : '')
+    );
+  }
+
+  function renderCacheGuardBadgeHtml(item) {
+    const cg = item && item.cacheGuard;
+    if (!cg) return '';
+    if (!cg.eligible) {
+      return '<span class="req-log-badge cg-excl" title="하야쿠/플래시백 등 비서사 요청은 캐시 비교에서 제외됩니다">' + esc('제외 · ' + (cg.excludedLabel || cg.excludedReason || '보조')) + '</span>';
+    }
+    const laneBadge = '<span class="req-log-badge cg-lane">' + esc((cg.laneLabel || '그룹') + ' · T' + (cg.turnIndex || 1)) + '</span>';
+    let statusBadge = '';
+    if (cg.verdict === 'baseline') {
+      statusBadge = '<span class="req-log-badge cg-lane">기준선</span>';
+    } else if (cg.cacheBroken) {
+      const pctText = cg.prefixMatchPct !== null && cg.prefixMatchPct !== undefined ? (' ' + cg.prefixMatchPct + '%') : '';
+      statusBadge = '<span class="req-log-badge cg-brk">⚠️ 캐시 깨짐' + esc(pctText) + '</span>';
+    } else {
+      const hitText = cg.serverHitPct !== null && cg.serverHitPct !== undefined ? ('KV ' + cg.serverHitPct + '%') : '🛡️ 캐시 유지';
+      statusBadge = '<span class="req-log-badge cg-ok">' + esc(hitText) + '</span>';
+    }
+    const minBadge = cg.belowMinCacheTokens ? '<span class="req-log-badge cg-excl" title="모델 최소 캐시 토큰 기준 미만">소용량</span>' : '';
+    return laneBadge + statusBadge + minBadge;
+  }
+
   function filterRequestLogs(list) {
     const arr = Array.isArray(list) ? list : [];
     if (reqLogFilter === 'proxy') return arr.filter((x) => x.source === 'proxy');
     if (reqLogFilter === 'direct') return arr.filter((x) => x.source === 'direct_chat' || x.source === 'direct_reroll');
     if (reqLogFilter === 'translate') return arr.filter((x) => x.source === 'translate');
+    if (reqLogFilter === 'narrative') return arr.filter((x) => x.cacheGuard && x.cacheGuard.eligible);
+    if (reqLogFilter === 'broken') return arr.filter((x) => x.cacheGuard && x.cacheGuard.eligible && x.cacheGuard.cacheBroken);
     return arr;
+  }
+
+  function renderLogRowHtml(item) {
+    const u = item.usage || {};
+    const tokText = u.total_tokens ? ('토큰 ' + u.total_tokens + ' (' + (u.prompt_tokens || 0) + '→' + (u.completion_tokens || 0) + (u.cached_tokens ? ' · 캐시 ' + u.cached_tokens : '') + ')') : '';
+    const statusText = item.status ? ('HTTP ' + item.status) : (item.ok ? 'OK' : 'ERR');
+    return '<button type="button" class="req-log-row" data-log-id="' + esc(item.id) + '">' +
+      '<div class="req-log-row-top">' +
+        '<span class="req-log-badge ' + (item.ok ? 'ok' : 'err') + '">' + (item.ok ? '✓ ' : '⚠ ') + esc(statusText) + '</span>' +
+        '<span class="req-log-badge src">' + esc(formatLogSource(item.source)) + (item.stream ? ' · stream' : '') + '</span>' +
+        renderCacheGuardBadgeHtml(item) +
+        '<span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + esc(item.model || item.profileName || 'Unknown') + '</span>' +
+        '<span style="margin-left:auto; font-size:11.5px; font-weight:500; color:var(--sub);">' + esc(formatLogTime(item.at)) + '</span>' +
+      '</div>' +
+      '<div class="req-log-row-meta">' +
+        '<span>' + esc(formatLogDuration(item.durationMs)) + '</span>' +
+        '<span>메시지 ' + Number(item.msgCount || 0) + '개</span>' +
+        (tokText ? '<span>' + esc(tokText) + '</span>' : '') +
+        (item.cacheGuard && item.cacheGuard.eligible && item.cacheGuard.causeLabel ? '<span>' + esc(item.cacheGuard.causeLabel) + '</span>' : '') +
+        (item.profileName ? '<span>프로필: ' + esc(item.profileName) + '</span>' : '') +
+      '</div>' +
+      (item.responsePreview ? '<div class="req-log-row-prev">' + esc(item.responsePreview) + '</div>' : '') +
+    '</button>';
   }
 
   function buildRequestLogRowsHtml(list) {
@@ -8283,40 +10408,54 @@ function renderWebApp() {
         (reqLogsCache.length ? '선택한 필터에 해당하는 로그가 없습니다.' : '아직 기록된 요청이 없습니다.') +
         '</div>';
     }
-    return filtered.map((item) => {
-      const u = item.usage || {};
-      const tokText = u.total_tokens ? ('토큰 ' + u.total_tokens + ' (' + (u.prompt_tokens || 0) + '→' + (u.completion_tokens || 0) + ')') : '';
-      const statusText = item.status ? ('HTTP ' + item.status) : (item.ok ? 'OK' : 'ERR');
-      return '<button type="button" class="req-log-row" data-log-id="' + esc(item.id) + '">' +
-        '<div class="req-log-row-top">' +
-          '<span class="req-log-badge ' + (item.ok ? 'ok' : 'err') + '">' + (item.ok ? '✓ ' : '⚠ ') + esc(statusText) + '</span>' +
-          '<span class="req-log-badge src">' + esc(formatLogSource(item.source)) + (item.stream ? ' · stream' : '') + '</span>' +
-          '<span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + esc(item.model || item.profileName || 'Unknown') + '</span>' +
-          '<span style="margin-left:auto; font-size:11.5px; font-weight:500; color:var(--sub);">' + esc(formatLogTime(item.at)) + '</span>' +
-        '</div>' +
-        '<div class="req-log-row-meta">' +
-          '<span>' + esc(formatLogDuration(item.durationMs)) + '</span>' +
-          '<span>메시지 ' + Number(item.msgCount || 0) + '개</span>' +
-          (tokText ? '<span>' + esc(tokText) + '</span>' : '') +
-          (item.profileName ? '<span>프로필: ' + esc(item.profileName) + '</span>' : '') +
-        '</div>' +
-        (item.responsePreview ? '<div class="req-log-row-prev">' + esc(item.responsePreview) + '</div>' : '') +
-      '</button>';
-    }).join('');
+    if (!reqLogGroupByLane) {
+      return filtered.map(renderLogRowHtml).join('');
+    }
+    const groups = new Map();
+    for (const item of filtered) {
+      const cg = item.cacheGuard;
+      const key = (cg && cg.eligible && cg.laneId) ? cg.laneId : '__excluded__';
+      if (!groups.has(key)) {
+        groups.set(key, {
+          key,
+          label: key === '__excluded__' ? '🚫 집계 제외 (하야쿠 / 플래시백 / 번역 / 오류)' : ('📂 ' + (cg.laneLabel || key) + ' (' + (cg.namespace === 'proxy' ? '프록시' : '원격 직접') + ')'),
+          items: [],
+          broken: 0,
+        });
+      }
+      const g = groups.get(key);
+      g.items.push(item);
+      if (cg && cg.eligible && cg.cacheBroken) g.broken++;
+    }
+    let out = '';
+    for (const g of groups.values()) {
+      out += '<div class="cg-lane-hdr"><span>' + esc(g.label) + '</span><span>' + g.items.length + '건' + (g.broken > 0 ? ' · 깨짐 ' + g.broken + '건' : '') + '</span></div>';
+      out += g.items.map(renderLogRowHtml).join('');
+    }
+    return out;
   }
 
   function renderRequestLogsList() {
+    const sumEl = document.getElementById('reqLogCgSummary');
+    if (sumEl) {
+      const sumHtml = buildCacheGuardSummaryHtml(reqLogSummaryCache);
+      sumEl.innerHTML = sumHtml;
+      sumEl.style.display = sumHtml ? 'flex' : 'none';
+    }
     const el = document.getElementById('reqLogList');
     if (el) el.innerHTML = buildRequestLogRowsHtml(reqLogsCache);
     document.querySelectorAll('#reqLogFilters [data-log-filter]').forEach((btn) => {
       btn.classList.toggle('active', btn.getAttribute('data-log-filter') === reqLogFilter);
     });
+    const grpBtn = document.getElementById('reqLogGroupToggle');
+    if (grpBtn) grpBtn.classList.toggle('active', reqLogGroupByLane);
   }
 
   async function loadRequestLogs() {
     try {
       const res = await api('/api/logs');
       reqLogsCache = Array.isArray(res && res.logs) ? res.logs : [];
+      reqLogSummaryCache = (res && res.summary) ? res.summary : null;
       renderRequestLogsList();
       if (reqLogModalOpen && !reqLogActiveDetail && !reqLogDetailLoading) renderReqLogModal();
     } catch (e) {
@@ -8333,6 +10472,7 @@ function renderWebApp() {
   function getReqLogCopyPayload() {
     const d = reqLogActiveDetail;
     if (!d) return '';
+    if (reqLogDetailTab === 'cache') return JSON.stringify(d.cacheGuard || {}, null, 2);
     if (reqLogDetailTab === 'request') return d.requestJson || '';
     if (reqLogDetailTab === 'response') {
       if (d.responseText && d.responseJson) return d.responseText + '\\n\\n--- RAW JSON ---\\n' + d.responseJson;
@@ -8413,6 +10553,99 @@ function renderWebApp() {
     return out.join('');
   }
 
+  function renderHighlightDiffPair(prevText, currText) {
+    const a = String(prevText || '');
+    const b = String(currText || '');
+    const minLen = Math.min(a.length, b.length);
+    let prefixLen = 0;
+    while (prefixLen < minLen && a.charCodeAt(prefixLen) === b.charCodeAt(prefixLen)) prefixLen++;
+    let suffixLen = 0;
+    while (
+      suffixLen < (minLen - prefixLen) &&
+      a.charCodeAt(a.length - 1 - suffixLen) === b.charCodeAt(b.length - 1 - suffixLen)
+    ) {
+      suffixLen++;
+    }
+    const aMid = a.slice(prefixLen, a.length - suffixLen);
+    const bMid = b.slice(prefixLen, b.length - suffixLen);
+    return {
+      prevHtml: esc(a.slice(0, prefixLen)) + (aMid ? '<span class="cg-diff-hi-del">' + esc(aMid) + '</span>' : '') + esc(suffixLen > 0 ? a.slice(a.length - suffixLen) : ''),
+      currHtml: esc(b.slice(0, prefixLen)) + (bMid ? '<span class="cg-diff-hi-add">' + esc(bMid) + '</span>' : '') + esc(suffixLen > 0 ? b.slice(b.length - suffixLen) : ''),
+    };
+  }
+
+  function renderReqLogCacheTabHtml(d) {
+    const cg = d && d.cacheGuard;
+    if (!cg) {
+      return '<div class="cg-banner">캐시 분석 정보가 아직 생성되지 않았습니다.</div>';
+    }
+    if (!cg.eligible) {
+      return (
+        '<div class="cg-banner">' +
+          '<div style="font-weight:800; font-size:14px;">🚫 캐시 감시 집계 제외 요청</div>' +
+          '<div style="font-size:12.5px; color:var(--sub);">분류: <b>' + esc(cg.excludedLabel || cg.excludedReason || '보조 요청') + '</b></div>' +
+          '<div style="font-size:12px; color:var(--sub);">하야쿠·플래시백·번역·플러그인 호출 및 오류 응답은 실제 서사 턴과 프롬프트 구조가 다르므로 캐싱 비교 그룹에 섞이지 않도록 자동 제외됩니다.</div>' +
+        '</div>'
+      );
+    }
+    const cls = cg.verdict === 'broken' ? 'broken' : (cg.verdict === 'baseline' ? 'baseline' : 'ok');
+    const titleIcon = cg.verdict === 'broken' ? '⚠️ ' : (cg.verdict === 'baseline' ? '📌 ' : '🛡️ ');
+    const hitStr = (cg.serverHitPct !== null && cg.serverHitPct !== undefined) ? (cg.serverHitPct + '%') : '서버 미보고';
+    const matchStr = (cg.prefixMatchPct !== null && cg.prefixMatchPct !== undefined) ? (cg.prefixMatchPct + '%') : '기준선';
+    let html =
+      '<div class="cg-banner ' + cls + '">' +
+        '<div style="display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;">' +
+          '<div style="font-weight:800; font-size:14.5px;">' + titleIcon + esc(cg.verdictLabel || '분석 완료') + '</div>' +
+          (cg.prevLogId ? '<button type="button" class="pill" data-log-id="' + esc(cg.prevLogId) + '">← 비교 기준 이전 턴 보기</button>' : '') +
+        '</div>' +
+        '<div style="font-size:12.5px;">' + esc(cg.causeLabel || '') + '</div>' +
+        (cg.belowMinCacheTokens ? '<div style="font-size:11.5px; color:var(--sub);">참고: 현재 입력 토큰(' + Number(cg.promptTokens || 0) + ')이 모델 최소 캐시 기준(' + Number(cg.minCacheTokens || 1024) + ')보다 작습니다.</div>' : '') +
+      '</div>' +
+      '<div class="req-log-meta-grid">' +
+        '<div class="req-log-meta-item"><b>그룹 / 턴</b><span>' + esc((cg.laneLabel || '-') + ' · T' + (cg.turnIndex || 1) + ' (' + (cg.namespace === 'proxy' ? '프록시' : '원격 직접') + ')') + '</span></div>' +
+        '<div class="req-log-meta-item"><b>프리픽스 일치율</b><span>' + esc(matchStr) + '</span></div>' +
+        '<div class="req-log-meta-item"><b>서버 KV 적중률</b><span>' + esc(hitStr) + '</span></div>' +
+        '<div class="req-log-meta-item"><b>캐시 읽기 / 쓰기 / 입력</b><span>' + esc(Number(cg.cachedTokens || 0) + ' / ' + Number(cg.cacheCreationTokens || 0) + ' / ' + Number(cg.promptTokens || 0)) + '</span></div>' +
+        '<div class="req-log-meta-item"><b>예상 턴 비용 / 절감</b><span>' + esc(cg.cost ? (formatUsd(cg.cost.totalUsd) + ' / 절감 ' + formatUsd(cg.cost.cacheSavingsUsd)) : '모델 요율 미등록') + '</span></div>' +
+        '<div class="req-log-meta-item"><b>로어북 / 브레이크포인트</b><span>' + esc((cg.culpritLorebook ? cg.culpritLorebook.name + ' (' + cg.culpritLorebook.action + ')' : '-') + (cg.afterBreakpoint ? ' · BP 이후' : '')) + '</span></div>' +
+      '</div>';
+
+    const segs = Array.isArray(cg.segmentMap) ? cg.segmentMap : [];
+    if (segs.length) {
+      html += '<div><div class="f-label" style="margin-top:0;">세그먼트별 캐시 맵 (' + segs.length + '개 블록)</div><div class="cg-segmap-bar">';
+      for (const s of segs) {
+        const w = Math.max(1, Number(s.pct || 0));
+        const stCls = s.status === 'changed' ? 'changed' : (s.status === 'after' ? 'after' : 'cached');
+        html += '<div class="cg-seg ' + stCls + '" style="width:' + w + '%;" title="' + esc('#' + (s.idx + 1) + ' ' + s.role + ' (' + s.tokens + ' tok · ' + s.pct + '%)') + '"></div>';
+      }
+      html += '</div><div class="cg-seg-list" style="margin-top:8px;">';
+      for (const s of segs.slice(0, 12)) {
+        const dotColor = s.status === 'changed' ? 'var(--danger)' : (s.status === 'after' ? 'var(--sub)' : '#34d399');
+        html += '<div class="cg-seg-item">' +
+          '<span style="width:9px; height:9px; border-radius:50%; flex-shrink:0; background:' + dotColor + ';"></span>' +
+          '<b style="min-width:68px;">#' + (s.idx + 1) + ' ' + esc(s.role) + (s.hasCacheControl ? ' 📌' : '') + '</b>' +
+          '<span style="color:var(--sub); min-width:85px;">~' + Number(s.tokens || 0) + ' tok (' + s.pct + '%)</span>' +
+          '<span style="color:var(--sub); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + esc(s.preview || '') + '</span>' +
+        '</div>';
+      }
+      if (segs.length > 12) {
+        html += '<div style="font-size:11.5px; color:var(--sub); padding-left:4px;">외 ' + (segs.length - 12) + '개 세그먼트...</div>';
+      }
+      html += '</div></div>';
+    }
+
+    if (cg.firstDiff) {
+      const pair = renderHighlightDiffPair(cg.firstDiff.prevSnippet, cg.firstDiff.currSnippet);
+      html += '<div><div class="f-label" style="margin-top:0;">최초 불일치 위치 (세그먼트 #' + (Number(cg.firstDiff.segIdx || 0) + 1) + ' · ' + esc(cg.firstDiff.role || '') + ' · offset ' + Number(cg.firstDiff.offset || 0) + ')</div>' +
+        '<div class="cg-diff-box">' +
+          '<div class="cg-diff-col"><div class="cg-diff-head">이전 턴 (비교 기준)</div><pre class="cg-diff-pre">' + pair.prevHtml + '</pre></div>' +
+          '<div class="cg-diff-col"><div class="cg-diff-head">현재 턴 (변경 발생)</div><pre class="cg-diff-pre">' + pair.currHtml + '</pre></div>' +
+        '</div>' +
+      '</div>';
+    }
+    return html;
+  }
+
   function renderReqLogModal() {
     const modal = document.getElementById('reqLogModal');
     if (!modal) return;
@@ -8436,6 +10669,7 @@ function renderWebApp() {
     }
 
     if (!reqLogActiveDetail) {
+      const sumHtml = buildCacheGuardSummaryHtml(reqLogSummaryCache);
       modal.innerHTML =
         '<div class="req-log-dialog">' +
           '<div class="req-log-head">' +
@@ -8451,8 +10685,12 @@ function renderWebApp() {
             '<button type="button" class="pill' + (reqLogFilter === 'proxy' ? ' active' : '') + '" data-modal-filter="proxy">프록시</button>' +
             '<button type="button" class="pill' + (reqLogFilter === 'direct' ? ' active' : '') + '" data-modal-filter="direct">원격 채팅/리롤</button>' +
             '<button type="button" class="pill' + (reqLogFilter === 'translate' ? ' active' : '') + '" data-modal-filter="translate">번역</button>' +
+            '<button type="button" class="pill' + (reqLogFilter === 'narrative' ? ' active' : '') + '" data-modal-filter="narrative">🛡️ 서사 감시</button>' +
+            '<button type="button" class="pill' + (reqLogFilter === 'broken' ? ' active' : '') + '" data-modal-filter="broken">⚠️ 캐시 깨짐</button>' +
+            '<button type="button" class="pill' + (reqLogGroupByLane ? ' active' : '') + '" data-modal-group-toggle="1">📂 그룹별 보기</button>' +
           '</div>' +
           '<div class="req-log-body">' +
+            (sumHtml ? '<div class="cg-summary-bar" style="margin-bottom:4px;">' + sumHtml + '</div>' : '') +
             '<div class="req-log-list" style="max-height:none;">' + buildRequestLogRowsHtml(reqLogsCache) + '</div>' +
           '</div>' +
         '</div>';
@@ -8463,9 +10701,12 @@ function renderWebApp() {
     const d = reqLogActiveDetail;
     const msgs = Array.isArray(d.messages) ? d.messages : [];
     const u = d.usage || {};
+    const cg = d.cacheGuard || null;
     const statusText = d.status ? ('HTTP ' + d.status) : (d.ok ? 'OK' : 'ERR');
     let tabBody = '';
-    if (reqLogDetailTab === 'messages') {
+    if (reqLogDetailTab === 'cache') {
+      tabBody = renderReqLogCacheTabHtml(d);
+    } else if (reqLogDetailTab === 'messages') {
       tabBody =
         '<div class="req-log-toolbar">' +
           '<input class="f-inp" id="reqLogMsgSearch" placeholder="메시지 역할/내용 검색..." value="' + esc(reqLogMsgQuery) + '" />' +
@@ -8488,7 +10729,7 @@ function renderWebApp() {
           '<div class="req-log-meta-item"><b>프로필 / 포맷</b><span>' + esc((d.profileName || '-') + ' / ' + (d.providerType || '-')) + '</span></div>' +
           '<div class="req-log-meta-item"><b>모델</b><span>' + esc(d.model || '-') + '</span></div>' +
           '<div class="req-log-meta-item"><b>소요 시간</b><span>' + esc(formatLogDuration(d.durationMs)) + '</span></div>' +
-          '<div class="req-log-meta-item"><b>토큰 사용량</b><span>' + esc('총 ' + (u.total_tokens || 0) + ' (입력 ' + (u.prompt_tokens || 0) + ' / 출력 ' + (u.completion_tokens || 0) + ')') + '</span></div>' +
+          '<div class="req-log-meta-item"><b>토큰 사용량</b><span>' + esc('총 ' + (u.total_tokens || 0) + ' (입력 ' + (u.prompt_tokens || 0) + ' / 출력 ' + (u.completion_tokens || 0) + (u.cached_tokens ? ' / 캐시 ' + u.cached_tokens : '') + ')') + '</span></div>' +
           '<div class="req-log-meta-item" style="grid-column:1 / -1;"><b>엔드포인트</b><span>' + esc(d.endpoint || '-') + '</span></div>' +
         '</div>' +
         '<div><div class="f-label">요청 헤더 (인증 정보 마스킹됨)</div><pre class="req-log-pre">' + esc(JSON.stringify(d.headers || {}, null, 2)) + '</pre></div>';
@@ -8501,6 +10742,7 @@ function renderWebApp() {
             '<button type="button" class="pill" data-log-back="1">← 목록</button>' +
             '<span class="req-log-badge ' + (d.ok ? 'ok' : 'err') + '">' + esc(statusText) + '</span>' +
             '<span class="req-log-badge src">' + esc(formatLogSource(d.source)) + '</span>' +
+            renderCacheGuardBadgeHtml(d) +
             '<span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">' + esc(d.model || d.profileName || 'Request') + '</span>' +
             '<span style="font-size:11.5px; font-weight:500; color:var(--sub);">' + esc(formatLogDuration(d.durationMs)) + '</span>' +
           '</div>' +
@@ -8511,6 +10753,7 @@ function renderWebApp() {
         '</div>' +
         '<div class="req-log-tabs">' +
           '<button type="button" class="pill' + (reqLogDetailTab === 'messages' ? ' active' : '') + '" data-log-tab="messages">메시지 (' + msgs.length + ')</button>' +
+          '<button type="button" class="pill' + (reqLogDetailTab === 'cache' ? ' active' : '') + '" data-log-tab="cache">🛡️ 캐시 분석' + (cg && cg.eligible && cg.cacheBroken ? ' ⚠️' : '') + '</button>' +
           '<button type="button" class="pill' + (reqLogDetailTab === 'request' ? ' active' : '') + '" data-log-tab="request">요청 JSON</button>' +
           '<button type="button" class="pill' + (reqLogDetailTab === 'response' ? ' active' : '') + '" data-log-tab="response">응답</button>' +
           '<button type="button" class="pill' + (reqLogDetailTab === 'meta' ? ' active' : '') + '" data-log-tab="meta">헤더 · 정보</button>' +
@@ -8566,6 +10809,7 @@ function renderWebApp() {
   async function clearRequestLogs() {
     await api('/api/logs', { method: 'DELETE' });
     reqLogsCache = [];
+    reqLogSummaryCache = null;
     reqLogActiveDetail = null;
     renderRequestLogsList();
     if (reqLogModalOpen) renderReqLogModal();
@@ -8576,6 +10820,12 @@ function renderWebApp() {
   document.getElementById('reqLogRefreshBtn').onclick = loadRequestLogs;
   document.getElementById('reqLogClearBtn').onclick = clearRequestLogs;
   document.getElementById('reqLogFilters').addEventListener('click', (e) => {
+    if (e.target.closest('#reqLogGroupToggle')) {
+      reqLogGroupByLane = !reqLogGroupByLane;
+      renderRequestLogsList();
+      if (reqLogModalOpen && !reqLogActiveDetail) renderReqLogModal();
+      return;
+    }
     const btn = e.target.closest('[data-log-filter]');
     if (!btn) return;
     reqLogFilter = btn.getAttribute('data-log-filter') || 'all';
@@ -8631,6 +10881,12 @@ function renderWebApp() {
     const tabBtn = e.target.closest('[data-log-tab]');
     if (tabBtn) {
       reqLogDetailTab = tabBtn.getAttribute('data-log-tab') || 'messages';
+      renderReqLogModal();
+      return;
+    }
+    if (e.target.closest('[data-modal-group-toggle]')) {
+      reqLogGroupByLane = !reqLogGroupByLane;
+      renderRequestLogsList();
       renderReqLogModal();
       return;
     }
@@ -8874,6 +11130,7 @@ function renderWebApp() {
         backendPluginsCache = Array.isArray(res && res.plugins) ? res.plugins : [];
         backendPluginsLoadedAt = Date.now();
         renderBackendPluginsList();
+        if (typeof pollState === 'function') pollState();
         toast('PC 플러그인 동기화 완료 (' + backendPluginsCache.length + '개)');
       } catch (e) {
         toast('동기화 오류: ' + (e && e.message ? e.message : '실패'));
@@ -8908,6 +11165,7 @@ function renderWebApp() {
         backendPluginsCache = Array.isArray(res && res.plugins) ? res.plugins : [];
         backendPluginsLoadedAt = Date.now();
         renderBackendPluginsList();
+        if (typeof pollState === 'function') pollState();
         toast('플러그인 추가 및 활성화됨: ' + f.name);
       } catch (e) {
         toast('업로드 실패: ' + (e && e.message ? e.message : '오류'));
@@ -8929,6 +11187,7 @@ function renderWebApp() {
         backendPluginsCache = Array.isArray(res && res.plugins) ? res.plugins : [];
         backendPluginsLoadedAt = Date.now();
         renderBackendPluginsList();
+        if (typeof pollState === 'function') pollState();
         toast(name + (enabled ? ' 켜짐' : ' 꺼짐'));
       } catch (err) {
         chk.checked = !enabled;
@@ -8979,6 +11238,311 @@ function renderWebApp() {
     });
   }
 
+  // ===== RisuStand Floating Mini-Bar (matches risustand.js PC top mini-bar) =====
+
+  function clearRsMiniBarTimer() {
+    if (rsMiniBarAutoTimer) { clearTimeout(rsMiniBarAutoTimer); rsMiniBarAutoTimer = null; }
+  }
+  function scheduleRsMiniBarAutoMin() {
+    clearRsMiniBarTimer();
+    if (!uiPref.zenMode || rsMiniBarMinimized) return;
+    rsMiniBarAutoTimer = setTimeout(() => {
+      if (!rsMiniBarDrag && !rsMiniBarMinimized) {
+        rsMiniBarMinimized = true;
+        try { localStorage.setItem('rs_minibar_min', '1'); } catch (_) {}
+        renderRsMiniBar(true);
+      }
+    }, 5000);
+  }
+  function applyRsMiniBarPos(el) {
+    if (!el) return;
+    try {
+      const saved = JSON.parse(localStorage.getItem('rs_minibar_pos') || 'null');
+      if (saved && typeof saved.x === 'number' && typeof saved.y === 'number') {
+        const vw = window.innerWidth || 390;
+        const vh = window.innerHeight || 844;
+        el.style.left = Math.max(8, Math.min(vw - 48, saved.x)) + 'px';
+        el.style.top = Math.max(8, Math.min(vh - 48, saved.y)) + 'px';
+        el.style.transform = 'none';
+        return;
+      }
+    } catch (_) {}
+    el.style.left = '50%';
+    el.style.top = 'calc(14px + env(safe-area-inset-top))';
+    el.style.transform = 'translateX(-50%)';
+  }
+  function renderRsMiniBar(force = false) {
+    const el = document.getElementById('rsMiniBar');
+    if (!el) return;
+    if (!uiPref.zenMode) {
+      clearRsMiniBarTimer();
+      el.style.display = 'none';
+      lastRsMiniBarSig = 'off';
+      return;
+    }
+    const themeBrands = {
+      'ai-gemini': '✦ Gemini',
+      'ai-claude': '✻ Claude',
+      'ai-chatgpt': '◉ ChatGPT',
+      'midnight-glass': '✧ Glass',
+      'epub-1p-day': '📖 1쪽',
+      'epub-1p-night': '🌙 1쪽',
+      'epub-2p-day': '📖 2쪽',
+      'epub-2p-night': '🌙 2쪽',
+      'sakura-pastel': '🌸 사쿠라',
+      'forest-moss': '🌿 모스',
+    };
+    const brand = themeBrands[uiPref.theme] || '✦ RisuStand';
+    const shortIc = brand.split(' ')[0] || '✦';
+    const rwCount = (latestPluginFloatingUi && Array.isArray(latestPluginFloatingUi.rootWidgets)) ? latestPluginFloatingUi.rootWidgets.length : 0;
+    const sig = JSON.stringify([rsMiniBarMinimized, uiPref.theme, uiPref.assetMode, uiPref.zenMode, rwCount]);
+    el.style.display = 'inline-flex';
+    applyRsMiniBarPos(el);
+    if (!force && sig === lastRsMiniBarSig) return;
+    lastRsMiniBarSig = sig;
+    if (rsMiniBarMinimized) {
+      el.className = 'minimized';
+      const stealthDot = uiPref.assetMode !== 'show' ? ' 🙈' : '';
+      el.innerHTML = '<span style="pointer-events:none;">' + esc(shortIc + stealthDot) + '</span>';
+      el.title = '리스스탠드 미니바 펼치기 (드래그 이동 가능)';
+    } else {
+      el.className = 'expanded';
+      el.removeAttribute('title');
+      const eyeLabel = uiPref.assetMode === 'hide' ? '🙈 스텔스' : (uiPref.assetMode === 'blur' ? '🌫️ 블러' : '👁️ 표시');
+      const zenLabel = uiPref.zenMode ? '🧘 집중 ON' : '🧘 집중';
+      const fltLabel = rwCount > 0 ? ('🎛️ 플로팅 (' + rwCount + ')') : '🎛️ 플로팅';
+      el.innerHTML =
+        '<span class="rs-mb-handle" data-rsmb-drag="1">⠿ ' + esc(brand) + '</span>' +
+        '<button type="button" class="rs-mb-pill" data-rsmb-act="bottom" title="맨 아래로 이동">⬇</button>' +
+        '<button type="button" class="rs-mb-pill' + (uiPref.assetMode !== 'show' ? ' active' : '') + '" data-rsmb-act="eye">' + eyeLabel + '</button>' +
+        '<button type="button" class="rs-mb-pill' + (uiPref.zenMode ? ' active' : '') + '" data-rsmb-act="zen">' + zenLabel + '</button>' +
+        '<button type="button" class="rs-mb-pill" data-rsmb-act="floating">' + fltLabel + '</button>' +
+        '<button type="button" class="rs-mb-pill" data-rsmb-act="theme">🎨 테마</button>' +
+        '<button type="button" class="rs-mb-pill" data-rsmb-act="min" title="미니바 접기">—</button>';
+    }
+  }
+  (function bindRsMiniBarEvents() {
+    const el = document.getElementById('rsMiniBar');
+    if (!el) return;
+    let suppressTapUntil = 0;
+    el.addEventListener('pointerdown', (e) => {
+      if (!rsMiniBarMinimized && !e.target.closest('[data-rsmb-drag]')) return;
+      const r = el.getBoundingClientRect();
+      rsMiniBarDrag = { pid: e.pointerId, startX: e.clientX, startY: e.clientY, origLeft: r.left, origTop: r.top, moved: false };
+    });
+    window.addEventListener('pointermove', (e) => {
+      if (!rsMiniBarDrag || e.pointerId !== rsMiniBarDrag.pid) return;
+      const dx = e.clientX - rsMiniBarDrag.startX;
+      const dy = e.clientY - rsMiniBarDrag.startY;
+      if (!rsMiniBarDrag.moved && Math.hypot(dx, dy) < 6) return;
+      rsMiniBarDrag.moved = true;
+      clearRsMiniBarTimer();
+      const vw = window.innerWidth || 390;
+      const vh = window.innerHeight || 844;
+      el.style.left = Math.max(8, Math.min(vw - el.offsetWidth - 8, rsMiniBarDrag.origLeft + dx)) + 'px';
+      el.style.top = Math.max(8, Math.min(vh - el.offsetHeight - 8, rsMiniBarDrag.origTop + dy)) + 'px';
+      el.style.transform = 'none';
+    });
+    const endDrag = (e) => {
+      if (!rsMiniBarDrag || e.pointerId !== rsMiniBarDrag.pid) return;
+      if (rsMiniBarDrag.moved) {
+        suppressTapUntil = Date.now() + 180;
+        const r = el.getBoundingClientRect();
+        try { localStorage.setItem('rs_minibar_pos', JSON.stringify({ x: Math.round(r.left), y: Math.round(r.top) })); } catch (_) {}
+        if (!rsMiniBarMinimized) scheduleRsMiniBarAutoMin();
+      }
+      rsMiniBarDrag = null;
+    };
+    window.addEventListener('pointerup', endDrag);
+    window.addEventListener('pointercancel', endDrag);
+    el.addEventListener('click', (e) => {
+      if (Date.now() < suppressTapUntil) { e.preventDefault(); e.stopPropagation(); return; }
+      if (rsMiniBarMinimized) {
+        e.stopPropagation();
+        rsMiniBarMinimized = false;
+        try { localStorage.setItem('rs_minibar_min', '0'); } catch (_) {}
+        renderRsMiniBar(true);
+        scheduleRsMiniBarAutoMin();
+        return;
+      }
+      const btn = e.target.closest('[data-rsmb-act]');
+      if (!btn) return;
+      e.stopPropagation();
+      const act = btn.getAttribute('data-rsmb-act');
+      if (act === 'min') {
+        clearRsMiniBarTimer();
+        rsMiniBarMinimized = true;
+        try { localStorage.setItem('rs_minibar_min', '1'); } catch (_) {}
+        renderRsMiniBar(true);
+        return;
+      }
+      scheduleRsMiniBarAutoMin();
+      if (act === 'bottom') {
+        const box = document.getElementById('tab-chat');
+        if (isBookMode() && typeof goToBookSpread === 'function') {
+          goToBookSpread(Math.max(0, bookTotalSpreads - 1), false);
+        } else if (box) {
+          box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' });
+        }
+      } else if (act === 'eye') {
+        const order = ['show', 'blur', 'hide'];
+        const next = order[(order.indexOf(uiPref.assetMode) + 1) % order.length];
+        window.setAssetMode(next);
+      } else if (act === 'zen') {
+        setZenMode(!uiPref.zenMode);
+      } else if (act === 'floating') {
+        openPluginFloatingModal();
+      } else if (act === 'theme') {
+        const rb = document.getElementById('readBar');
+        setReadBar(!(rb && rb.classList.contains('open')));
+      }
+    });
+  })();
+
+  function isPluginFloatingModalOpen() {
+    const modal = document.getElementById('pluginFloatingModal');
+    return Boolean(modal && modal.style.display === 'flex');
+  }
+
+  function closePluginFloatingModal() {
+    const modal = document.getElementById('pluginFloatingModal');
+    if (modal) {
+      modal.style.display = 'none';
+      modal.innerHTML = '';
+      lastFloatingModalSig = '';
+    }
+  }
+
+  function renderPluginFloatingModal(force = false) {
+    const modal = document.getElementById('pluginFloatingModal');
+    if (!modal) return;
+    if (!force && !isPluginFloatingModalOpen()) return;
+    const isHide = uiPref.assetMode === 'hide';
+    const snap = (lastState && lastState.snapshot) || {};
+    const uiData = latestPluginFloatingUi || { rev: '', buttons: [], rootWidgets: [] };
+    const widgets = Array.isArray(uiData.rootWidgets) ? uiData.rootWidgets : [];
+    const sig = JSON.stringify([uiData.rev || '', widgets.length, uiPref.assetMode]);
+    if (!force && sig === lastFloatingModalSig) return;
+    lastFloatingModalSig = sig;
+
+    const cardsHtml = widgets.map((w) => {
+      const safeAttrName = w.pluginName.replace(/[^a-zA-Z0-9_-]/g, '');
+      const scopeSel = '.rs-pfm-stage[data-rs-rw-plugin="' + safeAttrName + '"]';
+      const styleHtml = (w.styles || []).map((s) => '<style>' + scopeBotCss(sanitizeBotCss(s), scopeSel) + '</style>').join('');
+      const bodyHtml = sanitizePluginWidgetHtml(w.html || '', scopeSel, snap.assetMap || {});
+      return '<div class="rs-pfm-card">' +
+        '<div class="rs-pfm-card-head">' +
+          '<b style="font-size:13.5px;">🧩 ' + esc(w.displayName || w.pluginName) + '</b>' +
+        '</div>' +
+        '<div class="rs-pfm-stage" data-rs-rw-plugin="' + esc(safeAttrName) + '" data-rs-plugin-raw="' + esc(w.pluginName) + '">' +
+          styleHtml + bodyHtml +
+        '</div>' +
+      '</div>';
+    }).join('');
+
+    const emptyHtml = !widgets.length
+      ? '<div style="font-size:13px; color:var(--sub); padding:10px 2px; line-height:1.6;">' +
+          '현재 플로팅 컨트롤 위젯을 마운트한 활성 플러그인이 없습니다.<br>' +
+          '<b>[모듈/설정 → 백엔드 플러그인 어댑터]</b>에서 해당 플러그인이 활성화되어 있는지 확인해 주세요.' +
+        '</div>'
+      : '';
+
+    const titleTxt = isHide ? '🎛️ 확장 플로팅 도구' : '🎛️ 플러그인 플로팅 컨트롤';
+    modal.innerHTML =
+      '<div class="plg-float-dialog">' +
+        '<div class="plg-float-head">' +
+          '<div style="font-size:15px; font-weight:800;">' + titleTxt + '</div>' +
+          '<button type="button" class="pill" data-pfm-close="1">✕ 닫기</button>' +
+        '</div>' +
+        '<div class="plg-float-body">' +
+          cardsHtml +
+          emptyHtml +
+        '</div>' +
+      '</div>';
+    modal.style.display = 'flex';
+  }
+
+  async function openPluginFloatingModal() {
+    const snap = (lastState && lastState.snapshot) || {};
+    try {
+      const res = await api('/api/plugins/floating-open', {
+        method: 'POST',
+        body: JSON.stringify({
+          charIndex: Number.isFinite(Number(snap.charIndex)) ? Number(snap.charIndex) : -1,
+          chatIndex: Number.isFinite(Number(snap.chatIndex)) ? Number(snap.chatIndex) : -1,
+        }),
+      });
+      if (res && res.pluginFloatingUi) {
+        latestPluginFloatingUi = res.pluginFloatingUi;
+        renderRsMiniBar(false);
+      }
+    } catch (_) {}
+    lastFloatingModalSig = '';
+    renderPluginFloatingModal(true);
+  }
+
+  (function bindPluginFloatingModalEvents() {
+    const readBarBtn = document.getElementById('openPlgFloatingBtn');
+    if (readBarBtn) {
+      readBarBtn.onclick = () => {
+        setReadBar(false);
+        openPluginFloatingModal();
+      };
+    }
+    const modal = document.getElementById('pluginFloatingModal');
+    if (!modal) return;
+    modal.addEventListener('click', async (e) => {
+      if (e.target === modal || e.target.closest('[data-pfm-close]')) {
+        closePluginFloatingModal();
+        return;
+      }
+      const stage = e.target.closest('[data-rs-rw-plugin]');
+      if (!stage) return;
+      const pName = stage.getAttribute('data-rs-plugin-raw') || stage.getAttribute('data-rs-rw-plugin');
+      const target = e.target.closest('button, [data-am-runtime-generation-count-action], [data-am-runtime-toast-action], a, [role="button"], [data-am-slot], [data-am-count-node]') || e.target;
+      if (!pName || !target || target === stage) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const snap = (lastState && lastState.snapshot) || {};
+      const cIdx = Number.isFinite(Number(snap.charIndex)) ? Number(snap.charIndex) : -1;
+      const chIdx = Number.isFinite(Number(snap.chatIndex)) ? Number(snap.chatIndex) : -1;
+      const ds = {};
+      for (const a of Array.from(target.attributes || [])) {
+        if (a.name.startsWith('data-') || a.name.startsWith('x-')) ds[a.name] = a.value;
+      }
+      const countNode = target.getAttribute('data-am-count-node') || '';
+      const actionAttr = target.getAttribute('data-am-runtime-generation-count-action');
+      const toastAttr = target.getAttribute('data-am-runtime-toast-action');
+      let selector = '';
+      if (target.id) selector = '#' + target.id.replace(/[^a-zA-Z0-9_-]/g, '');
+      else if (actionAttr) selector = '[data-am-runtime-generation-count-action="' + actionAttr + '"]';
+      else if (toastAttr) selector = '[data-am-runtime-toast-action="' + toastAttr + '"]';
+
+      try {
+        const res = await api('/api/plugins/root-click', {
+          method: 'POST',
+          body: JSON.stringify({
+            pluginName: pName,
+            charIndex: cIdx,
+            chatIndex: chIdx,
+            countNode,
+            selector,
+            actionHtml: target.outerHTML || '',
+            dataset: ds,
+            x: 24,
+            y: 24,
+          }),
+        });
+        if (res && res.pluginFloatingUi) {
+          latestPluginFloatingUi = res.pluginFloatingUi;
+          renderPluginFloatingModal(true);
+        }
+      } catch (err) {
+        toast('컨트롤 실행 오류: ' + (err && err.message ? err.message : '실패'));
+      }
+    });
+  })();
+
   function closeSceneCtrlModal() {
     const modal = document.getElementById('sceneCtrlModal');
     if (modal) {
@@ -8993,6 +11557,8 @@ function renderWebApp() {
     if (!backendPluginsCache.length) {
       await loadBackendPlugins(true).catch(() => {});
     }
+    const isHide = uiPref.assetMode === 'hide';
+    const isBlur = uiPref.assetMode === 'blur';
     const snap = (lastState && lastState.snapshot) || {};
     const msgs = Array.isArray(snap.messages) ? snap.messages : [];
     const cards = [];
@@ -9002,10 +11568,17 @@ function renderWebApp() {
       const imgs = Array.isArray(m.images) ? m.images : [];
       const hasLb = Boolean(m.html && /risu-form|lb-interaction/i.test(m.html));
       if (!ctrls.length && !imgs.length && !hasLb) continue;
-      const thumbsHtml = imgs.map((im) => {
-        const src = String(im).startsWith('[[RSASSET:') ? resolveAssetTokens(im, snap.assetMap) : safeImgSrc(im);
-        return src ? '<img class="scene-slot-thumb" src="' + esc(src) + '" />' : '';
-      }).join('');
+      let thumbsHtml = '';
+      if (isHide && imgs.length) {
+        thumbsHtml = '<div class="scene-stealth-note">🙈 스텔스 모드 적용 중 · 이미지 ' + imgs.length + '장 숨김</div>';
+      } else if (!isHide && imgs.length) {
+        const itemsHtml = imgs.map((im) => {
+          const src = String(im).startsWith('[[RSASSET:') ? resolveAssetTokens(im, snap.assetMap) : safeImgSrc(im);
+          if (!src) return '';
+          return '<span class="scene-thumb-wrap" data-scene-thumb-reveal="1"><img class="scene-slot-thumb" src="' + esc(src) + '" /><span class="scene-thumb-veil">' + (isBlur ? '🌫️ 보기' : '') + '</span></span>';
+        }).join('');
+        if (itemsHtml) thumbsHtml = '<div class="scene-slot-thumbs">' + itemsHtml + '</div>';
+      }
       const amBtnsHtml = ctrls.map((c) => {
         const payload = esc(JSON.stringify({ msgIndex: m.index, actionHtml: c.outerHTML, dataset: c.dataset }));
         return '<button type="button" class="rs-pbb-btn" data-scene-am="' + payload + '">' + esc(c.label) + '</button>';
@@ -9017,23 +11590,26 @@ function renderWebApp() {
         '<div class="scene-slot-card">' +
           '<div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">' +
             '<b style="font-size:13px;">#' + (m.index >= 0 ? m.index + 1 : '인사말') + ' · ' + esc(displayBotName(snap.charName)) + '</b>' +
-            '<span class="badge">삽화 ' + imgs.length + ' · 컨트롤 ' + (ctrls.length + (hasLb ? 1 : 0)) + '</span>' +
+            '<span class="badge">' + (isHide ? '항목 ' : '삽화 ') + imgs.length + ' · 컨트롤 ' + (ctrls.length + (hasLb ? 1 : 0)) + '</span>' +
           '</div>' +
-          (thumbsHtml ? '<div class="scene-slot-thumbs">' + thumbsHtml + '</div>' : '') +
+          thumbsHtml +
           '<div class="plg-acts">' + amBtnsHtml + lbBtnHtml + '</div>' +
         '</div>'
       );
     }
     const activeGuiPlugins = (backendPluginsCache || []).filter((p) => p && p.enabled);
-    const guiLinksHtml = activeGuiPlugins.length
-      ? '<div class="plg-acts" style="margin-bottom:4px;">' +
-          activeGuiPlugins.map((p) => '<button type="button" class="pill" data-scene-open-gui="' + esc(p.name) + '">🖥️ ' + esc(p.displayName || p.name) + ' GUI</button>').join('') +
-        '</div>'
-      : '';
+    const rwCount = (latestPluginFloatingUi && Array.isArray(latestPluginFloatingUi.rootWidgets)) ? latestPluginFloatingUi.rootWidgets.length : 0;
+    const floatingPopupBtn = '<button type="button" class="pill active" data-scene-open-floating="1">🎛️ 플러그인 플로팅 컨트롤 열기' + (rwCount > 0 ? ' (' + rwCount + ')' : '') + '</button>';
+    const guiLinksHtml =
+      '<div class="plg-acts" style="margin-bottom:4px;">' +
+        floatingPopupBtn +
+        activeGuiPlugins.map((p) => '<button type="button" class="pill" data-scene-open-gui="' + esc(p.name) + '">🖥️ ' + esc(p.displayName || p.name) + ' GUI</button>').join('') +
+      '</div>';
+    const modalTitle = isHide ? '⚙️ 문서 · 확장 도구 제어함' : '🖼️ 장면 · 삽화 · 플러그인 제어함';
     modal.innerHTML =
       '<div class="scene-ctrl-dialog">' +
         '<div class="scene-ctrl-head">' +
-          '<div style="font-size:15px; font-weight:800;">🖼️ 장면 · 삽화 · 플러그인 제어함</div>' +
+          '<div style="font-size:15px; font-weight:800;">' + modalTitle + '</div>' +
           '<button type="button" class="pill" data-scene-close="1">✕ 닫기</button>' +
         '</div>' +
         '<div class="scene-ctrl-body">' +
@@ -9051,6 +11627,16 @@ function renderWebApp() {
     sceneModalEl.addEventListener('click', async (e) => {
       if (e.target === sceneModalEl || e.target.closest('[data-scene-close]')) {
         closeSceneCtrlModal();
+        return;
+      }
+      const revealWrap = e.target.closest('[data-scene-thumb-reveal]');
+      if (revealWrap && document.body.classList.contains('asset-blur')) {
+        revealWrap.classList.toggle('revealed');
+        return;
+      }
+      if (e.target.closest('[data-scene-open-floating]')) {
+        closeSceneCtrlModal();
+        openPluginFloatingModal();
         return;
       }
       const guiBtn = e.target.closest('[data-scene-open-gui]');
@@ -9088,7 +11674,7 @@ function renderWebApp() {
 }
 
 function sanitizeConfigForClient() {
-    if (syncBundledLeavePresetToggles(config.presetToggles)) {
+    if (syncDirectPresetToggles(config)) {
         saveConfig();
     }
     const remoteToggleValues = (config.remoteToggleValues && typeof config.remoteToggleValues === 'object' && !Array.isArray(config.remoteToggleValues))
@@ -9302,6 +11888,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         };
         configPersistDisabled = true;
         customPresetsCache = [];
+        syncDirectPresetToggles(config);
     }
 
     function cloneJsonSafe(v) {
@@ -9359,6 +11946,164 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
     activeHostRpc = hostRpc;
 
     let llmHookDepth = 0;
+    const activityState = {
+        seq: 0,
+        nextId: 0,
+        activeMap: new Map(), // id -> { id, kind, name, phase, startedAt }
+        recentList: [], // [{ id, kind, name, phase, endedAt }]
+        subscribers: new Set(), // Set<{ res, kaTimer }>
+        cleanupTimer: null,
+    };
+    const snapshotWaiters = new Set();
+
+    function notifySnapshotWaiters() {
+        for (const w of snapshotWaiters) {
+            try { w(); } catch (_) {}
+        }
+    }
+
+    let surfaceRefreshTimer = null;
+    let surfaceRefreshRunning = false;
+    let surfaceRefreshQueued = false;
+
+    const refreshDisplaySnapshot = async () => {
+        if (!state.baseSnapshot) return;
+        await rebuildDisplayedSnapshot(state.baseSnapshot, pluginAdapter);
+        state.snapshotVersion += 1;
+        notifySnapshotWaiters();
+    };
+
+    function scheduleSurfaceSnapshotRefresh(delayMs = 60) {
+        if (surfaceRefreshTimer) return;
+        surfaceRefreshTimer = setTimeout(async () => {
+            surfaceRefreshTimer = null;
+            if (surfaceRefreshRunning) {
+                surfaceRefreshQueued = true;
+                return;
+            }
+            surfaceRefreshRunning = true;
+            try {
+                await refreshDisplaySnapshot();
+            } catch (_) {
+            } finally {
+                surfaceRefreshRunning = false;
+                if (surfaceRefreshQueued) {
+                    surfaceRefreshQueued = false;
+                    scheduleSurfaceSnapshotRefresh(40);
+                }
+            }
+        }, Math.max(10, Number(delayMs) || 60));
+        if (typeof surfaceRefreshTimer.unref === 'function') surfaceRefreshTimer.unref();
+    }
+
+    function waitForSnapshotBump(prevVer, timeoutMs = 260) {
+        if (state.snapshotVersion > prevVer) return Promise.resolve(true);
+        return new Promise((resolve) => {
+            let done = false;
+            const cleanup = () => {
+                if (done) return;
+                done = true;
+                clearTimeout(t);
+                snapshotWaiters.delete(onBump);
+            };
+            const onBump = () => {
+                if (state.snapshotVersion > prevVer) {
+                    cleanup();
+                    resolve(true);
+                }
+            };
+            const t = setTimeout(() => {
+                cleanup();
+                resolve(state.snapshotVersion > prevVer);
+            }, timeoutMs);
+            if (typeof t.unref === 'function') t.unref();
+            snapshotWaiters.add(onBump);
+        });
+    }
+
+    function getActivitySnapshot() {
+        const now = Date.now();
+        activityState.recentList = activityState.recentList.filter((x) => now - x.endedAt < 1400);
+        return {
+            seq: activityState.seq,
+            active: Array.from(activityState.activeMap.values()),
+            recent: activityState.recentList.slice(-4),
+        };
+    }
+
+    function broadcastActivity() {
+        const snapAct = getActivitySnapshot();
+        const line = `data: ${JSON.stringify(snapAct)}\n\n`;
+        for (const sub of [...activityState.subscribers]) {
+            try {
+                sub.res.write(line);
+            } catch (_) {
+                clearInterval(sub.kaTimer);
+                activityState.subscribers.delete(sub);
+            }
+        }
+        if (activityState.recentList.length > 0 && !activityState.cleanupTimer) {
+            activityState.cleanupTimer = setTimeout(() => {
+                activityState.cleanupTimer = null;
+                if (getActivitySnapshot().recent.length === 0 && activityState.activeMap.size === 0) {
+                    broadcastActivity();
+                } else if (activityState.recentList.length > 0) {
+                    broadcastActivity();
+                }
+            }, 1450);
+            if (typeof activityState.cleanupTimer.unref === 'function') activityState.cleanupTimer.unref();
+        }
+    }
+
+    function recordActivity({ kind = 'plugin_hook', stage = '', step = 0, total = 0, name = '플러그인', phase = '' } = {}) {
+        const id = ++activityState.nextId;
+        const entry = {
+            id,
+            kind: String(kind || 'plugin_hook'),
+            stage: String(stage || ''),
+            step: Number(step) || 0,
+            total: Number(total) || 0,
+            name: String(name || '플러그인'),
+            phase: String(phase || ''),
+            startedAt: Date.now(),
+        };
+        activityState.activeMap.set(id, entry);
+        activityState.seq += 1;
+        broadcastActivity();
+        let finished = false;
+        const finish = () => {
+            if (finished) return;
+            finished = true;
+            const removed = activityState.activeMap.get(id);
+            activityState.activeMap.delete(id);
+            if (removed) {
+                activityState.recentList.push({
+                    id: removed.id,
+                    kind: removed.kind,
+                    stage: removed.stage,
+                    step: removed.step,
+                    total: removed.total,
+                    name: removed.name,
+                    phase: removed.phase,
+                    endedAt: Date.now(),
+                });
+                if (activityState.recentList.length > 10) activityState.recentList.shift();
+            }
+            activityState.seq += 1;
+            broadcastActivity();
+        };
+        finish.update = (patch = {}) => {
+            if (finished) return;
+            const cur = activityState.activeMap.get(id);
+            if (!cur) return;
+            if (typeof patch.phase === 'string') cur.phase = patch.phase;
+            if (typeof patch.name === 'string' && patch.name) cur.name = patch.name;
+            activityState.seq += 1;
+            broadcastActivity();
+        };
+        return finish;
+    }
+
     async function runUnifiedBackendLLM(req, callerLabel = 'plugin', customProviders = null) {
         const mode = String((req && req.mode) || 'model');
         let msgs = Array.isArray(req && req.messages) ? req.messages.map((m) => ({ ...m })) : [];
@@ -9426,8 +12171,29 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         getBackendConfig: () => config,
         saveBackendConfig: () => saveConfig(),
         hostRpc,
-        getFallbackSnapshot: () => state.snapshot,
+        getFallbackSnapshot: () => state.baseSnapshot || state.snapshot,
         runLLM: (req, pluginName, customProviders) => runUnifiedBackendLLM(req, `plugin:${pluginName}`, customProviders),
+        onActivity: (info) => recordActivity(info),
+        onSurfaceMutated: () => scheduleSurfaceSnapshotRefresh(60),
+        onDbMutated: ({ charIndex, chatIndex, chatObj } = {}) => {
+            if (!hostRpc.isConnected() && state.baseSnapshot && Number(charIndex) === Number(state.baseSnapshot.charIndex)) {
+                if (chatObj && Number(chatIndex) === Number(state.baseSnapshot.chatIndex) && Array.isArray(chatObj.message) && Array.isArray(state.baseSnapshot.messages)) {
+                    for (let i = 0; i < state.baseSnapshot.messages.length; i += 1) {
+                        const m = state.baseSnapshot.messages[i];
+                        if (!m || m.isFirstMessage || Number(m.index) < 0) continue;
+                        const src = chatObj.message[Number(m.index)];
+                        if (!src) continue;
+                        const nextRaw = String(src.data ?? src.content ?? '');
+                        if (nextRaw !== String(m.raw || '')) {
+                            m.raw = nextRaw;
+                            m.html = nextRaw;
+                            m.text = nextRaw;
+                        }
+                    }
+                }
+            }
+            scheduleSurfaceSnapshotRefresh(50);
+        },
     });
     activePluginAdapter = pluginAdapter;
 
@@ -9440,6 +12206,22 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
     const moduleAdapter = createModuleAdapter({
         hostRpc,
         getBackendConfig: () => config,
+        getToggleContext: () => {
+            const curDirectId = (typeof config.directPresetId === 'string' && config.directPresetId) ? config.directPresetId : 'bundled:leave';
+            const p = resolveDirectPreset(curDirectId);
+            const snapNow = state.snapshot || {};
+            const manualSyntax = (Array.isArray(config.presetToggles) ? config.presetToggles : [])
+                .filter((pt) => pt && pt.enabled !== false && pt.syntax && (!pt.parentPresetId || pt.parentPresetId === curDirectId))
+                .map((pt) => pt.syntax)
+                .join('\n');
+            return {
+                presetToggleSyntax: [manualSyntax, (p && (p.toggleSyntax || p.customPromptTemplateToggle)) || ''].filter(Boolean).join('\n'),
+                presetDefaultVariables: (p && (p.defaultVariables || p.templateDefaultVariables)) || '',
+                globalToggleValues: snapNow.globalToggleValues || {},
+                localToggleValues: snapNow.localToggleValues || {},
+                useLocal: Boolean(snapNow.useLocallySetGlobalVariables),
+            };
+        },
         runLLM: (req, srcLabel) => runUnifiedBackendLLM(req, srcLabel || 'module', pluginAdapter.getRegisteredProviders()),
         imageProvider,
         evalCbs: evalPresetCbs,
@@ -9528,6 +12310,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     state.baseSnapshot = externalizeSnapshotAssets(body.snapshot);
                     await rebuildDisplayedSnapshot(state.baseSnapshot, pluginAdapter);
                     state.snapshotVersion += 1;
+                    notifySnapshotWaiters();
                 }
                 if (body.triggerEvent) state.lastTriggerEvent = body.triggerEvent;
                 const needFullSync = !state.catalog || !Array.isArray(state.catalog.characters) || state.catalog.characters.length === 0 || !state.snapshot || typeof state.snapshot.charIndex !== 'number' || state.snapshot.charIndex < 0;
@@ -9570,7 +12353,11 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 rpcState.rpcClientActive = true;
                 if (!rpcState.pcSyncedOnce) {
                     rpcState.pcSyncedOnce = true;
-                    setTimeout(() => { void pluginAdapter.syncPcPlugins().catch(() => {}); }, 20);
+                    setTimeout(() => {
+                        void pluginAdapter.syncPcPlugins()
+                            .then(() => scheduleSurfaceSnapshotRefresh(80))
+                            .catch(() => {});
+                    }, 20);
                 }
                 if (rpcState.queue.length) {
                     return sendJson(res, 200, { ok: true, calls: rpcState.queue.splice(0, 25) }, req);
@@ -9605,7 +12392,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         if (pathname === '/api/pc/rpc-result' && req.method === 'POST') {
             if (!requireAuth(req, res)) return;
             try {
-                const body = JSON.parse((await readBody(req)) || '{}');
+                const body = JSON.parse((await readBody(req, 256 * 1024 * 1024)) || '{}');
                 rpcState.rpcClientActive = true;
                 state.pcConnected = true;
                 state.pcLastSeen = Date.now();
@@ -9651,6 +12438,29 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             return sendJson(res, 202, publicUpdateState(), req);
         }
 
+        // 3c) Live Runtime Activity SSE Stream (real-time module & plugin indicator)
+        if (pathname === '/api/activity/stream' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            res.writeHead(200, {
+                'Content-Type': 'text/event-stream; charset=utf-8',
+                'Cache-Control': 'no-cache, no-transform',
+                'Connection': 'keep-alive',
+                ...corsHeaders(req),
+            });
+            try { res.write(`data: ${JSON.stringify(getActivitySnapshot())}\n\n`); } catch (_) {}
+            const kaTimer = setInterval(() => {
+                try { res.write(': keepalive\n\n'); } catch (_) {}
+            }, 20000);
+            if (typeof kaTimer.unref === 'function') kaTimer.unref();
+            const sub = { res, kaTimer };
+            activityState.subscribers.add(sub);
+            req.on('close', () => {
+                clearInterval(kaTimer);
+                activityState.subscribers.delete(sub);
+            });
+            return;
+        }
+
         // 4) Client State
         if (pathname === '/api/state' && req.method === 'GET') {
             if (!requireAuth(req, res)) return;
@@ -9680,6 +12490,8 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 lastTriggerEvent: state.lastTriggerEvent,
                 catalogVersion: state.catalogVersion,
                 snapshotVersion: state.snapshotVersion,
+                runtimeActivity: getActivitySnapshot(),
+                pluginFloatingUi: pluginAdapter.getFloatingUiState(),
             };
             if (reqCv === null || reqCv !== state.catalogVersion) payload.catalog = state.catalog;
             if (reqSv === null || reqSv !== state.snapshotVersion) {
@@ -9705,13 +12517,49 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     const p = body.payload;
                     const key = String(p.key || '').trim();
                     const scope = p.scope || 'global';
-                    if (key && scope !== 'local') {
+                    if (key) {
                         const fullKey = key.startsWith('toggle_') ? key : `toggle_${key}`;
-                        if (!config.remoteToggleValues || typeof config.remoteToggleValues !== 'object') {
-                            config.remoteToggleValues = {};
+                        const strVal = (p.value === null || p.value === undefined) ? '' : String(p.value);
+                        if (scope !== 'local') {
+                            if (!config.remoteToggleValues || typeof config.remoteToggleValues !== 'object') {
+                                config.remoteToggleValues = {};
+                            }
+                            if (strVal === '') delete config.remoteToggleValues[fullKey];
+                            else config.remoteToggleValues[fullKey] = strVal;
+                            saveConfig();
+                            for (const targetSnap of [state.snapshot, state.baseSnapshot]) {
+                                if (!targetSnap) continue;
+                                if (!targetSnap.globalToggleValues || typeof targetSnap.globalToggleValues !== 'object') {
+                                    targetSnap.globalToggleValues = {};
+                                }
+                                if (strVal === '') delete targetSnap.globalToggleValues[fullKey];
+                                else targetSnap.globalToggleValues[fullKey] = strVal;
+                            }
+                        } else {
+                            for (const targetSnap of [state.snapshot, state.baseSnapshot]) {
+                                if (targetSnap && Number(p.charIndex) === targetSnap.charIndex && Number(p.chatIndex) === targetSnap.chatIndex) {
+                                    targetSnap.useLocallySetGlobalVariables = true;
+                                    if (!targetSnap.localToggleValues || typeof targetSnap.localToggleValues !== 'object') {
+                                        targetSnap.localToggleValues = {};
+                                    }
+                                    if (strVal === '') delete targetSnap.localToggleValues[fullKey];
+                                    else targetSnap.localToggleValues[fullKey] = strVal;
+                                }
+                            }
                         }
-                        config.remoteToggleValues[fullKey] = String(p.value ?? '');
-                        saveConfig();
+                        if (state.snapshot) state.snapshotVersion += 1;
+                    }
+                }
+                if (body.type === 'set_local_toggle_mode' && body.payload && typeof body.payload === 'object') {
+                    const p = body.payload;
+                    const nextEnabled = Boolean(p.enabled);
+                    for (const targetSnap of [state.snapshot, state.baseSnapshot]) {
+                        if (targetSnap && Number(p.charIndex) === targetSnap.charIndex && Number(p.chatIndex) === targetSnap.chatIndex) {
+                            targetSnap.useLocallySetGlobalVariables = nextEnabled;
+                        }
+                    }
+                    if (state.snapshot && Number(p.charIndex) === state.snapshot.charIndex && Number(p.chatIndex) === state.snapshot.chatIndex) {
+                        state.snapshotVersion += 1;
                     }
                 }
                 if (body.type === 'set_author_note' && body.payload && typeof body.payload === 'object') {
@@ -9951,9 +12799,12 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                         name: String(pt.name || '프롬프트 프리셋'),
                         enabled: pt.enabled !== false,
                         syntax: String(pt.syntax || ''),
+                        ...(typeof pt.parentPresetId === 'string' && pt.parentPresetId.trim()
+                            ? { parentPresetId: pt.parentPresetId.trim() }
+                            : {}),
                     }));
-                    syncBundledLeavePresetToggles(config.presetToggles);
                 }
+                syncDirectPresetToggles(config);
                 if (body.translator && typeof body.translator === 'object') {
                     config.translator = {
                         ...config.translator,
@@ -10002,9 +12853,11 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         // 8b-2) LLM Request Log Viewer API
         if (pathname === '/api/logs' && req.method === 'GET') {
             if (!requireAuth(req, res)) return;
+            const summary = recomputeRequestLogsCacheGuard(requestLogs);
             return sendJson(res, 200, {
                 ok: true,
                 max: REQUEST_LOG_MAX,
+                summary,
                 logs: requestLogs.map(summarizeRequestLog),
             }, req);
         }
@@ -10012,7 +12865,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         if (pathname === '/api/logs' && req.method === 'DELETE') {
             if (!requireAuth(req, res)) return;
             requestLogs.length = 0;
-            return sendJson(res, 200, { ok: true }, req);
+            return sendJson(res, 200, { ok: true, summary: buildCacheGuardSessionSummary(requestLogs) }, req);
         }
 
         const logDetailMatch = pathname.match(/^\/api\/logs\/([^/]+)$/);
@@ -10020,11 +12873,12 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             if (!requireAuth(req, res)) return;
             let reqId = logDetailMatch[1];
             try { reqId = decodeURIComponent(reqId); } catch (_) {}
+            recomputeRequestLogsCacheGuard(requestLogs);
             const found = requestLogs.find((item) => item.id === reqId);
             if (!found) {
                 return sendJson(res, 404, { error: '요청 로그를 찾을 수 없습니다.' }, req);
             }
-            return sendJson(res, 200, { ok: true, log: found }, req);
+            return sendJson(res, 200, { ok: true, log: serializeRequestLogDetail(found) }, req);
         }
 
         // 8c) Bundled Leave Preset API
@@ -10088,6 +12942,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     return sendJson(res, 404, { error: '선택한 프리셋을 찾을 수 없습니다.' }, req);
                 }
                 config.directPresetId = nextId;
+                syncDirectPresetToggles(config);
                 saveConfig();
                 return sendJson(res, 200, sanitizeConfigForClient(), req);
             } catch (e) {
@@ -10104,23 +12959,12 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     dataBase64: body.dataBase64,
                     jsonObject: body.jsonObject,
                 });
+                entry.autoRegisterToggle = body.registerToggle !== false;
                 const list = loadCustomPresets().slice();
                 list.push(entry);
                 saveCustomPresets(list);
                 config.directPresetId = `custom:${entry.id}`;
-                if (body.registerToggle !== false && entry.customPromptTemplateToggle) {
-                    if (!Array.isArray(config.presetToggles)) config.presetToggles = [];
-                    const ptId = `pt-${entry.id}`;
-                    const ptEntry = {
-                        id: ptId,
-                        name: `📄 ${entry.name}`,
-                        enabled: true,
-                        syntax: entry.customPromptTemplateToggle,
-                    };
-                    const idx = config.presetToggles.findIndex((x) => x && x.id === ptId);
-                    if (idx >= 0) config.presetToggles[idx] = ptEntry;
-                    else config.presetToggles.unshift(ptEntry);
-                }
+                syncDirectPresetToggles(config);
                 saveConfig();
                 const summary = listDirectPresets().find((p) => p.id === config.directPresetId) || null;
                 return sendJson(res, 200, { ok: true, preset: summary, config: sanitizeConfigForClient() }, req);
@@ -10147,6 +12991,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             if (config.directPresetId === `custom:${cid}`) {
                 config.directPresetId = loadBundledLeavePreset() ? 'bundled:leave' : 'off';
             }
+            syncDirectPresetToggles(config);
             saveConfig();
             return sendJson(res, 200, { ok: true, config: sanitizeConfigForClient() }, req);
         }
@@ -10246,13 +13091,6 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         }
 
         // 8d) Backend Plugin Adapter & Native GUI Iframe APIs
-        const refreshDisplaySnapshot = async () => {
-            if (state.baseSnapshot) {
-                await rebuildDisplayedSnapshot(state.baseSnapshot, pluginAdapter);
-                state.snapshotVersion += 1;
-            }
-        };
-
         if (pathname === '/api/plugins' && req.method === 'GET') {
             if (!requireAuth(req, res)) return;
             return sendJson(res, 200, {
@@ -10306,7 +13144,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         if (pathname === '/api/plugins/upload' && req.method === 'POST') {
             if (!requireAuth(req, res)) return;
             try {
-                const body = JSON.parse((await readBody(req)) || '{}');
+                const body = JSON.parse((await readBody(req, 64 * 1024 * 1024)) || '{}');
                 const plugins = await pluginAdapter.addCustomPlugin({
                     filename: body.filename,
                     script: body.script,
@@ -10379,11 +13217,128 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     charIndex,
                     chatIndex,
                     msgIndex: Number(body.msgIndex ?? -1),
+                    chatId: String(body.chatId || ''),
                     actionHtml: String(body.actionHtml || ''),
                     dataset: (body.dataset && typeof body.dataset === 'object') ? body.dataset : {},
                 });
                 await refreshDisplaySnapshot();
                 return sendJson(res, 200, { ok: true, ...out }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
+            }
+        }
+
+        if (pathname === '/api/plugins/floating-open' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const snapNow = state.snapshot || {};
+                const charIndex = Number.isFinite(Number(body.charIndex)) ? Number(body.charIndex) : snapNow.charIndex;
+                const chatIndex = Number.isFinite(Number(body.chatIndex)) ? Number(body.chatIndex) : snapNow.chatIndex;
+                const ui = await pluginAdapter.prepareFloatingPopupWidgets({ charIndex, chatIndex });
+                return sendJson(res, 200, { ok: true, pluginFloatingUi: ui }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
+            }
+        }
+
+        if (pathname === '/api/plugins/root-click' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const snapNow = state.snapshot || {};
+                const charIndex = Number.isFinite(Number(body.charIndex)) ? Number(body.charIndex) : snapNow.charIndex;
+                const chatIndex = Number.isFinite(Number(body.chatIndex)) ? Number(body.chatIndex) : snapNow.chatIndex;
+                const out = await pluginAdapter.dispatchRootWidgetClick({
+                    pluginName: String(body.pluginName || ''),
+                    charIndex,
+                    chatIndex,
+                    selector: String(body.selector || ''),
+                    countNode: String(body.countNode || ''),
+                    actionHtml: String(body.actionHtml || ''),
+                    dataset: (body.dataset && typeof body.dataset === 'object') ? body.dataset : {},
+                    x: Number(body.x ?? 24),
+                    y: Number(body.y ?? 24),
+                });
+                if (pluginAdapter.hasEditDisplayHandlers()) {
+                    await refreshDisplaySnapshot();
+                }
+                return sendJson(res, 200, { ok: true, ...out, pluginFloatingUi: pluginAdapter.getFloatingUiState() }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
+            }
+        }
+
+        if (pathname === '/api/triggers/run' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const snapNow = state.snapshot || {};
+                const charIndex = Number.isFinite(Number(body.charIndex)) ? Number(body.charIndex) : snapNow.charIndex;
+                const chatIndex = Number.isFinite(Number(body.chatIndex)) ? Number(body.chatIndex) : snapNow.chatIndex;
+                const trigger = String(body.trigger || '').trim();
+                const promptAnswers = Array.isArray(body.promptAnswers) ? body.promptAnswers : [];
+                if (!trigger) return sendJson(res, 400, { error: 'Missing trigger' }, req);
+
+                if (hostRpc.isConnected() && charIndex >= 0 && chatIndex >= 0) {
+                    const prevSnapVer = state.snapshotVersion;
+                    await pluginAdapter.prepareTurn(charIndex, chatIndex, state.snapshot);
+                    try {
+                        const tCtx = pluginAdapter.getTurnContext();
+                        const trigRes = await moduleAdapter.runManualTrigger({
+                            charIndex,
+                            chatIndex,
+                            charObj: tCtx.charObj,
+                            chatObj: tCtx.chatObj,
+                            triggerName: trigger,
+                            promptAnswers,
+                        });
+                        if (trigRes && trigRes.handled) {
+                            if (trigRes.pause) {
+                                return sendJson(res, 200, {
+                                    ok: true,
+                                    mode: 'backend_instant',
+                                    handled: true,
+                                    pause: trigRes.pause,
+                                    triggerEvent: state.lastTriggerEvent,
+                                }, req);
+                            }
+                            if (trigRes.chatObj) {
+                                await hostRpc.invoke('db.setChat', [Number(charIndex), Number(chatIndex), cloneJsonSafe(trigRes.chatObj)]);
+                                if (state.snapshot && state.snapshot.charIndex === Number(charIndex) && state.snapshot.chatIndex === Number(chatIndex)) {
+                                    state.snapshot = syncSnapVarsFromChatObj(state.snapshot, trigRes.chatObj);
+                                }
+                                if (state.baseSnapshot && state.baseSnapshot.charIndex === Number(charIndex) && state.baseSnapshot.chatIndex === Number(chatIndex)) {
+                                    state.baseSnapshot = syncSnapVarsFromChatObj(state.baseSnapshot, trigRes.chatObj);
+                                }
+                            }
+                            await waitForSnapshotBump(prevSnapVer, 260);
+                            let lightSnap = null;
+                            if (state.snapshot) {
+                                if (state.snapshot.charContext && Object.prototype.hasOwnProperty.call(state.snapshot.charContext, 'loreEntries')) {
+                                    const { loreEntries: _omitLoreEntries, ...lightCtx } = state.snapshot.charContext;
+                                    lightSnap = { ...state.snapshot, charContext: lightCtx };
+                                } else {
+                                    lightSnap = state.snapshot;
+                                }
+                            }
+                            return sendJson(res, 200, {
+                                ok: true,
+                                mode: 'backend_instant',
+                                handled: true,
+                                pause: null,
+                                triggerEvent: state.lastTriggerEvent,
+                                snapshotVersion: state.snapshotVersion,
+                                snapshot: lightSnap,
+                            }, req);
+                        }
+                    } finally {
+                        moduleAdapter.endTurn();
+                        pluginAdapter.endTurn();
+                    }
+                }
+                queueCommand('run_trigger', { charIndex, chatIndex, trigger, promptAnswers });
+                return sendJson(res, 200, { ok: true, mode: 'queued', handled: false }, req);
             } catch (e) {
                 return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
             }
@@ -10448,6 +13403,16 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             p.reject(new Error('Relay server closed'));
         }
         rpcState.pending.clear();
+        if (activityState.cleanupTimer) {
+            clearTimeout(activityState.cleanupTimer);
+            activityState.cleanupTimer = null;
+        }
+        for (const sub of [...activityState.subscribers]) {
+            clearInterval(sub.kaTimer);
+            try { sub.res.end(); } catch (_) {}
+        }
+        activityState.subscribers.clear();
+        notifySnapshotWaiters();
     }
     const origServerClose = server.close.bind(server);
     server.close = function (...args) {
@@ -10557,5 +13522,13 @@ module.exports = {
     buildDirectPromptMessages,
     loadBundledLeavePreset,
     syncBundledLeavePresetToggles,
+    mergeStreamUsage,
+    mapUsageToOpenAI,
+    detectAuxiliaryOrSubRequest,
+    buildLaneSignature,
+    findMatchingMainLane,
+    computePrefixDiff,
+    recomputeRequestLogsCacheGuard,
+    buildCacheGuardSessionSummary,
     createRelayServer,
 };
