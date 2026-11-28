@@ -5742,7 +5742,8 @@ function stripAuxBlocksFromProse(text) {
         .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
         .replace(/<Thoughts>[\s\S]*?<\/Thoughts>/gi, '')
         .replace(/<statusdata>[\s\S]*?<\/statusdata>/gi, '')
-        .replace(/<!--\s*HAYAKU_STATE_PACKET_START\s*-->[\s\S]*?<!--\s*HAYAKU_STATE_PACKET_END\s*-->/gi, '')
+        .replace(/(?:<!--\s*)?HAYAKU_STATE_PACKET_START(?:\s*-->)?[\s\S]*?(?:(?:<!--\s*)?HAYAKU_STATE_PACKET_END(?:\s*-->)?|$)/gi, '')
+        .replace(/^\s*◈CG\b[\s\S]*?^\s*◈\s*$/gm, '')
         .replace(/^\s*\[[☀️🌤️⛅🌥️🌦️🌧️⛈️🌩️❄️🌫️🌙✨][^\n]*\]\s*$/gm, '')
         .replace(/\n{3,}/g, '\n\n')
         .trim();
@@ -5818,7 +5819,7 @@ function extractTerminalSceneTail(historyMessages, maxChars = 2400) {
     return '';
 }
 
-function auditDraftWithDeterministicGuards(draftText, { prevAssistantText = '', userText = '', personaName = '', isRpMode = true } = {}) {
+function auditDraftWithDeterministicGuards(draftText, { prevAssistantText = '', userText = '', personaName = '', isRpMode = true, intimateAssetMode = false } = {}) {
     const issues = [];
     const rawDraft = String(draftText || '');
     const visibleDraft = stripAuxBlocksFromProse(rawDraft);
@@ -5921,10 +5922,46 @@ function auditDraftWithDeterministicGuards(draftText, { prevAssistantText = '', 
         });
     }
 
+    // 6) Stray Chinese/Hanzi language leak inside Korean prose (e.g., "그녀의 허벅지가他的手 안에서")
+    if ((visibleDraft.match(/[가-힣]/g) || []).length >= 30) {
+        const plainForCjk = visibleDraft.replace(/<[^>]+>/g, ' ').replace(/\([^)\n]{1,40}\)/g, ' ');
+        const rawLeaks = plainForCjk.match(/[\u4E00-\u9FFF]{2,}|(?<=[가-힣])[他她它这那们着过为说让把被的了](?=[가-힣\s,.!?])/g) || [];
+        const cjkLeaks = rawLeaks.filter((tok) => !String(userText || '').includes(tok));
+        if (cjkLeaks.length > 0) {
+            issues.push({
+                code: 'cjk_language_leak',
+                message: `Stray Chinese/Hanzi characters leaked into Korean prose (${cjkLeaks.slice(0, 4).join(', ')}). Replace every leaked foreign character with natural pure Korean.`,
+            });
+        }
+    }
+
+    // 7) Intimate asset SFW fallback guard when sub_intimacy_asset is enabled during active sexual beats
+    if (intimateAssetMode) {
+        const imgCmds = [];
+        const cmdRe = /<img\b[^>]*\bcmd\s*=\s*["']([^"']+)["']/gi;
+        let cm;
+        while ((cm = cmdRe.exec(visibleDraft)) !== null) {
+            if (cm[1]) imgCmds.push(String(cm[1]).trim());
+        }
+        if (imgCmds.length > 0) {
+            const hasActiveSexProse = /(?:삽입|질내|질\s*안|질구|애널|후배위|기승위|정상위|대면좌위|입위|펠라|커닐링구스|파이즈리|수음|핸드잡|풋잡|자위|딜도|바이브|진동기|애널비즈|스팽킹|유두|가슴.{0,8}(?:주무|만지|움켜|빨)|손가락.{0,8}(?:넣|찔|문질|자극)|허리를\s*(?:밀|움직|흔들|쳐올)|사정|절정|정액|자지|보지|성기|애무|blowjob|handjob|footjob|paizuri|cunnilingus|penetration|cowgirl|doggy|missionary|analsex|fingering|dildo|vibrator|analbeads|spanking|masturbat|tribadism|ejaculat|orgasm|thrusting)/i.test(visibleDraft);
+            if (hasActiveSexProse) {
+                const nsfwTagRe = /(?:sex|cowgirl|missionary|doggy|standing|spooning|mating|fullnelson|blowjob|handjob|footjob|cunnilingus|fingering|paizuri|irrumatio|69position|kiss|breast\s*grab|nipple|vibrator|dildo|anal|spanking|straddle|suspended|masturbation|\.cum\b|aftercum|bukkake|tribadism|creampie|groupsex|mfm\.)/i;
+                const hasNsfwTag = imgCmds.some((cmd) => nsfwTagRe.test(cmd));
+                if (!hasNsfwTag) {
+                    issues.push({
+                        code: 'intimate_asset_sfw_fallback',
+                        message: `Active sexual beat used only generic SFW expression tags (${imgCmds.slice(0, 4).join(', ')}). Replace them with exact matching NSFW act/position/climax asset tags registered in the character card or lorebook asset list (preserving the active attire/nude segment and exact spelling such as spaces or ".cum").`,
+                    });
+                }
+            }
+        }
+    }
+
     return { ok: issues.length === 0, issues };
 }
 
-function buildTwoPassDraftMessages({ builtMessages, historyMessages, terminalTail, userText, charName = '', personaName = '', isRpMode = true } = {}) {
+function buildTwoPassDraftMessages({ builtMessages, historyMessages, terminalTail, userText, charName = '', personaName = '', isRpMode = true, intimateAssetMode = false } = {}) {
     const baseMsgs = Array.isArray(builtMessages) ? builtMessages : [];
     const safeChar = charName || 'Character';
     const compactSys = [];
@@ -5942,10 +5979,15 @@ function buildTwoPassDraftMessages({ builtMessages, historyMessages, terminalTai
         `- You are writing a clean Pass 1 scene draft for "${safeChar}"${personaName ? ` (User persona: ${personaName})` : ''}.`,
         isRpMode
             ? '- RP AGENCY LOCK: {{user}} performs ONLY what their latest input explicitly states. Never invent unstated {{user}} dialogue, actions, feelings, or third-person proxying ("그가/그녀가" / "he/she" / "彼/彼女").'
-            : '- NOVEL MODE: Advance the full cast naturally while honoring author reservations.',
+            : `- NOVEL MODE (ACTIVE FULL-CAST FICTION): Treat ${personaName || '{{user}}'} as an active, full lead character — NOT a silent RP observer. Actively write ${personaName || '{{user}}'}'s spoken back-and-forth dialogue, physical actions, gaze exchanges, reactions, and inner texture matching the [USER PERSONA] profile while advancing the full cast naturally and honoring explicit author reservations.`,
         '- TERMINAL-FIRST CONTINUITY: Continue seamlessly from the immediately preceding scene tail without replaying earlier turns or adding sudden contrived interruptions.',
         '- CHARACTER VOICE FIDELITY: Match each speaker\'s character sheet / Voice Guard cadence, sentence endings, warmth, teasing, and quirks—never flatten distinct NPCs into stiff, clipped, robotic statements even in tense beats.',
         '- NATURAL PHYSICAL TRANSITIONS: When a character moves into a physical context that implies attire or posture changes (e.g., entering a bath or shower to wash), show the natural undressing/transition on-screen rather than keeping them awkwardly clothed.',
+        '- ANATOMICAL & SPATIAL FEASIBILITY: Strictly honor physical reach, insertion depth, occlusion, and knowledge boundaries — never have a character touch, see, or detect something physically unreachable in the current posture (e.g., feeling the enclosed tip or pinhole of a condom with external fingers while fully inserted during penetration) or leak hidden secrets they have no sensory path to learn.',
+        '- OUTPUT LANGUAGE PURITY: Write newly composed prose strictly in the established narrative language without slipping stray foreign/Chinese characters (e.g., 他的手, 她的) or English pronouns into Korean sentences.',
+        intimateAssetMode
+            ? '- INTIMATE ASSET TAGS: During active sexual beats (foreplay, oral/manual, paizuri, penetration, position shifts, climax/ejaculation), emit exact registered NSFW act/position/climax image tags from the card/lorebook asset list (preserving current attire/nude segment and exact spelling including spaces or ".cum") instead of generic SFW emotion tags.'
+            : '',
         '- PROSE ONLY: Output ONLY the raw in-world prose draft. Omit <thinking>, <statusdata>, character-card status lines, and trailing memory packets (Pass 2 will polish and append footers).',
         compactSys.length ? compactSys.join('\n\n').slice(0, 14000) : '',
     ].filter(Boolean).join('\n\n');
@@ -6383,7 +6425,7 @@ function syncSnapVarsFromChatObj(snap, chatObj) {
     return { ...snap, chatVariables: nextVars };
 }
 
-function resolveEffectiveWritingRpMode(preset, snap, remoteToggleValues = null) {
+function resolveEffectiveToggleVars(preset, snap, remoteToggleValues = null) {
     const vars = parsePresetDefaultToggles(
         (preset && (preset.toggleSyntax || preset.customPromptTemplateToggle)) || '',
         (preset && (preset.defaultVariables || preset.templateDefaultVariables)) || ''
@@ -6393,7 +6435,19 @@ function resolveEffectiveWritingRpMode(preset, snap, remoteToggleValues = null) 
     if (snap && snap.useLocallySetGlobalVariables) {
         normalizeToggleMapInto(vars, snap.localToggleValues);
     }
+    return vars;
+}
+
+function resolveEffectiveWritingRpMode(preset, snap, remoteToggleValues = null) {
+    const vars = resolveEffectiveToggleVars(preset, snap, remoteToggleValues);
     return String(vars.toggle_writing_mode ?? '0').trim() !== '1';
+}
+
+function resolveEffectiveIntimateAssetMode(preset, snap, remoteToggleValues = null) {
+    const vars = resolveEffectiveToggleVars(preset, snap, remoteToggleValues);
+    return String(vars.toggle_sub_intimacy ?? '0').trim() === '1'
+        && String(vars.toggle_sub_intimacy_asset ?? '0').trim() === '1'
+        && ['1', '2', '3'].includes(String(vars.toggle_nsfw_mode ?? '0').trim());
 }
 
 function selectSourceHistoryForTurn(tCtx, snap, beforeIndex = Infinity) {
@@ -6432,6 +6486,7 @@ async function executeDirectModelTurn({
         const draftProfile = getAuxProfile() || profile;
         const terminalTail = extractTerminalSceneTail(historyMessages, 2400);
         const isRpMode = resolveEffectiveWritingRpMode(preset, snap, config.remoteToggleValues);
+        const intimateAssetMode = resolveEffectiveIntimateAssetMode(preset, snap, config.remoteToggleValues);
         const draftMsgs = buildTwoPassDraftMessages({
             builtMessages,
             historyMessages,
@@ -6440,6 +6495,7 @@ async function executeDirectModelTurn({
             charName,
             personaName,
             isRpMode,
+            intimateAssetMode,
         });
         console.log(`[DirectChat Pass1] char#${charIndex} chat#${chatIndex} via ${draftProfile.name} (${draftProfile.model}) tail=${terminalTail.length}c`);
         const draftRes = await callLLMNonStream(draftProfile, draftMsgs, {
@@ -6457,6 +6513,7 @@ async function executeDirectModelTurn({
             userText,
             personaName,
             isRpMode,
+            intimateAssetMode,
         });
         if (!audit.ok) {
             console.log(`[DirectChat Guard] ${audit.issues.map((x) => x.code).join(', ')}`);
@@ -7135,6 +7192,7 @@ function renderWebApp() {
     background:var(--book-bg); border:1px solid var(--border); border-radius:12px;
     box-shadow: var(--shadow); overflow:hidden; position:relative; min-height:0;
   }
+  .book-frame.book-zone-cursor { cursor:pointer; }
   .book-frame:not(.single-page)::before {
     content:''; position:absolute; top:0; bottom:0; left:50%; width:1px;
     background:var(--border); pointer-events:none; z-index:3;
@@ -7146,6 +7204,7 @@ function renderWebApp() {
   }
   .book-viewport {
     flex:1; min-height:0; overflow:hidden; margin: clamp(8px, 2vw, 22px) auto; padding:12px 0; box-sizing:border-box; position:relative;
+    contain: layout style;
   }
   .book-tap-zone {
     position:absolute; top:0; bottom:0; width:12%; min-width:44px; max-width:100px;
@@ -7187,13 +7246,16 @@ function renderWebApp() {
   .epub-flip-leaf {
     position:absolute; top:0; bottom:0; width:50%; pointer-events:none; opacity:0;
     background:var(--leaf-bg); z-index:15; backface-visibility:hidden;
-    box-shadow:0 0 26px rgba(0,0,0,0.22);
+    box-shadow:0 0 20px rgba(0,0,0,0.18);
+    will-change: transform, opacity; contain: strict; transform: translateZ(0);
   }
   .book-frame.single-page .epub-flip-leaf { width:100%; }
-  .epub-flip-leaf.flip-next { right:0; transform-origin:left center; animation: rsFlipNext 640ms cubic-bezier(0.32, 0.08, 0.24, 1) forwards; }
-  .epub-flip-leaf.flip-prev { left:0; transform-origin:right center; animation: rsFlipPrev 640ms cubic-bezier(0.32, 0.08, 0.24, 1) forwards; }
-  @keyframes rsFlipNext { 0% { opacity:0.95; transform:perspective(1800px) rotateY(0deg); } 50% { opacity:0.98; transform:perspective(1800px) rotateY(-90deg); } 100% { opacity:0; transform:perspective(1800px) rotateY(-180deg); } }
-  @keyframes rsFlipPrev { 0% { opacity:0.95; transform:perspective(1800px) rotateY(0deg); } 50% { opacity:0.98; transform:perspective(1800px) rotateY(90deg); } 100% { opacity:0; transform:perspective(1800px) rotateY(180deg); } }
+  .epub-flip-leaf.flip-next { right:0; transform-origin:left center; }
+  .epub-flip-leaf.flip-prev { left:0; transform-origin:right center; }
+  .epub-flip-leaf.flip-next.css-anim { animation: rsFlipNext 180ms cubic-bezier(0.22, 1, 0.36, 1) forwards; }
+  .epub-flip-leaf.flip-prev.css-anim { animation: rsFlipPrev 180ms cubic-bezier(0.22, 1, 0.36, 1) forwards; }
+  @keyframes rsFlipNext { 0% { opacity:0.32; transform:translate3d(0,0,0) scaleX(1); } 100% { opacity:0; transform:translate3d(-16%,0,0) scaleX(0.35); } }
+  @keyframes rsFlipPrev { 0% { opacity:0.32; transform:translate3d(0,0,0) scaleX(1); } 100% { opacity:0; transform:translate3d(16%,0,0) scaleX(0.35); } }
 
   .book-nav { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:10px 2px 2px; flex-shrink:0; font-size:12.5px; color:var(--sub); font-variant-numeric: tabular-nums; position:relative; }
   .book-page-btn { min-height:30px; padding:0 12px; font-size:12px; font-variant-numeric: tabular-nums; background:var(--surface); }
@@ -7795,7 +7857,7 @@ function renderWebApp() {
   .plg-gui-entries .pill.active {
     background:var(--accent); color:var(--on-accent); border-color:var(--accent);
   }
-  #pluginGuiFrame {
+  #pluginGuiFrame, #pluginGuiLiveFrame {
     flex:1; width:100%; min-height:0; border:none; background:#0f172a;
   }
   .plg-gui-recall-bar {
@@ -9401,21 +9463,41 @@ function renderWebApp() {
   let bookColStep = 1;
   let bookColOffsets = [];
   let bookScrollGuardLock = false;
+  let bookScrollGuardTimer = null;
   let bookTotalSpreads = 1;
   let bookTotalPages = 1;
   let bookSinglePage = false;
-  let bookFlipMidTimer = null;
   let bookFlipEndTimer = null;
   let bookWheelLock = false;
+  let bookWheelTimer = null;
   let bookResizeTimer = null;
   let bookFrameResizeObserver = null;
+  let bookScrollSnapTimer = null;
+  let bookRelayoutTimer = null;
   let bookRelayoutRaf = 0;
+  let lastBookFlipAt = 0;
+  let lastBookLayoutSig = '';
+  let cachedBookFrameRect = null;
+  function cancelBookFlipAnim(flipLeaf) {
+    if (bookFlipEndTimer) { clearTimeout(bookFlipEndTimer); bookFlipEndTimer = null; }
+    if (!flipLeaf) return;
+    flipLeaf.classList.remove('flip-next', 'flip-prev', 'css-anim');
+    if (typeof flipLeaf.getAnimations === 'function') {
+      try {
+        for (const a of flipLeaf.getAnimations()) a.cancel();
+      } catch (_) {}
+    }
+  }
   function scheduleBookRelayout() {
-    if (bookRelayoutRaf) return;
-    bookRelayoutRaf = requestAnimationFrame(() => {
-      bookRelayoutRaf = 0;
-      if (isBookMode() && typeof layoutBookSpreads === 'function') layoutBookSpreads(false);
-    });
+    if (bookRelayoutTimer) { clearTimeout(bookRelayoutTimer); bookRelayoutTimer = null; }
+    if (bookRelayoutRaf) { cancelAnimationFrame(bookRelayoutRaf); bookRelayoutRaf = 0; }
+    bookRelayoutTimer = setTimeout(() => {
+      bookRelayoutTimer = null;
+      bookRelayoutRaf = requestAnimationFrame(() => {
+        bookRelayoutRaf = 0;
+        if (isBookMode() && typeof layoutBookSpreads === 'function') layoutBookSpreads(false);
+      });
+    }, 90);
   }
   const localTranslations = new Map();
   const shownTranslations = new Set();
@@ -11365,20 +11447,33 @@ function renderWebApp() {
       }
     }
     if (rulerEl) {
-      let ruler = '';
       const maxTicks = 48;
-      if (bookTotalSpreads <= maxTicks) {
-        for (let i = 0; i < bookTotalSpreads; i++) {
-          ruler += '<div class="ruler-tick' + (i === bookSpreadIdx ? ' active' : '') + '" data-book-spread="' + i + '"></div>';
+      const tickCount = bookTotalSpreads <= maxTicks ? bookTotalSpreads : maxTicks;
+      const activeTick = bookTotalSpreads <= maxTicks
+        ? Math.max(0, Math.min(bookTotalSpreads - 1, bookSpreadIdx))
+        : Math.round((bookSpreadIdx / Math.max(1, bookTotalSpreads - 1)) * (maxTicks - 1));
+      if (rulerEl._rsTotalSpreads !== bookTotalSpreads || rulerEl.children.length !== tickCount) {
+        let ruler = '';
+        if (bookTotalSpreads <= maxTicks) {
+          for (let i = 0; i < bookTotalSpreads; i++) {
+            ruler += '<div class="ruler-tick' + (i === activeTick ? ' active' : '') + '" data-book-spread="' + i + '"></div>';
+          }
+        } else {
+          for (let t = 0; t < maxTicks; t++) {
+            const sp = Math.round((t / (maxTicks - 1)) * (bookTotalSpreads - 1));
+            ruler += '<div class="ruler-tick' + (t === activeTick ? ' active' : '') + '" data-book-spread="' + sp + '"></div>';
+          }
         }
-      } else {
-        const activeTick = Math.round((bookSpreadIdx / Math.max(1, bookTotalSpreads - 1)) * (maxTicks - 1));
-        for (let t = 0; t < maxTicks; t++) {
-          const sp = Math.round((t / (maxTicks - 1)) * (bookTotalSpreads - 1));
-          ruler += '<div class="ruler-tick' + (t === activeTick ? ' active' : '') + '" data-book-spread="' + sp + '"></div>';
-        }
+        rulerEl.innerHTML = ruler;
+        rulerEl._rsTotalSpreads = bookTotalSpreads;
+        rulerEl._rsActiveTickIdx = activeTick;
+      } else if (rulerEl._rsActiveTickIdx !== activeTick) {
+        const prevTick = rulerEl.children[rulerEl._rsActiveTickIdx];
+        if (prevTick) prevTick.classList.remove('active');
+        const nextTick = rulerEl.children[activeTick];
+        if (nextTick) nextTick.classList.add('active');
+        rulerEl._rsActiveTickIdx = activeTick;
       }
-      rulerEl.innerHTML = ruler;
     }
     const jBar = document.getElementById('bookJumpBar');
     if (jBar && jBar.style.display !== 'none') {
@@ -11515,7 +11610,7 @@ function renderWebApp() {
       if (!img.complete) {
         img.addEventListener('load', () => {
           evaluateImg(img);
-          if (isBookMode() && typeof layoutBookSpreads === 'function') layoutBookSpreads(false);
+          if (isBookMode() && typeof scheduleBookRelayout === 'function') scheduleBookRelayout();
         }, { once: true });
       }
     });
@@ -11535,7 +11630,7 @@ function renderWebApp() {
         ensureBotAssetRatio(bgUrl, (ratio) => {
           if (ratio && ratio.w > 0 && ratio.h > 0 && el.isConnected && uiPref.assetFit !== 'original') {
             el.style.setProperty('--rs-fit-ar', ratio.w + ' / ' + ratio.h);
-            if (isBookMode() && typeof layoutBookSpreads === 'function') layoutBookSpreads(false);
+            if (isBookMode() && typeof scheduleBookRelayout === 'function') scheduleBookRelayout();
           }
         });
       }
@@ -11903,9 +11998,16 @@ function renderWebApp() {
 
   function setBookViewportScrollLeft(vp, leftPx) {
     if (!vp) return;
+    if (bookScrollSnapTimer) { clearTimeout(bookScrollSnapTimer); bookScrollSnapTimer = null; }
+    if (bookScrollGuardTimer) { clearTimeout(bookScrollGuardTimer); bookScrollGuardTimer = null; }
+    const maxScroll = Math.max(0, (vp.scrollWidth || 0) - (vp.clientWidth || 0));
+    const targetLeft = Math.min(maxScroll, Math.max(0, Math.round(leftPx)));
     bookScrollGuardLock = true;
-    vp.scrollLeft = Math.max(0, Math.round(leftPx));
-    requestAnimationFrame(() => { bookScrollGuardLock = false; });
+    vp.scrollLeft = targetLeft;
+    bookScrollGuardTimer = setTimeout(() => {
+      bookScrollGuardTimer = null;
+      bookScrollGuardLock = false;
+    }, 90);
   }
 
   function goToBookSpread(nextIdx, animate = false, fromLayout = false) {
@@ -11921,44 +12023,68 @@ function renderWebApp() {
     const clamped = Math.max(0, Math.min(bookTotalSpreads - 1, nextIdx));
     bookSpreadIdx = clamped;
 
-    if (bookFlipMidTimer) { clearTimeout(bookFlipMidTimer); bookFlipMidTimer = null; }
-    if (bookFlipEndTimer) { clearTimeout(bookFlipEndTimer); bookFlipEndTimer = null; }
+    setBookViewportScrollLeft(vp, getBookSpreadScrollLeft(bookSpreadIdx));
+    updateBookNavUI();
 
+    const now = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+    const isRapidFlip = (now - lastBookFlipAt) < 110;
     if (animate && flipLeaf && clamped !== prev) {
-      const dirClass = clamped > prev ? 'flip-next' : 'flip-prev';
-      flipLeaf.classList.remove('flip-next', 'flip-prev');
-      void flipLeaf.offsetWidth;
-      flipLeaf.classList.add(dirClass);
-      bookFlipMidTimer = setTimeout(() => {
-        bookFlipMidTimer = null;
-        setBookViewportScrollLeft(vp, getBookSpreadScrollLeft(bookSpreadIdx));
-        updateBookNavUI();
-      }, 300);
-      bookFlipEndTimer = setTimeout(() => {
-        bookFlipEndTimer = null;
-        flipLeaf.classList.remove('flip-next', 'flip-prev');
-      }, 650);
-    } else {
-      if (flipLeaf) flipLeaf.classList.remove('flip-next', 'flip-prev');
-      setBookViewportScrollLeft(vp, getBookSpreadScrollLeft(bookSpreadIdx));
-      updateBookNavUI();
+      lastBookFlipAt = now;
+      cancelBookFlipAnim(flipLeaf);
+      if (!isRapidFlip) {
+        const dirClass = clamped > prev ? 'flip-next' : 'flip-prev';
+        flipLeaf.classList.add(dirClass);
+        if (typeof flipLeaf.animate === 'function') {
+          const shiftX = clamped > prev ? '-16%' : '16%';
+          try {
+            const anim = flipLeaf.animate(
+              [
+                { opacity: 0.32, transform: 'translate3d(0,0,0) scaleX(1)' },
+                { opacity: 0, transform: 'translate3d(' + shiftX + ',0,0) scaleX(0.35)' },
+              ],
+              { duration: 180, easing: 'cubic-bezier(0.22, 1, 0.36, 1)', fill: 'none' }
+            );
+            anim.onfinish = () => {
+              if (flipLeaf) flipLeaf.classList.remove('flip-next', 'flip-prev');
+            };
+            anim.oncancel = () => {
+              if (flipLeaf) flipLeaf.classList.remove('flip-next', 'flip-prev');
+            };
+          } catch (_) {
+            flipLeaf.classList.remove('flip-next', 'flip-prev');
+          }
+        } else {
+          requestAnimationFrame(() => {
+            if (!flipLeaf) return;
+            flipLeaf.classList.add('css-anim');
+            bookFlipEndTimer = setTimeout(() => {
+              bookFlipEndTimer = null;
+              flipLeaf.classList.remove('flip-next', 'flip-prev', 'css-anim');
+            }, 190);
+          });
+        }
+      }
+    } else if (flipLeaf) {
+      cancelBookFlipAnim(flipLeaf);
     }
   }
 
   function prepareBookPaginationBlocks(cols, colH) {
     if (!cols || !cols.querySelectorAll || !(colH > 0)) return;
+    // Phase 1 (Write batch): reset previous pagination attributes
     cols.querySelectorAll('[data-rs-book-atomic], [data-rs-book-inline-block], [data-rs-book-breakable], [data-rs-book-flow], [data-rs-book-flow-block], [data-rs-book-scaled]').forEach((el) => {
-      el.removeAttribute('data-rs-book-atomic');
-      el.removeAttribute('data-rs-book-inline-block');
-      el.removeAttribute('data-rs-book-breakable');
-      el.removeAttribute('data-rs-book-flow');
-      el.removeAttribute('data-rs-book-flow-block');
+      if (el.hasAttribute('data-rs-book-atomic')) el.removeAttribute('data-rs-book-atomic');
+      if (el.hasAttribute('data-rs-book-inline-block')) el.removeAttribute('data-rs-book-inline-block');
+      if (el.hasAttribute('data-rs-book-breakable')) el.removeAttribute('data-rs-book-breakable');
+      if (el.hasAttribute('data-rs-book-flow')) el.removeAttribute('data-rs-book-flow');
+      if (el.hasAttribute('data-rs-book-flow-block')) el.removeAttribute('data-rs-book-flow-block');
       if (el.hasAttribute('data-rs-book-scaled')) {
         el.removeAttribute('data-rs-book-scaled');
         el.style.zoom = '';
       }
     });
 
+    // Phase 2 (Read-only pass): measure and classify without writing to DOM
     const mediaSel = 'img, picture, figure, video, canvas, svg, .msg-img-wrap, .image-container, [data-rs-bg-img="1"], [data-rs-asset-fit-box="1"], [data-rs-asset-fit-bg="1"], .am-illustration-projection, .x-risu-am-illustration-projection, .x-risu-am-illustration-slot, .am-image, .x-risu-am-image, .am-generated-image, .x-risu-am-generated-image';
     const mediaAnchors = Array.from(cols.querySelectorAll(mediaSel));
     cols.querySelectorAll('.rs-bot-html div, .rs-bot-html span, .rs-bot-html a, .rs-bot-html section, .rs-bot-html article').forEach((el) => {
@@ -11979,6 +12105,8 @@ function renderWebApp() {
     ));
     const majorMediaSel = 'img, picture, video, canvas, .image-container, [data-rs-bg-img="1"], [data-rs-asset-fit-bg="1"]';
 
+    const atomicSet = new Set();
+    const inlineBlockSet = new Set();
     for (const anchor of mediaAnchors) {
       if (anchor.closest && anchor.closest('.turn-tts-btn, .msg-actions, .book-turn-tag, button')) continue;
       let cardRoot = anchor;
@@ -12011,25 +12139,36 @@ function renderWebApp() {
         cardRoot = anc;
         anc = anc.parentElement;
       }
-      cardRoot.setAttribute('data-rs-book-atomic', '1');
+      atomicSet.add(cardRoot);
       if (typeof getComputedStyle === 'function') {
         try {
           if (getComputedStyle(cardRoot).display === 'inline') {
-            cardRoot.setAttribute('data-rs-book-inline-block', '1');
+            inlineBlockSet.add(cardRoot);
           }
         } catch (_) {}
       }
     }
 
+    const breakableList = [];
     cols.querySelectorAll('.book-user-block, .leave-hud-card, .leave-ooc-card, .rs-bot-html details').forEach((el) => {
       if (Math.max(el.offsetHeight || 0, el.scrollHeight || 0) > colH * 0.82) {
-        el.setAttribute('data-rs-book-breakable', '1');
+        breakableList.push(el);
       }
     });
 
+    const hasAtomicAnc = (el) => {
+      let cur = el.parentElement;
+      while (cur && cur !== cols) {
+        if (atomicSet.has(cur)) return true;
+        cur = cur.parentElement;
+      }
+      return false;
+    };
+    const flowList = [];
+    const flowBlockList = [];
     cols.querySelectorAll('.rs-bot-html div, .rs-bot-html section, .rs-bot-html article, .rs-bot-html blockquote, .rs-bot-html main').forEach((el) => {
-      if (el.getAttribute('data-rs-book-atomic') === '1') return;
-      if (el.closest && el.closest('[data-rs-book-atomic="1"], [data-rs-asset-fit-box="1"], .leave-hud-card, .leave-ooc-card')) return;
+      if (atomicSet.has(el) || hasAtomicAnc(el)) return;
+      if (el.closest && el.closest('[data-rs-asset-fit-box="1"], .leave-hud-card, .leave-ooc-card')) return;
       const txtLen = (el.textContent || '').trim().length;
       const boxH = Math.max(el.offsetHeight || 0, el.scrollHeight || 0);
       if (txtLen <= 140 && boxH <= colH * 0.78) return;
@@ -12039,16 +12178,27 @@ function renderWebApp() {
       const ovBlocked = /^(hidden|clip|auto|scroll)$/.test(cs.overflow || '') || /^(hidden|clip|auto|scroll)$/.test(cs.overflowY || '');
       const containBlocked = Boolean(cs.contain && cs.contain !== 'none');
       if (ovBlocked || containBlocked) {
-        el.setAttribute('data-rs-book-flow', '1');
+        flowList.push(el);
       }
       if ((cs.display === 'flex' || cs.display === 'inline-flex') && /^column/i.test(cs.flexDirection || '') && boxH > colH * 0.78) {
-        el.setAttribute('data-rs-book-flow', '1');
-        el.setAttribute('data-rs-book-flow-block', '1');
+        flowBlockList.push(el);
       }
     });
 
-    cols.querySelectorAll('[data-rs-book-atomic="1"]').forEach((el) => {
-      if (el.parentElement && el.parentElement.closest && el.parentElement.closest('[data-rs-book-atomic="1"]')) return;
+    // Phase 3 (Write batch): apply attributes in one pass
+    for (const el of atomicSet) el.setAttribute('data-rs-book-atomic', '1');
+    for (const el of inlineBlockSet) el.setAttribute('data-rs-book-inline-block', '1');
+    for (const el of breakableList) el.setAttribute('data-rs-book-breakable', '1');
+    for (const el of flowList) el.setAttribute('data-rs-book-flow', '1');
+    for (const el of flowBlockList) {
+      el.setAttribute('data-rs-book-flow', '1');
+      el.setAttribute('data-rs-book-flow-block', '1');
+    }
+
+    // Phase 4 (Read batch then write batch): scale oversized top-level atomic blocks
+    const scaleQueue = [];
+    for (const el of atomicSet) {
+      if (hasAtomicAnc(el)) continue;
       let totalH = Math.max(el.offsetHeight || 0, el.scrollHeight || 0);
       if (el.getClientRects) {
         const rects = el.getClientRects();
@@ -12060,10 +12210,13 @@ function renderWebApp() {
       }
       if (totalH > colH - 12) {
         const scale = Math.max(0.45, Math.min(0.98, (colH - 16) / totalH));
-        el.style.zoom = scale.toFixed(3);
-        el.setAttribute('data-rs-book-scaled', '1');
+        scaleQueue.push([el, scale.toFixed(3)]);
       }
-    });
+    }
+    for (const [el, zoomVal] of scaleQueue) {
+      el.style.zoom = zoomVal;
+      el.setAttribute('data-rs-book-scaled', '1');
+    }
   }
 
   function layoutBookSpreads(jumpAuto = false) {
@@ -12074,22 +12227,29 @@ function renderWebApp() {
     const frameW = frame.clientWidth;
     if (!frameW || frameW < 100) return;
 
-    const oldPad = document.getElementById('bookEndPad');
-    if (oldPad) oldPad.remove();
+    const frRect = frame.getBoundingClientRect();
+    cachedBookFrameRect = { left: frRect.left, width: frRect.width || frameW };
 
-    bookSinglePage = frameW < 700;
-    frame.classList.toggle('single-page', bookSinglePage);
-    const colsPerSpread = bookSinglePage ? 1 : 2;
-    const colGap = bookSinglePage ? 32 : 84;
-    const sideMargin = bookSinglePage ? 36 : 84;
+    const singleNext = frameW < 700;
+    const colsPerSpread = singleNext ? 1 : 2;
+    const colGap = singleNext ? 32 : 84;
+    const sideMargin = singleNext ? 36 : 84;
     const colW = Math.floor(Math.max(180, (frameW - sideMargin - colGap * (colsPerSpread - 1)) / colsPerSpread) / 4) * 4;
     const evenW = colW * colsPerSpread + colGap * (colsPerSpread - 1);
 
-    vp.style.width = evenW + 'px';
-    cols.style.width = evenW + 'px';
     const vpCs = typeof getComputedStyle === 'function' ? getComputedStyle(vp) : null;
     const vpPadY = vpCs ? ((parseFloat(vpCs.paddingTop) || 0) + (parseFloat(vpCs.paddingBottom) || 0)) : 0;
     const colH = Math.max(160, Math.floor(vp.clientHeight - vpPadY));
+    const layoutSig = [frameW, colH, singleNext ? 1 : 0, cols.scrollWidth, cols.children.length, uiPref.font, uiPref.fsize, uiPref.lh, uiPref.assetFit].join('|');
+    if (!jumpAuto && layoutSig === lastBookLayoutSig) return;
+
+    const oldPad = document.getElementById('bookEndPad');
+    if (oldPad) oldPad.remove();
+
+    bookSinglePage = singleNext;
+    frame.classList.toggle('single-page', bookSinglePage);
+    vp.style.width = evenW + 'px';
+    cols.style.width = evenW + 'px';
     cols.style.height = colH + 'px';
     cols.style.setProperty('--book-col-h', colH + 'px');
     cols.style.columnWidth = colW + 'px';
@@ -12101,8 +12261,8 @@ function renderWebApp() {
 
     const theoColStep = colW + colGap;
     const vpRect = vp.getBoundingClientRect();
-    const measured = [];
-    let maxMeasuredCol = 0;
+    const fullWidthSamples = [];
+    const stepSamples = [];
     let maxContentCol = 0;
     cols.querySelectorAll('.book-char-block, .book-user-block, .rs-chat-end-float').forEach((el) => {
       const rects = el.getClientRects ? el.getClientRects() : [el.getBoundingClientRect()];
@@ -12114,19 +12274,27 @@ function renderWebApp() {
         const cIdx = Math.round(absLeft / theoColStep);
         if (cIdx < 0) continue;
         if (cIdx > maxContentCol) maxContentCol = cIdx;
-        if (r.width < colW * 0.65) continue;
-        if (Math.abs(absLeft - cIdx * theoColStep) > Math.max(4, cIdx * 1.5)) continue;
-        const floored = Math.max(0, Math.floor(absLeft));
-        if (measured[cIdx] === undefined || floored < measured[cIdx]) measured[cIdx] = floored;
-        if (cIdx > maxMeasuredCol) maxMeasuredCol = cIdx;
+        if (Math.abs(r.width - colW) > 3) continue;
+        if (Math.abs(absLeft - cIdx * theoColStep) > Math.max(3, cIdx * 0.12)) continue;
+        fullWidthSamples.push([cIdx, Math.max(0, Math.floor(absLeft))]);
+        if (cIdx >= 2) stepSamples.push(absLeft / cIdx);
       }
     });
-    bookColOffsets = measured;
     let actualColStep = theoColStep;
-    if (maxMeasuredCol > 0 && typeof measured[maxMeasuredCol] === 'number' && measured[maxMeasuredCol] > 0) {
-      const est = measured[maxMeasuredCol] / maxMeasuredCol;
-      if (Math.abs(est - theoColStep) <= 2) actualColStep = est;
+    if (stepSamples.length > 0) {
+      stepSamples.sort((a, b) => a - b);
+      const med = stepSamples[Math.floor(stepSamples.length / 2)];
+      if (Math.abs(med - theoColStep) <= 0.5) actualColStep = med;
     }
+    const measured = [];
+    for (let i = 0; i < fullWidthSamples.length; i++) {
+      const cIdx = fullWidthSamples[i][0];
+      const floored = fullWidthSamples[i][1];
+      if (Math.abs(floored - cIdx * actualColStep) <= 3) {
+        if (measured[cIdx] === undefined || floored < measured[cIdx]) measured[cIdx] = floored;
+      }
+    }
+    bookColOffsets = measured;
     bookColStep = actualColStep;
     bookSpreadStride = actualColStep * colsPerSpread;
     const estPagesFromWidth = Math.max(1, Math.ceil((cols.scrollWidth - 4) / actualColStep));
@@ -12138,7 +12306,14 @@ function renderWebApp() {
       pad.id = 'bookEndPad';
       pad.style.cssText = 'break-before:column; -webkit-column-break-before:always; height:1px; width:100%; pointer-events:none;';
       cols.appendChild(pad);
+    } else if (cols.scrollWidth < (bookTotalSpreads - 1) * bookSpreadStride + evenW - 2) {
+      const pad = document.createElement('div');
+      pad.id = 'bookEndPad';
+      pad.style.cssText = 'width:100%; height:1px; pointer-events:none;';
+      cols.appendChild(pad);
     }
+
+    lastBookLayoutSig = [frameW, colH, singleNext ? 1 : 0, cols.scrollWidth, cols.children.length, uiPref.font, uiPref.fsize, uiPref.lh, uiPref.assetFit].join('|');
 
     if (bookAnchorMode === 'last-user') {
       const msgs = (lastState && lastState.snapshot && lastState.snapshot.messages) || [];
@@ -12405,18 +12580,29 @@ function renderWebApp() {
     if (!target || target.nodeType !== 1) return false;
     const sel = 'button, a, summary, input, select, textarea, label, audio, video, [role="button"], [role="link"], [onclick], [tabindex]:not([tabindex="-1"]), .msg-actions, .rs-am-footer-host, .rs-plugin-bubble-bar, .x-risu-am-illustration-footer, .x-risu-am-illustration-revision-controls, .x-risu-am-chat-history-edge-controls, .x-risu-am-image, .am-image, .x-risu-am-generated-image, .am-generated-image, .x-risu-am-illustration-projection, .am-illustration-projection, .x-risu-am-illustration-slot, .rs-chat-end-float, .rs-pfm-stage, .rs-chat-float-cfg-btn, .turn-tts-btn, .turn-tts-script-btn, .turn-tts-grp, .msg-img-wrap, .image-container, [data-rs-bg-img="1"], #bookImgPreview, [risu-btn], [risu-trigger], [x-risu-btn], [data-am-proxy], [data-am-illustration-action], [data-am-illustration-revision-action], [data-am-revision-action], [data-am-chat-history-action], [data-am-image-action], [data-am-viewer-action], [data-tts-msg], [data-tts-script-msg], [data-reroll-msg], [data-tr-key], [data-edit-msg], [data-del-msg], [data-swipe-msg], [data-img-reveal], [data-fm-swipe], [data-chat-var-key]';
     if (target.closest(sel)) return true;
-    let cur = target;
-    let hops = 0;
-    while (cur && cur !== rootEl && hops < 12) {
-      if (cur.nodeType === 1 && typeof window.getComputedStyle === 'function') {
-        try {
-          if (window.getComputedStyle(cur).cursor === 'pointer') return true;
-        } catch (_) {}
+    const botRoot = target.closest('.rs-bot-html');
+    if (!botRoot || typeof window.getComputedStyle !== 'function') return false;
+    const hadZoneCls = rootEl && rootEl.classList && rootEl.classList.contains('book-zone-cursor');
+    const prevInlineCursor = (rootEl && rootEl.style) ? rootEl.style.cursor : '';
+    if (hadZoneCls) rootEl.classList.remove('book-zone-cursor');
+    if (rootEl && rootEl.style && prevInlineCursor) rootEl.style.cursor = '';
+    try {
+      let cur = target;
+      let hops = 0;
+      while (cur && cur !== botRoot && cur !== rootEl && hops < 12) {
+        if (cur.nodeType === 1) {
+          try {
+            if (window.getComputedStyle(cur).cursor === 'pointer') return true;
+          } catch (_) {}
+        }
+        cur = cur.parentElement;
+        hops += 1;
       }
-      cur = cur.parentElement;
-      hops += 1;
+      return false;
+    } finally {
+      if (hadZoneCls) rootEl.classList.add('book-zone-cursor');
+      if (rootEl && rootEl.style && prevInlineCursor) rootEl.style.cursor = prevInlineCursor;
     }
-    return false;
   }
 
   function renderChat() {
@@ -12432,6 +12618,8 @@ function renderWebApp() {
 
     if (isBookMode()) {
       const singleInit = window.innerWidth < 700;
+      lastBookLayoutSig = '';
+      cachedBookFrameRect = null;
       box.innerHTML =
         '<div class="book-shell">' +
           '<div class="book-frame' + (singleInit ? ' single-page' : '') + '" id="bookFrame">' +
@@ -12526,20 +12714,57 @@ function renderWebApp() {
       const vp = document.getElementById('bookViewport');
       const preview = document.getElementById('bookImgPreview');
       closeBookImgPreview(true);
+      const BOOK_FAST_INTERACTIVE_SEL = 'button, a, summary, input, select, textarea, label, audio, video, [role="button"], [role="link"], [onclick], .msg-actions, .rs-am-footer-host, .rs-plugin-bubble-bar, .x-risu-am-image, .am-image, .msg-img-wrap, .image-container, [data-rs-bg-img="1"], #bookImgPreview, [risu-btn], [risu-trigger], [x-risu-btn]';
       if (window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches) {
+        let lastFrameCursor = false;
+        frame.addEventListener('mouseenter', () => {
+          const fr = frame.getBoundingClientRect();
+          cachedBookFrameRect = { left: fr.left, width: fr.width || frame.clientWidth };
+        });
         frame.addEventListener('mouseover', (e) => {
-          const info = findExpandableBotAsset(e.target, frame);
+          const t = e.target;
+          if (!t || t.nodeType !== 1) return;
+          if (t.tagName !== 'IMG' && !(t.closest && t.closest('.rs-bot-html, .msg-img-wrap, .image-container, [data-rs-bg-img="1"]'))) return;
+          const info = findExpandableBotAsset(t, frame);
           if (info && info.isCropped) openBookImgPreview(info, false);
         });
         frame.addEventListener('mousemove', (e) => {
-          const rect = frame.getBoundingClientRect();
+          const rect = cachedBookFrameRect || { left: 0, width: frame.clientWidth };
+          if (!(rect.width > 0)) return;
           const zoneW = Math.max(44, Math.min(100, rect.width * 0.12));
           const relX = e.clientX - rect.left;
           const inPrev = relX <= zoneW && bookSpreadIdx > 0;
           const inNext = relX >= rect.width - zoneW && bookSpreadIdx < bookTotalSpreads - 1;
-          frame.style.cursor = ((inPrev || inNext) && !isInteractiveBookTarget(e.target, frame)) ? 'pointer' : '';
+          const t = e.target;
+          const nextCursor = Boolean((inPrev || inNext) && !(t && t.closest && t.closest(BOOK_FAST_INTERACTIVE_SEL)));
+          if (nextCursor !== lastFrameCursor) {
+            lastFrameCursor = nextCursor;
+            frame.classList.toggle('book-zone-cursor', nextCursor);
+          }
         });
+        frame.onmouseleave = () => {
+          if (lastFrameCursor) {
+            lastFrameCursor = false;
+            frame.classList.remove('book-zone-cursor');
+          }
+          if (!bookImgPreviewState.pinned) closeBookImgPreview(false);
+        };
+      } else {
+        frame.onmouseleave = () => {
+          frame.classList.remove('book-zone-cursor');
+          if (!bookImgPreviewState.pinned) closeBookImgPreview(false);
+        };
       }
+      frame.addEventListener('mousedown', (e) => {
+        if (e.button !== 0 || (e.detail || 0) < 2) return;
+        const rect = cachedBookFrameRect || frame.getBoundingClientRect();
+        if (!(rect.width > 0)) return;
+        const zoneW = Math.max(44, Math.min(100, rect.width * 0.12));
+        const relX = e.clientX - rect.left;
+        if ((relX <= zoneW || relX >= rect.width - zoneW) && !isInteractiveBookTarget(e.target, frame)) {
+          e.preventDefault();
+        }
+      });
       if (preview) {
         preview.onmouseleave = (e) => {
           if (e.relatedTarget && bookImgPreviewState.el && (e.relatedTarget === bookImgPreviewState.el || bookImgPreviewState.el.contains(e.relatedTarget))) return;
@@ -12550,10 +12775,6 @@ function renderWebApp() {
           closeBookImgPreview(false);
         };
       }
-      frame.onmouseleave = () => {
-        frame.style.cursor = '';
-        if (!bookImgPreviewState.pinned) closeBookImgPreview(false);
-      };
       frame.addEventListener('click', (e) => {
         const info = findExpandableBotAsset(e.target, frame);
         if (info) {
@@ -12588,25 +12809,31 @@ function renderWebApp() {
         }
       };
       vp.onwheel = (e) => {
-        if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
-          e.preventDefault();
-          if (bookWheelLock) return;
-          bookWheelLock = true;
-          flipBook(e.deltaY > 0 ? 1 : -1);
-          setTimeout(() => { bookWheelLock = false; }, 260);
-        }
+        const ax = Math.abs(e.deltaX || 0);
+        const ay = Math.abs(e.deltaY || 0);
+        if (ay > 1 || ax > 1) e.preventDefault();
+        if (bookWheelLock) return;
+        let dir = 0;
+        if (ay >= ax && ay >= 8) dir = e.deltaY > 0 ? 1 : -1;
+        else if (ax > ay && ax >= 18) dir = e.deltaX > 0 ? 1 : -1;
+        if (!dir) return;
+        bookWheelLock = true;
+        flipBook(dir);
+        if (bookWheelTimer) clearTimeout(bookWheelTimer);
+        bookWheelTimer = setTimeout(() => { bookWheelTimer = null; bookWheelLock = false; }, 180);
       };
-      let bookScrollSnapTimer = null;
       vp.onscroll = () => {
         if (bookScrollGuardLock || bookSpreadIdx < 0) return;
-        const expected = getBookSpreadScrollLeft(bookSpreadIdx);
-        if (Math.abs(vp.scrollLeft - expected) <= 1) return;
+        const maxScroll = Math.max(0, (vp.scrollWidth || 0) - (vp.clientWidth || 0));
+        const expected = Math.min(maxScroll, getBookSpreadScrollLeft(bookSpreadIdx));
+        if (Math.abs(vp.scrollLeft - expected) <= 2) return;
         if (bookScrollSnapTimer) clearTimeout(bookScrollSnapTimer);
         bookScrollSnapTimer = setTimeout(() => {
           bookScrollSnapTimer = null;
           if (bookScrollGuardLock || bookSpreadIdx < 0) return;
-          const exp2 = getBookSpreadScrollLeft(bookSpreadIdx);
-          if (Math.abs(vp.scrollLeft - exp2) > 1) setBookViewportScrollLeft(vp, exp2);
+          const max2 = Math.max(0, (vp.scrollWidth || 0) - (vp.clientWidth || 0));
+          const exp2 = Math.min(max2, getBookSpreadScrollLeft(bookSpreadIdx));
+          if (Math.abs(vp.scrollLeft - exp2) > 2) setBookViewportScrollLeft(vp, exp2);
         }, 40);
       };
       frame.querySelectorAll('img').forEach((img) => {
@@ -12639,8 +12866,7 @@ function renderWebApp() {
       }
 
       requestAnimationFrame(() => layoutBookSpreads(true));
-      setTimeout(() => layoutBookSpreads(false), 80);
-      setTimeout(() => layoutBookSpreads(false), 260);
+      setTimeout(() => layoutBookSpreads(false), 180);
       return;
     }
 
@@ -18322,8 +18548,10 @@ function renderWebApp() {
 
   function renderPluginGuiRecallUi() {
     const toggleBtn = document.getElementById('pluginGuiRecallToggleBtn');
+    const liveBtn = document.getElementById('pluginGuiLiveToggleBtn');
     const barEl = document.getElementById('pluginGuiRecallBar');
     const frameEl = document.getElementById('pluginGuiFrame');
+    const liveFrameEl = document.getElementById('pluginGuiLiveFrame');
     const paneEl = document.getElementById('pluginGuiRecallPane');
     const rec = pluginGuiState.recallData;
     const history = rec && Array.isArray(rec.history) ? rec.history : [];
@@ -18343,6 +18571,12 @@ function renderWebApp() {
     const recentStorageKeys = (rec && Array.isArray(rec.recentStorageKeys)) ? rec.recentStorageKeys : [];
     const pendingDirtyCount = (rec && rec.pendingDirtyCount) || 0;
     const isRecallView = pluginGuiState.viewMode === 'recall';
+    const isLiveView = pluginGuiState.viewMode === 'live';
+
+    if (liveBtn) {
+      liveBtn.textContent = isLiveView ? '🖥️ 브라우저 GUI' : '⚡ 라이브 GUI';
+      liveBtn.className = isLiveView ? 'pill active' : 'pill';
+    }
 
     if (toggleBtn) {
       if (isRecallView) {
@@ -18364,17 +18598,18 @@ function renderWebApp() {
     }
 
     if (barEl) {
-      if (!isRecallView && !pluginGuiState.bannerDismissed && (totalHookRuns > 0 || history.length > 0)) {
+      if (!isRecallView && !isLiveView && !pluginGuiState.bannerDismissed && (totalHookRuns > 0 || history.length > 0)) {
         const summaryTxt = (activeItem && activeChars > 0)
           ? '<b>🧠 백엔드에서 최근 회상·주입 완료</b> (' + activeCount + '블록 · ' + activeChars.toLocaleString() + '자)'
           : '<b>🧠 백엔드 훅 ' + Math.max(totalHookRuns, history.length) + '회 실행됨</b> (주입 0자 · 저장 ' + storageWrites + '회)';
         barEl.innerHTML =
           '<div style="min-width:0; flex:1 1 260px;">' +
             summaryTxt +
-            ' <span style="color:var(--sub);">· 원격 GUI의 메모리 내 실행 이력은 백엔드 VM과 RAM이 분리되어 비어 보일 수 있으나, 스토리지 데이터는 공유·저장됩니다.</span>' +
+            ' <span style="color:var(--sub);">· 메모리 내 실행 결과는 백엔드 VM에서 실행되므로 <b>⚡ 라이브 GUI</b>에서 바로 확인할 수 있습니다.</span>' +
           '</div>' +
           '<div style="display:flex; gap:6px; align-items:center;">' +
-            '<button type="button" class="pill active" data-plg-gui-open-recall="1">실행·저장 내역 보기</button>' +
+            '<button type="button" class="pill active" data-plg-gui-open-live="1">⚡ 라이브 GUI 보기</button>' +
+            '<button type="button" class="pill" data-plg-gui-open-recall="1">실행·저장 내역</button>' +
             '<button type="button" class="pill" data-plg-gui-dismiss-bar="1" aria-label="배너 닫기">✕</button>' +
           '</div>';
         barEl.style.display = 'flex';
@@ -18383,7 +18618,8 @@ function renderWebApp() {
       }
     }
 
-    if (frameEl) frameEl.style.display = isRecallView ? 'none' : 'block';
+    if (frameEl) frameEl.style.display = (!isRecallView && !isLiveView) ? 'block' : 'none';
+    if (liveFrameEl) liveFrameEl.style.display = isLiveView ? 'block' : 'none';
     if (!paneEl) return;
     paneEl.style.display = isRecallView ? 'flex' : 'none';
     if (!isRecallView) return;
@@ -18393,8 +18629,9 @@ function renderWebApp() {
 
     const noticeHtml =
       '<div class="plg-recall-notice">' +
-        '<div>💡 RisuStand에서는 플러그인 본체(<code>beforeRequest</code> / <code>afterRequest</code> / <code>chatOutput</code>)가 <b>PC 백엔드 VM</b>에서 실행되고, GUI 화면은 별도 iframe 샌드박스에서 열립니다. 두 환경은 <code>pluginStorage</code>·<code>safeLocalStorage</code>·<code>localPluginStorage</code>·<code>localStorage</code>·<code>DB</code>를 공유하며, 훅 실행 및 스토리지 기록이 아래에 집계됩니다.</div>' +
-        '<div style="display:flex; gap:6px; align-items:center;">' +
+        '<div>💡 RisuStand에서는 플러그인 본체(<code>beforeRequest</code> / <code>afterRequest</code> / <code>chatOutput</code>)가 <b>PC 백엔드 VM</b>에서 실행되고, GUI 화면은 별도 iframe 샌드박스에서 열립니다. 스토리지는 양쪽이 공유하며, 메모리 내 <code>실행 결과</code> 화면은 <b>⚡ 라이브 GUI 보기</b>로 백엔드 VM 상태를 직접 볼 수 있습니다.</div>' +
+        '<div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">' +
+          '<button type="button" class="pill active" data-plg-gui-open-live="1">⚡ 라이브 GUI 보기</button>' +
           '<button type="button" class="pill" data-plg-gui-recall-refresh="1">↻ 기록 새로고침</button>' +
           (blocks.length ? '<button type="button" class="pill" data-plg-recall-copy-all="1">📋 전체 주입 텍스트 복사</button>' : '') +
         '</div>' +
@@ -18536,15 +18773,27 @@ function renderWebApp() {
     } catch (_) {}
   }
 
+  let liveGuiReadyResolver = null;
+  let liveGuiEventChain = Promise.resolve();
+
   function closePluginGuiModal() {
+    if (pluginGuiState.liveOpened && pluginGuiState.pluginName) {
+      void api('/api/plugins/live-gui-close', {
+        method: 'POST',
+        body: JSON.stringify({ pluginName: pluginGuiState.pluginName }),
+      }).catch(() => {});
+    }
     pluginGuiState.open = false;
     pluginGuiState.pluginName = '';
     pluginGuiState.uiItems = [];
     pluginGuiState.viewMode = 'gui';
+    pluginGuiState.liveOpened = false;
+    pluginGuiState.liveViewerPlugin = '';
     pluginGuiState.recallData = null;
     pluginGuiState.selectedRecallIdx = 0;
     pluginGuiState.selectedRecallId = 0;
     pluginGuiState.bannerDismissed = false;
+    liveGuiReadyResolver = null;
     const modal = document.getElementById('pluginGuiModal');
     if (modal) {
       modal.style.display = 'none';
@@ -18591,6 +18840,67 @@ function renderWebApp() {
     barEl.style.display = 'flex';
   }
 
+  async function openLivePluginGuiView(pluginName, entryId = '') {
+    if (!pluginName) return;
+    pluginGuiState.viewMode = 'live';
+    pluginGuiState.liveOpened = true;
+    renderPluginGuiRecallUi();
+    const liveFrame = document.getElementById('pluginGuiLiveFrame');
+    if (!liveFrame) return;
+    try {
+      if (pluginGuiState.liveViewerPlugin !== pluginName || !liveFrame.srcdoc) {
+        const isNight = /night|midnight|dark|claude/i.test(uiPref.theme || '');
+        const viewerRes = await api('/api/plugins/live-gui-srcdoc?name=' + encodeURIComponent(pluginName) + '&theme=' + (isNight ? 'dark' : 'light'));
+        if (!pluginGuiState.open || pluginGuiState.pluginName !== pluginName) return;
+        if (viewerRes && viewerRes.srcdoc) {
+          const readyProm = new Promise((resolve) => {
+            liveGuiReadyResolver = resolve;
+            const onLoad = () => {
+              liveFrame.removeEventListener('load', onLoad);
+              setTimeout(resolve, 60);
+            };
+            liveFrame.addEventListener('load', onLoad);
+            setTimeout(resolve, 1200);
+          });
+          liveFrame.srcdoc = viewerRes.srcdoc;
+          pluginGuiState.liveViewerPlugin = pluginName;
+          await readyProm;
+          liveGuiReadyResolver = null;
+        }
+      }
+      if (!pluginGuiState.open || pluginGuiState.pluginName !== pluginName) return;
+      const openRes = await api('/api/plugins/live-gui-open', {
+        method: 'POST',
+        body: JSON.stringify({ pluginName, entryId: entryId || '' }),
+      });
+      if (!pluginGuiState.open || pluginGuiState.pluginName !== pluginName) return;
+      if (Array.isArray(openRes && openRes.uiItems) && openRes.uiItems.length) {
+        pluginGuiState.uiItems = openRes.uiItems;
+      }
+      if (openRes && openRes.entryId) {
+        pluginGuiState.entryId = openRes.entryId;
+      }
+      renderPluginGuiEntriesBar();
+      if (openRes && Array.isArray(openRes.diagnostics) && openRes.diagnostics.length) {
+        console.warn('[LiveGUI:' + pluginName + ']', openRes.diagnostics);
+      }
+      if (liveFrame.contentWindow) {
+        liveFrame.contentWindow.postMessage({
+          __rsLiveGuiRender: 1,
+          styles: (openRes && openRes.styles) || [],
+          stylesUnchanged: false,
+          html: (openRes && openRes.html) || '',
+          rootAttrs: (openRes && openRes.rootAttrs) || null,
+          emptyMessage: (openRes && openRes.error)
+            ? ('라이브 GUI 오류: ' + openRes.error)
+            : '이 메뉴에서는 백엔드 VM DOM 화면이 열리지 않았습니다. (상단 버튼으로 다른 메뉴를 선택하거나 브라우저 GUI로 전환해 주세요)',
+        }, '*');
+      }
+    } catch (e) {
+      toast('라이브 GUI 열기 실패: ' + (e && e.message ? e.message : '오류'));
+    }
+  }
+
   async function openPluginGuiModal(pluginName, entryId = '') {
     const modal = document.getElementById('pluginGuiModal');
     if (!modal || !pluginName) return;
@@ -18601,6 +18911,8 @@ function renderWebApp() {
     pluginGuiState.entryId = entryId || '';
     pluginGuiState.uiItems = (plg && Array.isArray(plg.uiItems)) ? plg.uiItems : [];
     pluginGuiState.viewMode = 'gui';
+    pluginGuiState.liveOpened = false;
+    pluginGuiState.liveViewerPlugin = '';
     pluginGuiState.recallData = null;
     pluginGuiState.selectedRecallIdx = 0;
     pluginGuiState.selectedRecallId = 0;
@@ -18612,6 +18924,7 @@ function renderWebApp() {
         '<div class="plg-gui-head">' +
           '<div style="font-size:14.5px; font-weight:800; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🖥️ ' + esc(pluginGuiState.displayName) + '</div>' +
           '<div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">' +
+            '<button type="button" class="pill" id="pluginGuiLiveToggleBtn" data-plg-gui-live-toggle="1">⚡ 라이브 GUI</button>' +
             '<button type="button" class="pill" id="pluginGuiRecallToggleBtn" data-plg-gui-recall-toggle="1">🧠 백엔드 회상 기록</button>' +
             '<button type="button" class="pill" data-plg-gui-reload="1">↻ 새로고침</button>' +
             '<button type="button" class="pill" data-plg-gui-close="1">✕ 닫기</button>' +
@@ -18620,6 +18933,7 @@ function renderWebApp() {
         '<div id="pluginGuiEntriesBar" class="plg-gui-entries" style="display:none;"></div>' +
         '<div id="pluginGuiRecallBar" class="plg-gui-recall-bar" style="display:none;"></div>' +
         '<iframe id="pluginGuiFrame" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads"></iframe>' +
+        '<iframe id="pluginGuiLiveFrame" sandbox="allow-scripts allow-forms allow-modals allow-popups" style="display:none;"></iframe>' +
         '<div id="pluginGuiRecallPane" class="plg-gui-recall-pane" style="display:none;"></div>' +
       '</div>';
     modal.style.display = 'flex';
@@ -18640,6 +18954,65 @@ function renderWebApp() {
   }
 
   window.addEventListener('message', async (ev) => {
+    const liveFrame = document.getElementById('pluginGuiLiveFrame');
+    if (liveFrame && liveFrame.contentWindow && ev.source === liveFrame.contentWindow) {
+      const ld = ev.data;
+      if (!ld || typeof ld !== 'object') return;
+      if (ld.__rsLiveGuiReady === 1) {
+        if (typeof liveGuiReadyResolver === 'function') {
+          const resolveFn = liveGuiReadyResolver;
+          liveGuiReadyResolver = null;
+          resolveFn();
+        }
+        return;
+      }
+      if (ld.__rsLiveGuiEvent === 1 && ld.nodeId) {
+        const targetPlugin = ld.pluginName || pluginGuiState.pluginName;
+        if (!targetPlugin) return;
+        liveGuiEventChain = liveGuiEventChain.then(async () => {
+          const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+          const reqTimer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, 12000) : null;
+          try {
+            const res = await api('/api/plugins/live-gui-event', {
+              method: 'POST',
+              ...(ctrl ? { signal: ctrl.signal } : {}),
+              body: JSON.stringify({
+                pluginName: targetPlugin,
+                nodeId: ld.nodeId,
+                eventType: ld.eventType || 'click',
+                value: ld.value,
+                checked: ld.checked,
+                fireClick: Boolean(ld.fireClick),
+                x: ld.x,
+                y: ld.y,
+              }),
+            });
+            if (res && Array.isArray(res.diagnostics) && res.diagnostics.length) {
+              console.warn('[LiveGUI:' + targetPlugin + ']', res.diagnostics);
+            }
+            if (res && res.unchanged && !res.closed) return;
+            if (document.getElementById('pluginGuiLiveFrame') === liveFrame && liveFrame.contentWindow) {
+              liveFrame.contentWindow.postMessage({
+                __rsLiveGuiRender: 1,
+                styles: (res && res.styles) || [],
+                stylesUnchanged: Boolean(res && res.stylesUnchanged),
+                html: (res && res.html) || '',
+                rootAttrs: (res && res.rootAttrs) || null,
+                emptyMessage: (res && res.closed) ? '플러그인 GUI가 닫혔습니다.' : '',
+              }, '*');
+            }
+          } catch (err) {
+            const msg = (err && err.name === 'AbortError')
+              ? '요청 시간 초과(12s)'
+              : (err && err.message ? err.message : '오류');
+            toast('라이브 GUI 이벤트 오류: ' + msg);
+          } finally {
+            if (reqTimer) clearTimeout(reqTimer);
+          }
+        });
+      }
+      return;
+    }
     const frame = document.getElementById('pluginGuiFrame');
     if (!frame || !frame.contentWindow || ev.source !== frame.contentWindow) return;
     const d = ev.data;
@@ -18725,13 +19098,34 @@ function renderWebApp() {
         return;
       }
       if (e.target.closest('[data-plg-gui-reload]')) {
-        openPluginGuiModal(pluginGuiState.pluginName, pluginGuiState.entryId);
+        if (pluginGuiState.viewMode === 'live') {
+          void openLivePluginGuiView(pluginGuiState.pluginName, pluginGuiState.entryId);
+        } else {
+          openPluginGuiModal(pluginGuiState.pluginName, pluginGuiState.entryId);
+        }
         return;
       }
       const entryBtn = e.target.closest('[data-plg-gui-entry]');
       if (entryBtn) {
         const targetId = entryBtn.getAttribute('data-plg-gui-entry') || '';
-        openPluginGuiModal(pluginGuiState.pluginName, targetId);
+        if (pluginGuiState.viewMode === 'live') {
+          void openLivePluginGuiView(pluginGuiState.pluginName, targetId);
+        } else {
+          openPluginGuiModal(pluginGuiState.pluginName, targetId);
+        }
+        return;
+      }
+      if (e.target.closest('[data-plg-gui-live-toggle]')) {
+        if (pluginGuiState.viewMode === 'live') {
+          pluginGuiState.viewMode = 'gui';
+          renderPluginGuiRecallUi();
+        } else {
+          void openLivePluginGuiView(pluginGuiState.pluginName, pluginGuiState.entryId);
+        }
+        return;
+      }
+      if (e.target.closest('[data-plg-gui-open-live]')) {
+        void openLivePluginGuiView(pluginGuiState.pluginName, pluginGuiState.entryId);
         return;
       }
       if (e.target.closest('[data-plg-gui-recall-toggle]')) {
@@ -22620,6 +23014,57 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             const out = pluginAdapter.getGuiSrcdoc(pName, entryId, theme);
             if (!out) return sendJson(res, 404, { error: '플러그인을 찾을 수 없습니다.' }, req);
             return sendJson(res, 200, { ok: true, ...out }, req);
+        }
+
+        if (pathname === '/api/plugins/live-gui-srcdoc' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            const pName = urlObj.searchParams.get('name') || '';
+            const theme = urlObj.searchParams.get('theme') || 'dark';
+            const out = pluginAdapter.getLiveGuiViewerSrcdoc(pName, theme);
+            if (!out) return sendJson(res, 404, { error: '플러그인을 찾을 수 없습니다.' }, req);
+            return sendJson(res, 200, { ok: true, ...out }, req);
+        }
+
+        if (pathname === '/api/plugins/live-gui-open' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const out = await pluginAdapter.openLiveBackendGui(body.pluginName, body.entryId || '');
+                return sendJson(res, 200, out, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
+            }
+        }
+
+        if (pathname === '/api/plugins/live-gui-event' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const out = await pluginAdapter.dispatchLiveBackendGuiEvent({
+                    pluginName: body.pluginName,
+                    nodeId: body.nodeId,
+                    eventType: body.eventType || 'click',
+                    value: body.value,
+                    checked: body.checked,
+                    fireClick: Boolean(body.fireClick),
+                    x: body.x,
+                    y: body.y,
+                });
+                return sendJson(res, 200, out, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
+            }
+        }
+
+        if (pathname === '/api/plugins/live-gui-close' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const out = pluginAdapter.closeLiveBackendGui(body.pluginName);
+                return sendJson(res, 200, out, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
+            }
         }
 
         if (pathname === '/api/plugins/runtime-recall' && req.method === 'GET') {

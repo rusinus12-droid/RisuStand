@@ -2362,8 +2362,10 @@
                     pointer-events: none;
                     z-index: 8;
                     display: none;
-                    backface-visibility: visible;
+                    backface-visibility: hidden;
                     will-change: transform, opacity;
+                    contain: strict;
+                    transform: translateZ(0);
                     background: ${preset.pageBg || preset.scheme.bgcolor};
                 }
                 .epub-flip-leaf.flip-next {
@@ -2371,32 +2373,30 @@
                     left: 50%;
                     transform-origin: left center;
                     border-left: 1px solid ${preset.borderColor};
-                    background: linear-gradient(90deg, ${isLight ? 'rgba(0,0,0,0.11)' : 'rgba(255,255,255,0.07)'} 0%, ${preset.pageBg || preset.scheme.bgcolor} 16%, ${preset.pageBg || preset.scheme.bgcolor} 82%, ${isLight ? 'rgba(0,0,0,0.14)' : 'rgba(0,0,0,0.55)'} 100%);
-                    box-shadow: -14px 0 34px rgba(0, 0, 0, ${isLight ? '0.24' : '0.62'});
-                    animation: epubFlipNext 640ms cubic-bezier(0.36, 0.06, 0.22, 1) forwards;
+                    background: linear-gradient(90deg, ${isLight ? 'rgba(0,0,0,0.08)' : 'rgba(255,255,255,0.05)'} 0%, ${preset.pageBg || preset.scheme.bgcolor} 24%, ${isLight ? 'rgba(0,0,0,0.08)' : 'rgba(0,0,0,0.36)'} 100%);
+                    box-shadow: -10px 0 24px rgba(0, 0, 0, ${isLight ? '0.18' : '0.45'});
                 }
                 .epub-flip-leaf.flip-prev {
                     display: block;
                     left: 0;
                     transform-origin: right center;
                     border-right: 1px solid ${preset.borderColor};
-                    background: linear-gradient(270deg, ${isLight ? 'rgba(0,0,0,0.11)' : 'rgba(255,255,255,0.07)'} 0%, ${preset.pageBg || preset.scheme.bgcolor} 16%, ${preset.pageBg || preset.scheme.bgcolor} 82%, ${isLight ? 'rgba(0,0,0,0.14)' : 'rgba(0,0,0,0.55)'} 100%);
-                    box-shadow: 14px 0 34px rgba(0, 0, 0, ${isLight ? '0.24' : '0.62'});
-                    animation: epubFlipPrev 640ms cubic-bezier(0.36, 0.06, 0.22, 1) forwards;
+                    background: linear-gradient(270deg, ${isLight ? 'rgba(0,0,0,0.08)' : 'rgba(255,255,255,0.05)'} 0%, ${preset.pageBg || preset.scheme.bgcolor} 24%, ${isLight ? 'rgba(0,0,0,0.08)' : 'rgba(0,0,0,0.36)'} 100%);
+                    box-shadow: 10px 0 24px rgba(0, 0, 0, ${isLight ? '0.18' : '0.45'});
+                }
+                .epub-flip-leaf.flip-next.css-anim {
+                    animation: epubFlipNext 180ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+                }
+                .epub-flip-leaf.flip-prev.css-anim {
+                    animation: epubFlipPrev 180ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
                 }
                 @keyframes epubFlipNext {
-                    0% { transform: rotateY(0deg); opacity: 0.94; }
-                    22% { transform: rotateY(-32deg); opacity: 0.98; }
-                    50% { transform: rotateY(-90deg); opacity: 1; }
-                    82% { transform: rotateY(-156deg); opacity: 0.88; }
-                    100% { transform: rotateY(-180deg); opacity: 0; }
+                    0% { transform: translate3d(0, 0, 0) scaleX(1); opacity: 0.32; }
+                    100% { transform: translate3d(-16%, 0, 0) scaleX(0.35); opacity: 0; }
                 }
                 @keyframes epubFlipPrev {
-                    0% { transform: rotateY(0deg); opacity: 0.94; }
-                    22% { transform: rotateY(32deg); opacity: 0.98; }
-                    50% { transform: rotateY(90deg); opacity: 1; }
-                    82% { transform: rotateY(156deg); opacity: 0.88; }
-                    100% { transform: rotateY(180deg); opacity: 0; }
+                    0% { transform: translate3d(0, 0, 0) scaleX(1); opacity: 0.32; }
+                    100% { transform: translate3d(16%, 0, 0) scaleX(0.35); opacity: 0; }
                 }
                 ${
                     twoPage
@@ -2415,7 +2415,7 @@
                 .epub-viewport {
                     flex: 1; min-height: 0;
                     overflow: ${twoPage ? 'hidden' : 'auto'};
-                    ${twoPage ? 'margin: 18px auto; padding: 12px 0; box-sizing: border-box;' : 'padding: 30px 42px;'}
+                    ${twoPage ? 'margin: 18px auto; padding: 12px 0; box-sizing: border-box; will-change: scroll-position; contain: layout style;' : 'padding: 30px 42px;'}
                     scrollbar-width: none;
                     position: relative;
                 }
@@ -2946,8 +2946,20 @@
             };
 
             const flipLeaf = document.getElementById('epub-flip-leaf');
-            let flipMidTimer = null;
             let flipEndTimer = null;
+            let lastEpubFlipAt = 0;
+            let lastEpubLayoutSig = '';
+            let cachedEpubFrameRect = null;
+            const cancelEpubFlipAnim = () => {
+                if (flipEndTimer) { clearTimeout(flipEndTimer); flipEndTimer = null; }
+                if (!flipLeaf) return;
+                flipLeaf.classList.remove('flip-next', 'flip-prev', 'css-anim');
+                if (typeof flipLeaf.getAnimations === 'function') {
+                    try {
+                        for (const a of flipLeaf.getAnimations()) a.cancel();
+                    } catch (_) {}
+                }
+            };
 
             const goToSpread = (idx, animateFlip) => {
                 if (!vp) return;
@@ -2955,31 +2967,49 @@
                 const nextSpread = Math.max(0, Math.min(totalSpreads - 1, idx));
                 curSpread = nextSpread;
 
-                if (flipMidTimer) { clearTimeout(flipMidTimer); flipMidTimer = null; }
-                if (flipEndTimer) { clearTimeout(flipEndTimer); flipEndTimer = null; }
+                vp.scrollLeft = curSpread * spreadStride;
+                updatePageInfo();
 
+                const now = typeof performance !== 'undefined' && performance.now ? performance.now() : Date.now();
+                const isRapid = (now - lastEpubFlipAt) < 110;
                 if (animateFlip && flipLeaf && nextSpread !== prevSpread) {
-                    const dirClass = nextSpread > prevSpread ? 'flip-next' : 'flip-prev';
-                    flipLeaf.classList.remove('flip-next', 'flip-prev');
-                    // Restart GPU animation cleanly
-                    void flipLeaf.offsetWidth;
-                    flipLeaf.classList.add(dirClass);
-
-                    // Swap the underlying spread at the exact midpoint when the paper stands upright
-                    flipMidTimer = setTimeout(() => {
-                        flipMidTimer = null;
-                        vp.scrollLeft = curSpread * spreadStride;
-                        updatePageInfo();
-                    }, 300);
-
-                    flipEndTimer = setTimeout(() => {
-                        flipEndTimer = null;
-                        flipLeaf.classList.remove('flip-next', 'flip-prev');
-                    }, 650);
+                    lastEpubFlipAt = now;
+                    cancelEpubFlipAnim();
+                    if (!isRapid) {
+                        const dirClass = nextSpread > prevSpread ? 'flip-next' : 'flip-prev';
+                        flipLeaf.classList.add(dirClass);
+                        if (typeof flipLeaf.animate === 'function') {
+                            const shiftX = nextSpread > prevSpread ? '-16%' : '16%';
+                            try {
+                                const anim = flipLeaf.animate(
+                                    [
+                                        { opacity: 0.32, transform: 'translate3d(0,0,0) scaleX(1)' },
+                                        { opacity: 0, transform: `translate3d(${shiftX},0,0) scaleX(0.35)` },
+                                    ],
+                                    { duration: 180, easing: 'cubic-bezier(0.22, 1, 0.36, 1)', fill: 'forwards' }
+                                );
+                                anim.onfinish = () => {
+                                    if (flipLeaf) flipLeaf.classList.remove('flip-next', 'flip-prev');
+                                };
+                                anim.oncancel = () => {
+                                    if (flipLeaf) flipLeaf.classList.remove('flip-next', 'flip-prev');
+                                };
+                            } catch (_) {
+                                flipLeaf.classList.remove('flip-next', 'flip-prev');
+                            }
+                        } else {
+                            requestAnimationFrame(() => {
+                                if (!flipLeaf) return;
+                                flipLeaf.classList.add('css-anim');
+                                flipEndTimer = setTimeout(() => {
+                                    flipEndTimer = null;
+                                    flipLeaf.classList.remove('flip-next', 'flip-prev', 'css-anim');
+                                }, 190);
+                            });
+                        }
+                    }
                 } else {
-                    if (flipLeaf) flipLeaf.classList.remove('flip-next', 'flip-prev');
-                    vp.scrollLeft = curSpread * spreadStride;
-                    updatePageInfo();
+                    cancelEpubFlipAnim();
                 }
             };
 
@@ -2995,18 +3025,20 @@
 
             const prepareEpubPaginationBlocks = (colsEl, colH) => {
                 if (!colsEl || !colsEl.querySelectorAll || !(colH > 0)) return;
+                // Phase 1 (Write batch): reset previous pagination attributes
                 colsEl.querySelectorAll('[data-rs-book-atomic], [data-rs-book-inline-block], [data-rs-book-breakable], [data-rs-book-flow], [data-rs-book-flow-block], [data-rs-book-scaled]').forEach((el) => {
-                    el.removeAttribute('data-rs-book-atomic');
-                    el.removeAttribute('data-rs-book-inline-block');
-                    el.removeAttribute('data-rs-book-breakable');
-                    el.removeAttribute('data-rs-book-flow');
-                    el.removeAttribute('data-rs-book-flow-block');
+                    if (el.hasAttribute('data-rs-book-atomic')) el.removeAttribute('data-rs-book-atomic');
+                    if (el.hasAttribute('data-rs-book-inline-block')) el.removeAttribute('data-rs-book-inline-block');
+                    if (el.hasAttribute('data-rs-book-breakable')) el.removeAttribute('data-rs-book-breakable');
+                    if (el.hasAttribute('data-rs-book-flow')) el.removeAttribute('data-rs-book-flow');
+                    if (el.hasAttribute('data-rs-book-flow-block')) el.removeAttribute('data-rs-book-flow-block');
                     if (el.hasAttribute('data-rs-book-scaled')) {
                         el.removeAttribute('data-rs-book-scaled');
                         el.style.zoom = '';
                     }
                 });
 
+                // Phase 2 (Read-only pass): measure and classify without mutating DOM
                 const mediaSel = 'img, picture, figure, video, canvas, svg, .image-container';
                 const mediaAnchors = Array.from(colsEl.querySelectorAll(mediaSel));
                 colsEl.querySelectorAll('.epub-turn-body div, .epub-turn-body span, .epub-turn-body a, .epub-turn-body section, .epub-turn-body article').forEach((el) => {
@@ -3027,6 +3059,8 @@
                 ));
                 const majorMediaSel = 'img, picture, video, canvas, .image-container';
 
+                const atomicSet = new Set();
+                const inlineBlockSet = new Set();
                 for (const anchor of mediaAnchors) {
                     if (anchor.closest && anchor.closest('button, .epub-turn-tag, .epub-turn-divider')) continue;
                     let cardRoot = anchor;
@@ -3054,23 +3088,34 @@
                         cardRoot = anc;
                         anc = anc.parentElement;
                     }
-                    cardRoot.setAttribute('data-rs-book-atomic', '1');
+                    atomicSet.add(cardRoot);
                     try {
                         if (window.getComputedStyle(cardRoot).display === 'inline') {
-                            cardRoot.setAttribute('data-rs-book-inline-block', '1');
+                            inlineBlockSet.add(cardRoot);
                         }
                     } catch (_) {}
                 }
 
+                const breakableList = [];
                 colsEl.querySelectorAll('.epub-user-block, .epub-status-card, .epub-hud-wrap, .leave-hud-card, .epub-turn-body details').forEach((el) => {
                     if (Math.max(el.offsetHeight || 0, el.scrollHeight || 0) > colH * 0.82) {
-                        el.setAttribute('data-rs-book-breakable', '1');
+                        breakableList.push(el);
                     }
                 });
 
+                const hasAtomicAnc = (el) => {
+                    let cur = el.parentElement;
+                    while (cur && cur !== colsEl) {
+                        if (atomicSet.has(cur)) return true;
+                        cur = cur.parentElement;
+                    }
+                    return false;
+                };
+                const flowList = [];
+                const flowBlockList = [];
                 colsEl.querySelectorAll('.epub-turn-body div, .epub-turn-body section, .epub-turn-body article, .epub-turn-body blockquote, .epub-turn-body main').forEach((el) => {
-                    if (el.getAttribute('data-rs-book-atomic') === '1') return;
-                    if (el.closest && el.closest('[data-rs-book-atomic="1"], .epub-status-card, .epub-hud-wrap, .leave-hud-card')) return;
+                    if (atomicSet.has(el) || hasAtomicAnc(el)) return;
+                    if (el.closest && el.closest('.epub-status-card, .epub-hud-wrap, .leave-hud-card')) return;
                     const txtLen = (el.textContent || '').trim().length;
                     const boxH = Math.max(el.offsetHeight || 0, el.scrollHeight || 0);
                     if (txtLen <= 140 && boxH <= colH * 0.78) return;
@@ -3080,16 +3125,27 @@
                     const ovBlocked = /^(hidden|clip|auto|scroll)$/.test(cs.overflow || '') || /^(hidden|clip|auto|scroll)$/.test(cs.overflowY || '');
                     const containBlocked = Boolean(cs.contain && cs.contain !== 'none');
                     if (ovBlocked || containBlocked) {
-                        el.setAttribute('data-rs-book-flow', '1');
+                        flowList.push(el);
                     }
                     if ((cs.display === 'flex' || cs.display === 'inline-flex') && /^column/i.test(cs.flexDirection || '') && boxH > colH * 0.78) {
-                        el.setAttribute('data-rs-book-flow', '1');
-                        el.setAttribute('data-rs-book-flow-block', '1');
+                        flowBlockList.push(el);
                     }
                 });
 
-                colsEl.querySelectorAll('[data-rs-book-atomic="1"]').forEach((el) => {
-                    if (el.parentElement && el.parentElement.closest && el.parentElement.closest('[data-rs-book-atomic="1"]')) return;
+                // Phase 3 (Write batch): apply attributes in one pass
+                for (const el of atomicSet) el.setAttribute('data-rs-book-atomic', '1');
+                for (const el of inlineBlockSet) el.setAttribute('data-rs-book-inline-block', '1');
+                for (const el of breakableList) el.setAttribute('data-rs-book-breakable', '1');
+                for (const el of flowList) el.setAttribute('data-rs-book-flow', '1');
+                for (const el of flowBlockList) {
+                    el.setAttribute('data-rs-book-flow', '1');
+                    el.setAttribute('data-rs-book-flow-block', '1');
+                }
+
+                // Phase 4 (Read batch then write batch): scale oversized top-level atomic blocks
+                const scaleQueue = [];
+                for (const el of atomicSet) {
+                    if (hasAtomicAnc(el)) continue;
                     let totalH = Math.max(el.offsetHeight || 0, el.scrollHeight || 0);
                     if (el.getClientRects) {
                         const rects = el.getClientRects();
@@ -3101,10 +3157,13 @@
                     }
                     if (totalH > colH - 12) {
                         const scale = Math.max(0.45, Math.min(0.98, (colH - 16) / totalH));
-                        el.style.zoom = scale.toFixed(3);
-                        el.setAttribute('data-rs-book-scaled', '1');
+                        scaleQueue.push([el, scale.toFixed(3)]);
                     }
-                });
+                }
+                for (const [el, zoomVal] of scaleQueue) {
+                    el.style.zoom = zoomVal;
+                    el.setAttribute('data-rs-book-scaled', '1');
+                }
             };
 
             const layoutSpreads = (jumpToLast) => {
@@ -3112,6 +3171,10 @@
                 const frame = vp.parentElement;
                 const frameW = frame ? frame.clientWidth : vp.clientWidth;
                 if (!frameW || frameW < 100) return;
+                if (frame) {
+                    const fr = frame.getBoundingClientRect();
+                    cachedEpubFrameRect = { left: fr.left, width: fr.width || frameW };
+                }
                 const isNarrow = frameW < 760;
                 colsPerSpread = isNarrow ? 1 : 2;
                 colGap = isNarrow ? 36 : 96;
@@ -3123,11 +3186,14 @@
 
                 const colW = Math.floor(Math.max(180, (frameW - sideMargin - colGap * (colsPerSpread - 1)) / colsPerSpread) / 4) * 4;
                 const evenW = colW * colsPerSpread + colGap * (colsPerSpread - 1);
-                vp.style.width = `${evenW}px`;
-                cols.style.width = `${evenW}px`;
                 const vpCs = typeof window.getComputedStyle === 'function' ? window.getComputedStyle(vp) : null;
                 const vpPadY = vpCs ? ((parseFloat(vpCs.paddingTop) || 0) + (parseFloat(vpCs.paddingBottom) || 0)) : 0;
                 const colH = Math.max(160, Math.floor(vp.clientHeight - vpPadY));
+                const nextLayoutSig = `${frameW}|${colH}|${isNarrow ? 1 : 0}|${cols.scrollWidth}|${cols.children.length}`;
+                if (!jumpToLast && nextLayoutSig === lastEpubLayoutSig) return;
+
+                vp.style.width = `${evenW}px`;
+                cols.style.width = `${evenW}px`;
                 cols.style.margin = '0';
                 cols.style.padding = '0';
                 cols.style.boxSizing = 'border-box';
@@ -3140,6 +3206,7 @@
                 prepareEpubPaginationBlocks(cols, colH);
                 spreadStride = (colW + colGap) * colsPerSpread;
                 totalSpreads = Math.max(1, Math.ceil((cols.scrollWidth - 4) / spreadStride));
+                lastEpubLayoutSig = `${frameW}|${colH}|${isNarrow ? 1 : 0}|${cols.scrollWidth}|${cols.children.length}`;
                 if (jumpToLast && typeof options.targetSpread === 'number') {
                     goToSpread(options.targetSpread, false);
                 } else if (jumpToLast && options.jumpToTurn) {
@@ -3184,13 +3251,18 @@
                 goToSpread(nextSpread, true);
             };
 
+            let epubRelayoutTimer = null;
             let epubRelayoutRaf = 0;
             const scheduleEpubRelayout = () => {
-                if (epubRelayoutRaf) return;
-                epubRelayoutRaf = requestAnimationFrame(() => {
-                    epubRelayoutRaf = 0;
-                    layoutSpreads(false);
-                });
+                if (epubRelayoutTimer || epubRelayoutRaf) return;
+                epubRelayoutTimer = setTimeout(() => {
+                    epubRelayoutTimer = null;
+                    if (epubRelayoutRaf) return;
+                    epubRelayoutRaf = requestAnimationFrame(() => {
+                        epubRelayoutRaf = 0;
+                        layoutSpreads(false);
+                    });
+                }, 45);
             };
 
             setTimeout(() => layoutSpreads(true), 60);
@@ -3246,21 +3318,24 @@
                 };
             }
 
+            let wheelTimer = null;
             vp.onwheel = (e) => {
                 if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
                     e.preventDefault();
-                    if (wheelLock) return;
+                    if (Math.abs(e.deltaY) < 4 || wheelLock) return;
                     wheelLock = true;
                     turnPage(e.deltaY > 0 ? 1 : -1);
-                    setTimeout(() => { wheelLock = false; }, 260);
+                    if (wheelTimer) clearTimeout(wheelTimer);
+                    wheelTimer = setTimeout(() => { wheelTimer = null; wheelLock = false; }, 110);
                 }
             };
             document.getElementById('epub-prev').onclick = () => turnPage(-1);
             document.getElementById('epub-next').onclick = () => turnPage(1);
             const epubFrame = vp ? vp.closest('.epub-book-frame') : null;
+            const EPUB_FAST_INTERACTIVE_SEL = 'button, a, summary, input, select, textarea, label, [role="button"], [onclick], [risu-btn], [risu-trigger], [x-risu-btn], img, .epub-nav';
             const isInteractiveEpubTarget = (target, rootEl) => {
                 if (!target || target.nodeType !== 1) return false;
-                if (target.closest('button, a, summary, input, select, textarea, label, [role="button"], [onclick], [risu-btn], [risu-trigger], [x-risu-btn], img, .epub-nav')) {
+                if (target.closest(EPUB_FAST_INTERACTIVE_SEL)) {
                     return true;
                 }
                 let cur = target;
@@ -3278,16 +3353,30 @@
             };
             if (epubFrame) {
                 if (window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches) {
+                    let lastEpubCursor = '';
+                    epubFrame.addEventListener('mouseenter', () => {
+                        const fr = epubFrame.getBoundingClientRect();
+                        cachedEpubFrameRect = { left: fr.left, width: fr.width || epubFrame.clientWidth };
+                    });
                     epubFrame.addEventListener('mousemove', (e) => {
-                        const rect = epubFrame.getBoundingClientRect();
+                        const rect = cachedEpubFrameRect || { left: 0, width: epubFrame.clientWidth };
+                        if (!(rect.width > 0)) return;
                         const zoneW = Math.max(48, Math.min(110, rect.width * 0.12));
                         const relX = e.clientX - rect.left;
                         const inPrev = relX <= zoneW && curSpread > 0;
                         const inNext = relX >= rect.width - zoneW && curSpread < totalSpreads - 1;
-                        epubFrame.style.cursor = ((inPrev || inNext) && !isInteractiveEpubTarget(e.target, epubFrame)) ? 'pointer' : '';
+                        const t = e.target;
+                        const nextCursor = ((inPrev || inNext) && !(t && t.closest && t.closest(EPUB_FAST_INTERACTIVE_SEL))) ? 'pointer' : '';
+                        if (nextCursor !== lastEpubCursor) {
+                            lastEpubCursor = nextCursor;
+                            epubFrame.style.cursor = nextCursor;
+                        }
                     });
                     epubFrame.addEventListener('mouseleave', () => {
-                        epubFrame.style.cursor = '';
+                        if (lastEpubCursor) {
+                            lastEpubCursor = '';
+                            epubFrame.style.cursor = '';
+                        }
                     });
                 }
                 epubFrame.addEventListener('click', (e) => {

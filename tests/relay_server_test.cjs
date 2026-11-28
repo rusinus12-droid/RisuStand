@@ -2100,7 +2100,7 @@ test('Zen minibar visibility on all tabs, horizontal touch-scroll CSS, bot menu 
         assert.ok(html.includes('__rsGuiReloadPlugin'));
         assert.ok(html.includes('#tab-chat { gap:18px; z-index:auto; isolation:auto; }'));
         assert.ok(!html.includes('.book-frame {\n    flex:1; display:flex; flex-direction:column;\n    background:var(--book-bg); border:1px solid var(--border); border-radius:12px;\n    box-shadow: var(--shadow); overflow:hidden; position:relative;\n    perspective:1800px;'));
-        assert.ok(html.includes('@keyframes rsFlipNext { 0% { opacity:0.95; transform:perspective(1800px) rotateY(0deg); }'));
+        assert.ok(html.includes('@keyframes rsFlipNext { 0% { opacity:0.32; transform:translate3d(0,0,0) scaleX(1); }'));
         assert.ok(html.includes('html body #bookBotOverlay {\n    position:fixed !important; inset:0 !important; z-index:42 !important;'));
         assert.ok(html.includes('#botMenuFab {\n    position:fixed; right:12px; top:62px; z-index:44;'));
         assert.ok(html.includes('!/(?:side-panel|drawer|modal)/i.test(fallbackBar.className'));
@@ -3585,6 +3585,12 @@ test('2-page book pagination guards atomic polaroid assets, relaxes tall text bl
         assert.equal(tallProseWrap.getAttribute('data-rs-book-flow'), '1', 'Tall overflow:hidden prose wrapper must become breakable flow');
         assert.equal(giantWrap.getAttribute('data-rs-book-scaled'), '1', 'Oversized atomic polaroid must be scaled down to fit colH');
         assert.ok(Number(giantWrap.style.zoom) > 0 && Number(giantWrap.style.zoom) < 1, 'Oversized atomic polaroid zoom must be < 1');
+
+        const goToMatch = scriptMatch[1].match(/function goToBookSpread[\s\S]*?function prepareBookPaginationBlocks/);
+        assert.ok(goToMatch, 'Expected goToBookSpread function in relay web UI');
+        assert.ok(!goToMatch[0].includes('flipLeaf.offsetWidth'), 'goToBookSpread must not force synchronous offsetWidth reflow');
+        assert.ok(!goToMatch[0].includes('bookFlipMidTimer'), 'goToBookSpread must update scrollLeft immediately without bookFlipMidTimer delay');
+        assert.ok(html.includes('contain: layout style;') && !/\.book-viewport\s*\{[^}]*will-change:\s*scroll-position/.test(html), 'book-viewport should isolate layout/style without giant will-change scroll layer');
     } finally {
         if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
         await new Promise((r) => server.close(r));
@@ -3594,6 +3600,10 @@ test('2-page book pagination guards atomic polaroid assets, relaxes tall text bl
     assert.ok(pluginSrc.includes('prepareEpubPaginationBlocks'), 'risustand.js must include prepareEpubPaginationBlocks');
     assert.ok(pluginSrc.includes('--epub-col-h'), 'risustand.js must set --epub-col-h');
     assert.ok(!/\bspreadIdx\b/.test(pluginSrc), 'risustand.js must not reference undefined spreadIdx');
+    const epubGoToMatch = pluginSrc.match(/const goToSpread = [\s\S]*?const extractEpubBgUrl =/);
+    assert.ok(epubGoToMatch, 'Expected goToSpread in risustand.js');
+    assert.ok(!epubGoToMatch[0].includes('flipLeaf.offsetWidth'), 'risustand.js goToSpread must not force synchronous offsetWidth reflow');
+    assert.ok(!epubGoToMatch[0].includes('flipMidTimer'), 'risustand.js goToSpread must not delay vp.scrollLeft behind flipMidTimer');
 });
 
 test('Leave lorebook expands {{user}}/{{char}} in comments & variables and prevents alwaysActive/statusdata cascade bloat', () => {
@@ -3742,6 +3752,11 @@ test('Relay web UI includes multi-entry plugin GUI switcher bar and compiles cle
             '스토리지 기록 상태',
             'storageWrites',
             'recentStorageKeys',
+            'pluginGuiLiveToggleBtn',
+            'pluginGuiLiveFrame',
+            'openLivePluginGuiView',
+            '__rsLiveGuiEvent',
+            '/api/plugins/live-gui-open',
         ]) {
             assert.ok(html.includes(marker), `Expected ${marker} in relay web UI`);
         }
@@ -3773,5 +3788,606 @@ test('Relay web UI includes multi-entry plugin GUI switcher bar and compiles cle
     } finally {
         if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
         await new Promise((r) => server.close(r));
+    }
+});
+
+test('Leave Novel mode strengthens active protagonist guidance across GRADIA compat, pure Leave, and two_pass Pass 1', async () => {
+    const leave = relay.loadBundledLeavePreset();
+    assert.ok(leave, 'Bundled Leave preset must load');
+
+    const baseSnap = {
+        charName: '클로젬 여행동아리',
+        charContext: {
+            name: '클로젬 여행동아리',
+            personaName: '푸딩',
+            personaPrompt: 'Active male lead.',
+            desc: 'Ensemble modern story.',
+        },
+    };
+    const history = [{ index: 0, role: 'user', raw: '안녕.' }, { index: 1, role: 'char', raw: '지원이 고개를 들었다.' }];
+
+    // 1) GRADIA compat ON + Novel mode ON: hides RP prohibition & injects active protagonist rule
+    const gradiaNovelText = relay.buildDirectPromptMessages({
+        preset: leave,
+        snap: baseSnap,
+        historyMessages: history,
+        userText: '지원에게 다가갔다.',
+        remoteToggleValues: { toggle_gradia_compat_mode: '1', toggle_writing_mode: '1' },
+    }).map((m) => m.content).join('\n');
+    assert.ok(!gradiaNovelText.includes('never invent unperformed'), 'GRADIA compat + Novel mode must hide RP prohibition');
+    assert.ok(gradiaNovelText.includes('NOVEL MODE — ACTIVE FULL-CAST PROTAGONIST'));
+    assert.ok(gradiaNovelText.includes('Novel-mode full-cast authorship'));
+
+    // 2) GRADIA compat ON + RP mode: preserves RP prohibition & omits Novel protagonist rule
+    const gradiaRpText = relay.buildDirectPromptMessages({
+        preset: leave,
+        snap: baseSnap,
+        historyMessages: history,
+        userText: '지원에게 다가갔다.',
+        remoteToggleValues: { toggle_gradia_compat_mode: '1', toggle_writing_mode: '0' },
+    }).map((m) => m.content).join('\n');
+    assert.ok(gradiaRpText.includes('never invent unperformed'));
+    assert.ok(gradiaRpText.includes('RP player-agency boundaries'));
+    assert.ok(!gradiaRpText.includes('NOVEL MODE — ACTIVE FULL-CAST PROTAGONIST'));
+
+    // 3) Pure Leave (GRADIA compat OFF) + Novel mode ON: includes ACTIVE PROTAGONIST PRESENCE rule
+    const pureNovelText = relay.buildDirectPromptMessages({
+        preset: leave,
+        snap: baseSnap,
+        historyMessages: history,
+        userText: '지원에게 다가갔다.',
+        remoteToggleValues: { toggle_gradia_compat_mode: '0', toggle_writing_mode: '1' },
+    }).map((m) => m.content).join('\n');
+    assert.ok(pureNovelText.includes('ACTIVE PROTAGONIST PRESENCE (NO RP SILENCE HABIT)'));
+    assert.ok(!pureNovelText.includes('RP MODE — THE PERSONA'));
+
+    // 4) Two-pass Novel Pass 1 prompt includes ACTIVE FULL-CAST FICTION with persona name
+    const captured = [];
+    const mockLlm = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => { body += c; });
+        req.on('end', () => {
+            captured.push(JSON.parse(body));
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                choices: [{ message: { content: '푸딩이 웃으며 답했다. "괜찮아."' } }],
+                usage: { prompt_tokens: 10, completion_tokens: 8, total_tokens: 18 },
+            }));
+        });
+    });
+    await new Promise((r) => mockLlm.listen(0, '127.0.0.1', r));
+    const llmPort = mockLlm.address().port;
+    const tok = 'novel-twopass-tok';
+    const srv = relay.createRelayServer({
+        token: tok,
+        configOverride: {
+            activeProfileId: 'prof-oai',
+            directPresetId: 'bundled:leave',
+            directHistoryMode: 'chunked',
+            directPipelineMode: 'two_pass',
+            remoteToggleValues: { toggle_writing_mode: '1' },
+            profiles: [{
+                id: 'prof-oai',
+                name: 'Mock Novel Model',
+                providerType: 'openai_compat',
+                baseUrl: `http://127.0.0.1:${llmPort}/v1/chat/completions`,
+                apiKey: 'sk-test',
+                model: 'mock-model',
+            }],
+        },
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const srvPort = srv.address().port;
+    try {
+        const hdrs = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+        await requestHttp(srvPort, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({
+                catalog: { characters: [{ index: 0, name: '클럽', chats: [{ index: 0, id: 'c0', name: 'Chat 1', msgCount: 2 }] }] },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: '클럽',
+                    chatName: 'Chat 1',
+                    isPcActive: false,
+                    charContext: { name: '클럽', personaName: '푸딩', personaPrompt: 'Active male lead.', desc: 'Club.' },
+                    messages: history,
+                },
+            }),
+        });
+        const sendRes = await requestHttp(srvPort, {
+            method: 'POST',
+            path: '/api/chat/send',
+            headers: hdrs,
+            body: JSON.stringify({ charIndex: 0, chatIndex: 0, text: '지원을 바라보았다.' }),
+        });
+        assert.equal(sendRes.status, 200);
+        for (let i = 0; i < 80 && captured.length < 2; i += 1) await new Promise((r) => setTimeout(r, 20));
+        assert.equal(captured.length, 2, 'Two-pass Novel mode must invoke Pass 1 and Pass 2');
+        const pass1Sys = captured[0].messages[0].content;
+        assert.ok(pass1Sys.includes('NOVEL MODE (ACTIVE FULL-CAST FICTION)'));
+        assert.ok(pass1Sys.includes('Treat 푸딩 as an active, full lead character'));
+        assert.ok(!pass1Sys.includes('RP AGENCY LOCK'));
+    } finally {
+        if (typeof srv.closeAllConnections === 'function') srv.closeAllConnections();
+        await new Promise((r) => srv.close(r));
+        await new Promise((r) => mockLlm.close(r));
+    }
+});
+
+test('2-page book transition stability: tap-zone cursor isolation, relayout debounce, and exact spread alignment past inset polaroids', async () => {
+    const server = relay.createRelayServer({ token: 'book-transition-stability-tok' });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    try {
+        const htmlRes = await requestHttp(port, { path: '/' });
+        assert.equal(htmlRes.status, 200);
+        const html = htmlRes.body;
+
+        // 1) CSS & relayout debounce checks
+        assert.ok(html.includes('.book-frame.book-zone-cursor { cursor:pointer; }'));
+        assert.ok(!/\.book-viewport\s*\{[^}]*will-change:\s*scroll-position/.test(html), '.book-viewport must not pin giant will-change compositing layer');
+        assert.ok(!/if \(isBookMode\(\) && typeof layoutBookSpreads === 'function'\) layoutBookSpreads\(false\);\s*\}, \{ once: true \}/.test(html), 'image load must use debounced scheduleBookRelayout');
+        assert.ok(html.includes('if (isBookMode() && typeof scheduleBookRelayout === \'function\') scheduleBookRelayout();'));
+
+        const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(scriptMatch);
+        const script = scriptMatch[1];
+        new vm.Script(script, { filename: 'webapp-book-stability-inline.js' });
+
+        // 2) Extract isInteractiveBookTarget, getBookSpreadScrollLeft, layoutBookSpreads
+        const interactiveFn = script.match(/function isInteractiveBookTarget\(target, rootEl\)\s*\{[\s\S]*?\n  \}/);
+        const scrollLeftFn = script.match(/function getBookSpreadScrollLeft\(spreadIdx\)\s*\{[\s\S]*?\n  \}/);
+        const layoutFn = script.match(/function layoutBookSpreads\(jumpAuto = false\)\s*\{[\s\S]*?\n  \}/);
+        assert.ok(interactiveFn && scrollLeftFn && layoutFn, 'Expected book functions in inline script');
+
+        const mkNode = (tagName, { id = '', className = '', cursor = '' } = {}) => {
+            const clsSet = new Set(className ? className.split(/\s+/).filter(Boolean) : []);
+            const node = {
+                nodeType: 1,
+                tagName: tagName.toUpperCase(),
+                id,
+                parentElement: null,
+                children: [],
+                style: { setProperty(k, v) { this[k] = v; } },
+                _cursor: cursor,
+                _rects: [],
+                classList: {
+                    contains: (c) => clsSet.has(c),
+                    add: (...cs) => cs.forEach((c) => clsSet.add(c)),
+                    remove: (...cs) => cs.forEach((c) => clsSet.delete(c)),
+                    toggle: (c, f) => (f ? clsSet.add(c) : clsSet.delete(c)),
+                },
+                append(...kids) {
+                    for (const k of kids) {
+                        k.parentElement = node;
+                        node.children.push(k);
+                    }
+                    return node;
+                },
+                closest(sel) {
+                    const tokens = sel.split(',').map((s) => s.trim()).filter(Boolean);
+                    let cur = node;
+                    while (cur) {
+                        for (const t of tokens) {
+                            if (t.startsWith('.') && cur.classList.contains(t.slice(1))) return cur;
+                            if (/^[a-z0-9_-]+$/i.test(t) && cur.tagName.toLowerCase() === t.toLowerCase()) return cur;
+                        }
+                        cur = cur.parentElement;
+                    }
+                    return null;
+                },
+                getBoundingClientRect() { return node._rects[0] || { left: 0, width: 0, height: 0 }; },
+                getClientRects() { return node._rects; },
+                querySelectorAll(sel) {
+                    const classes = sel.split(',').map((s) => s.trim().replace(/^\./, ''));
+                    const out = [];
+                    const walk = (n) => {
+                        for (const ch of n.children) {
+                            if (classes.some((c) => ch.classList.contains(c))) out.push(ch);
+                            walk(ch);
+                        }
+                    };
+                    walk(node);
+                    return out;
+                },
+                querySelector() { return null; },
+            };
+            return node;
+        };
+
+        const frame = mkNode('div', { id: 'bookFrame', className: 'book-frame book-zone-cursor' });
+        const vp = mkNode('div', { id: 'bookViewport', className: 'book-viewport' });
+        const cols = mkNode('div', { id: 'bookColumns', className: 'book-columns' });
+        const charBlock = mkNode('div', { className: 'book-char-block' });
+        const botHtml = mkNode('div', { className: 'rs-bot-html' });
+        const proseEl = mkNode('p');
+        const customBtnSpan = mkNode('span', { cursor: 'pointer' });
+        const realButton = mkNode('button');
+        botHtml.append(proseEl, customBtnSpan, realButton);
+        charBlock.append(botHtml);
+        cols.append(charBlock);
+        vp.append(cols);
+        frame.append(vp);
+
+        const sandbox = {
+            window: {
+                getComputedStyle(el) {
+                    let cur = el;
+                    while (cur) {
+                        if (cur._cursor) return { cursor: cur._cursor };
+                        if (cur.classList.contains('book-zone-cursor')) return { cursor: 'pointer' };
+                        cur = cur.parentElement;
+                    }
+                    return { cursor: 'auto' };
+                },
+            },
+            getComputedStyle: () => ({ paddingTop: '12px', paddingBottom: '12px' }),
+            document: {
+                getElementById: (id) => (id === 'bookFrame' ? frame : (id === 'bookViewport' ? vp : (id === 'bookColumns' ? cols : null))),
+                createElement: (tag) => mkNode(tag),
+            },
+            uiPref: { font: 'serif', fsize: 15.5, lh: 1.75, assetFit: 'compact' },
+            bookAnchorMode: 'manual',
+            bookDesiredSpreadIdx: 70,
+            bookSpreadIdx: 70,
+            bookSinglePage: false,
+            bookColOffsets: [],
+            bookColStep: 1,
+            bookSpreadStride: 1,
+            bookTotalPages: 1,
+            bookTotalSpreads: 1,
+            lastBookLayoutSig: '',
+            cachedBookFrameRect: null,
+            lastState: null,
+            prepareBookPaginationBlocks: () => {},
+            goToBookSpread: (idx) => { sandbox.bookSpreadIdx = idx; },
+        };
+
+        vm.runInNewContext(`${interactiveFn[0]}\n${scrollLeftFn[0]}\n${layoutFn[0]}`, sandbox);
+
+        // Tap-zone inherited cursor:pointer must NOT make prose/viewport count as interactive
+        assert.equal(sandbox.isInteractiveBookTarget(vp, frame), false, 'Viewport inside book-zone-cursor must still allow tap flip');
+        assert.equal(sandbox.isInteractiveBookTarget(proseEl, frame), false, 'Prose inside book-zone-cursor must still allow tap flip');
+        assert.equal(sandbox.isInteractiveBookTarget(realButton, frame), true, 'Buttons remain interactive');
+        assert.equal(sandbox.isInteractiveBookTarget(customBtnSpan, frame), true, 'Bot element with own cursor:pointer remains interactive');
+        assert.equal(frame.classList.contains('book-zone-cursor'), true, 'book-zone-cursor must be restored after check');
+
+        // 3) Column alignment with colW=540, colGap=84 -> theoColStep=624; inject a +25px inset polaroid at col 140
+        const frameW = 1248; // colW = floor((1248 - 84 - 84)/2 / 4) * 4 = 540, colGap = 84 -> step = 624
+        frame.clientWidth = frameW;
+        frame._rects = [{ left: 0, width: frameW, height: 620 }];
+        vp.clientWidth = 1164;
+        vp.clientHeight = 580;
+        vp.scrollLeft = 0;
+        vp._rects = [{ left: 42, width: 1164, height: 580 }];
+        cols.scrollWidth = 144 * 624;
+
+        const insetPolaroidBlock = mkNode('div', { className: 'book-char-block' });
+        insetPolaroidBlock._rects = [
+            { left: 42 + 139 * 624, width: 540, height: 540 },
+            { left: 42 + 140 * 624 + 25, width: 490, height: 280 }, // inset polaroid +25px at col 140
+            { left: 42 + 141 * 624, width: 540, height: 540 },
+        ];
+        charBlock._rects = [
+            { left: 42 + 0 * 624, width: 540, height: 540 },
+            { left: 42 + 2 * 624, width: 540, height: 540 },
+            { left: 42 + 142 * 624, width: 540, height: 540 },
+        ];
+        cols.append(insetPolaroidBlock);
+
+        sandbox.layoutBookSpreads(true);
+        assert.equal(sandbox.bookColStep, 624, 'Column step must stay exact at 624px');
+        assert.equal(sandbox.bookColOffsets[140], undefined, 'Inset polaroid rect (+25px, width 490) must be ignored in bookColOffsets');
+        assert.equal(sandbox.getBookSpreadScrollLeft(70), 140 * 624, 'Spread 70 (cols 140-141) must align at exact 140*624 without +25px drift');
+    } finally {
+        if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+        await new Promise((r) => server.close(r));
+    }
+});
+
+test('Leave sub_intimacy_asset option injects sex/position asset alignment only when enabled alongside sub_intimacy and nsfw_mode', () => {
+    const leave = relay.loadBundledLeavePreset();
+    assert.ok(leave, 'Bundled Leave preset must load');
+    assert.ok(leave.toggleSyntax.includes('sub_intimacy_asset=↳ 정사 세부: 성교 중 성교·체위 에셋 우선 사용'));
+    assert.ok(leave.defaultVariables.includes('toggle_sub_intimacy_asset=0'));
+
+    const snap = {
+        charName: 'Alice',
+        charContext: { name: 'Alice', desc: 'Room.' },
+    };
+    const history = [{ index: 0, role: 'user', raw: '안녕' }];
+    const buildText = (remoteToggleValues) => relay.buildDirectPromptMessages({
+        preset: leave,
+        snap,
+        historyMessages: history,
+        userText: '계속.',
+        remoteToggleValues,
+    }).map((m) => m.content).join('\n');
+
+    // 1) Pure Leave: nsfw=2, sub_intimacy=1, sub_intimacy_asset=1 -> enabled cleanly in both Block 4 & recency lock Block 20
+    const pureOn = buildText({
+        toggle_gradia_compat_mode: '0',
+        toggle_nsfw_mode: '2',
+        toggle_sub_intimacy: '1',
+        toggle_sub_intimacy_asset: '1',
+    });
+    assert.ok(pureOn.includes('Intimate Asset & Position Tag Alignment (MANDATORY DURING SEXUAL BEATS)'));
+    assert.ok(pureOn.includes('INTIMATE ASSET LOCK (RECENCY CHECK)'));
+    assert.ok(!/\{\{#if|\{\{getglobalvar|\{\{\/if\}\}/.test(pureOn), 'Pure Leave prompt must have zero unexpanded CBS tags');
+
+    // 2) Pure Leave: turning off any of the 3 gates omits both directives
+    const pureOff = buildText({ toggle_gradia_compat_mode: '0', toggle_nsfw_mode: '2', toggle_sub_intimacy: '1', toggle_sub_intimacy_asset: '0' });
+    assert.ok(!pureOff.includes('Intimate Asset & Position Tag Alignment'));
+    assert.ok(!pureOff.includes('INTIMATE ASSET LOCK'));
+    assert.ok(!buildText({ toggle_gradia_compat_mode: '0', toggle_nsfw_mode: '2', toggle_sub_intimacy: '0', toggle_sub_intimacy_asset: '1' }).includes('Intimate Asset & Position Tag Alignment'));
+    assert.ok(!buildText({ toggle_gradia_compat_mode: '0', toggle_nsfw_mode: '0', toggle_sub_intimacy: '1', toggle_sub_intimacy_asset: '1' }).includes('Intimate Asset & Position Tag Alignment'));
+
+    // 3) GRADIA compat ON: respects sub_intimacy_asset toggle as well
+    const gradiaOn = buildText({
+        toggle_gradia_compat_mode: '1',
+        toggle_nsfw_mode: '2',
+        toggle_sub_intimacy: '1',
+        toggle_sub_intimacy_asset: '1',
+    });
+    assert.ok(gradiaOn.includes('Intimate Asset & Position Tag Alignment (MANDATORY)'));
+    assert.ok(!/\{\{#if|\{\{getglobalvar|\{\{\/if\}\}/.test(gradiaOn), 'GRADIA compat prompt must have zero unexpanded CBS tags');
+
+    const gradiaOff = buildText({
+        toggle_gradia_compat_mode: '1',
+        toggle_nsfw_mode: '2',
+        toggle_sub_intimacy: '1',
+        toggle_sub_intimacy_asset: '0',
+    });
+    assert.ok(!gradiaOff.includes('Intimate Asset & Position Tag Alignment'));
+});
+
+test('intimateAssetMode triggers intimate_asset_sfw_fallback guard on SFW emotion tags during sex and accepts registered act/position/cum tags', async () => {
+    const sexProseBase = '그가 그녀의 허리를 붙잡고 깊이 삽입했다. 질내로 밀려 들어오는 열기에 그녀의 호흡이 가빠졌다.';
+
+    // 1) Unit checks on auditDraftWithDeterministicGuards
+    const sfwFallbackAudit = relay.auditDraftWithDeterministicGuards(
+        `${sexProseBase}\n<img cmd="Jiwon_nude_flustered">\n<img cmd="Jiwon_nude_serious">`,
+        { prevAssistantText: '', userText: '계속.', personaName: '푸딩', isRpMode: false, intimateAssetMode: true }
+    );
+    assert.equal(sfwFallbackAudit.ok, false);
+    assert.ok(sfwFallbackAudit.issues.some((it) => it.code === 'intimate_asset_sfw_fallback'));
+
+    // 2) All 39 registered act/position/toy/climax/group/lesbian tags pass cleanly
+    const all39Tags = 'aftercum, analbeads, analsex, blowjob, breast grabbed, mfm.bukkake, cowgirl, cowgirl.cum, cunnilingus, dildo, doggysex, doggysex.cum, fingering pussy, footjob, fullnelson, fullnelson.cum, mfm.groupsex, handjob, irrumatio, kiss, masturbation, matingpress, matingpress.cum, missionary, missionary.cum, nipple stimulation, paizuri, restrained mfm.groupsex, spanking, spooningsex, spooningsex.cum, standingsex, standingsex.cum, suspended congress, upright straddle, vibrator, 69position, lesbian doubledildo sex, lesbian tribadism sex'.split(', ');
+    for (const tag of all39Tags) {
+        const validCmd = `Jiwon_casual_${tag}`;
+        const okAudit = relay.auditDraftWithDeterministicGuards(
+            `${sexProseBase}\n<img cmd="${validCmd}">`,
+            { prevAssistantText: '', userText: '계속.', personaName: '푸딩', isRpMode: false, intimateAssetMode: true }
+        );
+        assert.ok(!okAudit.issues.some((it) => it.code === 'intimate_asset_sfw_fallback'), `Expected ${validCmd} to pass intimate_asset_sfw_fallback`);
+    }
+
+    // 2b) Toy/spanking prose with SFW emotion tag triggers intimate_asset_sfw_fallback
+    const toyFallbackAudit = relay.auditDraftWithDeterministicGuards(
+        '바이브를 켜고 진동이 닿자 그녀의 허리가 활처럼 휘었다.\n<img cmd="Jiwon_home_flustered">',
+        { prevAssistantText: '', userText: '계속.', personaName: '푸딩', isRpMode: false, intimateAssetMode: true }
+    );
+    assert.ok(toyFallbackAudit.issues.some((it) => it.code === 'intimate_asset_sfw_fallback'));
+
+    // 3) Disabled intimateAssetMode never flags SFW tags
+    const offAudit = relay.auditDraftWithDeterministicGuards(
+        `${sexProseBase}\n<img cmd="Jiwon_nude_flustered">`,
+        { prevAssistantText: '', userText: '계속.', personaName: '푸딩', isRpMode: false, intimateAssetMode: false }
+    );
+    assert.ok(!offAudit.issues.some((it) => it.code === 'intimate_asset_sfw_fallback'));
+
+    // 4) Two-pass end-to-end: Pass 1 receives INTIMATE ASSET TAGS and Pass 2 audit receives intimate_asset_sfw_fallback when Pass 1 emits SFW tags during sex
+    const captured = [];
+    const mockLlm = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => { body += c; });
+        req.on('end', () => {
+            captured.push(JSON.parse(body));
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                choices: [{
+                    message: {
+                        content: '그가 그녀의 골반을 잡고 뒤로 삽입했다. 뜨거운 숨결이 엉켰다.\n<img cmd="Jiwon_nude_flustered">',
+                    },
+                }],
+                usage: { prompt_tokens: 10, completion_tokens: 12, total_tokens: 22 },
+            }));
+        });
+    });
+    await new Promise((r) => mockLlm.listen(0, '127.0.0.1', r));
+    const llmPort = mockLlm.address().port;
+    const tok = 'intimate-asset-twopass-tok';
+    const srv = relay.createRelayServer({
+        token: tok,
+        configOverride: {
+            activeProfileId: 'prof-oai',
+            directPresetId: 'bundled:leave',
+            directHistoryMode: 'chunked',
+            directPipelineMode: 'two_pass',
+            remoteToggleValues: {
+                toggle_writing_mode: '1',
+                toggle_nsfw_mode: '2',
+                toggle_sub_intimacy: '1',
+                toggle_sub_intimacy_asset: '1',
+            },
+            profiles: [{
+                id: 'prof-oai',
+                name: 'Mock Intimate Model',
+                providerType: 'openai_compat',
+                baseUrl: `http://127.0.0.1:${llmPort}/v1/chat/completions`,
+                apiKey: 'sk-test',
+                model: 'mock-model',
+            }],
+        },
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const srvPort = srv.address().port;
+    try {
+        const hdrs = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+        await requestHttp(srvPort, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({
+                catalog: { characters: [{ index: 0, name: '이지원', chats: [{ index: 0, id: 'c0', name: 'Chat 1', msgCount: 1 }] }] },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: '이지원',
+                    chatName: 'Chat 1',
+                    isPcActive: false,
+                    charContext: { name: '이지원', personaName: '푸딩', desc: 'Scene.' },
+                    messages: [{ index: 0, role: 'user', raw: '계속한다.' }],
+                },
+            }),
+        });
+        const sendRes = await requestHttp(srvPort, {
+            method: 'POST',
+            path: '/api/chat/send',
+            headers: hdrs,
+            body: JSON.stringify({ charIndex: 0, chatIndex: 0, text: '허리를 움직였다.' }),
+        });
+        assert.equal(sendRes.status, 200);
+        for (let i = 0; i < 80 && captured.length < 2; i += 1) await new Promise((r) => setTimeout(r, 20));
+        assert.equal(captured.length, 2);
+        const pass1Sys = captured[0].messages[0].content;
+        assert.ok(pass1Sys.includes('INTIMATE ASSET TAGS:'));
+        const pass2Text = captured[1].messages.map((m) => m.content).join('\n');
+        assert.ok(pass2Text.includes('intimate_asset_sfw_fallback'));
+    } finally {
+        if (typeof srv.closeAllConnections === 'function') srv.closeAllConnections();
+        await new Promise((r) => srv.close(r));
+        await new Promise((r) => mockLlm.close(r));
+    }
+});
+
+test('extractTerminalSceneTail strips single-comment HAYAKU & CG status blocks, audit catches cjk_language_leak, and Leave/two_pass include anatomical feasibility', async () => {
+    // 1) extractTerminalSceneTail strips both single-comment and raw HAYAKU packets + ◈CG ... ◈
+    const msgSingleComment = [
+        {
+            role: 'user',
+            raw: '앞장면',
+        },
+        {
+            role: 'char',
+            raw: '그녀의 숨이 가까워졌다. 바람이 풀숲을 스쳤다.\n\n<statusdata>\nHUD 내용\n</statusdata>\n\n◈CG\nTIME|2027.05.29(토)|18:56\nLOC|개울가|none|맑음\n@|이지원\n◈\n\n<!-- HAYAKU_STATE_PACKET_START\n{"meta":{"schema":"hayaku_packet_v1"},"entity":{"secrets":[{"summary":"콘돔 끝에 몰래 구멍"}]}}\nHAYAKU_STATE_PACKET_END -->',
+        },
+    ];
+    const tail1 = relay.extractTerminalSceneTail(msgSingleComment, 2400);
+    assert.ok(tail1.includes('그녀의 숨이 가까워졌다.'));
+    assert.ok(!tail1.includes('HAYAKU_STATE_PACKET'));
+    assert.ok(!tail1.includes('콘돔 끝에 몰래 구멍'));
+    assert.ok(!tail1.includes('◈CG'));
+
+    const msgRawMarkers = [
+        {
+            role: 'char',
+            raw: '마지막 문장만 남아야 한다.\nHAYAKU_STATE_PACKET_START\n{"secrets":[{"summary":"숨겨진 비밀"}]}\nHAYAKU_STATE_PACKET_END',
+        },
+    ];
+    const tail2 = relay.extractTerminalSceneTail(msgRawMarkers, 2400);
+    assert.equal(tail2, '마지막 문장만 남아야 한다.');
+
+    // 2) cjk_language_leak guard catches stray Chinese characters inside Korean prose, ignores clean Korean & short parenthetical Hanja
+    const leakAudit = relay.auditDraftWithDeterministicGuards(
+        '그녀의 숨이 짧게 끊겼다. 그녀의 허벅지가他的手 안에서 떨렸다. 바깥쪽에서 소리가 들려왔다.',
+        { prevAssistantText: '', userText: '계속 진행.', personaName: '푸딩', isRpMode: false }
+    );
+    assert.equal(leakAudit.ok, false);
+    assert.ok(leakAudit.issues.some((it) => it.code === 'cjk_language_leak'));
+
+    const cleanAudit = relay.auditDraftWithDeterministicGuards(
+        '그녀는 대인(大人)스럽게 웃으며 천천히 몸을 일으켰다. 바람이 창문을 흔들며 차가운 밤공기를 들였다.',
+        { prevAssistantText: '', userText: '계속.', personaName: '푸딩', isRpMode: false }
+    );
+    assert.ok(!cleanAudit.issues.some((it) => it.code === 'cjk_language_leak'));
+
+    // 3) Pure Leave includes Anatomical & Physical Feasibility when sub_intimacy=1 & nsfw>=1
+    const leave = relay.loadBundledLeavePreset();
+    const leaveText = relay.buildDirectPromptMessages({
+        preset: leave,
+        snap: { charName: '이지원', charContext: { name: '이지원', desc: 'Scene.' } },
+        historyMessages: [{ index: 0, role: 'user', raw: '계속' }],
+        userText: '움직였다.',
+        remoteToggleValues: { toggle_gradia_compat_mode: '0', toggle_nsfw_mode: '2', toggle_sub_intimacy: '1' },
+    }).map((m) => m.content).join('\n');
+    assert.ok(leaveText.includes('Anatomical & Physical Feasibility'));
+
+    // 4) Two-pass Pass 1 includes ANATOMICAL & SPATIAL FEASIBILITY and OUTPUT LANGUAGE PURITY
+    const captured = [];
+    const mockLlm = http.createServer((req, res) => {
+        let body = '';
+        req.on('data', (c) => { body += c; });
+        req.on('end', () => {
+            captured.push(JSON.parse(body));
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                choices: [{ message: { content: '깨끗한 한국어 초안 문장이다. 그녀가 눈을 감았다.' } }],
+                usage: { prompt_tokens: 8, completion_tokens: 8, total_tokens: 16 },
+            }));
+        });
+    });
+    await new Promise((r) => mockLlm.listen(0, '127.0.0.1', r));
+    const llmPort = mockLlm.address().port;
+    const tok = 'feasibility-twopass-tok';
+    const srv = relay.createRelayServer({
+        token: tok,
+        configOverride: {
+            activeProfileId: 'prof-oai',
+            directPresetId: 'bundled:leave',
+            directHistoryMode: 'chunked',
+            directPipelineMode: 'two_pass',
+            remoteToggleValues: { toggle_writing_mode: '1' },
+            profiles: [{
+                id: 'prof-oai',
+                name: 'Mock Check Model',
+                providerType: 'openai_compat',
+                baseUrl: `http://127.0.0.1:${llmPort}/v1/chat/completions`,
+                apiKey: 'sk-test',
+                model: 'mock-model',
+            }],
+        },
+    });
+    await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+    const srvPort = srv.address().port;
+    try {
+        const hdrs = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+        await requestHttp(srvPort, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({
+                catalog: { characters: [{ index: 0, name: '테스트', chats: [{ index: 0, id: 'c0', name: 'Chat 1', msgCount: 1 }] }] },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: '테스트',
+                    chatName: 'Chat 1',
+                    isPcActive: false,
+                    charContext: { name: '테스트', personaName: '푸딩', desc: 'Scene.' },
+                    messages: [{ index: 0, role: 'user', raw: '시작.' }],
+                },
+            }),
+        });
+        const sendRes = await requestHttp(srvPort, {
+            method: 'POST',
+            path: '/api/chat/send',
+            headers: hdrs,
+            body: JSON.stringify({ charIndex: 0, chatIndex: 0, text: '진행한다.' }),
+        });
+        assert.equal(sendRes.status, 200);
+        for (let i = 0; i < 80 && captured.length < 2; i += 1) await new Promise((r) => setTimeout(r, 20));
+        assert.equal(captured.length, 2);
+        const pass1Sys = captured[0].messages[0].content;
+        assert.ok(pass1Sys.includes('ANATOMICAL & SPATIAL FEASIBILITY'));
+        assert.ok(pass1Sys.includes('OUTPUT LANGUAGE PURITY'));
+    } finally {
+        if (typeof srv.closeAllConnections === 'function') srv.closeAllConnections();
+        await new Promise((r) => srv.close(r));
+        await new Promise((r) => mockLlm.close(r));
     }
 });

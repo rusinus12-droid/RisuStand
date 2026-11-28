@@ -2315,3 +2315,1051 @@ risuai.addRisuChatListener('output', async () => {
         await adapter.dispose();
     }
 });
+
+test('live Backend VM GUI projection exposes in-memory plugin state across turns, strips scripts, handles events, and serves HTTP endpoints', async () => {
+    const upstream = http.createServer((req, res) => {
+        const chunks = [];
+        req.on('data', (c) => chunks.push(c));
+        req.on('end', () => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                id: 'live-gui-up',
+                model: 'mock',
+                choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+            }));
+        });
+    });
+    await new Promise((r) => upstream.listen(0, '127.0.0.1', r));
+    const upstreamPort = upstream.address().port;
+
+    const tok = 'live-gui-tok';
+    const authHeaders = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+    const server = relay.createRelayServer({
+        token: tok,
+        configOverride: {
+            activeProfileId: 'mock-openai',
+            directPresetId: '',
+            backendPlugins: {},
+            profiles: [{
+                id: 'mock-openai',
+                name: 'Mock',
+                providerType: 'openai_compat',
+                baseUrl: `http://127.0.0.1:${upstreamPort}/v1/chat/completions`,
+                apiKey: 'sk-test',
+                model: 'mock-model',
+            }],
+        },
+    });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const port = server.address().port;
+
+    const pluginScript = `
+//@name live_memory_gui_test
+//@display-name Live Memory GUI Test
+//@api 3.0
+//@version 1.0.0
+(async () => {
+  // Stored ONLY in VM RAM (never written to pluginStorage)
+  let runCount = 0;
+  let lastDraft = '';
+  let activeTab = 'overview';
+  let searchFilter = '';
+  let modalEl = null;
+
+  await risuai.addRisuReplacer('beforeRequest', async (msgs) => {
+    runCount += 1;
+    const lastUser = [...(msgs || [])].reverse().find((m) => m && m.role === 'user');
+    lastDraft = 'SHADOW_ACT #' + runCount + ': ' + (lastUser ? lastUser.content : '');
+    return msgs;
+  });
+
+  await risuai.registerButton({ name: '인풋 작성', location: 'action' }, async () => {
+    // action button should NOT win over registerSetting when entryId is empty
+  });
+
+  function renderModal() {
+    if (!modalEl) return;
+    const escaped = String(lastDraft).replace(/</g, '&lt;');
+    const bodyHtml = activeTab === 'results'
+      ? '<div id="tab-results"><details id="det"><summary id="det-sum">기억 조회 상세</summary><div id="det-body">' + escaped + ' | filter=' + searchFilter + '</div></details></div>'
+      : '<div id="tab-overview">Overview Count: ' + runCount + '</div>';
+    modalEl.innerHTML =
+      '<div class="live-shell">' +
+        '<button type="button" data-tab="overview">개요</button>' +
+        '<button type="button" data-tab="results" onclick="evilInline()">실행 결과</button>' +
+        '<input id="live-filter" type="text" value="' + searchFilter + '" />' +
+        '<button type="button" id="live-close-btn">닫기</button>' +
+        bodyHtml +
+        '<script>window.__xss = 1;</script>' +
+      '</div>';
+    const inp = modalEl.querySelector('#live-filter');
+    if (inp) {
+      inp.addEventListener('input', (e) => {
+        searchFilter = String(e.target.value || '');
+        const out = modalEl.querySelector('#det-body');
+        if (out) out.textContent = lastDraft + ' | filter=' + searchFilter;
+      });
+    }
+    const closeBtn = modalEl.querySelector('#live-close-btn');
+    if (closeBtn) {
+      closeBtn.onclick = async () => {
+        if (modalEl) { modalEl.remove(); modalEl = null; }
+        await risuai.hideContainer();
+      };
+    }
+  }
+
+  await risuai.registerSetting('메인 설정', async () => {
+    const st = document.createElement('style');
+    st.textContent = '.live-shell { color: #e2e8f0; }';
+    document.head.appendChild(st);
+    modalEl = document.createElement('div');
+    modalEl.id = 'live-gui-root';
+    modalEl.addEventListener('click', (e) => {
+      const tabBtn = e.target && e.target.closest ? e.target.closest('[data-tab]') : null;
+      if (tabBtn) {
+        activeTab = tabBtn.getAttribute('data-tab') || 'overview';
+        renderModal();
+      }
+    });
+    renderModal();
+    document.body.appendChild(modalEl);
+    await risuai.showContainer();
+  }, '⚡', 'html');
+})();
+`;
+
+    const pluginStore = makeMapStore();
+    const safeLocalStore = makeMapStore();
+    const localPluginStore = makeMapStore();
+    const mockDb = {
+        characters: [{
+            name: 'Char',
+            desc: '',
+            personality: '',
+            scenario: '',
+            firstMessage: 'Hi',
+            chats: [{ id: 'chat-live-1', name: 'Chat 1', message: [{ role: 'user', data: 'prev', chatId: 'm0' }], note: '' }],
+        }],
+        plugins: [],
+    };
+    const vmBridge = bootRisuStandInVm({
+        relayPort: port,
+        token: tok,
+        mockDb,
+        pluginStore,
+        safeLocalStore,
+        localPluginStore,
+    });
+
+    try {
+        // 1) Auth enforcement & wait for PC bridge snapshot sync
+        const unauth = await requestHttp(port, { path: '/api/plugins/live-gui-srcdoc?name=live_memory_gui_test' });
+        assert.equal(unauth.status, 401);
+
+        await waitUntil(async () => {
+            const st = JSON.parse((await requestHttp(port, { path: '/api/state', headers: authHeaders })).body);
+            return st.snapshot && st.snapshot.charIndex === 0;
+        });
+
+        // 2) Upload & enable plugin
+        const upRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/plugins/upload',
+            headers: authHeaders,
+            body: JSON.stringify({ filename: 'live_memory_gui_test.js', script: pluginScript, enabled: true }),
+        });
+        assert.equal(upRes.status, 200);
+
+        // 3) Compile check viewer srcdoc
+        const viewerRes = await requestHttp(port, {
+            path: '/api/plugins/live-gui-srcdoc?name=live_memory_gui_test&theme=dark',
+            headers: authHeaders,
+        });
+        assert.equal(viewerRes.status, 200);
+        const viewerJson = JSON.parse(viewerRes.body);
+        assert.ok(viewerJson.srcdoc.includes('__rsLiveGuiRender'));
+        assert.ok(viewerJson.srcdoc.includes('__rsLiveGuiEvent'));
+        const vScripts = [];
+        const re = /<script(?:\s+([^>]*))?>([\s\S]*?)<\/script>/gi;
+        let m;
+        while ((m = re.exec(viewerJson.srcdoc)) !== null) {
+            if (!(m[1] || '').includes('__rs_live_')) vScripts.push(m[2]);
+        }
+        assert.equal(vScripts.length, 1);
+        new vm.Script(vScripts[0], { filename: 'live-gui-viewer-runtime.js' });
+
+        // Run a real LLM turn via /api/chat/send so plugin's beforeRequest increments runCount in VM RAM
+        const send1 = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/chat/send',
+            headers: authHeaders,
+            body: JSON.stringify({ text: 'Turn1User', charIndex: 0, chatIndex: 0 }),
+        });
+        assert.equal(send1.status, 200);
+        await waitUntil(async () => {
+            const st = JSON.parse((await requestHttp(port, { path: '/api/state', headers: authHeaders })).body);
+            return !st.directGenerating && mockDb.characters[0].chats[0].message.length >= 3;
+        });
+
+        // 4) Open live GUI via HTTP -> picks registerSetting ('메인 설정'), renders Overview Count: 1, strips script/onclick
+        const open1Res = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/plugins/live-gui-open',
+            headers: authHeaders,
+            body: JSON.stringify({ pluginName: 'live_memory_gui_test' }),
+        });
+        assert.equal(open1Res.status, 200);
+        const open1 = JSON.parse(open1Res.body);
+        assert.equal(open1.ok, true);
+        assert.equal(open1.entryName, '메인 설정');
+        assert.ok(open1.html.includes('Overview Count: 1'));
+        assert.ok(open1.styles.some((s) => s.includes('.live-shell')));
+        assert.ok(!open1.html.includes('__xss'), '<script> must be stripped from serialized DOM');
+        assert.ok(!open1.html.includes('evilInline'), 'on* attributes must be stripped');
+
+        // 5) Click '실행 결과' tab (tests e.target.closest('[data-tab]') on sync listener)
+        const tabMatch = open1.html.match(/<button[^>]*data-rs-vm-nid="(\d+)"[^>]*data-tab="results"/);
+        assert.ok(tabMatch, 'Tab button must carry data-rs-vm-nid');
+        const evTabRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/plugins/live-gui-event',
+            headers: authHeaders,
+            body: JSON.stringify({ pluginName: 'live_memory_gui_test', eventType: 'click', nodeId: Number(tabMatch[1]) }),
+        });
+        const evTab = JSON.parse(evTabRes.body);
+        assert.ok(evTab.html.includes('SHADOW_ACT #1: Turn1User'));
+
+        // 6) Type into <input id="live-filter"> (tests input listener & live value sync)
+        const inpMatch = evTab.html.match(/<input[^>]*data-rs-vm-nid="(\d+)"[^>]*id="live-filter"/);
+        assert.ok(inpMatch);
+        const evInpRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/plugins/live-gui-event',
+            headers: authHeaders,
+            body: JSON.stringify({ pluginName: 'live_memory_gui_test', eventType: 'input', nodeId: Number(inpMatch[1]), value: 'abc' }),
+        });
+        const evInp = JSON.parse(evInpRes.body);
+        assert.ok(evInp.html.includes('filter=abc'));
+
+        // 7) Click <summary> inside <details> -> toggles open=""
+        const sumMatch = evInp.html.match(/<summary[^>]*data-rs-vm-nid="(\d+)"/);
+        assert.ok(sumMatch);
+        const evDetRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/plugins/live-gui-event',
+            headers: authHeaders,
+            body: JSON.stringify({ pluginName: 'live_memory_gui_test', eventType: 'click', nodeId: Number(sumMatch[1]) }),
+        });
+        const evDet = JSON.parse(evDetRes.body);
+        assert.ok(/<details[^>]*\bopen=/.test(evDet.html), 'Clicking <summary> must toggle details[open]');
+
+        // 8) Close live GUI (preserving VM RAM state), run Turn 2, re-open -> shows Turn 2 RAM draft
+        const closeRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/plugins/live-gui-close',
+            headers: authHeaders,
+            body: JSON.stringify({ pluginName: 'live_memory_gui_test' }),
+        });
+        assert.equal(closeRes.status, 200);
+
+        const send2 = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/chat/send',
+            headers: authHeaders,
+            body: JSON.stringify({ text: 'Turn2User', charIndex: 0, chatIndex: 0 }),
+        });
+        assert.equal(send2.status, 200);
+        await waitUntil(async () => {
+            const st = JSON.parse((await requestHttp(port, { path: '/api/state', headers: authHeaders })).body);
+            return !st.directGenerating && mockDb.characters[0].chats[0].message.length >= 5;
+        });
+
+        const open2 = JSON.parse((await requestHttp(port, {
+            method: 'POST',
+            path: '/api/plugins/live-gui-open',
+            headers: authHeaders,
+            body: JSON.stringify({ pluginName: 'live_memory_gui_test' }),
+        })).body);
+        assert.ok(open2.html.includes('SHADOW_ACT #2: Turn2User'), 'Re-opening live GUI after Turn 2 must show updated RAM state');
+
+        // 9) Clicking inline close button triggers hideContainer -> closed: true
+        const closeBtnMatch = open2.html.match(/<button[^>]*data-rs-vm-nid="(\d+)"[^>]*id="live-close-btn"/);
+        assert.ok(closeBtnMatch);
+        const evClose = JSON.parse((await requestHttp(port, {
+            method: 'POST',
+            path: '/api/plugins/live-gui-event',
+            headers: authHeaders,
+            body: JSON.stringify({ pluginName: 'live_memory_gui_test', eventType: 'click', nodeId: Number(closeBtnMatch[1]) }),
+        })).body);
+        assert.equal(evClose.closed, true);
+    } finally {
+        await vmBridge.shutdown();
+        if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+        await new Promise((r) => server.close(r));
+        await new Promise((r) => upstream.close(r));
+    }
+});
+
+test('Backend VM enforces same-realm prototypes/Errors, DOM parity (style.setProperty, dataset, numeric querySelectorAll, innerText), and settles un-awaited async Live GUI loaders', async () => {
+    const adapter = adapterMod.createPluginAdapter({
+        persistDisabled: true,
+        hostRpc: {
+            isConnected: () => true,
+            async invoke(op, args) {
+                if (op === 'pluginStorage.getItem' && args[0] === 'k') {
+                    await new Promise((r) => setTimeout(r, 120));
+                    return { loaded: true, label: 'from-storage' };
+                }
+                if (op === 'pluginStorage.keys') return ['k'];
+                if (op === 'localPluginStorage.getItem' && args[0] === 'lk') return { localOk: 42 };
+                if (op === 'localPluginStorage.keys') return ['lk'];
+                if (op === 'db.getCurrentIndices') return { charIndex: 0, chatIndex: 0 };
+                if (op === 'db.getCharacter') return { name: 'Hero', chats: [{ id: 'ch-1', message: [{ role: 'user', data: 'hi' }] }] };
+                if (op === 'db.getChat') return { id: 'ch-1', message: [{ role: 'user', data: 'hi' }] };
+                if (op === 'db.getDatabase') {
+                    await new Promise((r) => setTimeout(r, 120));
+                    return { characters: [{ name: 'Hero', chats: [{ id: 'ch-1', message: [] }] }], plugins: [] };
+                }
+                return null;
+            },
+        },
+    });
+
+    try {
+        await adapter.addCustomPlugin({
+            filename: 'vm_realm_and_dom_parity.js',
+            enabled: true,
+            script: `
+//@name vm_realm_and_dom_parity
+//@display-name VM Realm & DOM Parity
+//@api 3.0
+(async () => {
+  await risuai.addRisuChatListener((_ev) => {});
+
+  const db = await risuai.getDatabase('all');
+  const ch = await risuai.getCharacter();
+  const chat = await risuai.getChat();
+  const stVal = await risuai.pluginStorage.getItem('k');
+  const stKeys = await risuai.pluginStorage.keys();
+  const lps = await risuai.getLocalPluginStorage();
+  const lpsVal = await lps.getItem('lk');
+  const lpsKeys = await lps.keys();
+  const lpsKey0 = await lps.key(0);
+  const lpsLen = await lps.length();
+  const scheme = await risuai.getColorScheme();
+  const rInfo = await risuai.getRuntimeInfo();
+  const cloned = structuredClone({ nested: { a: [1, 2] }, when: new Date(1000) });
+
+  let rejectedErr = null;
+  try {
+    await risuai.addRisuReplacer('invalid_mode', () => {});
+  } catch (e) {
+    rejectedErr = e;
+  }
+
+  const realmChecks = {
+    apiObj: (risuai instanceof Object),
+    dbObj: (db instanceof Object && Object.getPrototypeOf(db) === Object.prototype),
+    dbCharsArr: (db.characters instanceof Array && Object.getPrototypeOf(db.characters) === Array.prototype),
+    charObj: (ch instanceof Object && Object.getPrototypeOf(ch) === Object.prototype),
+    chatObj: (chat instanceof Object && Object.getPrototypeOf(chat) === Object.prototype),
+    stObj: (stVal instanceof Object && Object.getPrototypeOf(stVal) === Object.prototype),
+    stKeysArr: (stKeys instanceof Array && Object.getPrototypeOf(stKeys) === Array.prototype),
+    lpsObj: (lps instanceof Object),
+    lpsValObj: (lpsVal instanceof Object && Object.getPrototypeOf(lpsVal) === Object.prototype),
+    lpsKeysArr: (lpsKeys instanceof Array && lpsKey0 === 'lk' && lpsLen === 1),
+    schemeObj: (scheme instanceof Object && Object.getPrototypeOf(scheme) === Object.prototype && typeof scheme.bgcolor === 'string'),
+    infoObj: (rInfo instanceof Object && Object.getPrototypeOf(rInfo) === Object.prototype),
+    clonedObj: (cloned instanceof Object && Object.getPrototypeOf(cloned) === Object.prototype && cloned.nested instanceof Object && cloned.nested.a instanceof Array && cloned.when instanceof Date),
+    errIsError: (rejectedErr instanceof Error),
+  };
+
+  risuai.registerSetting('Parity Settings', () => {
+    document.documentElement.style.setProperty('--test-bg', '#123456');
+    const root = document.createElement('div');
+    root.id = 'parity-root';
+    root.innerHTML = '<div class="item">1</div><div class="item">2</div>';
+    document.body.appendChild(root);
+
+    async function loadAsync() {
+      const [loadedDb, loadedStore] = await Promise.all([
+        risuai.getDatabase('all'),
+        risuai.pluginStorage.getItem('k'),
+      ]);
+      const btn = document.createElement('button');
+      btn.style.setProperty('--btn-color', '#22c55e');
+      btn.dataset.tab = 'results';
+      const label = document.createElement('span');
+      label.innerText = 'loaded';
+      btn.appendChild(label);
+      root.appendChild(btn);
+      const countEl = document.createElement('div');
+      countEl.id = 'meta-out';
+      countEl.textContent = JSON.stringify({
+        itemCount: root.querySelectorAll('.item').length,
+        hasResultsTab: Boolean(root.querySelector('[data-tab="results"]')),
+        dbOk: (loadedDb instanceof Object && Object.getPrototypeOf(loadedDb) === Object.prototype),
+        storeLabel: loadedStore && loadedStore.label,
+        btnColorProp: btn.style.getPropertyValue('--btn-color'),
+        realmChecks,
+      });
+      root.appendChild(countEl);
+      console.warn('live-gui-diag-ok');
+    }
+
+    // Fire un-awaited async loader (must be awaited by settleLiveGuiDom!)
+    void loadAsync();
+    void risuai.showContainer();
+  });
+})();
+`,
+        });
+
+        await waitUntil(() => adapter.listPlugins().some((p) => p.name === 'vm_realm_and_dom_parity' && p.uiItems.length >= 1));
+        const res = await adapter.openLiveBackendGui('vm_realm_and_dom_parity');
+        assert.equal(res.ok, true);
+        assert.ok(res.rootAttrs && String(res.rootAttrs.htmlStyle || '').includes('--test-bg:#123456'), 'rootAttrs.htmlStyle must preserve --test-bg CSS variable');
+        assert.ok(res.html.includes('data-tab="results"'), 'dataset.tab must serialize as data-tab="results"');
+        assert.ok(res.html.includes('--btn-color:#22c55e'), 'style.setProperty CSS variable must serialize cleanly');
+        assert.ok(res.html.includes('>loaded</span>'), 'innerText setter must update element text');
+        assert.ok(res.diagnostics.some((d) => d.includes('live-gui-diag-ok')), 'Live GUI warnings must be captured in diagnostics');
+
+        const metaMatch = res.html.match(/id="meta-out"[^>]*>([\s\S]*?)<\/div>/);
+        assert.ok(metaMatch, 'Un-awaited async loader must complete before openLiveBackendGui returns');
+        const parsedMeta = JSON.parse(metaMatch[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&'));
+        assert.equal(parsedMeta.itemCount, 2, 'Sync querySelectorAll().length must be numeric');
+        assert.equal(parsedMeta.hasResultsTab, true);
+        assert.equal(parsedMeta.dbOk, true);
+        assert.equal(parsedMeta.storeLabel, 'from-storage');
+        assert.equal(parsedMeta.btnColorProp, '#22c55e');
+        for (const [k, v] of Object.entries(parsedMeta.realmChecks)) {
+            assert.equal(v, true, `Cross-realm check failed for ${k}`);
+        }
+    } finally {
+        await adapter.dispose();
+    }
+});
+
+test('Backend VM headless DOM exposes select/option/form/table collections, classList/textNode/document collections, and logs Error details', async () => {
+    const adapter = adapterMod.createPluginAdapter({
+        persistDisabled: true,
+        hostRpc: { isConnected: () => false, async invoke() { throw new Error('offline'); } },
+    });
+
+    try {
+        await adapter.addCustomPlugin({
+            filename: 'dom_collections_parity.js',
+            enabled: true,
+            script: `
+//@name dom_collections_parity
+//@display-name DOM Collections Parity
+//@api 3.0
+risuai.registerSetting('DOM Collections', () => {
+  const form = document.createElement('form');
+  const sel = document.createElement('select');
+  sel.name = 'modelSelect';
+  const opt1 = new Option('Alpha', 'a', false, false);
+  const opt2 = new Option('Beta', 'b', false, true);
+  sel.add(opt1);
+  sel.add(opt2);
+
+  const inp = document.createElement('input');
+  inp.type = 'file';
+  form.appendChild(sel);
+  form.appendChild(inp);
+
+  const tbl = document.createElement('table');
+  const tbody = document.createElement('tbody');
+  const tr = document.createElement('tr');
+  const td1 = document.createElement('td');
+  const td2 = document.createElement('td');
+  tr.append(td1, td2);
+  tbody.appendChild(tr);
+  tbl.appendChild(tbody);
+
+  const box = document.createElement('div');
+  box.className = 'alpha beta';
+  const classReplaceOk = box.classList.replace('beta', 'gamma');
+  const classSpread = [...box.classList];
+  const tn = document.createTextNode('old-txt');
+  tn.nodeValue = 'new-txt';
+  box.appendChild(tn);
+
+  document.body.appendChild(form);
+  document.body.appendChild(tbl);
+  document.body.appendChild(box);
+
+  // Switch via selectedIndex and verify option/select state
+  sel.selectedIndex = 0;
+
+  const summary = {
+    selOptsLen: sel.options.length,
+    selLenProp: sel.length,
+    selValueAfterIdx: sel.value,
+    selSelectedOptsLen: sel.selectedOptions.length,
+    selSelectedIndex: sel.selectedIndex,
+    opt1Selected: opt1.selected,
+    opt2Selected: opt2.selected,
+    opt1Text: opt1.text,
+    opt1FormMatches: opt1.form === form,
+    formElemsLen: form.elements.length,
+    inpFilesLen: inp.files.length,
+    inpLabelsLen: inp.labels.length,
+    tblRowsLen: tbl.rows.length,
+    tblBodiesLen: tbl.tBodies.length,
+    trCellsLen: tr.cells.length,
+    classLen: box.classList.length,
+    classItem0: box.classList.item(0),
+    classReplaceOk,
+    classSpread,
+    tnChildLen: tn.childNodes.length,
+    tnValue: tn.nodeValue,
+    tnConnected: tn.isConnected,
+    docSheetsLen: document.styleSheets.length,
+    docChildrenLen: document.childNodes.length,
+    docFormsLen: document.forms.length,
+    winSelRangeCount: window.getSelection().rangeCount,
+  };
+
+  const out = document.createElement('pre');
+  out.id = 'collections-out';
+  out.textContent = JSON.stringify(summary);
+  document.body.appendChild(out);
+
+  console.warn('err-tag', new Error('boom-detail'));
+  void risuai.showContainer();
+});
+`,
+        });
+
+        await waitUntil(() => adapter.listPlugins().some((p) => p.name === 'dom_collections_parity' && p.uiItems.length >= 1));
+        const res = await adapter.openLiveBackendGui('dom_collections_parity');
+        assert.equal(res.ok, true);
+        assert.ok(res.diagnostics.some((d) => d.includes('err-tag') && d.includes('boom-detail')), 'formatLogArgs must include Error message/stack instead of {}');
+
+        const m = res.html.match(/id="collections-out"[^>]*>([\s\S]*?)<\/pre>/);
+        assert.ok(m, 'Expected collections-out <pre> in serialized DOM');
+        const summary = JSON.parse(m[1].replace(/&quot;/g, '"').replace(/&amp;/g, '&'));
+        assert.equal(summary.selOptsLen, 2);
+        assert.equal(summary.selLenProp, 2);
+        assert.equal(summary.selValueAfterIdx, 'a');
+        assert.equal(summary.selSelectedOptsLen, 1);
+        assert.equal(summary.selSelectedIndex, 0);
+        assert.equal(summary.opt1Selected, true);
+        assert.equal(summary.opt2Selected, false);
+        assert.equal(summary.opt1Text, 'Alpha');
+        assert.equal(summary.opt1FormMatches, true);
+        assert.equal(summary.formElemsLen, 2);
+        assert.equal(summary.inpFilesLen, 0);
+        assert.equal(summary.inpLabelsLen, 0);
+        assert.equal(summary.tblRowsLen, 1);
+        assert.equal(summary.tblBodiesLen, 1);
+        assert.equal(summary.trCellsLen, 2);
+        assert.equal(summary.classLen, 2);
+        assert.equal(summary.classItem0, 'alpha');
+        assert.equal(summary.classReplaceOk, true);
+        assert.deepEqual(summary.classSpread, ['alpha', 'gamma']);
+        assert.equal(summary.tnChildLen, 0);
+        assert.equal(summary.tnValue, 'new-txt');
+        assert.equal(summary.tnConnected, true);
+        assert.equal(summary.docSheetsLen, 0);
+        assert.equal(summary.docChildrenLen, 1);
+        assert.equal(summary.docFormsLen, 1);
+        assert.equal(summary.winSelRangeCount, 0);
+    } finally {
+        await adapter.dispose();
+    }
+});
+
+test('Live GUI supports nested e.currentTarget sidebar nav, capture/stopPropagation, dedup re-append, class/disabled sync, entities, selectors, radio/label, and fast delta settle', async () => {
+    let releaseBackgroundOp = null;
+    const backgroundStarted = new Promise((res) => {
+        releaseBackgroundOp = res;
+    });
+    let holdBg = null;
+    const bgPromise = new Promise((res) => {
+        holdBg = res;
+    });
+
+    const adapter = adapterMod.createPluginAdapter({
+        persistDisabled: true,
+        hostRpc: {
+            isConnected: () => true,
+            async invoke(op, args) {
+                if (op === 'pluginStorage.getItem' && args[0] === 'bg_poll') {
+                    releaseBackgroundOp();
+                    await bgPromise;
+                    return { ok: true };
+                }
+                return null;
+            },
+        },
+    });
+
+    try {
+        await adapter.addCustomPlugin({
+            filename: 'live_gui_parity_fast_test.js',
+            enabled: true,
+            script: `
+//@name live_gui_parity_fast_test
+//@display-name Live GUI Parity Fast Test
+//@api 3.0
+(async () => {
+  // Start an unrelated background RPC op that stays in flight
+  void risuai.pluginStorage.getItem('bg_poll');
+
+  risuai.registerSetting('Overview', () => {
+    const style = document.createElement('style');
+    style.textContent = '.pill{color:#fff} body.gradia-dark{background:#000}';
+    document.head.appendChild(style);
+    document.body.className = 'gradia-dark';
+
+    const root = document.createElement('div');
+    root.id = 'gradia-root';
+    root.innerHTML =
+      '<nav class="sidebar">' +
+        '<button type="button" class="nav-btn active" data-page="overview"><span id="nav-ov-lbl">개요</span></button>' +
+        '<button type="button" class="nav-btn" data-page="results"><span id="nav-res-lbl">실행 결과</span></button>' +
+        '<button type="button" id="noop-btn">No-op</button>' +
+      '</nav>' +
+      '<div id="pipeline-flow" data-mode="Pro"></div>' +
+      '<div id="gradia:overview.count">0 / 7</div>' +
+      '<button type="button" id="save-btn" disabled>저장</button>' +
+      '<form id="mode-form">' +
+        '<label id="lbl-mode-lite"><input type="radio" name="workMode" id="rad-lite" value="lite" checked> Lite</label>' +
+        '<label id="lbl-mode-pro"><input type="radio" name="workMode" id="rad-pro" value="pro"> Pro</label>' +
+      '</form>' +
+      '<div id="page-out">page=overview</div>' +
+      '<div id="dom-checks"></div>';
+    document.body.appendChild(root);
+
+    const flow = document.getElementById('pipeline-flow');
+    const makePill = (label) => {
+      const s = document.createElement('span');
+      s.className = 'pill';
+      s.textContent = label;
+      return s;
+    };
+    const pills = [makePill('SHADOW ACT'), makePill('인물 AIDE'), makePill('세계관 AIDE'), makePill('플롯 AIDE'), makePill('메인 응답')];
+    const renderFlow = () => {
+      // Deliberately re-append existing child nodes without clearing first (must move, NOT duplicate!)
+      for (const p of pills) flow.appendChild(p);
+      // Also parse &rarr; and &middot; entities
+      const arrowCheck = document.createElement('div');
+      arrowCheck.id = 'entity-box';
+      arrowCheck.innerHTML = '<span>A &rarr; B &middot; C</span>';
+      if (!document.getElementById('entity-box')) flow.appendChild(arrowCheck);
+    };
+    renderFlow();
+    renderFlow();
+
+    // Test property-attribute sync: mutate className & disabled after HTML parsing
+    const saveBtn = document.getElementById('save-btn');
+    saveBtn.disabled = false;
+    saveBtn.className = 'btn-ready';
+
+    const countEl = document.getElementById('gradia:overview.count');
+    if (countEl) countEl.textContent = '6 / 7';
+
+    // Verify selectors
+    const selChecks = {
+      pillCount: flow.querySelectorAll(':scope > .pill').length,
+      adjCount: flow.querySelectorAll('.pill + .pill').length,
+      enabledSave: Boolean(root.querySelector('#save-btn:enabled')),
+      caseAttr: Boolean(root.querySelector('[data-mode="PRO" i]')),
+      exactId: Boolean(countEl),
+    };
+    document.getElementById('dom-checks').textContent = JSON.stringify(selChecks);
+
+    // Event order + stopPropagation + e.currentTarget test
+    const eventLog = [];
+    document.addEventListener('click', (e) => {
+      eventLog.push('doc-capture:' + (e.currentTarget === document));
+    }, true);
+    document.addEventListener('click', () => {
+      eventLog.push('doc-bubble-should-not-run');
+    });
+
+    const navBtns = root.querySelectorAll('.nav-btn');
+    navBtns.forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const page = e.currentTarget && e.currentTarget.dataset ? e.currentTarget.dataset.page : 'MISSING';
+        eventLog.push('btn:' + page);
+        document.getElementById('page-out').textContent = 'page=' + page + '|log=' + eventLog.join(',');
+      });
+    });
+
+    document.getElementById('mode-form').addEventListener('change', (e) => {
+      const checked = Array.from(document.querySelectorAll('input[name="workMode"]'))
+        .filter((inp) => inp.checked)
+        .map((inp) => inp.value);
+      document.getElementById('page-out').textContent = 'mode=' + e.target.value + '|checked=' + checked.join(',');
+    });
+
+    void risuai.showContainer();
+  });
+})();
+`,
+        });
+
+        await waitUntil(() => adapter.listPlugins().some((p) => p.name === 'live_gui_parity_fast_test' && p.uiItems.length >= 1));
+        await backgroundStarted;
+
+        // Compile-check viewer srcdoc & inspect optimizations
+        const viewer = adapter.getLiveGuiViewerSrcdoc('live_gui_parity_fast_test', 'dark');
+        assert.ok(viewer && viewer.srcdoc.includes('stylesUnchanged'));
+        assert.ok(viewer.srcdoc.includes('fireClick'));
+        const vScripts = [];
+        const re = /<script(?:\s+([^>]*))?>([\s\S]*?)<\/script>/gi;
+        let sm;
+        while ((sm = re.exec(viewer.srcdoc)) !== null) {
+            if (!(sm[1] || '').includes('__rs_live_')) vScripts.push(sm[2]);
+        }
+        assert.equal(vScripts.length, 1);
+        new vm.Script(vScripts[0], { filename: 'live-gui-viewer-fast.js' });
+
+        // Open Live GUI while background RPC is STILL pending (must NOT hang 3500ms)
+        const tOpen0 = Date.now();
+        const openRes = await adapter.openLiveBackendGui('live_gui_parity_fast_test');
+        const openElapsed = Date.now() - tOpen0;
+        assert.equal(openRes.ok, true);
+        assert.ok(openElapsed < 800, `openLiveBackendGui took ${openElapsed}ms; background op should not block baselinePendingOps`);
+        assert.ok(openRes.html.includes('6 / 7'), 'getElementById with ":" and "." must update node');
+        assert.ok(openRes.html.includes('A → B · C'), '&rarr; and &middot; entities must decode cleanly');
+        assert.ok(openRes.html.includes('class="btn-ready"'), 'className setter must sync serialized class attribute');
+        assert.ok(!/<button[^>]*id="save-btn"[^>]*disabled=/.test(openRes.html), 'disabled=false must remove disabled="" attribute');
+
+        const checksMatch = openRes.html.match(/id="dom-checks"[^>]*>([\s\S]*?)<\/div>/);
+        assert.ok(checksMatch);
+        const selChecks = JSON.parse(checksMatch[1].replace(/&quot;/g, '"'));
+        assert.equal(selChecks.pillCount, 5, 'Re-appending existing children must move, not duplicate');
+        assert.equal(selChecks.adjCount, 4, '.pill + .pill combinator must match 4 adjacent pills');
+        assert.equal(selChecks.enabledSave, true, ':enabled must match save-btn after disabled=false');
+        assert.equal(selChecks.caseAttr, true, '[data-mode="PRO" i] must match case-insensitively');
+        assert.equal(selChecks.exactId, true);
+
+        // Also verify async wrapSafeElement child/sibling traversal + replaceChildren on mockDom
+        const mockDom = adapter._debug.pluginDoms.get('live_gui_parity_fast_test');
+        const asyncFlow = await mockDom.asyncDoc.getElementById('pipeline-flow');
+        assert.ok(asyncFlow && asyncFlow.firstChild && asyncFlow.children.length >= 5);
+        const asyncTmp = await mockDom.asyncDoc.createElement('div');
+        await asyncTmp.append('one', 'two');
+        while (asyncTmp.firstChild) {
+            await asyncTmp.removeChild(asyncTmp.firstChild);
+        }
+        assert.equal(asyncTmp.childNodes.length, 0);
+        await asyncTmp.replaceChildren('three');
+        assert.equal(asyncTmp.textContent, 'three');
+
+        // 1) Click nested <span id="nav-res-lbl"> inside <button data-page="results">
+        const spanMatch = openRes.html.match(/<span[^>]*data-rs-vm-nid="(\d+)"[^>]*id="nav-res-lbl"/);
+        assert.ok(spanMatch, 'Nested nav span must have nodeId');
+        const tClick0 = Date.now();
+        const navRes = await adapter.dispatchLiveBackendGuiEvent({
+            pluginName: 'live_gui_parity_fast_test',
+            eventType: 'click',
+            nodeId: Number(spanMatch[1]),
+        });
+        const clickElapsed = Date.now() - tClick0;
+        assert.equal(navRes.ok, true);
+        assert.equal(navRes.unchanged, false);
+        assert.equal(navRes.stylesUnchanged, true, 'Unchanged CSS must set stylesUnchanged: true and omit styles');
+        assert.equal(navRes.styles, undefined);
+        assert.ok(clickElapsed < 350, `Sync click took ${clickElapsed}ms, expected < 350ms even with background RPC in flight`);
+        assert.ok(navRes.html.includes('page=results|log=doc-capture:true,btn:results'), 'e.currentTarget must resolve to button & stopPropagation must block doc bubble');
+        assert.ok(!navRes.html.includes('doc-bubble-should-not-run'));
+
+        // 2) No-op button click -> unchanged: true
+        const noopMatch = navRes.html.match(/<button[^>]*data-rs-vm-nid="(\d+)"[^>]*id="noop-btn"/);
+        assert.ok(noopMatch);
+        const noopRes = await adapter.dispatchLiveBackendGuiEvent({
+            pluginName: 'live_gui_parity_fast_test',
+            eventType: 'click',
+            nodeId: Number(noopMatch[1]),
+        });
+        assert.equal(noopRes.ok, true);
+        assert.equal(noopRes.unchanged, true);
+
+        // 3) Radio change via fireClick:true switches group cleanly (only 'pro' checked)
+        const proRadioMatch = navRes.html.match(/<input[^>]*data-rs-vm-nid="(\d+)"[^>]*id="rad-pro"/);
+        assert.ok(proRadioMatch);
+        const radRes = await adapter.dispatchLiveBackendGuiEvent({
+            pluginName: 'live_gui_parity_fast_test',
+            eventType: 'change',
+            nodeId: Number(proRadioMatch[1]),
+            value: 'pro',
+            checked: true,
+            fireClick: true,
+        });
+        assert.ok(radRes.html.includes('mode=pro|checked=pro'));
+
+        // 4) Clicking <label id="lbl-mode-lite"> forwards click back to <input id="rad-lite">
+        const lblLiteMatch = radRes.html.match(/<label[^>]*data-rs-vm-nid="(\d+)"[^>]*id="lbl-mode-lite"/);
+        assert.ok(lblLiteMatch);
+        const lblRes = await adapter.dispatchLiveBackendGuiEvent({
+            pluginName: 'live_gui_parity_fast_test',
+            eventType: 'click',
+            nodeId: Number(lblLiteMatch[1]),
+        });
+        assert.ok(lblRes.html.includes('mode=lite|checked=lite'));
+    } finally {
+        if (holdBg) holdBg();
+        await adapter.dispose();
+    }
+});
+
+test('Live GUI avoids O(N^2) chatScreen.contains slowdown across 200 messages, supports TextNode contains, and caps slow async sync-DOM listeners', async () => {
+    let releaseSlowRpc = null;
+    const slowRpcDone = new Promise((res) => { releaseSlowRpc = res; });
+    const adapter = adapterMod.createPluginAdapter({
+        persistDisabled: true,
+        onSurfaceMutated: () => {},
+        hostRpc: {
+            isConnected: () => true,
+            async invoke(op, args) {
+                if (op === 'pluginStorage.getItem' && args[0] === 'slow_tab_load') {
+                    await Promise.race([
+                        slowRpcDone,
+                        new Promise((r) => setTimeout(r, 5000)),
+                    ]);
+                    return { loaded: true };
+                }
+                return null;
+            },
+        },
+    });
+
+    try {
+        await adapter.addCustomPlugin({
+            filename: 'live_gui_scale_perf_test.js',
+            enabled: true,
+            script: `
+//@name live_gui_scale_perf_test
+//@display-name Live GUI Scale Perf
+//@api 3.0
+risuai.registerSetting('Scale Perf', () => {
+  const root = document.createElement('div');
+  root.id = 'perf-root';
+  root.innerHTML =
+    '<button type="button" id="render-600">Render 600</button>' +
+    '<button type="button" id="slow-tab-btn">Slow Tab</button>' +
+    '<div id="perf-out">init</div>' +
+    '<div id="detached-probe"></div>';
+  document.body.appendChild(root);
+
+  document.getElementById('render-600').addEventListener('click', () => {
+    let html = '';
+    for (let i = 0; i < 600; i++) {
+      html += '<div class="row card item-row" id="row-' + i + '" data-idx="' + i + '"><span class="lbl">R' + i + '</span><button type="button" class="act" data-idx="' + i + '">Go</button></div>';
+    }
+    const outEl = document.getElementById('perf-out');
+    outEl.innerHTML = html;
+    // Heavy selector workload after render: 120x getElementById, 80x querySelector, 40x querySelectorAll + classList.contains
+    for (let i = 0; i < 120; i++) {
+      document.getElementById('row-' + (i % 600));
+    }
+    for (let i = 0; i < 80; i++) {
+      document.querySelector('#perf-root .item-row[data-idx="' + i + '"]');
+    }
+    for (let i = 0; i < 40; i++) {
+      const rows = document.querySelectorAll('.card.item-row');
+      for (let j = 0; j < rows.length; j++) {
+        rows[j].classList.contains('active');
+      }
+    }
+  });
+
+  document.getElementById('slow-tab-btn').addEventListener('click', async () => {
+    // Immediately switch visible tab state, then run slow RPC
+    document.getElementById('perf-out').textContent = 'tab=switched-fast';
+    await risuai.pluginStorage.getItem('slow_tab_load');
+  });
+
+  void risuai.showContainer();
+});
+`,
+        });
+
+        await waitUntil(() => adapter.listPlugins().some((p) => p.name === 'live_gui_scale_perf_test' && p.uiItems.length >= 1));
+
+        // Populate 200 rich chat messages into chatScreen
+        const msgs = [];
+        for (let i = 0; i < 200; i += 1) {
+            msgs.push({
+                index: i,
+                role: i % 2 === 0 ? 'user' : 'char',
+                chatId: `cid-${i}`,
+                html: `<div class="p"><p>Msg ${i} <span>a</span><span>b</span><span>c</span><b>d</b></p><div><span>e</span><span>f</span></div></div>`,
+            });
+        }
+        await adapter.syncAndProjectChatSurface({ charIndex: 0, chatIndex: 0, messages: msgs });
+
+        const openRes = await adapter.openLiveBackendGui('live_gui_scale_perf_test');
+        assert.equal(openRes.ok, true);
+
+        const mockDom = adapter._debug.pluginDoms.get('live_gui_scale_perf_test');
+        // Non-observer plugin must NOT get 200 chat messages synced into its chatScreen
+        assert.equal(mockDom.chatScreen.childNodes.length, 0, 'syncAndProjectChatSurface must skip non-observer plugins');
+        // Now explicitly populate chatScreen with 200 messages anyway to verify O(1)/early-exit DOM perf under load
+        mockDom.syncChatMessages(msgs);
+
+        // Verify lazy .style sync after setAttribute('style', ...) before .style access
+        const lazyStyleEl = mockDom.syncDoc.createElement('div');
+        lazyStyleEl.setAttribute('style', 'color: red; --x: 1');
+        assert.equal(lazyStyleEl.style.color, 'red');
+        assert.equal(lazyStyleEl.style.getPropertyValue('--x'), '1');
+        lazyStyleEl.style.display = 'none';
+        assert.ok(String(lazyStyleEl.getAttribute('style') || '').includes('display:none'));
+
+        // Verify O(depth) contains() behavior with TextNode, deep descendant, sibling, and detached node
+        const perfRoot = mockDom.syncDoc.getElementById('perf-root');
+        const perfOut = mockDom.syncDoc.getElementById('perf-out');
+        const slowBtn = mockDom.syncDoc.getElementById('slow-tab-btn');
+        const detached = mockDom.syncDoc.createElement('div');
+        assert.equal(perfRoot.contains(perfOut), true);
+        assert.equal(perfRoot.contains(perfOut.firstChild), true, 'contains(TextNode) must return true');
+        assert.equal(perfOut.contains(slowBtn), false, 'sibling must return false');
+        assert.equal(perfRoot.contains(detached), false, 'detached node must return false');
+
+        // 1) Rendering 600 rows (1,800 elements) + 240 selector queries while 200 chat messages exist must finish < 150ms
+        const btn600Match = openRes.html.match(/<button[^>]*data-rs-vm-nid="(\d+)"[^>]*id="render-600"/);
+        assert.ok(btn600Match);
+        const tRender0 = Date.now();
+        const res600 = await adapter.dispatchLiveBackendGuiEvent({
+            pluginName: 'live_gui_scale_perf_test',
+            eventType: 'click',
+            nodeId: Number(btn600Match[1]),
+        });
+        const renderElapsed = Date.now() - tRender0;
+        assert.equal(res600.ok, true);
+        assert.ok(res600.html.includes('R599'), '600 rows must serialize completely');
+        assert.ok(renderElapsed < 150, `600-row + 240-query render with 200 chat messages took ${renderElapsed}ms; expected < 150ms`);
+
+        // 2) Slow 5s async sync-DOM listener must NOT block dispatchSurfaceClick; returns switched tab in < 1500ms
+        const slowBtnMatch = res600.html.match(/<button[^>]*data-rs-vm-nid="(\d+)"[^>]*id="slow-tab-btn"/);
+        assert.ok(slowBtnMatch);
+        const tSlow0 = Date.now();
+        const slowRes = await adapter.dispatchLiveBackendGuiEvent({
+            pluginName: 'live_gui_scale_perf_test',
+            eventType: 'click',
+            nodeId: Number(slowBtnMatch[1]),
+        });
+        const slowElapsed = Date.now() - tSlow0;
+        assert.equal(slowRes.ok, true);
+        assert.ok(slowRes.html.includes('tab=switched-fast'), 'Switched tab state must appear even while slow RPC is still pending');
+        assert.ok(slowElapsed < 1500, `Slow async sync-DOM listener blocked for ${slowElapsed}ms; expected < 1500ms`);
+    } finally {
+        if (releaseSlowRpc) releaseSlowRpc();
+        await adapter.dispose();
+    }
+});
+
+test('Plugin adapter DOM global index accelerates 1600+ GRADIA-style queries (<120ms) and preserves detach/order/x-risu semantics', async () => {
+    const adapter = adapterMod.createPluginAdapter({
+        persistDisabled: true,
+        onSurfaceMutated: () => {},
+        hostRpc: { isConnected: () => true, invoke: async () => null },
+    });
+    try {
+        await adapter.addCustomPlugin({
+            filename: 'live_index_test.js',
+            enabled: true,
+            script: `//@name live_gui_index_test
+//@display-name Live Index Test
+//@api 3.0
+risuai.registerSetting('Index Test', () => {});
+const modal = document.createElement('div');
+modal.id = 'index-modal';
+const rows = [];
+for (let i = 0; i < 650; i += 1) {
+    const cls = i % 10 === 0 ? 'row pill' : 'row';
+    const tabAttr = i % 25 === 0 ? ' data-tab="t' + (i / 25) + '"' : '';
+    rows.push('<div class="' + cls + '" data-field="f' + i + '"' + tabAttr + '><span>V' + i + '</span></div>');
+}
+modal.innerHTML = rows.join('');
+document.body.appendChild(modal);
+`,
+        });
+
+        const mockDom = adapter._debug.pluginDoms.get('live_gui_index_test');
+        assert.ok(mockDom, 'mockDom must exist');
+        const { syncDoc, chatScreen } = mockDom;
+        const modal = syncDoc.getElementById('index-modal');
+        assert.ok(modal, 'index-modal must exist');
+
+        // 1) 1,100 querySelector + 500 querySelectorAll + 100 getElementById inside 2,000+ node DOM
+        const t0 = Date.now();
+        for (let i = 0; i < 1100; i += 1) {
+            const k = i % 650;
+            const el = modal.querySelector(`[data-field="f${k}"]`);
+            assert.ok(el, `missing f${k}`);
+        }
+        let multiCount = 0;
+        for (let i = 0; i < 500; i += 1) {
+            const list = modal.querySelectorAll('.pill, [data-tab="t3"]');
+            multiCount = list.length;
+        }
+        assert.equal(multiCount, 66, '.pill (65) + [data-tab=t3] at i=75 (1) count mismatch');
+        for (let i = 0; i < 100; i += 1) {
+            assert.equal(syncDoc.getElementById('index-modal'), modal);
+        }
+        const elapsed = Date.now() - t0;
+        assert.ok(elapsed < 120, `1,700 indexed queries took ${elapsed}ms; expected < 120ms`);
+
+        // 2) Document order preservation under insertBefore / prepend / replaceWith
+        const orderBox = syncDoc.createElement('div');
+        orderBox.id = 'order-box';
+        const second = syncDoc.createElement('span');
+        second.className = 'ord';
+        second.setAttribute('data-k', '2');
+        const first = syncDoc.createElement('span');
+        first.className = 'ord';
+        first.setAttribute('data-k', '1');
+        const zero = syncDoc.createElement('span');
+        zero.className = 'ord';
+        zero.setAttribute('data-k', '0');
+        syncDoc.body.appendChild(orderBox);
+        orderBox.appendChild(second);
+        orderBox.insertBefore(first, second);
+        orderBox.prepend(zero);
+        const ordered = syncDoc.querySelectorAll('#order-box .ord');
+        assert.deepEqual(ordered.map((n) => n.getAttribute('data-k')), ['0', '1', '2']);
+        assert.equal(syncDoc.querySelector('.ord'), zero);
+
+        // 3) Detach cleanup + cloneNode(true) isolation + re-attach
+        const cloned = orderBox.cloneNode(true);
+        assert.equal(cloned.isConnected, false);
+        assert.equal(syncDoc.getElementById('order-box'), orderBox, 'detached clone must not enter global idIndex');
+        const removed = orderBox.removeChild(zero);
+        assert.equal(removed.isConnected, false);
+        assert.deepEqual(syncDoc.querySelectorAll('#order-box .ord').map((n) => n.getAttribute('data-k')), ['1', '2']);
+        orderBox.innerHTML = '';
+        assert.equal(syncDoc.querySelector('#order-box .ord'), null, 'cleared descendants must be removed from classIndex');
+        assert.equal(first.isConnected, false);
+
+        // 4) Detached fragment & subtree queries still work via fallback walk
+        const frag = syncDoc.createDocumentFragment();
+        const fragChild = syncDoc.createElement('button');
+        fragChild.setAttribute('data-frag', 'yes');
+        frag.appendChild(fragChild);
+        assert.equal(frag.querySelector('[data-frag="yes"]'), fragChild);
+
+        // 5) Case-insensitive [attr="VAL" i] query uses attrNameIndex cleanly
+        const ciEl = syncDoc.createElement('div');
+        ciEl.setAttribute('data-mode', 'MiXeD');
+        syncDoc.body.appendChild(ciEl);
+        assert.equal(syncDoc.querySelector('[data-mode="mixed" i]'), ciEl);
+
+        // 6) Asset Maid x-risu- prefix compatibility inside chatScreen
+        const rowEl = syncDoc.createElement('div');
+        rowEl.className = 'am-chip';
+        rowEl._rsAllowRisuPrefixMatch = true;
+        chatScreen.appendChild(rowEl);
+        assert.equal(syncDoc.querySelector('.x-risu-am-chip'), rowEl);
+        assert.equal(chatScreen.querySelector('.x-risu-am-chip'), rowEl);
+    } finally {
+        await adapter.dispose();
+    }
+});

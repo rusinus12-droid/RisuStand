@@ -262,6 +262,179 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
     let pendingChildMutationTargets = new Set();
     let childMutationFlushScheduled = false;
     let surfaceMutationFlushScheduled = false;
+    let domMutationSeq = 0;
+    let parsingHtmlDepth = 0;
+    const bumpDomMutation = () => { domMutationSeq += 1; };
+    const perfCounters = { qs: 0, qsa: 0, getById: 0, parse: 0, syncListenerMs: 0, asyncListenerMs: 0 };
+    const idIndex = new Map();
+    const classIndex = new Map();
+    const attrNameIndex = new Map();
+    const attrValIndex = new Map();
+    const tagIndex = new Map();
+    const EMPTY_BUCKET = new Set();
+    let connectedElementCount = 0;
+    let treeStructureSeq = 0;
+    let docOrderSeq = -1;
+
+    function addIndexBucket(map, key, el) {
+        let bucket = map.get(key);
+        if (!bucket) {
+            bucket = new Set();
+            map.set(key, bucket);
+        }
+        bucket.add(el);
+    }
+
+    function delIndexBucket(map, key, el) {
+        const bucket = map.get(key);
+        if (bucket) {
+            bucket.delete(el);
+            if (bucket.size === 0) map.delete(key);
+        }
+    }
+
+    function updateIdIndex(el, prevId, nextId) {
+        if (!el || !el._isConnectedFast) return;
+        if (prevId && prevId !== nextId) {
+            delIndexBucket(idIndex, prevId, el);
+        }
+        if (nextId && nextId !== prevId) {
+            addIndexBucket(idIndex, nextId, el);
+        }
+    }
+
+    function indexClassTokens(el, classStr, add) {
+        if (!classStr) return;
+        const tokens = String(classStr).split(/\s+/);
+        for (let i = 0; i < tokens.length; i += 1) {
+            const t = tokens[i];
+            if (!t) continue;
+            if (add) addIndexBucket(classIndex, t, el);
+            else delIndexBucket(classIndex, t, el);
+        }
+    }
+
+    function updateClassIndex(el, prevCls, nextCls) {
+        if (!el || !el._isConnectedFast || prevCls === nextCls) return;
+        if (prevCls) indexClassTokens(el, prevCls, false);
+        if (nextCls) indexClassTokens(el, nextCls, true);
+    }
+
+    function syncAttrBucket(el, key, prevVal, nextVal) {
+        if (!el || !el._isConnectedFast) return;
+        const low = String(key || '').toLowerCase();
+        if (!low) return;
+        if (prevVal !== null && prevVal !== undefined) {
+            if (nextVal === null || nextVal === undefined) {
+                delIndexBucket(attrNameIndex, low, el);
+                delIndexBucket(attrValIndex, `${low}\0${prevVal}`, el);
+            } else if (prevVal !== nextVal) {
+                delIndexBucket(attrValIndex, `${low}\0${prevVal}`, el);
+                addIndexBucket(attrValIndex, `${low}\0${nextVal}`, el);
+            }
+        } else if (nextVal !== null && nextVal !== undefined) {
+            addIndexBucket(attrNameIndex, low, el);
+            addIndexBucket(attrValIndex, `${low}\0${nextVal}`, el);
+        }
+    }
+
+    function setDirectAttr(el, key, val) {
+        const had = el.attributes.has(key);
+        const prev = had ? el.attributes.get(key) : null;
+        if (val === null || val === undefined) {
+            if (had) {
+                el.attributes.delete(key);
+                syncAttrBucket(el, key, prev, null);
+            }
+        } else {
+            const s = String(val);
+            el.attributes.set(key, s);
+            if (!had || prev !== s) {
+                syncAttrBucket(el, key, had ? prev : null, s);
+            }
+        }
+    }
+
+    function indexElementSelf(el) {
+        if (!el || el.nodeType !== 1 || el._isConnectedFast) return;
+        el._isConnectedFast = true;
+        connectedElementCount += 1;
+        addIndexBucket(tagIndex, el.tagName, el);
+        if (el._id) addIndexBucket(idIndex, el._id, el);
+        if (el._className) indexClassTokens(el, el._className, true);
+        for (const [k, v] of el.attributes.entries()) {
+            const low = String(k).toLowerCase();
+            addIndexBucket(attrNameIndex, low, el);
+            addIndexBucket(attrValIndex, `${low}\0${v}`, el);
+        }
+    }
+
+    function unindexElementSelf(el) {
+        if (!el || el.nodeType !== 1 || !el._isConnectedFast) return;
+        el._isConnectedFast = false;
+        el._docOrder = 0;
+        connectedElementCount = Math.max(0, connectedElementCount - 1);
+        delIndexBucket(tagIndex, el.tagName, el);
+        if (el._id) delIndexBucket(idIndex, el._id, el);
+        if (el._className) indexClassTokens(el, el._className, false);
+        for (const [k, v] of el.attributes.entries()) {
+            const low = String(k).toLowerCase();
+            delIndexBucket(attrNameIndex, low, el);
+            delIndexBucket(attrValIndex, `${low}\0${v}`, el);
+        }
+    }
+
+    function indexSubtree(node) {
+        if (!node || typeof node !== 'object') return;
+        if (node.nodeType === 1) {
+            indexElementSelf(node);
+            if (node.tagName === 'TEMPLATE') return;
+        } else if (node.nodeType === 3 || node.nodeType === 8) {
+            node._isConnectedFast = true;
+            return;
+        }
+        const list = node.childNodes;
+        if (list && list.length) {
+            for (let i = 0; i < list.length; i += 1) {
+                indexSubtree(list[i]);
+            }
+        }
+    }
+
+    function unindexSubtree(node) {
+        if (!node || typeof node !== 'object') return;
+        if (node.nodeType === 1) {
+            unindexElementSelf(node);
+            if (node.tagName === 'TEMPLATE') return;
+        } else if (node.nodeType === 3 || node.nodeType === 8) {
+            node._isConnectedFast = false;
+            return;
+        }
+        const list = node.childNodes;
+        if (list && list.length) {
+            for (let i = 0; i < list.length; i += 1) {
+                unindexSubtree(list[i]);
+            }
+        }
+    }
+
+    function ensureDocOrder() {
+        if (docOrderSeq === treeStructureSeq) return;
+        let ord = 0;
+        const stack = [documentElement];
+        while (stack.length > 0) {
+            const n = stack.pop();
+            if (!n || n.nodeType !== 1) continue;
+            n._docOrder = ++ord;
+            if (n.tagName === 'TEMPLATE') continue;
+            const list = n.childNodes;
+            for (let i = list.length - 1; i >= 0; i -= 1) {
+                const c = list[i];
+                if (c && c.nodeType === 1) stack.push(c);
+            }
+        }
+        docOrderSeq = treeStructureSeq;
+    }
 
     function markChatRowBodyMutated(targetNode) {
         if (suppressSurfaceMutationNotify) return;
@@ -277,9 +450,10 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
     }
 
     function scheduleSurfaceMutationNotify(targetNode) {
-        if (suppressSurfaceMutationNotify || typeof onChatSurfaceMutated !== 'function') return;
+        if (parsingHtmlDepth > 0 || suppressSurfaceMutationNotify || typeof onChatSurfaceMutated !== 'function') return;
         const raw = unwrapEl(targetNode);
-        if (!raw || !chatScreen || (raw !== chatScreen && !chatScreen.contains(raw))) return;
+        if (!raw || !chatScreen) return;
+        if (raw !== chatScreen && (!raw.parentNode || !chatScreen.contains(raw))) return;
         markChatRowBodyMutated(raw);
         if (surfaceMutationFlushScheduled) return;
         surfaceMutationFlushScheduled = true;
@@ -290,7 +464,12 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
     }
 
     function notifyChildListMutation(targetNode) {
+        bumpDomMutation();
         const raw = unwrapEl(targetNode);
+        if (raw && raw._isConnectedFast && raw.tagName !== 'TEMPLATE') {
+            treeStructureSeq += 1;
+        }
+        if (parsingHtmlDepth > 0) return;
         if (!raw) return;
         markChatRowBodyMutated(raw);
         if (mutationObservers.size > 0) {
@@ -322,14 +501,49 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         scheduleSurfaceMutationNotify(raw);
     }
 
+    const NAMED_HTML_ENTITIES = Object.freeze({
+        amp: '&',
+        lt: '<',
+        gt: '>',
+        quot: '"',
+        apos: "'",
+        nbsp: '\u00a0',
+        rarr: '→',
+        larr: '←',
+        uarr: '↑',
+        darr: '↓',
+        harr: '↔',
+        middot: '·',
+        bull: '•',
+        times: '×',
+        check: '✓',
+        mdash: '—',
+        ndash: '–',
+        hellip: '…',
+        laquo: '«',
+        raquo: '»',
+        lsaquo: '‹',
+        rsaquo: '›',
+        lsquo: '‘',
+        rsquo: '’',
+        ldquo: '“',
+        rdquo: '”',
+        copy: '©',
+        reg: '®',
+        trade: '™',
+        deg: '°',
+        plusmn: '±',
+        sect: '§',
+        para: '¶',
+        shy: '\u00ad',
+        thinsp: '\u2009',
+        ensp: '\u2002',
+        emsp: '\u2003',
+    });
+
     function decodeHtmlEntities(str) {
-        return String(str ?? '').replace(/&(#x?[0-9a-fA-F]+|amp|lt|gt|quot|#39|apos|nbsp);/g, (m, code) => {
-            if (code === 'amp') return '&';
-            if (code === 'lt') return '<';
-            if (code === 'gt') return '>';
-            if (code === 'quot') return '"';
-            if (code === '#39' || code === 'apos') return "'";
-            if (code === 'nbsp') return '\u00a0';
+        return String(str ?? '').replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g, (m, code) => {
+            if (code === '#39') return "'";
             if (code.startsWith('#x') || code.startsWith('#X')) {
                 const cp = parseInt(code.slice(2), 16);
                 return Number.isFinite(cp) ? String.fromCodePoint(cp) : m;
@@ -337,6 +551,13 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             if (code.startsWith('#')) {
                 const cp = parseInt(code.slice(1), 10);
                 return Number.isFinite(cp) ? String.fromCodePoint(cp) : m;
+            }
+            if (Object.prototype.hasOwnProperty.call(NAMED_HTML_ENTITIES, code)) {
+                return NAMED_HTML_ENTITIES[code];
+            }
+            const low = code.toLowerCase();
+            if (Object.prototype.hasOwnProperty.call(NAMED_HTML_ENTITIES, low)) {
+                return NAMED_HTML_ENTITIES[low];
             }
             return m;
         });
@@ -406,8 +627,8 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         while (i < s.length) {
             while (i < s.length && /\s/.test(s[i])) i += 1;
             if (i >= s.length) break;
-            if (s[i] === '>') {
-                nextComb = '>';
+            if (s[i] === '>' || s[i] === '+' || s[i] === '~') {
+                nextComb = s[i];
                 i += 1;
                 while (i < s.length && /\s/.test(s[i])) i += 1;
                 if (i >= s.length) break;
@@ -424,12 +645,13 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                     i += 1;
                     continue;
                 }
+                if (c === '\\') { i += 2; continue; }
                 if (c === '"' || c === "'") { quote = c; i += 1; continue; }
                 if (c === '(') { pDepth += 1; i += 1; continue; }
                 if (c === ')' && pDepth > 0) { pDepth -= 1; i += 1; continue; }
                 if (c === '[') { bDepth += 1; i += 1; continue; }
                 if (c === ']' && bDepth > 0) { bDepth -= 1; i += 1; continue; }
-                if (pDepth === 0 && bDepth === 0 && (c === '>' || /\s/.test(c))) break;
+                if (pDepth === 0 && bDepth === 0 && (c === '>' || c === '+' || c === '~' || /\s/.test(c))) break;
                 i += 1;
             }
             const part = s.slice(start, i).trim();
@@ -441,15 +663,43 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         return steps;
     }
 
+    function matchesNthExpression(idx1Based, exprRaw) {
+        const expr = String(exprRaw || '').trim().toLowerCase().replace(/\s+/g, '');
+        if (!expr || idx1Based < 1) return false;
+        if (expr === 'odd') return idx1Based % 2 === 1;
+        if (expr === 'even') return idx1Based % 2 === 0;
+        if (/^[+-]?\d+$/.test(expr)) return idx1Based === parseInt(expr, 10);
+        const m = expr.match(/^([+-]?\d*)n([+-]\d+)?$/);
+        if (!m) return false;
+        const aStr = m[1];
+        const a = (aStr === '' || aStr === '+') ? 1 : (aStr === '-' ? -1 : parseInt(aStr, 10));
+        const b = m[2] ? parseInt(m[2], 10) : 0;
+        if (a === 0) return idx1Based === b;
+        const diff = idx1Based - b;
+        if (a > 0) return diff >= 0 && diff % a === 0;
+        return diff <= 0 && diff % a === 0;
+    }
+
+    function getAttrCaseInsensitive(el, aName) {
+        if (!el || !el.attributes) return null;
+        if (el.attributes.has(aName)) return el.attributes.get(aName);
+        if (el.namespaceURI !== 'http://www.w3.org/2000/svg') {
+            const low = String(aName).toLowerCase();
+            if (el.attributes.has(low)) return el.attributes.get(low);
+            for (const [k, v] of el.attributes.entries()) {
+                if (String(k).toLowerCase() === low) return v;
+            }
+        }
+        return null;
+    }
+
     function matchRelativeHas(anchorEl, hasSelectorList) {
         const chains = splitSelectorTopLevel(hasSelectorList, ',').map((s) => s.trim()).filter(Boolean);
         for (const rawChain of chains) {
             const trimmed = rawChain.trim();
-            const directOnly = trimmed.startsWith('>');
-            const steps = tokenizeSelectorChain(directOnly ? trimmed.slice(1).trim() : trimmed);
+            const steps = tokenizeSelectorChain(trimmed);
             if (!steps.length) continue;
-            if (directOnly) steps[0].comb = '>';
-            const candidates = collectMatchingElements(anchorEl, '');
+            const candidates = [];
             const walkDesc = (node) => {
                 for (const c of node.children || []) {
                     candidates.push(c);
@@ -458,18 +708,27 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             };
             walkDesc(anchorEl);
             for (const cand of candidates) {
-                if (!matchSimpleSelector(cand, steps[steps.length - 1].sel)) continue;
+                if (!matchSimpleSelector(cand, steps[steps.length - 1].sel, anchorEl)) continue;
                 let cur = cand;
                 let ok = true;
                 for (let idx = steps.length - 1; idx >= 1; idx -= 1) {
                     const step = steps[idx];
                     const prevSel = steps[idx - 1].sel;
-                    if (step.comb === '>') {
+                    if (step.comb === '+') {
+                        cur = cur.previousElementSibling;
+                        if (!cur || cur === anchorEl || !anchorEl.contains(cur) || !matchSimpleSelector(cur, prevSel, anchorEl)) { ok = false; break; }
+                    } else if (step.comb === '~') {
+                        cur = cur.previousElementSibling;
+                        while (cur && cur !== anchorEl && anchorEl.contains(cur) && !matchSimpleSelector(cur, prevSel, anchorEl)) {
+                            cur = cur.previousElementSibling;
+                        }
+                        if (!cur || cur === anchorEl || !anchorEl.contains(cur)) { ok = false; break; }
+                    } else if (step.comb === '>') {
                         cur = cur.parentElement;
-                        if (!cur || !anchorEl.contains(cur) || !matchSimpleSelector(cur, prevSel)) { ok = false; break; }
+                        if (!cur || !anchorEl.contains(cur) || !matchSimpleSelector(cur, prevSel, anchorEl)) { ok = false; break; }
                     } else {
                         cur = cur.parentElement;
-                        while (cur && anchorEl.contains(cur) && !matchSimpleSelector(cur, prevSel)) {
+                        while (cur && anchorEl.contains(cur) && !matchSimpleSelector(cur, prevSel, anchorEl)) {
                             cur = cur.parentElement;
                         }
                         if (!cur || !anchorEl.contains(cur)) { ok = false; break; }
@@ -486,66 +745,117 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         return false;
     }
 
-    function matchSimpleSelector(el, token) {
-        if (!el || el.nodeType !== 1 || !token) return false;
-        let rest = token.trim();
-        if (!rest) return false;
-        if (rest === '*') return true;
+    function compileSimpleSelector(token) {
+        const out = { tag: null, id: null, classes: null, attrs: null, pseudos: null, invalid: false };
+        if (!token) { out.invalid = true; return out; }
+        let rest = String(token).trim();
+        if (!rest) { out.invalid = true; return out; }
+        if (rest === '*') return out;
 
         if (rest.startsWith('*')) {
             rest = rest.slice(1);
         } else {
             const tagMatch = rest.match(/^([a-zA-Z0-9_-]+)/);
             if (tagMatch) {
-                if (el.tagName !== tagMatch[1].toUpperCase()) return false;
+                out.tag = tagMatch[1].toUpperCase();
                 rest = rest.slice(tagMatch[1].length);
             }
         }
 
         while (rest.length > 0) {
             if (rest.startsWith('#')) {
-                const m = rest.match(/^#([a-zA-Z0-9_-]+)/);
-                if (!m || el.id !== m[1]) return false;
+                const m = rest.match(/^#((?:[a-zA-Z0-9_-]|\\.)+)/);
+                if (!m) { out.invalid = true; return out; }
+                const targetId = m[1].indexOf('\\') >= 0 ? m[1].replace(/\\(.)/g, '$1') : m[1];
+                if (out.id !== null && out.id !== targetId) { out.invalid = true; return out; }
+                out.id = targetId;
                 rest = rest.slice(m[0].length);
             } else if (rest.startsWith('.')) {
-                const m = rest.match(/^\.([a-zA-Z0-9_-]+)/);
-                if (!m || !el.classList || !el.classList.contains(m[1])) return false;
+                const m = rest.match(/^\.((?:[a-zA-Z0-9_-]|\\.)+)/);
+                if (!m) { out.invalid = true; return out; }
+                const targetCls = m[1].indexOf('\\') >= 0 ? m[1].replace(/\\(.)/g, '$1') : m[1];
+                if (!out.classes) out.classes = [targetCls];
+                else out.classes.push(targetCls);
                 rest = rest.slice(m[0].length);
             } else if (rest.startsWith('[')) {
                 const closeIdx = findBalancedClose(rest, 0, '[', ']');
-                if (closeIdx < 0) return false;
+                if (closeIdx < 0) { out.invalid = true; return out; }
                 const expr = rest.slice(1, closeIdx);
-                const m = expr.match(/^([a-zA-Z0-9_:-]+)(?:\s*([*^$|~]?=)\s*(?:"([^"]*)"|'([^']*)'|([\s\S]*)))?$/);
-                if (!m) return false;
+                const m = expr.match(/^\s*([a-zA-Z0-9_:-]+)(?:\s*([*^$|~]?=)\s*(?:"([^"]*)"|'([^']*)'|([^\]\s]+))(?:\s+([iIsS]))?)?\s*$/);
+                if (!m) { out.invalid = true; return out; }
                 const aName = m[1];
                 const op = m[2] || '';
-                const expected = m[3] !== undefined ? m[3] : (m[4] !== undefined ? m[4] : (m[5] !== undefined ? m[5].trim() : ''));
-                const actual = el.attributes && el.attributes.has(aName) ? el.attributes.get(aName) : null;
-                if (actual === null) return false;
+                const rawExpected = m[3] !== undefined ? m[3] : (m[4] !== undefined ? m[4] : (m[5] !== undefined ? m[5].trim() : ''));
+                const caseInsensitive = (m[6] || '').toLowerCase() === 'i';
+                const attrSpec = {
+                    name: aName,
+                    op,
+                    expected: caseInsensitive ? String(rawExpected).toLowerCase() : String(rawExpected),
+                    caseInsensitive,
+                };
+                if (!out.attrs) out.attrs = [attrSpec];
+                else out.attrs.push(attrSpec);
+                rest = rest.slice(closeIdx + 1);
+            } else if (rest.startsWith(':')) {
+                const pm = rest.match(/^::?([a-zA-Z0-9_-]+)/);
+                if (!pm) { out.invalid = true; return out; }
+                const pName = pm[1].toLowerCase();
+                let consumed = pm[0].length;
+                let inner = null;
+                if (rest[consumed] === '(') {
+                    const closeIdx = findBalancedClose(rest, consumed, '(', ')');
+                    if (closeIdx < 0) { out.invalid = true; return out; }
+                    inner = rest.slice(consumed + 1, closeIdx);
+                    consumed = closeIdx + 1;
+                }
+                rest = rest.slice(consumed);
+                const pseudoSpec = { name: pName, inner };
+                if (!out.pseudos) out.pseudos = [pseudoSpec];
+                else out.pseudos.push(pseudoSpec);
+            } else {
+                out.invalid = true;
+                return out;
+            }
+        }
+        return out;
+    }
+
+    function matchCompiledSimple(el, tok, scopeRoot = null) {
+        if (!el || el.nodeType !== 1 || !tok || tok.invalid) return false;
+        if (tok.tag && el.tagName !== tok.tag) return false;
+        if (tok.id !== null && el._id !== tok.id) return false;
+        if (tok.classes) {
+            for (let i = 0; i < tok.classes.length; i += 1) {
+                if (!el._hasClassFast(tok.classes[i])) return false;
+            }
+        }
+        if (tok.attrs) {
+            for (let i = 0; i < tok.attrs.length; i += 1) {
+                const spec = tok.attrs[i];
+                const rawActual = getAttrCaseInsensitive(el, spec.name);
+                if (rawActual === null) return false;
+                const op = spec.op;
+                if (!op) continue;
+                const actual = spec.caseInsensitive ? String(rawActual).toLowerCase() : String(rawActual);
+                const expected = spec.expected;
                 if (op === '=' && actual !== expected) return false;
                 if (op === '*=' && !actual.includes(expected)) return false;
                 if (op === '^=' && !actual.startsWith(expected)) return false;
                 if (op === '$=' && !actual.endsWith(expected)) return false;
                 if (op === '~=' && !String(actual).split(/\s+/).includes(expected)) return false;
                 if (op === '|=' && actual !== expected && !actual.startsWith(`${expected}-`)) return false;
-                rest = rest.slice(closeIdx + 1);
-            } else if (rest.startsWith(':')) {
-                const pm = rest.match(/^::?([a-zA-Z0-9_-]+)/);
-                if (!pm) return false;
-                const pName = pm[1].toLowerCase();
-                let consumed = pm[0].length;
-                let inner = null;
-                if (rest[consumed] === '(') {
-                    const closeIdx = findBalancedClose(rest, consumed, '(', ')');
-                    if (closeIdx < 0) return false;
-                    inner = rest.slice(consumed + 1, closeIdx);
-                    consumed = closeIdx + 1;
-                }
-                rest = rest.slice(consumed);
-                if (pName === 'is' || pName === 'where') {
-                    if (!inner || !matchesSelector(el, inner)) return false;
+            }
+        }
+        if (tok.pseudos) {
+            for (let i = 0; i < tok.pseudos.length; i += 1) {
+                const pName = tok.pseudos[i].name;
+                const inner = tok.pseudos[i].inner;
+                if (pName === 'scope') {
+                    if (scopeRoot ? el !== scopeRoot : el !== documentElement) return false;
+                } else if (pName === 'is' || pName === 'where') {
+                    if (!inner || !matchesSelector(el, inner, scopeRoot)) return false;
                 } else if (pName === 'not') {
-                    if (!inner || matchesSelector(el, inner)) return false;
+                    if (!inner || matchesSelector(el, inner, scopeRoot)) return false;
                 } else if (pName === 'has') {
                     if (!inner || !matchRelativeHas(el, inner)) return false;
                 } else if (pName === 'active') {
@@ -555,9 +865,11 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                 } else if (pName === 'focus' || pName === 'focus-visible') {
                     if (el !== focusedEl) return false;
                 } else if (pName === 'disabled') {
-                    if (!el.disabled && !el.hasAttribute('disabled')) return false;
+                    if (!el._disabled && !el.hasAttribute('disabled')) return false;
+                } else if (pName === 'enabled') {
+                    if (el._disabled || el.hasAttribute('disabled')) return false;
                 } else if (pName === 'checked') {
-                    if (!el.checked) return false;
+                    if (!(el._checked || (el.tagName === 'OPTION' && el.selected))) return false;
                 } else if (pName === 'empty') {
                     if ((el.childNodes || []).some((c) => c.nodeType === 1 || (c.nodeType === 3 && c.textContent))) return false;
                 } else if (pName === 'first-child') {
@@ -566,30 +878,79 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                 } else if (pName === 'last-child') {
                     const siblings = el.parentNode ? (el.parentNode.children || []) : [];
                     if (siblings[siblings.length - 1] !== el) return false;
+                } else if (pName === 'only-child') {
+                    const siblings = el.parentNode ? (el.parentNode.children || []) : [];
+                    if (siblings.length !== 1 || siblings[0] !== el) return false;
+                } else if (pName === 'first-of-type') {
+                    const siblings = el.parentNode ? (el.parentNode.children || []).filter((s) => s.tagName === el.tagName) : [];
+                    if (siblings[0] !== el) return false;
+                } else if (pName === 'last-of-type') {
+                    const siblings = el.parentNode ? (el.parentNode.children || []).filter((s) => s.tagName === el.tagName) : [];
+                    if (siblings[siblings.length - 1] !== el) return false;
+                } else if (pName === 'nth-child') {
+                    const siblings = el.parentNode ? (el.parentNode.children || []) : [];
+                    const idx = siblings.indexOf(el);
+                    if (idx < 0 || !matchesNthExpression(idx + 1, inner)) return false;
+                } else if (pName === 'nth-of-type') {
+                    const siblings = el.parentNode ? (el.parentNode.children || []).filter((s) => s.tagName === el.tagName) : [];
+                    const idx = siblings.indexOf(el);
+                    if (idx < 0 || !matchesNthExpression(idx + 1, inner)) return false;
                 } else {
                     return false;
                 }
-            } else {
-                return false;
             }
         }
         return true;
     }
 
-    function matchSingleChain(el, chainStr) {
-        const steps = tokenizeSelectorChain(chainStr);
-        if (!steps.length) return false;
-        if (!matchSimpleSelector(el, steps[steps.length - 1].sel)) return false;
+    function matchSimpleSelector(el, token, scopeRoot = null) {
+        return matchCompiledSimple(el, compileSimpleSelector(token), scopeRoot);
+    }
+
+    const parsedSelectorCache = new Map();
+
+    function getParsedSelectorChains(selectorList) {
+        const key = String(selectorList || '');
+        if (!key) return [];
+        let parsed = parsedSelectorCache.get(key);
+        if (parsed) return parsed;
+        parsed = splitSelectorTopLevel(key, ',')
+            .map((s) => tokenizeSelectorChain(s.trim()).map((st) => ({
+                comb: st.comb,
+                sel: st.sel,
+                compiled: compileSimpleSelector(st.sel),
+            })))
+            .filter((steps) => steps.length > 0);
+        if (parsedSelectorCache.size >= 512) {
+            const oldestKey = parsedSelectorCache.keys().next().value;
+            if (oldestKey !== undefined) parsedSelectorCache.delete(oldestKey);
+        }
+        parsedSelectorCache.set(key, parsed);
+        return parsed;
+    }
+
+    function matchParsedChain(el, steps, scopeRoot = null) {
+        if (!steps || !steps.length) return false;
+        if (!matchCompiledSimple(el, steps[steps.length - 1].compiled, scopeRoot)) return false;
         let cur = el;
         for (let i = steps.length - 1; i >= 1; i -= 1) {
             const step = steps[i];
-            const parentSel = steps[i - 1].sel;
-            if (step.comb === '>') {
+            const parentCompiled = steps[i - 1].compiled;
+            if (step.comb === '+') {
+                cur = cur.previousElementSibling;
+                if (!cur || !matchCompiledSimple(cur, parentCompiled, scopeRoot)) return false;
+            } else if (step.comb === '~') {
+                cur = cur.previousElementSibling;
+                while (cur && !matchCompiledSimple(cur, parentCompiled, scopeRoot)) {
+                    cur = cur.previousElementSibling;
+                }
+                if (!cur) return false;
+            } else if (step.comb === '>') {
                 cur = cur.parentElement;
-                if (!cur || !matchSimpleSelector(cur, parentSel)) return false;
+                if (!cur || !matchCompiledSimple(cur, parentCompiled, scopeRoot)) return false;
             } else {
                 cur = cur.parentElement;
-                while (cur && !matchSimpleSelector(cur, parentSel)) {
+                while (cur && !matchCompiledSimple(cur, parentCompiled, scopeRoot)) {
                     cur = cur.parentElement;
                 }
                 if (!cur) return false;
@@ -598,25 +959,201 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         return true;
     }
 
-    function matchesSelector(el, selectorList) {
-        if (!selectorList) return false;
-        const chains = splitSelectorTopLevel(selectorList, ',').map((s) => s.trim()).filter(Boolean);
-        return chains.some((ch) => matchSingleChain(el, ch));
+    function matchSingleChain(el, chainStr, scopeRoot = null) {
+        const steps = tokenizeSelectorChain(chainStr).map((st) => ({
+            comb: st.comb,
+            sel: st.sel,
+            compiled: compileSimpleSelector(st.sel),
+        }));
+        return matchParsedChain(el, steps, scopeRoot);
     }
 
-    function collectMatchingElements(rootNode, selectorList) {
+    function matchesSelector(el, selectorList, scopeRoot = null) {
+        if (!selectorList) return false;
+        const chains = getParsedSelectorChains(selectorList);
+        for (let i = 0; i < chains.length; i += 1) {
+            if (matchParsedChain(el, chains[i], scopeRoot)) return true;
+        }
+        return false;
+    }
+
+    function pickSmallestIndexBucket(tok) {
+        if (!tok || tok.invalid) return EMPTY_BUCKET;
+        let best = null;
+        if (tok.id !== null) {
+            if (!tok.id) return null;
+            const b = idIndex.get(tok.id);
+            if (!b || b.size === 0) return EMPTY_BUCKET;
+            best = b;
+            if (best.size <= 1) return best;
+        }
+        if (tok.attrs) {
+            for (let i = 0; i < tok.attrs.length; i += 1) {
+                const spec = tok.attrs[i];
+                const low = String(spec.name || '').toLowerCase();
+                if (!low) continue;
+                let b;
+                if (spec.op === '=' && !spec.caseInsensitive) {
+                    b = attrValIndex.get(`${low}\0${spec.expected}`);
+                } else {
+                    b = attrNameIndex.get(low);
+                }
+                if (!b || b.size === 0) return EMPTY_BUCKET;
+                if (!best || b.size < best.size) {
+                    best = b;
+                    if (best.size <= 1) return best;
+                }
+            }
+        }
+        if (tok.classes) {
+            for (let i = 0; i < tok.classes.length; i += 1) {
+                const cls = tok.classes[i];
+                if (!cls || cls.startsWith('x-risu-')) continue;
+                const b = classIndex.get(cls);
+                if (!b || b.size === 0) return EMPTY_BUCKET;
+                if (!best || b.size < best.size) {
+                    best = b;
+                    if (best.size <= 1) return best;
+                }
+            }
+        }
+        if (tok.tag) {
+            const b = tagIndex.get(tok.tag);
+            if (!b || b.size === 0) return EMPTY_BUCKET;
+            if (!best || b.size < best.size) best = b;
+        }
+        return best;
+    }
+
+    function collectMatchingElements(rootNode, selectorList, firstOnly = false) {
+        if (firstOnly) perfCounters.qs += 1;
+        else perfCounters.qsa += 1;
         const out = [];
         if (!rootNode || !selectorList) return out;
+        const chains = getParsedSelectorChains(selectorList);
+        if (!chains.length) return out;
+        const useDirectWalk = !rootNode._isConnectedFast || rootNode.tagName === 'TEMPLATE' || (
+            rootNode.childNodes.length <= 32
+            && (rootNode.tagName === 'SELECT' || rootNode.tagName === 'OPTGROUP' || rootNode.tagName === 'DATALIST' || rootNode.tagName === 'TR' || rootNode.tagName === 'LABEL')
+        );
+        if (!useDirectWalk) {
+            const isDocRoot = rootNode === documentElement;
+            if (chains.length === 1) {
+                const steps = chains[0];
+                const bucket = pickSmallestIndexBucket(steps[steps.length - 1].compiled);
+                if (bucket === EMPTY_BUCKET) return out;
+                if (bucket && bucket.size <= Math.max(64, connectedElementCount >> 1)) {
+                    for (const cand of bucket) {
+                        if (!cand || !cand._isConnectedFast || cand === rootNode) continue;
+                        if (!isDocRoot && !rootNode.contains(cand)) continue;
+                        if (matchParsedChain(cand, steps, rootNode)) out.push(cand);
+                    }
+                    if (out.length > 1) {
+                        ensureDocOrder();
+                        out.sort((a, b) => a._docOrder - b._docOrder);
+                        if (firstOnly) out.length = 1;
+                    }
+                    return out;
+                }
+            } else {
+                const buckets = new Array(chains.length);
+                let totalCand = 0;
+                let allIndexed = true;
+                for (let i = 0; i < chains.length; i += 1) {
+                    const steps = chains[i];
+                    const bucket = pickSmallestIndexBucket(steps[steps.length - 1].compiled);
+                    if (!bucket) {
+                        allIndexed = false;
+                        break;
+                    }
+                    buckets[i] = bucket;
+                    if (bucket !== EMPTY_BUCKET) totalCand += bucket.size;
+                }
+                if (allIndexed && totalCand <= Math.max(64, connectedElementCount >> 1)) {
+                    if (totalCand === 0) return out;
+                    const seen = new Set();
+                    for (let i = 0; i < chains.length; i += 1) {
+                        const bucket = buckets[i];
+                        if (!bucket || bucket === EMPTY_BUCKET) continue;
+                        const steps = chains[i];
+                        for (const cand of bucket) {
+                            if (seen.has(cand) || !cand || !cand._isConnectedFast || cand === rootNode) continue;
+                            if (!isDocRoot && !rootNode.contains(cand)) continue;
+                            if (matchParsedChain(cand, steps, rootNode)) {
+                                seen.add(cand);
+                                out.push(cand);
+                            }
+                        }
+                    }
+                    if (out.length > 1) {
+                        ensureDocOrder();
+                        out.sort((a, b) => a._docOrder - b._docOrder);
+                        if (firstOnly) out.length = 1;
+                    }
+                    return out;
+                }
+            }
+        }
         const walk = (node) => {
-            for (const c of node.childNodes || []) {
+            const list = node.childNodes;
+            for (let k = 0; k < list.length; k += 1) {
+                const c = list[k];
                 if (c && c.nodeType === 1) {
-                    if (matchesSelector(c, selectorList)) out.push(c);
+                    for (let i = 0; i < chains.length; i += 1) {
+                        if (matchParsedChain(c, chains[i], rootNode)) {
+                            out.push(c);
+                            if (firstOnly) return;
+                            break;
+                        }
+                    }
                     walk(c);
+                    if (firstOnly && out.length > 0) return;
                 }
             }
         };
         walk(rootNode);
         return out;
+    }
+
+    function findElementById(rootNode, id) {
+        perfCounters.getById += 1;
+        const target = String(id ?? '');
+        if (!rootNode || !target) return null;
+        if (rootNode._isConnectedFast && rootNode.tagName !== 'TEMPLATE') {
+            const bucket = idIndex.get(target);
+            if (!bucket || bucket.size === 0) return null;
+            const isDocRoot = rootNode === documentElement;
+            if (bucket.size === 1) {
+                const only = bucket.values().next().value;
+                return only && only !== rootNode && only._isConnectedFast && (isDocRoot || rootNode.contains(only)) ? only : null;
+            }
+            const matches = [];
+            for (const cand of bucket) {
+                if (cand && cand !== rootNode && cand._isConnectedFast && (isDocRoot || rootNode.contains(cand))) {
+                    matches.push(cand);
+                }
+            }
+            if (matches.length === 0) return null;
+            if (matches.length === 1) return matches[0];
+            ensureDocOrder();
+            let best = matches[0];
+            for (let i = 1; i < matches.length; i += 1) {
+                if (matches[i]._docOrder < best._docOrder) best = matches[i];
+            }
+            return best;
+        }
+        const walk = (node) => {
+            const list = node.childNodes;
+            for (let k = 0; k < list.length; k += 1) {
+                const c = list[k];
+                if (!c || c.nodeType !== 1) continue;
+                if (c._id === target) return c;
+                const hit = walk(c);
+                if (hit) return hit;
+            }
+            return null;
+        };
+        return walk(rootNode);
     }
 
     function makeSafeNodeList(arr) {
@@ -641,13 +1178,108 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         return target;
     }
 
+    function makeCollectionArray(arr) {
+        const list = Array.isArray(arr) ? arr : [];
+        Object.defineProperties(list, {
+            item: {
+                value: (i) => {
+                    const idx = Number(i);
+                    return Number.isInteger(idx) && idx >= 0 && idx < list.length ? list[idx] : null;
+                },
+                enumerable: false,
+                configurable: true,
+            },
+            namedItem: {
+                value: (name) => {
+                    const target = String(name ?? '');
+                    return list.find((el) => el && (el.id === target || (typeof el.getAttribute === 'function' && el.getAttribute('name') === target))) || null;
+                },
+                enumerable: false,
+                configurable: true,
+            },
+        });
+        return list;
+    }
+
     class AttrMap extends Map {
         get length() { return this.size; }
+        item(i) {
+            const idx = Number(i);
+            if (!Number.isInteger(idx) || idx < 0 || idx >= this.size) return null;
+            let k = 0;
+            for (const [name, value] of this.entries()) {
+                if (k === idx) return { name, value };
+                k += 1;
+            }
+            return null;
+        }
+        getNamedItem(name) {
+            const k = String(name ?? '');
+            return this.has(k) ? { name: k, value: this.get(k) } : null;
+        }
+        setNamedItem(attr) {
+            if (attr && typeof attr.name === 'string') {
+                this.set(attr.name, String(attr.value ?? ''));
+            }
+            return null;
+        }
+        removeNamedItem(name) {
+            const prev = this.getNamedItem(name);
+            if (prev) this.delete(prev.name);
+            return prev;
+        }
         *[Symbol.iterator]() {
             for (const [name, value] of this.entries()) {
                 yield { name, value };
             }
         }
+    }
+
+    let nodeSeq = 0;
+
+    class MockCommentNode {
+        constructor(text = '') {
+            this.nodeType = 8;
+            this.nodeName = '#comment';
+            this.parentNode = null;
+            this.parentElement = null;
+            this._isConnectedFast = false;
+            this._data = String(text ?? '');
+        }
+        get ownerDocument() { return syncDoc; }
+        get childNodes() { return makeCollectionArray([]); }
+        get children() { return makeCollectionArray([]); }
+        get isConnected() {
+            return Boolean(this._isConnectedFast);
+        }
+        get nextSibling() {
+            if (!this.parentNode || !Array.isArray(this.parentNode.childNodes)) return null;
+            const idx = this.parentNode.childNodes.indexOf(this);
+            return idx >= 0 && idx + 1 < this.parentNode.childNodes.length ? this.parentNode.childNodes[idx + 1] : null;
+        }
+        get previousSibling() {
+            if (!this.parentNode || !Array.isArray(this.parentNode.childNodes)) return null;
+            const idx = this.parentNode.childNodes.indexOf(this);
+            return idx > 0 ? this.parentNode.childNodes[idx - 1] : null;
+        }
+        get data() { return this._data; }
+        set data(v) { const s = String(v ?? ''); if (this._data !== s) { this._data = s; bumpDomMutation(); } }
+        get nodeValue() { return this._data; }
+        set nodeValue(v) { const s = String(v ?? ''); if (this._data !== s) { this._data = s; bumpDomMutation(); } }
+        get textContent() { return this._data; }
+        set textContent(v) { const s = String(v ?? ''); if (this._data !== s) { this._data = s; bumpDomMutation(); } }
+        get length() { return this._data.length; }
+        remove() {
+            if (this.parentNode && typeof this.parentNode.removeChild === 'function') {
+                this.parentNode.removeChild(this);
+            }
+        }
+        replaceWith(...nodes) {
+            if (this.parentNode && typeof this.parentNode._replaceChildWithMany === 'function') {
+                this.parentNode._replaceChildWithMany(this, nodes);
+            }
+        }
+        cloneNode() { return new MockCommentNode(this._data); }
     }
 
     class MockTextNode {
@@ -656,12 +1288,32 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             this.nodeName = '#text';
             this.parentNode = null;
             this.parentElement = null;
+            this._isConnectedFast = false;
             this._data = String(text ?? '');
         }
+        get ownerDocument() { return syncDoc; }
+        get childNodes() { return makeCollectionArray([]); }
+        get children() { return makeCollectionArray([]); }
+        get isConnected() {
+            return Boolean(this._isConnectedFast);
+        }
+        get nextSibling() {
+            if (!this.parentNode || !Array.isArray(this.parentNode.childNodes)) return null;
+            const idx = this.parentNode.childNodes.indexOf(this);
+            return idx >= 0 && idx + 1 < this.parentNode.childNodes.length ? this.parentNode.childNodes[idx + 1] : null;
+        }
+        get previousSibling() {
+            if (!this.parentNode || !Array.isArray(this.parentNode.childNodes)) return null;
+            const idx = this.parentNode.childNodes.indexOf(this);
+            return idx > 0 ? this.parentNode.childNodes[idx - 1] : null;
+        }
         get data() { return this._data; }
-        set data(v) { this._data = String(v ?? ''); }
+        set data(v) { const s = String(v ?? ''); if (this._data !== s) { this._data = s; bumpDomMutation(); } }
+        get nodeValue() { return this._data; }
+        set nodeValue(v) { const s = String(v ?? ''); if (this._data !== s) { this._data = s; bumpDomMutation(); } }
         get textContent() { return this._data; }
-        set textContent(v) { this._data = String(v ?? ''); }
+        set textContent(v) { const s = String(v ?? ''); if (this._data !== s) { this._data = s; bumpDomMutation(); } }
+        get length() { return this._data.length; }
         remove() {
             if (this.parentNode && typeof this.parentNode.removeChild === 'function') {
                 this.parentNode.removeChild(this);
@@ -682,11 +1334,12 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         while ((m = rx.exec(rawAttrStr)) !== null) {
             const k = m[1];
             const rawVal = m[2] !== undefined ? m[2] : (m[3] !== undefined ? m[3] : (m[4] !== undefined ? m[4] : ''));
-            el.setAttribute(k, decodeHtmlEntities(rawVal));
+            el.setAttribute(k, rawVal.indexOf('&') >= 0 ? decodeHtmlEntities(rawVal) : rawVal);
         }
     }
 
     function parseHtmlFragmentToNodes(rawHtml) {
+        perfCounters.parse += 1;
         const root = new MockElement('#fragment');
         root.nodeType = 11;
         const stack = [root];
@@ -697,82 +1350,90 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             if (parent.tagName === 'TEMPLATE' && parent.content) parent.content.appendChild(node);
             else parent.appendChild(node);
         };
-        while (i < html.length) {
-            const lt = html.indexOf('<', i);
-            if (lt < 0) {
-                const txt = decodeHtmlEntities(html.slice(i));
-                if (txt) appendNodeToCur(new MockTextNode(txt));
-                break;
-            }
-            if (lt > i) {
-                const txt = decodeHtmlEntities(html.slice(i, lt));
-                if (txt) appendNodeToCur(new MockTextNode(txt));
-            }
-            if (html.startsWith('<!--', lt)) {
-                const endComment = html.indexOf('-->', lt + 4);
-                i = endComment >= 0 ? endComment + 3 : html.length;
-                continue;
-            }
-            // Scan tag end accounting for quoted attribute values containing '>'
-            let gt = -1;
-            let q = '';
-            for (let j = lt + 1; j < html.length; j += 1) {
-                const ch = html[j];
-                if (q) {
-                    if (ch === q) q = '';
-                } else if (ch === '"' || ch === "'") {
-                    q = ch;
-                } else if (ch === '>') {
-                    gt = j;
+        parsingHtmlDepth += 1;
+        try {
+            while (i < html.length) {
+                const lt = html.indexOf('<', i);
+                if (lt < 0) {
+                    const slice = html.slice(i);
+                    const txt = slice.indexOf('&') >= 0 ? decodeHtmlEntities(slice) : slice;
+                    if (txt) appendNodeToCur(new MockTextNode(txt));
                     break;
                 }
-            }
-            if (gt < 0) {
-                appendNodeToCur(new MockTextNode(decodeHtmlEntities(html.slice(lt))));
-                break;
-            }
-            const tagBody = html.slice(lt + 1, gt);
-            i = gt + 1;
-            const closeMatch = tagBody.match(/^\/\s*([a-zA-Z0-9_-]+)/);
-            if (closeMatch) {
-                const closeTag = closeMatch[1].toUpperCase();
-                for (let k = stack.length - 1; k >= 1; k -= 1) {
-                    if (stack[k].tagName === closeTag) {
-                        stack.length = k;
+                if (lt > i) {
+                    const slice = html.slice(i, lt);
+                    const txt = slice.indexOf('&') >= 0 ? decodeHtmlEntities(slice) : slice;
+                    if (txt) appendNodeToCur(new MockTextNode(txt));
+                }
+                if (html.startsWith('<!--', lt)) {
+                    const endComment = html.indexOf('-->', lt + 4);
+                    i = endComment >= 0 ? endComment + 3 : html.length;
+                    continue;
+                }
+                // Scan tag end accounting for quoted attribute values containing '>'
+                let gt = -1;
+                let q = '';
+                for (let j = lt + 1; j < html.length; j += 1) {
+                    const ch = html[j];
+                    if (q) {
+                        if (ch === q) q = '';
+                    } else if (ch === '"' || ch === "'") {
+                        q = ch;
+                    } else if (ch === '>') {
+                        gt = j;
                         break;
                     }
                 }
-                continue;
-            }
-            const openMatch = tagBody.match(/^([a-zA-Z0-9_-]+)([\s\S]*)$/);
-            if (!openMatch) continue;
-            const tagNameLower = openMatch[1].toLowerCase();
-            let restAttrs = openMatch[2] || '';
-            let explicitSelfClose = false;
-            if (/\/\s*$/.test(restAttrs)) {
-                explicitSelfClose = true;
-                restAttrs = restAttrs.replace(/\/\s*$/, '');
-            }
-            const el = new MockElement(tagNameLower);
-            parseHtmlAttributesIntoElement(el, restAttrs);
-            appendNodeToCur(el);
-
-            if (RAW_TEXT_TAGS.has(tagNameLower) && !explicitSelfClose) {
-                const endRx = new RegExp(`<\\/\\s*${tagNameLower}\\s*>`, 'i');
-                const slice = html.slice(i);
-                const endM = endRx.exec(slice);
-                if (endM) {
-                    const rawContent = slice.slice(0, endM.index);
-                    if (rawContent) el.appendChild(new MockTextNode(rawContent));
-                    i += endM.index + endM[0].length;
+                if (gt < 0) {
+                    const slice = html.slice(lt);
+                    appendNodeToCur(new MockTextNode(slice.indexOf('&') >= 0 ? decodeHtmlEntities(slice) : slice));
+                    break;
                 }
-                continue;
+                const tagBody = html.slice(lt + 1, gt);
+                i = gt + 1;
+                const closeMatch = tagBody.match(/^\/\s*([a-zA-Z0-9_-]+)/);
+                if (closeMatch) {
+                    const closeTag = closeMatch[1].toUpperCase();
+                    for (let k = stack.length - 1; k >= 1; k -= 1) {
+                        if (stack[k].tagName === closeTag) {
+                            stack.length = k;
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                const openMatch = tagBody.match(/^([a-zA-Z0-9_-]+)([\s\S]*)$/);
+                if (!openMatch) continue;
+                const tagNameLower = openMatch[1].toLowerCase();
+                let restAttrs = openMatch[2] || '';
+                let explicitSelfClose = false;
+                if (/\/\s*$/.test(restAttrs)) {
+                    explicitSelfClose = true;
+                    restAttrs = restAttrs.replace(/\/\s*$/, '');
+                }
+                const el = new MockElement(tagNameLower);
+                parseHtmlAttributesIntoElement(el, restAttrs);
+                appendNodeToCur(el);
+
+                if (RAW_TEXT_TAGS.has(tagNameLower) && !explicitSelfClose) {
+                    const endRx = new RegExp(`<\\/\\s*${tagNameLower}\\s*>`, 'i');
+                    const slice = html.slice(i);
+                    const endM = endRx.exec(slice);
+                    if (endM) {
+                        const rawContent = slice.slice(0, endM.index);
+                        if (rawContent) el.appendChild(new MockTextNode(rawContent));
+                        i += endM.index + endM[0].length;
+                    }
+                    continue;
+                }
+                if (!explicitSelfClose && !VOID_HTML_TAGS.has(tagNameLower)) {
+                    stack.push(el);
+                }
             }
-            if (!explicitSelfClose && !VOID_HTML_TAGS.has(tagNameLower)) {
-                stack.push(el);
-            }
+            return [...root.childNodes];
+        } finally {
+            parsingHtmlDepth -= 1;
         }
-        return [...root.childNodes];
     }
 
     const listeners = new Map();
@@ -781,47 +1442,182 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
 
     class MockElement {
         constructor(tagName = 'div') {
+            this._rsNodeId = ++nodeSeq;
             this.tagName = String(tagName || 'div').toUpperCase();
             this.nodeName = this.tagName;
             this.nodeType = this.tagName === '#DOCUMENT-FRAGMENT' || this.tagName === '#FRAGMENT' ? 11 : 1;
-            this.id = '';
-            this.className = '';
-            this._styleMap = Object.create(null);
+            this._id = '';
+            this._className = '';
+            this._classSet = null;
+            this._disabled = false;
+            this._checked = false;
+            this._styleMap = null;
             this._styleRaw = '';
-            this.style = new Proxy(this._styleMap, {
+            this._styleProxy = null;
+            this._datasetProxy = null;
+            this._classListObj = null;
+            this.attributes = new AttrMap();
+            this.childNodes = [];
+            this._childrenCache = null;
+            this.parentNode = null;
+            this.parentElement = null;
+            this._isConnectedFast = false;
+            this._docOrder = 0;
+            this._outerHTMLOverride = '';
+            this._rect = { top: 16, left: 16, right: 240, bottom: 64, width: 224, height: 48 };
+            this._value = '';
+            this._hasExplicitValue = false;
+            this.scrollTop = 0;
+            this.scrollLeft = 0;
+            this.scrollHeight = 0;
+            this.scrollWidth = 0;
+            this.selectionStart = 0;
+            this.selectionEnd = 0;
+            this.selectionDirection = 'none';
+            if (this.tagName === 'TEMPLATE') {
+                this.content = new MockElement('#document-fragment');
+            }
+        }
+        _hasClassFast(c) {
+            const cls = this._className;
+            if (!cls) return false;
+            const key = String(c);
+            if (cls === key) return true;
+            if (!this._classSet) {
+                this._classSet = new Set(cls.split(/\s+/).filter(Boolean));
+            }
+            if (this._classSet.has(key)) return true;
+            if (this._rsAllowRisuPrefixMatch && key.startsWith('x-risu-')) {
+                return this._classSet.has(key.slice(7));
+            }
+            return false;
+        }
+        get style() {
+            if (this._styleProxy) return this._styleProxy;
+            if (!this._styleMap) {
+                this._styleMap = Object.create(null);
+                if (this._styleRaw) this._parseRawStyleInto(this._styleRaw, this._styleMap);
+            }
+            const toCamelStyle = (p) => String(p).replace(/-([a-z])/g, (_, ch) => ch.toUpperCase());
+            const toKebabStyle = (p) => String(p).replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`);
+            const readStyleProp = (tgt, p) => {
+                const k = String(p || '');
+                if (!k) return '';
+                if (Object.prototype.hasOwnProperty.call(tgt, k)) return tgt[k];
+                if (!k.startsWith('--')) {
+                    const c = toCamelStyle(k);
+                    if (Object.prototype.hasOwnProperty.call(tgt, c)) return tgt[c];
+                    const kb = toKebabStyle(k);
+                    if (Object.prototype.hasOwnProperty.call(tgt, kb)) return tgt[kb];
+                }
+                return '';
+            };
+            const setStyleProp = (tgt, p, v) => {
+                const k = String(p || '').trim();
+                if (!k) return;
+                const val = (v === null || v === undefined) ? '' : String(v);
+                if (k.startsWith('--')) {
+                    if (val === '') delete tgt[k];
+                    else tgt[k] = val;
+                } else {
+                    const camel = toCamelStyle(k);
+                    const kebab = toKebabStyle(k);
+                    if (camel !== k) delete tgt[k];
+                    if (kebab !== camel) delete tgt[kebab];
+                    if (val === '') delete tgt[camel];
+                    else tgt[camel] = val;
+                }
+                this._syncStyleAttr();
+            };
+            const removeStyleProp = (tgt, p) => {
+                const k = String(p || '').trim();
+                if (!k) return '';
+                const prev = readStyleProp(tgt, k);
+                delete tgt[k];
+                if (!k.startsWith('--')) {
+                    delete tgt[toCamelStyle(k)];
+                    delete tgt[toKebabStyle(k)];
+                }
+                this._syncStyleAttr();
+                return prev;
+            };
+            this._styleProxy = new Proxy(this._styleMap, {
                 set: (tgt, prop, val) => {
                     const k = String(prop);
                     if (k === 'cssText') {
                         void this.setStyleAttribute(val);
                         return true;
                     }
-                    if (val === null || val === undefined || val === '') delete tgt[k];
-                    else tgt[k] = String(val);
-                    this._syncStyleAttr();
+                    setStyleProp(tgt, k, val);
                     return true;
                 },
                 get: (tgt, prop) => {
                     if (prop === 'cssText') return this._styleRaw;
-                    return typeof prop === 'string' && Object.prototype.hasOwnProperty.call(tgt, prop) ? tgt[prop] : '';
+                    if (prop === 'setProperty') return (p, v) => { setStyleProp(tgt, p, v); };
+                    if (prop === 'getPropertyValue') return (p) => readStyleProp(tgt, p);
+                    if (prop === 'removeProperty') return (p) => removeStyleProp(tgt, p);
+                    if (prop === 'item') return (i) => Object.keys(tgt)[Number(i)] || '';
+                    if (prop === 'length') return Object.keys(tgt).length;
+                    return typeof prop === 'string' ? readStyleProp(tgt, prop) : '';
                 },
             });
-            this.dataset = {};
-            this.attributes = new AttrMap();
-            this.childNodes = [];
-            this.parentNode = null;
-            this.parentElement = null;
-            this._outerHTMLOverride = '';
-            this._rect = { top: 16, left: 16, right: 240, bottom: 64, width: 224, height: 48 };
-            this.value = '';
-            this.checked = false;
-            this.disabled = false;
-            if (this.tagName === 'TEMPLATE') {
-                this.content = new MockElement('#document-fragment');
-            }
+            return this._styleProxy;
+        }
+        get dataset() {
+            if (this._datasetProxy) return this._datasetProxy;
+            const datasetKeyToAttr = (k) => `data-${String(k).replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`)}`;
+            const collectDatasetEntries = () => {
+                const entries = [];
+                for (const [ak, av] of this.attributes.entries()) {
+                    if (String(ak).toLowerCase().startsWith('data-')) {
+                        entries.push([attrNameToDatasetKey(String(ak).toLowerCase()), av]);
+                    }
+                }
+                return entries;
+            };
+            this._datasetProxy = new Proxy(Object.create(null), {
+                get: (_t, prop) => {
+                    if (typeof prop !== 'string') return undefined;
+                    const ak = datasetKeyToAttr(prop);
+                    return this.attributes.has(ak) ? this.attributes.get(ak) : undefined;
+                },
+                set: (_t, prop, val) => {
+                    if (typeof prop !== 'string') return false;
+                    this.setAttribute(datasetKeyToAttr(prop), String(val ?? ''));
+                    return true;
+                },
+                deleteProperty: (_t, prop) => {
+                    if (typeof prop !== 'string') return false;
+                    this.removeAttribute(datasetKeyToAttr(prop));
+                    return true;
+                },
+                has: (_t, prop) => typeof prop === 'string' && this.attributes.has(datasetKeyToAttr(prop)),
+                ownKeys: () => collectDatasetEntries().map(([dk]) => dk),
+                getOwnPropertyDescriptor: (_t, prop) => {
+                    if (typeof prop !== 'string') return undefined;
+                    const ak = datasetKeyToAttr(prop);
+                    if (!this.attributes.has(ak)) return undefined;
+                    return { enumerable: true, configurable: true, writable: true, value: this.attributes.get(ak) };
+                },
+            });
+            return this._datasetProxy;
+        }
+        get classList() {
+            if (this._classListObj) return this._classListObj;
             const self = this;
-            this.classList = {
+            this._classListObj = {
+                get length() {
+                    return String(self._className || '').split(/\s+/).filter(Boolean).length;
+                },
+                get value() { return self._className || ''; },
+                set value(v) { self.className = v; },
+                item: (i) => {
+                    const list = String(self._className || '').split(/\s+/).filter(Boolean);
+                    const idx = Number(i);
+                    return Number.isInteger(idx) && idx >= 0 && idx < list.length ? list[idx] : null;
+                },
                 add: (...cls) => {
-                    const set = new Set(String(self.className || '').split(/\s+/).filter(Boolean));
+                    const set = new Set(String(self._className || '').split(/\s+/).filter(Boolean));
                     let changed = false;
                     for (const c of cls) {
                         if (c && !set.has(String(c))) {
@@ -829,45 +1625,268 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                             changed = true;
                         }
                     }
-                    const next = Array.from(set).join(' ');
-                    self.className = next;
-                    if (next) self.attributes.set('class', next);
-                    else self.attributes.delete('class');
-                    if (changed) scheduleSurfaceMutationNotify(self);
+                    if (changed) {
+                        self.className = Array.from(set).join(' ');
+                    }
                 },
                 remove: (...cls) => {
-                    const set = new Set(String(self.className || '').split(/\s+/).filter(Boolean));
+                    const set = new Set(String(self._className || '').split(/\s+/).filter(Boolean));
                     let changed = false;
                     for (const c of cls) {
                         if (set.delete(String(c))) changed = true;
                     }
-                    const next = Array.from(set).join(' ');
-                    self.className = next;
-                    if (next) self.attributes.set('class', next);
-                    else self.attributes.delete('class');
-                    if (changed) scheduleSurfaceMutationNotify(self);
-                },
-                contains: (c) => {
-                    const key = String(c);
-                    const list = String(self.className || '').split(/\s+/).filter(Boolean);
-                    if (list.includes(key)) return true;
-                    if (self._rsAllowRisuPrefixMatch && key.startsWith('x-risu-')) {
-                        return list.includes(key.slice(7));
+                    if (changed) {
+                        self.className = Array.from(set).join(' ');
                     }
-                    return false;
                 },
+                contains: (c) => self._hasClassFast(c),
                 toggle: (c, force) => {
-                    const has = self.classList.contains(c);
+                    const has = self._hasClassFast(c);
                     const next = force === undefined ? !has : Boolean(force);
                     if (next) self.classList.add(c);
                     else self.classList.remove(c);
                     return next;
                 },
+                replace: (oldCls, newCls) => {
+                    const oldKey = String(oldCls || '');
+                    const newKey = String(newCls || '');
+                    const list = String(self._className || '').split(/\s+/).filter(Boolean);
+                    const idx = list.indexOf(oldKey);
+                    if (idx < 0) return false;
+                    if (newKey) list[idx] = newKey;
+                    else list.splice(idx, 1);
+                    self.className = Array.from(new Set(list)).join(' ');
+                    return true;
+                },
+                forEach: (fn, thisArg) => {
+                    const list = String(self._className || '').split(/\s+/).filter(Boolean);
+                    list.forEach((v, i) => fn.call(thisArg, v, i, self.classList));
+                },
+                [Symbol.iterator]: () => String(self._className || '').split(/\s+/).filter(Boolean)[Symbol.iterator](),
             };
+            return this._classListObj;
         }
+        get id() { return this._id; }
+        set id(v) {
+            const s = String(v ?? '');
+            const prev = this._id;
+            this._id = s;
+            updateIdIndex(this, prev, s);
+            setDirectAttr(this, 'id', s ? s : null);
+            if (prev !== s) bumpDomMutation();
+        }
+        get className() { return this._className; }
+        set className(v) {
+            const s = String(v ?? '');
+            const prev = this._className;
+            this._className = s;
+            this._classSet = null;
+            updateClassIndex(this, prev, s);
+            setDirectAttr(this, 'class', s ? s : null);
+            if (prev !== s) {
+                bumpDomMutation();
+                scheduleSurfaceMutationNotify(this);
+            }
+        }
+        get disabled() { return this._disabled; }
+        set disabled(v) {
+            const next = Boolean(v);
+            const prev = this._disabled;
+            this._disabled = next;
+            setDirectAttr(this, 'disabled', next ? '' : null);
+            if (prev !== next) {
+                bumpDomMutation();
+                scheduleSurfaceMutationNotify(this);
+            }
+        }
+        get checked() { return this._checked; }
+        set checked(v) {
+            const next = Boolean(v);
+            const prev = this._checked;
+            this._checked = next;
+            if (prev !== next) bumpDomMutation();
+        }
+        get ownerDocument() { return syncDoc; }
+        get localName() { return this.tagName.toLowerCase(); }
+        get namespaceURI() {
+            const SVG_SET = new Set(['SVG', 'PATH', 'CIRCLE', 'RECT', 'LINE', 'POLYGON', 'POLYLINE', 'ELLIPSE', 'G', 'DEFS', 'USE', 'SYMBOL', 'TEXT', 'TSPAN', 'LINEARGRADIENT', 'RADIALGRADIENT', 'STOP', 'CLIPPATH', 'MASK']);
+            return SVG_SET.has(this.tagName) ? 'http://www.w3.org/2000/svg' : 'http://www.w3.org/1999/xhtml';
+        }
+        get isConnected() {
+            return Boolean(this._isConnectedFast);
+        }
+        get value() {
+            if (this.tagName === 'SELECT') {
+                if (this._hasExplicitValue) return this._value;
+                const opts = collectMatchingElements(this, 'option');
+                const sel = opts.find((o) => o.checked || o.hasAttribute('selected')) || opts[0];
+                if (!sel) return '';
+                return sel.attributes.has('value') ? sel.attributes.get('value') : String(sel.textContent || '');
+            }
+            if (this.tagName === 'TEXTAREA') {
+                return this._hasExplicitValue ? this._value : this.textContent;
+            }
+            if (this.tagName === 'OPTION') {
+                return this._hasExplicitValue
+                    ? this._value
+                    : (this.attributes.has('value') ? this.attributes.get('value') : this.textContent);
+            }
+            return this._value;
+        }
+        set value(v) {
+            const s = String(v ?? '');
+            const prev = this._value;
+            this._value = s;
+            this._hasExplicitValue = true;
+            if (prev !== s) bumpDomMutation();
+            if (this.tagName === 'TEXTAREA') {
+                this._clearChildNodes();
+                if (s !== '') this.appendChild(new MockTextNode(s));
+            } else if (this.tagName === 'SELECT') {
+                const opts = collectMatchingElements(this, 'option');
+                for (const opt of opts) {
+                    const ov = opt.attributes.has('value') ? opt.attributes.get('value') : String(opt.textContent || '');
+                    const match = ov === s;
+                    opt.checked = match;
+                    setDirectAttr(opt, 'selected', match ? '' : null);
+                }
+            }
+        }
+        get options() {
+            if (this.tagName === 'SELECT' || this.tagName === 'OPTGROUP' || this.tagName === 'DATALIST') {
+                return makeCollectionArray(collectMatchingElements(this, 'option'));
+            }
+            return undefined;
+        }
+        get selectedOptions() {
+            if (this.tagName === 'SELECT') {
+                return makeCollectionArray(this.options.filter((o) => o.selected));
+            }
+            return undefined;
+        }
+        get selectedIndex() {
+            if (this.tagName !== 'SELECT') return -1;
+            const opts = this.options;
+            const i = opts.findIndex((o) => o.selected);
+            if (i >= 0) return i;
+            return opts.length > 0 ? 0 : -1;
+        }
+        set selectedIndex(idx) {
+            if (this.tagName !== 'SELECT') return;
+            const i = Number(idx);
+            const opts = this.options;
+            if (!Number.isInteger(i) || i < 0 || i >= opts.length) {
+                this._hasExplicitValue = true;
+                this._value = '';
+                for (const o of opts) {
+                    o.checked = false;
+                    setDirectAttr(o, 'selected', null);
+                }
+                return;
+            }
+            this.value = opts[i].value;
+        }
+        get length() {
+            if (this.tagName === 'SELECT') return this.options.length;
+            return undefined;
+        }
+        add(opt, before) {
+            if (this.tagName !== 'SELECT' || !opt) return;
+            const ref = typeof before === 'number' ? (this.options[before] || null) : (before || null);
+            this.insertBefore(opt, ref);
+        }
+        get selected() {
+            if (this.tagName === 'OPTION') {
+                const sel = this.parentElement ? this.parentElement.closest('select') : null;
+                if (sel && sel._hasExplicitValue) return this.value === sel._value;
+                return Boolean(this.checked || this.hasAttribute('selected'));
+            }
+            return false;
+        }
+        set selected(v) {
+            const next = Boolean(v);
+            this.checked = next;
+            setDirectAttr(this, 'selected', next ? '' : null);
+            if (this.tagName === 'OPTION') {
+                const sel = this.parentElement ? this.parentElement.closest('select') : null;
+                if (sel && next) {
+                    sel._value = this.value;
+                    sel._hasExplicitValue = true;
+                    for (const o of sel.options) {
+                        if (o !== this) {
+                            o.checked = false;
+                            setDirectAttr(o, 'selected', null);
+                        }
+                    }
+                }
+            }
+        }
+        get defaultSelected() { return this.hasAttribute('selected'); }
+        set defaultSelected(v) { if (v) this.setAttribute('selected', ''); else this.removeAttribute('selected'); }
+        get text() { return this.textContent; }
+        set text(v) { this.textContent = v; }
+        get label() { return this.getAttribute('label') ?? this.textContent; }
+        set label(v) { this.setAttribute('label', v); }
+        get form() { return this.parentElement ? this.parentElement.closest('form') : null; }
+        get elements() {
+            if (this.tagName === 'FORM' || this.tagName === 'FIELDSET') {
+                return makeCollectionArray(collectMatchingElements(this, 'input, select, textarea, button, fieldset, output'));
+            }
+            return undefined;
+        }
+        get files() { return this.tagName === 'INPUT' ? makeCollectionArray([]) : undefined; }
+        get labels() { return makeCollectionArray([]); }
+        get defaultValue() { return this.tagName === 'TEXTAREA' ? this.textContent : (this.getAttribute('value') ?? ''); }
+        set defaultValue(v) { if (this.tagName === 'TEXTAREA') this.textContent = v; else this.setAttribute('value', v); }
+        get defaultChecked() { return this.hasAttribute('checked'); }
+        set defaultChecked(v) { if (v) this.setAttribute('checked', ''); else this.removeAttribute('checked'); }
+        setSelectionRange(start, end, dir = 'none') {
+            this.selectionStart = Number(start) || 0;
+            this.selectionEnd = Number(end) || 0;
+            this.selectionDirection = String(dir || 'none');
+        }
+        checkValidity() { return true; }
+        reportValidity() { return true; }
+        setCustomValidity() {}
+        reset() {}
+        submit() {}
+        requestSubmit() {}
+        get open() { return this.hasAttribute('open'); }
+        set open(v) {
+            if (v) this.setAttribute('open', '');
+            else this.removeAttribute('open');
+        }
+        get firstChild() { return this.childNodes.length ? this.childNodes[0] : null; }
+        get lastChild() { return this.childNodes.length ? this.childNodes[this.childNodes.length - 1] : null; }
+        get nextSibling() {
+            if (!this.parentNode || !Array.isArray(this.parentNode.childNodes)) return null;
+            const idx = this.parentNode.childNodes.indexOf(this);
+            return idx >= 0 && idx + 1 < this.parentNode.childNodes.length ? this.parentNode.childNodes[idx + 1] : null;
+        }
+        get previousSibling() {
+            if (!this.parentNode || !Array.isArray(this.parentNode.childNodes)) return null;
+            const idx = this.parentNode.childNodes.indexOf(this);
+            return idx > 0 ? this.parentNode.childNodes[idx - 1] : null;
+        }
+        get nextElementSibling() {
+            let cur = this.nextSibling;
+            while (cur && cur.nodeType !== 1) cur = cur.nextSibling;
+            return cur || null;
+        }
+        get previousElementSibling() {
+            let cur = this.previousSibling;
+            while (cur && cur.nodeType !== 1) cur = cur.previousSibling;
+            return cur || null;
+        }
+        scrollIntoView() {}
+        scrollTo() {}
         get children() {
-            return this.childNodes.filter((c) => c && c.nodeType === 1);
+            if (!this._childrenCache) {
+                this._childrenCache = this.childNodes.filter((c) => c && c.nodeType === 1);
+            }
+            return this._childrenCache;
         }
+        get childElementCount() { return this.children.length; }
         get firstElementChild() {
             const kids = this.children;
             return kids.length ? kids[0] : null;
@@ -876,35 +1895,68 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             const kids = this.children;
             return kids.length ? kids[kids.length - 1] : null;
         }
+        get offsetWidth() { return this.getBoundingClientRect().width || 0; }
+        get offsetHeight() { return this.getBoundingClientRect().height || 0; }
+        get offsetTop() { return this.getBoundingClientRect().top || 0; }
+        get offsetLeft() { return this.getBoundingClientRect().left || 0; }
+        get offsetParent() { return this.parentElement === documentElement ? null : this.parentElement; }
+        getClientRects() { return [this.getBoundingClientRect()]; }
+        _parseRawStyleInto(raw, map) {
+            for (const k of Object.keys(map)) delete map[k];
+            if (!raw) return;
+            for (const decl of String(raw).split(';')) {
+                const idx = decl.indexOf(':');
+                if (idx <= 0) continue;
+                const k = decl.slice(0, idx).trim();
+                const v = decl.slice(idx + 1).trim();
+                if (!k) continue;
+                const key = k.startsWith('--') ? k : k.replace(/-([a-z])/g, (_, ch) => ch.toUpperCase());
+                map[key] = v;
+            }
+        }
         _syncStyleAttr() {
+            if (!this._styleMap) return;
             const parts = [];
             for (const [k, v] of Object.entries(this._styleMap)) {
-                const cssProp = k.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`);
+                const cssProp = k.startsWith('--') ? k : k.replace(/[A-Z]/g, (m) => `-${m.toLowerCase()}`);
                 parts.push(`${cssProp}:${v}`);
             }
             const next = parts.join('; ');
             const prevStyle = this._styleRaw;
             this._styleRaw = next;
-            if (next) this.attributes.set('style', next);
-            else this.attributes.delete('style');
-            if (prevStyle !== next) scheduleSurfaceMutationNotify(this);
+            setDirectAttr(this, 'style', next ? next : null);
+            if (prevStyle !== next) {
+                bumpDomMutation();
+                scheduleSurfaceMutationNotify(this);
+            }
         }
         _clearChildNodes() {
             const target = (this.tagName === 'TEMPLATE' && this.content) ? this.content : this;
             const hadChildren = target.childNodes.length > 0;
+            const shouldUnindex = this._isConnectedFast && this.tagName !== 'TEMPLATE';
             for (const ch of target.childNodes) {
                 if (ch && typeof ch === 'object') {
+                    if (shouldUnindex) unindexSubtree(ch);
                     ch.parentNode = null;
                     ch.parentElement = null;
                 }
             }
             target.childNodes.length = 0;
+            target._childrenCache = null;
+            if (this.tagName === 'SELECT') {
+                this._hasExplicitValue = false;
+                this._value = '';
+            }
             if (hadChildren) notifyChildListMutation(this);
         }
         _replaceChildWithMany(oldCh, rawNodes) {
             const rawOld = unwrapEl(oldCh);
-            const idx = this.childNodes.indexOf(rawOld);
-            if (idx < 0) return;
+            const origIdx = this.childNodes.indexOf(rawOld);
+            if (origIdx < 0) return;
+            const isLiveTarget = this._isConnectedFast && this.tagName !== 'TEMPLATE';
+            const placeholder = { __rsPlaceholder: true };
+            this.childNodes[origIdx] = placeholder;
+            if (isLiveTarget) unindexSubtree(rawOld);
             rawOld.parentNode = null;
             rawOld.parentElement = null;
             const list = [];
@@ -920,8 +1972,12 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                             list.push(sub);
                         }
                         node.childNodes.length = 0;
+                        node._childrenCache = null;
                     } else {
-                        if (node.parentNode && node.parentNode !== this && typeof node.parentNode.removeChild === 'function') {
+                        if (node.parentNode === this) {
+                            const curIdx = this.childNodes.indexOf(node);
+                            if (curIdx >= 0) this.childNodes.splice(curIdx, 1);
+                        } else if (node.parentNode && typeof node.parentNode.removeChild === 'function') {
                             node.parentNode.removeChild(node);
                         }
                         node.parentNode = this;
@@ -930,7 +1986,15 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                     }
                 }
             }
-            this.childNodes.splice(idx, 1, ...list);
+            const phIdx = this.childNodes.indexOf(placeholder);
+            if (phIdx >= 0) this.childNodes.splice(phIdx, 1, ...list);
+            if (isLiveTarget) {
+                for (let i = 0; i < list.length; i += 1) {
+                    const ins = list[i];
+                    if (ins && !ins._isConnectedFast) indexSubtree(ins);
+                }
+            }
+            this._childrenCache = null;
             notifyChildListMutation(this);
         }
         get innerHTML() {
@@ -965,8 +2029,8 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             if (this._outerHTMLOverride) return this._outerHTMLOverride;
             const tag = this.tagName.toLowerCase();
             const attrPairs = [];
-            if (this.id && !this.attributes.has('id')) attrPairs.push(`id="${escapeHtmlAttr(this.id)}"`);
-            if (this.className && !this.attributes.has('class')) attrPairs.push(`class="${escapeHtmlAttr(this.className)}"`);
+            if (this._id && !this.attributes.has('id')) attrPairs.push(`id="${escapeHtmlAttr(this._id)}"`);
+            if (this._className && !this.attributes.has('class')) attrPairs.push(`class="${escapeHtmlAttr(this._className)}"`);
             for (const [k, v] of this.attributes.entries()) {
                 const escaped = escapeHtmlAttr(v);
                 attrPairs.push(v === '' ? `${k}=""` : `${k}="${escaped}"`);
@@ -975,6 +2039,17 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             if (VOID_HTML_TAGS.has(tag)) return open;
             const bodyHtml = this.innerHTML;
             return `${open}${bodyHtml}</${tag}>`;
+        }
+        set outerHTML(v) {
+            const raw = String(v ?? '');
+            this._outerHTMLOverride = '';
+            if (this.parentNode && typeof this.parentNode._replaceChildWithMany === 'function') {
+                const nodes = parseHtmlFragmentToNodes(raw);
+                this.parentNode._replaceChildWithMany(this, nodes);
+            } else {
+                this._outerHTMLOverride = raw;
+                bumpDomMutation();
+            }
         }
         get textContent() {
             const list = (this.tagName === 'TEMPLATE' && this.content) ? this.content.childNodes : this.childNodes;
@@ -989,21 +2064,55 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                 target.appendChild(new MockTextNode(s));
             }
         }
-        async innerText() { return this.textContent; }
+        get innerText() { return this.textContent; }
+        set innerText(v) { this.textContent = v; }
         async setInnerText(v) { this.textContent = v; }
+        get hidden() { return this.hasAttribute('hidden'); }
+        set hidden(v) { if (v) this.setAttribute('hidden', ''); else this.removeAttribute('hidden'); }
+        get type() { return this.getAttribute('type') ?? ''; }
+        set type(v) { this.setAttribute('type', v); }
+        get name() { return this.getAttribute('name') ?? ''; }
+        set name(v) { this.setAttribute('name', v); }
+        get placeholder() { return this.getAttribute('placeholder') ?? ''; }
+        set placeholder(v) { this.setAttribute('placeholder', v); }
+        get title() { return this.getAttribute('title') ?? ''; }
+        set title(v) { this.setAttribute('title', v); }
+        get href() { return this.getAttribute('href') ?? ''; }
+        set href(v) { this.setAttribute('href', v); }
+        get src() { return this.getAttribute('src') ?? ''; }
+        set src(v) { this.setAttribute('src', v); }
+        get role() { return this.getAttribute('role') ?? ''; }
+        set role(v) { this.setAttribute('role', v); }
+        get readOnly() { return this.hasAttribute('readonly'); }
+        set readOnly(v) { if (v) this.setAttribute('readonly', ''); else this.removeAttribute('readonly'); }
+        get required() { return this.hasAttribute('required'); }
+        set required(v) { if (v) this.setAttribute('required', ''); else this.removeAttribute('required'); }
+        get multiple() { return this.hasAttribute('multiple'); }
+        set multiple(v) { if (v) this.setAttribute('multiple', ''); else this.removeAttribute('multiple'); }
+        get rows() {
+            if (this.tagName === 'TABLE' || this.tagName === 'THEAD' || this.tagName === 'TBODY' || this.tagName === 'TFOOT') {
+                return makeCollectionArray(collectMatchingElements(this, 'tr'));
+            }
+            const n = Number(this.getAttribute('rows'));
+            return Number.isFinite(n) && n > 0 ? n : 2;
+        }
+        set rows(v) { this.setAttribute('rows', String(v ?? '')); }
+        get tBodies() { return this.tagName === 'TABLE' ? makeCollectionArray(collectMatchingElements(this, 'tbody')) : undefined; }
+        get cells() { return this.tagName === 'TR' ? makeCollectionArray(collectMatchingElements(this, 'td, th')) : undefined; }
+        get cols() { const n = Number(this.getAttribute('cols')); return Number.isFinite(n) && n > 0 ? n : 20; }
+        set cols(v) { this.setAttribute('cols', String(v ?? '')); }
+        get min() { return this.getAttribute('min') ?? ''; }
+        set min(v) { this.setAttribute('min', v); }
+        get max() { return this.getAttribute('max') ?? ''; }
+        set max(v) { this.setAttribute('max', v); }
+        get step() { return this.getAttribute('step') ?? ''; }
+        set step(v) { this.setAttribute('step', v); }
+        get tabIndex() { const n = Number(this.getAttribute('tabindex')); return Number.isFinite(n) ? n : 0; }
+        set tabIndex(v) { this.setAttribute('tabindex', String(v ?? '')); }
         async setInnerHTML(v) { this.innerHTML = v; }
         async getInnerHTML() { return this.innerHTML; }
         async getOuterHTML() { return this.outerHTML; }
-        async setOuterHTML(v) {
-            const raw = String(v ?? '');
-            this._outerHTMLOverride = '';
-            if (this.parentNode && typeof this.parentNode._replaceChildWithMany === 'function') {
-                const nodes = parseHtmlFragmentToNodes(raw);
-                this.parentNode._replaceChildWithMany(this, nodes);
-            } else {
-                this._outerHTMLOverride = raw;
-            }
-        }
+        async setOuterHTML(v) { this.outerHTML = v; }
         async setTextContent(v) { this.textContent = v; }
         async getTextContent() { return this.textContent; }
         async setStyle(prop, val) { this.style[String(prop || '')] = String(val ?? ''); }
@@ -1011,24 +2120,18 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         async getStyleAttribute() { return this.attributes.has('style') ? this.attributes.get('style') : this._styleRaw; }
         async setStyleAttribute(val) {
             const raw = String(val ?? '');
+            const prevRaw = this._styleRaw;
             this._styleRaw = raw;
-            for (const k of Object.keys(this._styleMap)) delete this._styleMap[k];
-            for (const decl of raw.split(';')) {
-                const idx = decl.indexOf(':');
-                if (idx <= 0) continue;
-                const k = decl.slice(0, idx).trim();
-                const v = decl.slice(idx + 1).trim();
-                if (k) this._styleMap[k] = v;
+            if (this._styleMap) {
+                this._parseRawStyleInto(raw, this._styleMap);
             }
-            if (raw) this.attributes.set('style', raw);
-            else this.attributes.delete('style');
+            setDirectAttr(this, 'style', raw ? raw : null);
+            if (prevRaw !== raw) {
+                bumpDomMutation();
+                scheduleSurfaceMutationNotify(this);
+            }
         }
-        async setClassName(v) {
-            const next = String(v ?? '');
-            this.className = next;
-            if (next) this.attributes.set('class', next);
-            else this.attributes.delete('class');
-        }
+        async setClassName(v) { this.className = v; }
         async getClassName() { return this.className; }
         async addClass(...cls) { this.classList.add(...cls); }
         async removeClass(...cls) { this.classList.remove(...cls); }
@@ -1039,37 +2142,98 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         async clientWidth() { return (await this.getBoundingClientRect()).width || 0; }
         async clientTop() { return (await this.getBoundingClientRect()).top || 0; }
         async clientLeft() { return (await this.getBoundingClientRect()).left || 0; }
-        hasAttribute(k) { return this.attributes.has(String(k)); }
+        _normalizeAttrKey(k) {
+            const raw = String(k);
+            return this.namespaceURI === 'http://www.w3.org/2000/svg' ? raw : raw.toLowerCase();
+        }
+        setAttributeNS(_ns, k, v) { this.setAttribute(k, v); }
+        getAttributeNS(_ns, k) { return this.getAttribute(k); }
+        removeAttributeNS(_ns, k) { this.removeAttribute(k); }
+        hasAttribute(k) {
+            const raw = String(k);
+            if (this.attributes.has(raw)) return true;
+            return this.namespaceURI !== 'http://www.w3.org/2000/svg' && this.attributes.has(raw.toLowerCase());
+        }
+        getAttributeNames() { return Array.from(this.attributes.keys()); }
+        toggleAttribute(k, force) {
+            const key = this._normalizeAttrKey(k);
+            const has = this.hasAttribute(key);
+            const next = force === undefined ? !has : Boolean(force);
+            if (next) this.setAttribute(key, '');
+            else this.removeAttribute(key);
+            return next;
+        }
         matches(sel) { return matchesSelector(this, sel); }
         setAttribute(k, v) {
-            const key = String(k);
+            const key = this._normalizeAttrKey(k);
+            const low = key.toLowerCase();
             const val = String(v ?? '');
-            const prev = this.attributes.has(key) ? this.attributes.get(key) : null;
+            const had = this.attributes.has(key);
+            const prev = had ? this.attributes.get(key) : null;
             this.attributes.set(key, val);
-            if (key === 'id') this.id = val;
-            if (key === 'class') this.className = val;
-            if (key === 'disabled') this.disabled = val !== 'false';
-            if (key === 'checked') this.checked = val !== 'false';
-            if (key === 'value') this.value = val;
-            if (key === 'style') void this.setStyleAttribute(val);
-            if (key.startsWith('data-')) this.dataset[attrNameToDatasetKey(key)] = val;
-            if (prev !== val && (key.startsWith('x-') || key.startsWith('data-') || key === 'class' || key === 'src' || key === 'style' || key === 'hidden' || key === 'disabled' || key === 'aria-disabled' || key === 'aria-label')) {
-                scheduleSurfaceMutationNotify(this);
+            if (!had || prev !== val) {
+                syncAttrBucket(this, key, had ? prev : null, val);
+            }
+            if (low === 'id') {
+                const prevId = this._id;
+                this._id = val;
+                updateIdIndex(this, prevId, val);
+            }
+            if (low === 'class') {
+                const prevCls = this._className;
+                this._className = val;
+                this._classSet = null;
+                updateClassIndex(this, prevCls, val);
+            }
+            if (low === 'disabled') this._disabled = val !== 'false';
+            if (low === 'checked') this._checked = val !== 'false';
+            if (low === 'value') this.value = val;
+            if (low === 'style') void this.setStyleAttribute(val);
+            if (!had || prev !== val) {
+                bumpDomMutation();
+                if (low.startsWith('x-') || low.startsWith('data-') || low === 'class' || low === 'src' || low === 'style' || low === 'hidden' || low === 'disabled' || low === 'aria-disabled' || low === 'aria-label') {
+                    scheduleSurfaceMutationNotify(this);
+                }
             }
         }
-        getAttribute(k) { return this.attributes.has(String(k)) ? this.attributes.get(String(k)) : null; }
+        getAttribute(k) {
+            const raw = String(k);
+            if (this.attributes.has(raw)) return this.attributes.get(raw);
+            if (this.namespaceURI !== 'http://www.w3.org/2000/svg') {
+                const low = raw.toLowerCase();
+                if (this.attributes.has(low)) return this.attributes.get(low);
+            }
+            return null;
+        }
         removeAttribute(k) {
-            const key = String(k);
-            const had = this.attributes.has(key);
+            const key = this._normalizeAttrKey(k);
+            const low = key.toLowerCase();
+            const prevPrimary = this.attributes.has(key) ? this.attributes.get(key) : null;
+            const prevLow = low !== key && this.attributes.has(low) ? this.attributes.get(low) : null;
+            const had = prevPrimary !== null || prevLow !== null;
             this.attributes.delete(key);
-            if (key === 'id') this.id = '';
-            if (key === 'class') this.className = '';
-            if (key === 'disabled') this.disabled = false;
-            if (key === 'checked') this.checked = false;
-            if (key === 'style') void this.setStyleAttribute('');
-            if (key.startsWith('data-')) delete this.dataset[attrNameToDatasetKey(key)];
-            if (had && (key.startsWith('x-') || key.startsWith('data-') || key === 'class' || key === 'src' || key === 'style' || key === 'hidden' || key === 'disabled' || key === 'aria-disabled' || key === 'aria-label')) {
-                scheduleSurfaceMutationNotify(this);
+            if (low !== key) this.attributes.delete(low);
+            if (prevPrimary !== null) syncAttrBucket(this, key, prevPrimary, null);
+            if (prevLow !== null && prevLow !== prevPrimary) syncAttrBucket(this, low, prevLow, null);
+            if (low === 'id') {
+                const prevId = this._id;
+                this._id = '';
+                updateIdIndex(this, prevId, '');
+            }
+            if (low === 'class') {
+                const prevCls = this._className;
+                this._className = '';
+                this._classSet = null;
+                updateClassIndex(this, prevCls, '');
+            }
+            if (low === 'disabled') this._disabled = false;
+            if (low === 'checked') this._checked = false;
+            if (low === 'style') void this.setStyleAttribute('');
+            if (had) {
+                bumpDomMutation();
+                if (low.startsWith('x-') || low.startsWith('data-') || low === 'class' || low === 'src' || low === 'style' || low === 'hidden' || low === 'disabled' || low === 'aria-disabled' || low === 'aria-label') {
+                    scheduleSurfaceMutationNotify(this);
+                }
             }
         }
         appendChild(chRaw) {
@@ -1079,12 +2243,19 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                     for (const sub of [...ch.childNodes]) this.appendChild(sub);
                     return chRaw;
                 }
-                if (ch.parentNode && ch.parentNode !== this && typeof ch.parentNode.removeChild === 'function') {
+                if (ch.parentNode === this) {
+                    const curIdx = this.childNodes.indexOf(ch);
+                    if (curIdx >= 0) this.childNodes.splice(curIdx, 1);
+                } else if (ch.parentNode && typeof ch.parentNode.removeChild === 'function') {
                     ch.parentNode.removeChild(ch);
                 }
                 ch.parentNode = this;
                 ch.parentElement = this.nodeType === 1 ? this : null;
                 this.childNodes.push(ch);
+                if (this._isConnectedFast && this.tagName !== 'TEMPLATE' && !ch._isConnectedFast) {
+                    indexSubtree(ch);
+                }
+                this._childrenCache = null;
                 notifyChildListMutation(this);
             }
             return chRaw;
@@ -1098,29 +2269,58 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         }
         prepend(...items) {
             let added = false;
+            const isLiveTarget = this._isConnectedFast && this.tagName !== 'TEMPLATE';
             for (let i = items.length - 1; i >= 0; i -= 1) {
                 const raw = unwrapEl(items[i]);
                 if (raw === null || raw === undefined) continue;
                 const ch = typeof raw === 'string' ? new MockTextNode(raw) : raw;
                 if (ch && typeof ch === 'object') {
-                    if (ch.parentNode && ch.parentNode !== this && typeof ch.parentNode.removeChild === 'function') {
+                    if (ch.nodeType === 11 && Array.isArray(ch.childNodes)) {
+                        for (let j = ch.childNodes.length - 1; j >= 0; j -= 1) {
+                            const sub = ch.childNodes[j];
+                            if (sub.parentNode === this) {
+                                const curIdx = this.childNodes.indexOf(sub);
+                                if (curIdx >= 0) this.childNodes.splice(curIdx, 1);
+                            }
+                            sub.parentNode = this;
+                            sub.parentElement = this.nodeType === 1 ? this : null;
+                            this.childNodes.unshift(sub);
+                            if (isLiveTarget && !sub._isConnectedFast) indexSubtree(sub);
+                            added = true;
+                        }
+                        ch.childNodes.length = 0;
+                        ch._childrenCache = null;
+                        continue;
+                    }
+                    if (ch.parentNode === this) {
+                        const curIdx = this.childNodes.indexOf(ch);
+                        if (curIdx >= 0) this.childNodes.splice(curIdx, 1);
+                    } else if (ch.parentNode && typeof ch.parentNode.removeChild === 'function') {
                         ch.parentNode.removeChild(ch);
                     }
                     ch.parentNode = this;
                     ch.parentElement = this.nodeType === 1 ? this : null;
                     this.childNodes.unshift(ch);
+                    if (isLiveTarget && !ch._isConnectedFast) indexSubtree(ch);
                     added = true;
                 }
             }
-            if (added) notifyChildListMutation(this);
+            if (added) {
+                this._childrenCache = null;
+                notifyChildListMutation(this);
+            }
         }
         removeChild(chRaw) {
             const ch = unwrapEl(chRaw);
             const idx = this.childNodes.indexOf(ch);
             if (idx >= 0) {
+                if (this._isConnectedFast && this.tagName !== 'TEMPLATE') {
+                    unindexSubtree(ch);
+                }
                 this.childNodes.splice(idx, 1);
                 ch.parentNode = null;
                 ch.parentElement = null;
+                this._childrenCache = null;
                 notifyChildListMutation(this);
             }
             return chRaw;
@@ -1139,31 +2339,149 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                 this.parentNode._replaceChildWithMany(this, nodes.map(unwrapEl));
             }
         }
+        insertBefore(newChRaw, refChRaw) {
+            if (!refChRaw) return this.appendChild(newChRaw);
+            const ch = unwrapEl(newChRaw);
+            const ref = unwrapEl(refChRaw);
+            if (!ch || typeof ch !== 'object') return newChRaw;
+            if (ch.nodeType === 11 && Array.isArray(ch.childNodes)) {
+                for (const sub of [...ch.childNodes]) {
+                    this.insertBefore(sub, ref);
+                }
+                return newChRaw;
+            }
+            if (ch.parentNode && ch.parentNode !== this && typeof ch.parentNode.removeChild === 'function') {
+                ch.parentNode.removeChild(ch);
+            } else if (ch.parentNode === this) {
+                const curIdx = this.childNodes.indexOf(ch);
+                if (curIdx >= 0) this.childNodes.splice(curIdx, 1);
+            }
+            const idx = this.childNodes.indexOf(ref);
+            ch.parentNode = this;
+            ch.parentElement = this.nodeType === 1 ? this : null;
+            if (idx < 0) this.childNodes.push(ch);
+            else this.childNodes.splice(idx, 0, ch);
+            if (this._isConnectedFast && this.tagName !== 'TEMPLATE' && !ch._isConnectedFast) {
+                indexSubtree(ch);
+            }
+            this._childrenCache = null;
+            notifyChildListMutation(this);
+            return newChRaw;
+        }
+        insertAdjacentElement(position, newEl) {
+            const pos = String(position || '').toLowerCase();
+            if (!newEl || typeof newEl !== 'object') return null;
+            if (pos === 'beforeend') this.appendChild(newEl);
+            else if (pos === 'afterbegin') this.prepend(newEl);
+            else if (pos === 'beforebegin' && this.parentNode && typeof this.parentNode.insertBefore === 'function') {
+                this.parentNode.insertBefore(newEl, this);
+            } else if (pos === 'afterend' && this.parentNode && typeof this.parentNode.insertBefore === 'function') {
+                this.parentNode.insertBefore(newEl, this.nextSibling);
+            }
+            return newEl;
+        }
+        insertAdjacentText(position, rawText) {
+            const pos = String(position || '').toLowerCase();
+            const tn = new MockTextNode(rawText);
+            if (pos === 'beforeend') this.appendChild(tn);
+            else if (pos === 'afterbegin') this.prepend(tn);
+            else if (pos === 'beforebegin' && this.parentNode && typeof this.parentNode.insertBefore === 'function') {
+                this.parentNode.insertBefore(tn, this);
+            } else if (pos === 'afterend' && this.parentNode && typeof this.parentNode.insertBefore === 'function') {
+                this.parentNode.insertBefore(tn, this.nextSibling);
+            }
+        }
+        replaceChildren(...items) {
+            this._clearChildNodes();
+            if (items.length) this.append(...items);
+        }
+        before(...items) {
+            if (!this.parentNode || typeof this.parentNode.insertBefore !== 'function') return;
+            for (const item of items) {
+                if (item === null || item === undefined) continue;
+                const unwrapped = unwrapEl(item);
+                this.parentNode.insertBefore(typeof unwrapped === 'string' ? new MockTextNode(unwrapped) : unwrapped, this);
+            }
+        }
+        after(...items) {
+            if (!this.parentNode || typeof this.parentNode.insertBefore !== 'function') return;
+            const ref = this.nextSibling;
+            for (const item of items) {
+                if (item === null || item === undefined) continue;
+                const unwrapped = unwrapEl(item);
+                this.parentNode.insertBefore(typeof unwrapped === 'string' ? new MockTextNode(unwrapped) : unwrapped, ref);
+            }
+        }
+        getElementsByTagName(tag) {
+            const t = String(tag || '').trim();
+            if (!t) return [];
+            const sel = t === '*' ? '*' : t.toLowerCase();
+            return this.querySelectorAll(sel);
+        }
+        getElementsByClassName(clsNames) {
+            const tokens = String(clsNames || '').trim().split(/\s+/).filter(Boolean);
+            if (!tokens.length) return [];
+            const sel = tokens.map((c) => `.${c}`).join('');
+            return this.querySelectorAll(sel);
+        }
+        insertAdjacentHTML(position, rawHtml) {
+            const pos = String(position || '').toLowerCase();
+            const nodes = parseHtmlFragmentToNodes(rawHtml);
+            if (!nodes.length) return;
+            if (pos === 'beforeend') {
+                for (const n of nodes) this.appendChild(n);
+            } else if (pos === 'afterbegin') {
+                this.prepend(...nodes);
+            } else if (pos === 'beforebegin' && this.parentNode && typeof this.parentNode.insertBefore === 'function') {
+                for (const n of nodes) this.parentNode.insertBefore(n, this);
+            } else if (pos === 'afterend' && this.parentNode && typeof this.parentNode.insertBefore === 'function') {
+                const ref = this.nextSibling;
+                for (const n of nodes) this.parentNode.insertBefore(n, ref);
+            }
+        }
         cloneNode(deep = false) {
             const c = new MockElement(this.tagName);
-            c.id = this.id;
-            c.className = this.className;
-            c.disabled = this.disabled;
-            c.checked = this.checked;
-            c.value = this.value;
+            c._id = this._id;
+            c._className = this._className;
+            c._disabled = this._disabled;
+            c._checked = this._checked;
+            c._value = this._value;
+            c._hasExplicitValue = this._hasExplicitValue;
             for (const [k, v] of this.attributes.entries()) c.attributes.set(k, v);
             void c.setStyleAttribute(this._styleRaw);
             if (deep) {
                 for (const ch of this.childNodes) {
                     if (ch && typeof ch.cloneNode === 'function') c.appendChild(ch.cloneNode(true));
                 }
+                if (this.tagName === 'TEMPLATE' && this.content && c.content) {
+                    for (const ch of this.content.childNodes) {
+                        if (ch && typeof ch.cloneNode === 'function') c.content.appendChild(ch.cloneNode(true));
+                    }
+                }
             }
             return c;
         }
-        remove() {
+        remove(idx) {
+            if (this.tagName === 'SELECT' && arguments.length >= 1 && typeof idx === 'number') {
+                const targetOpt = this.options[idx];
+                if (targetOpt && targetOpt.parentNode && typeof targetOpt.parentNode.removeChild === 'function') {
+                    targetOpt.parentNode.removeChild(targetOpt);
+                }
+                return;
+            }
             if (this.parentNode && typeof this.parentNode.removeChild === 'function') {
                 this.parentNode.removeChild(this);
             }
         }
         contains(target) {
-            const t = unwrapEl(target);
-            if (t === this) return true;
-            return this.childNodes.some((c) => typeof c.contains === 'function' && c.contains(t));
+            let cur = unwrapEl(target);
+            if (!cur || typeof cur !== 'object') return false;
+            if (this === documentElement) return Boolean(cur._isConnectedFast);
+            while (cur) {
+                if (cur === this) return true;
+                cur = cur.parentNode;
+            }
+            return false;
         }
         closest(sel) {
             let cur = this;
@@ -1174,12 +2492,12 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             return null;
         }
         querySelector(sel) {
-            return collectMatchingElements(this, sel)[0] || null;
+            return collectMatchingElements(this, sel, true)[0] || null;
         }
         querySelectorAll(sel) {
-            return makeSafeNodeList(collectMatchingElements(this, sel));
+            return makeCollectionArray(collectMatchingElements(this, sel, false));
         }
-        addEventListener(ev, fn) {
+        addEventListener(ev, fn, opts, isSync = true) {
             if (typeof fn !== 'function') return '';
             const id = `el-ev-${++seq}`;
             let map = elementListeners.get(this);
@@ -1187,7 +2505,13 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                 map = new Map();
                 elementListeners.set(this, map);
             }
-            map.set(id, { ev: String(ev), fn });
+            map.set(id, {
+                ev: String(ev),
+                fn,
+                sync: isSync !== false,
+                once: Boolean(opts && typeof opts === 'object' && opts.once),
+                capture: Boolean(opts === true || (opts && typeof opts === 'object' && opts.capture)),
+            });
             return id;
         }
         removeEventListener(ev, idOrFn) {
@@ -1198,19 +2522,67 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                 if (v.ev === ev && v.fn === idOrFn) map.delete(k);
             }
         }
-        async dispatchEvent(evObj) {
-            const map = elementListeners.get(this);
+        async dispatchEvent(evObj, syncEvObj = null, { phase = 'all' } = {}) {
             const evName = String((evObj && evObj.type) || '');
+            if (phase === 'all' && evObj && typeof evObj === 'object') {
+                try {
+                    if (!evObj.target) evObj.target = this;
+                    evObj.currentTarget = this;
+                } catch (_) {}
+            }
+            if (phase !== 'capture') {
+                const onProp = this['on' + evName];
+                if (typeof onProp === 'function') {
+                    const arg = syncEvObj || evObj;
+                    const ts0 = Date.now();
+                    try {
+                        const ret = onProp.call(this, arg);
+                        if (ret && typeof ret.then === 'function') {
+                            ret.catch((err) => {
+                                console.error('[PluginDom] element on* async error:', err && err.message ? err.message : String(err));
+                            });
+                        }
+                    } catch (err) {
+                        console.error('[PluginDom] element on* handler error:', err && err.message ? err.message : String(err));
+                    }
+                    perfCounters.syncListenerMs += (Date.now() - ts0);
+                    if (evObj && evObj.immediatePropagationStopped) return true;
+                }
+            }
+            const map = elementListeners.get(this);
             if (map) {
-                for (const rec of [...map.values()]) {
-                    if (rec.ev === evName) {
+                for (const [id, rec] of [...map.entries()]) {
+                    if (rec.ev !== evName) continue;
+                    if (phase === 'capture' && !rec.capture) continue;
+                    if (phase === 'bubble' && rec.capture) continue;
+                    if (rec.once) map.delete(id);
+                    const arg = rec.sync && syncEvObj ? syncEvObj : evObj;
+                    if (rec.sync) {
+                        const ts0 = Date.now();
                         try {
-                            await rec.fn(evObj);
+                            const ret = rec.fn.call(this, arg);
+                            if (ret && typeof ret.then === 'function') {
+                                ret.catch((err) => {
+                                    console.error('[PluginDom] element async listener error:', err && err.message ? err.message : String(err));
+                                });
+                            }
                         } catch (err) {
                             console.error('[PluginDom] element listener error:', err && err.message ? err.message : String(err));
                         }
-                        if (evObj && evObj.immediatePropagationStopped) break;
+                        perfCounters.syncListenerMs += (Date.now() - ts0);
+                    } else {
+                        const ta0 = Date.now();
+                        try {
+                            await Promise.race([
+                                Promise.resolve(rec.fn.call(wrapSafeElement(this), arg)),
+                                new Promise((r) => setTimeout(r, 2500)),
+                            ]);
+                        } catch (err) {
+                            console.error('[PluginDom] element listener error:', err && err.message ? err.message : String(err));
+                        }
+                        perfCounters.asyncListenerMs += (Date.now() - ta0);
                     }
+                    if (evObj && evObj.immediatePropagationStopped) break;
                 }
             }
             return true;
@@ -1231,6 +2603,10 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         }
     }
 
+    const documentElement = new MockElement('html');
+    documentElement._rect = { top: 0, left: 0, right: 1024, bottom: 900, width: 1024, height: 900 };
+    indexElementSelf(documentElement);
+
     const head = new MockElement('head');
     const body = new MockElement('body');
     body._rect = { top: 0, left: 0, right: 1024, bottom: 900, width: 1024, height: 900 };
@@ -1239,22 +2615,167 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
     chatScreen._rect = { top: 0, left: 0, right: 1024, bottom: 900, width: 1024, height: 900 };
     body.appendChild(chatScreen);
 
-    const documentElement = new MockElement('html');
-    documentElement._rect = { top: 0, left: 0, right: 1024, bottom: 900, width: 1024, height: 900 };
     documentElement.appendChild(head);
     documentElement.appendChild(body);
 
-    async function dispatchDocListeners(type, eventObj, syncEventObj) {
-        const list = [...listeners.values()].filter((v) => v.ev === type);
+    async function dispatchDocListeners(type, eventObj, syncEventObj, { phase = 'bubble' } = {}) {
+        const list = [...listeners.values()].filter((v) => {
+            if (v.ev !== type) return false;
+            if (phase === 'capture') return Boolean(v.capture);
+            if (phase === 'bubble') return !v.capture;
+            return true;
+        });
         for (const rec of list) {
+            if (rec.once) listeners.delete(rec.id);
             const evArg = rec.sync && syncEventObj ? syncEventObj : eventObj;
-            try {
-                await rec.fn(evArg);
-            } catch (err) {
-                console.error('[PluginDom] doc listener error:', err && err.message ? err.message : String(err));
+            if (rec.sync) {
+                const ts0 = Date.now();
+                try {
+                    const ret = rec.fn(evArg);
+                    if (ret && typeof ret.then === 'function') {
+                        ret.catch((err) => {
+                            console.error('[PluginDom] doc async listener error:', err && err.message ? err.message : String(err));
+                        });
+                    }
+                } catch (err) {
+                    console.error('[PluginDom] doc listener error:', err && err.message ? err.message : String(err));
+                }
+                perfCounters.syncListenerMs += (Date.now() - ts0);
+            } else {
+                const ta0 = Date.now();
+                try {
+                    await Promise.race([
+                        Promise.resolve(rec.fn(evArg)),
+                        new Promise((r) => setTimeout(r, 2500)),
+                    ]);
+                } catch (err) {
+                    console.error('[PluginDom] doc listener error:', err && err.message ? err.message : String(err));
+                }
+                perfCounters.asyncListenerMs += (Date.now() - ta0);
             }
             if (evArg && evArg.immediatePropagationStopped) break;
         }
+    }
+
+    function createSyntheticEventPair(type, rawTarget, extraFields = {}, { bubbles = true } = {}) {
+        const wrappedTarget = wrapSafeElement(rawTarget) || rawTarget;
+        const evState = {
+            defaultPrevented: false,
+            propagationStopped: false,
+            immediatePropagationStopped: false,
+            currentAsync: wrappedTarget,
+            currentSync: rawTarget,
+        };
+        const buildComposedPath = (forAsync) => {
+            const p = [];
+            let cur = rawTarget;
+            while (cur && cur.nodeType === 1) {
+                p.push(forAsync ? (wrapSafeElement(cur) || cur) : cur);
+                cur = cur.parentElement;
+            }
+            p.push(forAsync ? doc : syncDoc);
+            return p;
+        };
+        const makeView = (target, forAsync) => ({
+            type,
+            bubbles,
+            cancelable: true,
+            composed: true,
+            ...extraFields,
+            target,
+            get currentTarget() { return forAsync ? evState.currentAsync : evState.currentSync; },
+            set currentTarget(v) {
+                const raw = unwrapEl(v);
+                if (forAsync) evState.currentAsync = v;
+                else evState.currentSync = raw || v;
+            },
+            composedPath() { return buildComposedPath(forAsync); },
+            get defaultPrevented() { return evState.defaultPrevented; },
+            get propagationStopped() { return evState.propagationStopped; },
+            get immediatePropagationStopped() { return evState.immediatePropagationStopped; },
+            preventDefault() { evState.defaultPrevented = true; },
+            stopPropagation() { evState.propagationStopped = true; },
+            stopImmediatePropagation() { evState.propagationStopped = true; evState.immediatePropagationStopped = true; },
+        });
+        return {
+            asyncEv: makeView(wrappedTarget, true),
+            syncEv: makeView(rawTarget, false),
+            state: evState,
+            setCurrentTarget(node, isDoc = false) {
+                if (isDoc) {
+                    evState.currentAsync = doc;
+                    evState.currentSync = syncDoc;
+                } else {
+                    const raw = unwrapEl(node);
+                    evState.currentSync = raw;
+                    evState.currentAsync = wrapSafeElement(raw) || raw;
+                }
+            },
+        };
+    }
+
+    async function dispatchPathEvent(rawTarget, type, extraFields = {}, { bubbles = true } = {}) {
+        const pair = createSyntheticEventPair(type, rawTarget, extraFields, { bubbles });
+        const ancestors = [];
+        let p = rawTarget ? rawTarget.parentElement : null;
+        while (p && p.nodeType === 1) {
+            ancestors.push(p);
+            p = p.parentElement;
+        }
+        // 1) Capture phase: document -> html -> ... -> parent
+        pair.setCurrentTarget(null, true);
+        await dispatchDocListeners(type, pair.asyncEv, pair.syncEv, { phase: 'capture' });
+        for (let i = ancestors.length - 1; i >= 0 && !pair.state.propagationStopped; i -= 1) {
+            const anc = ancestors[i];
+            pair.setCurrentTarget(anc, false);
+            if (typeof anc.dispatchEvent === 'function') {
+                await anc.dispatchEvent(pair.asyncEv, pair.syncEv, { phase: 'capture' });
+            }
+        }
+        // 2) Target phase
+        if (rawTarget && !pair.state.propagationStopped && typeof rawTarget.dispatchEvent === 'function') {
+            pair.setCurrentTarget(rawTarget, false);
+            await rawTarget.dispatchEvent(pair.asyncEv, pair.syncEv, { phase: 'target' });
+        }
+        // 3) Bubble phase: parent -> ... -> html -> document
+        if (bubbles && !pair.state.propagationStopped) {
+            for (let i = 0; i < ancestors.length && !pair.state.propagationStopped; i += 1) {
+                const anc = ancestors[i];
+                pair.setCurrentTarget(anc, false);
+                if (typeof anc.dispatchEvent === 'function') {
+                    await anc.dispatchEvent(pair.asyncEv, pair.syncEv, { phase: 'bubble' });
+                }
+            }
+            if (!pair.state.propagationStopped) {
+                pair.setCurrentTarget(null, true);
+                await dispatchDocListeners(type, pair.asyncEv, pair.syncEv, { phase: 'bubble' });
+            }
+        }
+        return pair;
+    }
+
+    function updateRadioGroupState(radioEl) {
+        if (!radioEl || radioEl.tagName !== 'INPUT') return;
+        const name = String(radioEl.getAttribute('name') || '');
+        if (!name) return;
+        const scope = (typeof radioEl.closest === 'function' && radioEl.closest('form')) || documentElement;
+        const allInputs = collectMatchingElements(scope, 'input');
+        for (const peer of allInputs) {
+            if (peer === radioEl) continue;
+            if (String(peer.getAttribute('type') || '').toLowerCase() === 'radio' && String(peer.getAttribute('name') || '') === name) {
+                peer.checked = false;
+                peer.removeAttribute('checked');
+            }
+        }
+    }
+
+    function resolveLabelControl(labelEl) {
+        if (!labelEl || labelEl.tagName !== 'LABEL') return null;
+        const forId = labelEl.getAttribute('for');
+        if (forId) {
+            return findElementById(documentElement, forId);
+        }
+        return collectMatchingElements(labelEl, 'input, select, textarea, button', true)[0] || null;
     }
 
     async function dispatchSurfaceClick(targetEl, x = 24, y = 24) {
@@ -1287,56 +2808,60 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         if (!Number.isFinite(clickX)) clickX = 24;
         if (!Number.isFinite(clickY)) clickY = 24;
 
-        const wrappedTarget = wrapSafeElement(rawTarget) || rawTarget;
-        const wrappedDoc = wrapSafeElement(documentElement) || documentElement;
-        const makeEvPair = (type) => {
-            const evState = { defaultPrevented: false, propagationStopped: false, immediatePropagationStopped: false };
-            const makeView = (target, currentTarget) => ({
-                type,
-                bubbles: true,
-                cancelable: true,
-                composed: true,
+        activePressEl = rawTarget || null;
+        hoverEl = rawTarget || null;
+        focusedEl = rawTarget || null;
+        try {
+            let clickDefaultPrevented = false;
+            const mouseExtra = (type) => ({
                 clientX: clickX,
                 clientY: clickY,
                 pageX: clickX,
                 pageY: clickY,
                 button: 0,
                 buttons: type === 'mousedown' ? 1 : 0,
-                target,
-                currentTarget,
-                get defaultPrevented() { return evState.defaultPrevented; },
-                get propagationStopped() { return evState.propagationStopped; },
-                get immediatePropagationStopped() { return evState.immediatePropagationStopped; },
-                preventDefault() { evState.defaultPrevented = true; },
-                stopPropagation() { evState.propagationStopped = true; },
-                stopImmediatePropagation() { evState.propagationStopped = true; evState.immediatePropagationStopped = true; },
             });
-            return {
-                asyncEv: makeView(wrappedTarget, wrappedDoc),
-                syncEv: makeView(rawTarget, documentElement),
-            };
-        };
-
-        const dispatchBubble = async (ev) => {
-            let cur = rawTarget;
-            while (cur && cur.nodeType === 1 && !ev.propagationStopped) {
-                if (typeof cur.dispatchEvent === 'function') {
-                    await cur.dispatchEvent(ev);
-                }
-                cur = cur.parentElement;
-            }
-        };
-
-        activePressEl = rawTarget || null;
-        hoverEl = rawTarget || null;
-        focusedEl = rawTarget || null;
-        try {
             for (const type of ['mouseover', 'mouseenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-                const { asyncEv, syncEv } = makeEvPair(type);
-                await dispatchDocListeners(type, asyncEv, syncEv);
-                await dispatchBubble(asyncEv);
+                const pair = await dispatchPathEvent(rawTarget, type, mouseExtra(type), { bubbles: type !== 'mouseenter' });
+                if (type === 'click' && pair.state.defaultPrevented) {
+                    clickDefaultPrevented = true;
+                }
             }
-            await new Promise((r) => setTimeout(r, 12));
+            if (!clickDefaultPrevented && rawTarget) {
+                const summaryEl = typeof rawTarget.closest === 'function' ? rawTarget.closest('summary') : null;
+                if (summaryEl && summaryEl.parentElement && summaryEl.parentElement.tagName === 'DETAILS') {
+                    const det = summaryEl.parentElement;
+                    if (det.hasAttribute('open')) det.removeAttribute('open');
+                    else det.setAttribute('open', '');
+                } else if (rawTarget.tagName === 'INPUT' && !rawTarget.disabled && !rawTarget.hasAttribute('disabled')) {
+                    const typ = String(rawTarget.getAttribute('type') || 'text').toLowerCase();
+                    if (typ === 'checkbox') {
+                        const nextChecked = !rawTarget.checked;
+                        rawTarget.checked = nextChecked;
+                        if (nextChecked) rawTarget.setAttribute('checked', '');
+                        else rawTarget.removeAttribute('checked');
+                        await dispatchPathEvent(rawTarget, 'input', {}, { bubbles: true });
+                        await dispatchPathEvent(rawTarget, 'change', {}, { bubbles: true });
+                    } else if (typ === 'radio') {
+                        updateRadioGroupState(rawTarget);
+                        rawTarget.checked = true;
+                        rawTarget.setAttribute('checked', '');
+                        await dispatchPathEvent(rawTarget, 'input', {}, { bubbles: true });
+                        await dispatchPathEvent(rawTarget, 'change', {}, { bubbles: true });
+                    }
+                } else if (typeof rawTarget.closest === 'function') {
+                    const labelEl = rawTarget.closest('label');
+                    const ownControl = rawTarget.closest('input, select, textarea, button, a, summary');
+                    if (labelEl && (!ownControl || !labelEl.contains(ownControl))) {
+                        const ctl = resolveLabelControl(labelEl);
+                        const ctlTag = ctl && ctl.tagName;
+                        if (ctl && ctl !== rawTarget && (ctlTag === 'INPUT' || ctlTag === 'SELECT' || ctlTag === 'TEXTAREA' || ctlTag === 'BUTTON') && !ctl.disabled && !ctl.hasAttribute('disabled')) {
+                            await dispatchSurfaceClick(ctl, clickX, clickY);
+                        }
+                    }
+                }
+            }
+            await new Promise((r) => setTimeout(r, 0));
             return true;
         } finally {
             activePressEl = null;
@@ -1344,65 +2869,34 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         }
     }
 
-    async function dispatchElementInput(targetEl, { value, checked, eventType = 'input' } = {}) {
+    async function dispatchElementInput(targetEl, { value, checked, eventType = 'input', fireClick = false } = {}) {
         const rawTarget = unwrapEl(targetEl);
         if (!rawTarget || rawTarget.nodeType !== 1) return false;
         focusedEl = rawTarget;
+        if (fireClick) {
+            await dispatchPathEvent(rawTarget, 'click', { clientX: 24, clientY: 24, pageX: 24, pageY: 24, button: 0, buttons: 0 }, { bubbles: true });
+        }
         if (value !== undefined) {
             rawTarget.value = String(value);
-            if (rawTarget.tagName === 'TEXTAREA') {
-                rawTarget.textContent = String(value);
-            } else if (rawTarget.tagName === 'INPUT') {
-                rawTarget.attributes.set('value', String(value));
+            if (rawTarget.tagName === 'INPUT') {
+                setDirectAttr(rawTarget, 'value', String(value));
             }
         }
         if (typeof checked === 'boolean') {
+            if (checked && rawTarget.tagName === 'INPUT' && String(rawTarget.getAttribute('type') || '').toLowerCase() === 'radio') {
+                updateRadioGroupState(rawTarget);
+            }
             rawTarget.checked = checked;
-            if (checked) rawTarget.attributes.set('checked', '');
-            else rawTarget.attributes.delete('checked');
+            setDirectAttr(rawTarget, 'checked', checked ? '' : null);
         }
         const evName = eventType === 'change' ? 'change' : 'input';
-        const wrappedTarget = wrapSafeElement(rawTarget) || rawTarget;
-        const wrappedDoc = wrapSafeElement(documentElement) || documentElement;
-        const makeEvPair = (type) => {
-            const evState = { defaultPrevented: false, propagationStopped: false, immediatePropagationStopped: false };
-            const makeView = (target, currentTarget) => ({
-                type,
-                bubbles: true,
-                cancelable: true,
-                composed: true,
-                target,
-                currentTarget,
-                get defaultPrevented() { return evState.defaultPrevented; },
-                get propagationStopped() { return evState.propagationStopped; },
-                get immediatePropagationStopped() { return evState.immediatePropagationStopped; },
-                preventDefault() { evState.defaultPrevented = true; },
-                stopPropagation() { evState.propagationStopped = true; },
-                stopImmediatePropagation() { evState.propagationStopped = true; evState.immediatePropagationStopped = true; },
-            });
-            return {
-                asyncEv: makeView(wrappedTarget, wrappedDoc),
-                syncEv: makeView(rawTarget, documentElement),
-            };
-        };
-        const dispatchBubble = async (ev) => {
-            let cur = rawTarget;
-            while (cur && cur.nodeType === 1 && !ev.propagationStopped) {
-                if (typeof cur.dispatchEvent === 'function') {
-                    await cur.dispatchEvent(ev);
-                }
-                cur = cur.parentElement;
-            }
-        };
-        const pair1 = makeEvPair(evName);
-        await dispatchDocListeners(evName, pair1.asyncEv, pair1.syncEv);
-        await dispatchBubble(pair1.asyncEv);
         if (evName === 'change') {
-            const pairIn = makeEvPair('input');
-            await dispatchDocListeners('input', pairIn.asyncEv, pairIn.syncEv);
-            await dispatchBubble(pairIn.asyncEv);
+            await dispatchPathEvent(rawTarget, 'input', {}, { bubbles: true });
+            await dispatchPathEvent(rawTarget, 'change', {}, { bubbles: true });
+        } else {
+            await dispatchPathEvent(rawTarget, 'input', {}, { bubbles: true });
         }
-        await new Promise((r) => setTimeout(r, 10));
+        await new Promise((r) => setTimeout(r, 0));
         return true;
     }
 
@@ -1738,6 +3232,8 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         return { footersByChatId, footersByIndex, bodyHtmlByChatId };
     }
 
+    const wrapMixedNode = (n) => (!n ? null : (n.nodeType === 1 ? wrapSafeElement(n) : n));
+
     function wrapSafeElement(rawEl) {
         if (!rawEl || rawEl.nodeType !== 1) return null;
         const cached = safeWrapperCache.get(rawEl);
@@ -1748,17 +3244,30 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             get nodeName() { return rawEl.nodeName; },
             get tagName() { return rawEl.tagName; },
             get id() { return rawEl.id; },
+            set id(v) { rawEl.id = v; },
             get className() { return rawEl.className; },
+            set className(v) { rawEl.className = v; },
             get classList() { return rawEl.classList; },
             get dataset() { return rawEl.dataset; },
             get parentElement() { return wrapSafeElement(rawEl.parentElement); },
             get parentNode() { return wrapSafeElement(rawEl.parentNode); },
+            get firstChild() { return wrapMixedNode(rawEl.firstChild); },
+            get lastChild() { return wrapMixedNode(rawEl.lastChild); },
+            get firstElementChild() { return wrapSafeElement(rawEl.firstElementChild); },
+            get lastElementChild() { return wrapSafeElement(rawEl.lastElementChild); },
+            get nextSibling() { return wrapMixedNode(rawEl.nextSibling); },
+            get previousSibling() { return wrapMixedNode(rawEl.previousSibling); },
+            get nextElementSibling() { return wrapSafeElement(rawEl.nextElementSibling); },
+            get previousElementSibling() { return wrapSafeElement(rawEl.previousElementSibling); },
+            get childNodes() { return makeCollectionArray(rawEl.childNodes.map(wrapMixedNode).filter(Boolean)); },
+            get children() { return makeCollectionArray(rawEl.children.map(wrapSafeElement).filter(Boolean)); },
             get style() { return rawEl.style; },
             get textContent() { return rawEl.textContent; },
             set textContent(v) { rawEl.textContent = v; },
             get innerHTML() { return rawEl.innerHTML; },
             set innerHTML(v) { rawEl.innerHTML = v; },
             get outerHTML() { return rawEl.outerHTML; },
+            set outerHTML(v) { rawEl.outerHTML = v; },
             get ownerDocument() { return doc; },
             get value() { return rawEl.value; },
             set value(v) { rawEl.value = String(v ?? ''); },
@@ -1774,10 +3283,15 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             setAttribute: async (k, v) => { rawEl.setAttribute(k, v); },
             removeAttribute: async (k) => { rawEl.removeAttribute(k); },
             hasAttribute: async (k) => rawEl.hasAttribute(k),
+            getAttributeNames: async () => rawEl.getAttributeNames(),
+            toggleAttribute: async (k, force) => rawEl.toggleAttribute(k, force),
             appendChild: async (ch) => { rawEl.appendChild(unwrapEl(ch)); return wrapSafeElement(unwrapEl(ch)) || ch; },
+            insertBefore: async (n, ref) => { rawEl.insertBefore(unwrapEl(n), unwrapEl(ref)); return wrapSafeElement(unwrapEl(n)) || n; },
+            insertAdjacentHTML: async (pos, html) => { rawEl.insertAdjacentHTML(pos, html); },
             removeChild: async (ch) => { rawEl.removeChild(unwrapEl(ch)); return ch; },
             replaceChild: async (n, o) => { rawEl.replaceChild(unwrapEl(n), unwrapEl(o)); return o; },
             replaceWith: async (...nodes) => { rawEl.replaceWith(...nodes.map(unwrapEl)); },
+            replaceChildren: async (...items) => { rawEl.replaceChildren(...items.map(unwrapEl)); },
             remove: async () => { rawEl.remove(); },
             append: async (...items) => { rawEl.append(...items.map(unwrapEl)); },
             prepend: async (...items) => { rawEl.prepend(...items.map(unwrapEl)); },
@@ -1811,7 +3325,7 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             setStyle: async (p, v) => rawEl.setStyle(p, v),
             getStyleAttribute: async () => rawEl.getStyleAttribute(),
             setStyleAttribute: async (v) => rawEl.setStyleAttribute(v),
-            addEventListener: async (ev, fn, opts) => rawEl.addEventListener(ev, fn, opts),
+            addEventListener: async (ev, fn, opts) => rawEl.addEventListener(ev, fn, opts, false),
             removeEventListener: async (ev, idOrFn, opts) => rawEl.removeEventListener(ev, idOrFn, opts),
             dispatchEvent: async (evObj) => rawEl.dispatchEvent(evObj),
             focus: async () => rawEl.focus(),
@@ -1854,13 +3368,24 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         head: wrapSafeElement(head),
         body: wrapSafeElement(body),
         createElement: async (tag) => wrapSafeElement(new MockElement(tag)),
+        createElementNS: async (_ns, tag) => wrapSafeElement(new MockElement(tag)),
+        createDocumentFragment: async () => wrapSafeElement(new MockElement('#document-fragment')),
         createTextNode: async (txt) => new MockTextNode(txt),
-        getElementById: async (id) => wrapSafeElement(collectMatchingElements(documentElement, `#${String(id || '').replace(/[^a-zA-Z0-9_-]/g, '')}`)[0] || null),
-        querySelector: async (sel) => wrapSafeElement(collectMatchingElements(documentElement, sel)[0] || null),
-        querySelectorAll: async (sel) => makeSafeNodeList(collectMatchingElements(documentElement, sel).map(wrapSafeElement).filter(Boolean)),
+        createComment: async (txt) => new MockCommentNode(txt),
+        getElementById: async (id) => wrapSafeElement(findElementById(documentElement, id)),
+        querySelector: async (sel) => wrapSafeElement(collectMatchingElements(documentElement, sel, true)[0] || null),
+        querySelectorAll: async (sel) => makeSafeNodeList(collectMatchingElements(documentElement, sel, false).map(wrapSafeElement).filter(Boolean)),
         addEventListener: async (ev, fn, opts) => {
             const id = `doc-ev-${++seq}`;
-            listeners.set(id, { ev: String(ev), fn, opts: opts || false, sync: false });
+            listeners.set(id, {
+                id,
+                ev: String(ev),
+                fn,
+                opts: opts || false,
+                sync: false,
+                once: Boolean(opts && typeof opts === 'object' && opts.once),
+                capture: Boolean(opts === true || (opts && typeof opts === 'object' && opts.capture)),
+            });
             return id;
         },
         removeEventListener: async (ev, idOrFn) => {
@@ -1872,17 +3397,69 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
     };
     const syncDoc = {
         nodeType: 9,
+        readyState: 'complete',
+        visibilityState: 'visible',
+        hidden: false,
+        title: '',
+        compatMode: 'CSS1Compat',
+        characterSet: 'UTF-8',
+        contentType: 'text/html',
+        cookie: '',
+        referrer: '',
+        domain: 'risuai.local',
+        URL: 'https://risuai.local/',
+        documentURI: 'https://risuai.local/',
         documentElement,
         head,
         body,
+        get childNodes() { return makeCollectionArray([documentElement]); },
+        get children() { return makeCollectionArray([documentElement]); },
+        get styleSheets() { return makeCollectionArray([]); },
+        get scripts() { return makeCollectionArray([]); },
+        get forms() { return makeCollectionArray(collectMatchingElements(documentElement, 'form')); },
+        get images() { return makeCollectionArray(collectMatchingElements(documentElement, 'img')); },
+        get links() { return makeCollectionArray(collectMatchingElements(documentElement, 'a[href]')); },
+        fonts: { ready: Promise.resolve(), status: 'loaded', size: 0, [Symbol.iterator]: function* () {} },
+        get activeElement() { return focusedEl || body; },
+        hasFocus: () => true,
+        createRange: () => ({
+            selectNodeContents() {},
+            collapse() {},
+            setStart() {},
+            setEnd() {},
+            getBoundingClientRect: () => ({ top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }),
+            getClientRects: () => [],
+        }),
+        getSelection: () => ({
+            rangeCount: 0,
+            isCollapsed: true,
+            toString: () => '',
+            removeAllRanges() {},
+            addRange() {},
+            getRangeAt: () => null,
+        }),
+        contains: (el) => documentElement.contains(el),
         createElement: (tag) => new MockElement(tag),
+        createElementNS: (_ns, tag) => new MockElement(tag),
+        createDocumentFragment: () => new MockElement('#document-fragment'),
         createTextNode: (txt) => new MockTextNode(txt),
-        getElementById: (id) => collectMatchingElements(documentElement, `#${String(id || '').replace(/[^a-zA-Z0-9_-]/g, '')}`)[0] || null,
-        querySelector: (sel) => collectMatchingElements(documentElement, sel)[0] || null,
-        querySelectorAll: (sel) => collectMatchingElements(documentElement, sel),
+        createComment: (txt) => new MockCommentNode(txt),
+        getElementById: (id) => findElementById(documentElement, id),
+        querySelector: (sel) => collectMatchingElements(documentElement, sel, true)[0] || null,
+        querySelectorAll: (sel) => documentElement.querySelectorAll(sel),
+        getElementsByTagName: (tag) => documentElement.getElementsByTagName(tag),
+        getElementsByClassName: (cls) => documentElement.getElementsByClassName(cls),
         addEventListener: (ev, fn, opts) => {
             const id = `doc-ev-${++seq}`;
-            listeners.set(id, { ev: String(ev), fn, opts: opts || false, sync: true });
+            listeners.set(id, {
+                id,
+                ev: String(ev),
+                fn,
+                opts: opts || false,
+                sync: true,
+                once: Boolean(opts && typeof opts === 'object' && opts.once),
+                capture: Boolean(opts === true || (opts && typeof opts === 'object' && opts.capture)),
+            });
             return id;
         },
         removeEventListener: (ev, idOrFn) => {
@@ -1891,7 +3468,176 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                 if (v.ev === ev && v.fn === idOrFn) listeners.delete(k);
             }
         },
+        dispatchEvent: async (evObj) => {
+            const evName = String((evObj && evObj.type) || '');
+            await dispatchDocListeners(evName, evObj, evObj, { phase: 'all' });
+            return true;
+        },
     };
+
+    function findElementByNodeId(nid) {
+        const target = Number(nid);
+        if (!Number.isFinite(target) || target <= 0) return null;
+        const walk = (node, skipChatScreen = false) => {
+            if (!node || node.nodeType !== 1) return null;
+            if (skipChatScreen && node === chatScreen) return null;
+            if (node._rsNodeId === target) return node;
+            for (const ch of node.childNodes || []) {
+                const hit = walk(ch, skipChatScreen);
+                if (hit) return hit;
+            }
+            if (node.content) {
+                const hit = walk(node.content, skipChatScreen);
+                if (hit) return hit;
+            }
+            return null;
+        };
+        return walk(documentElement, true) || walk(chatScreen, false);
+    }
+
+    function serializeLiveNode(node, isRawTextParent = false) {
+        if (!node) return '';
+        if (node.nodeType === 3) {
+            return isRawTextParent ? String(node.textContent || '') : escapeHtmlText(node.textContent || '');
+        }
+        if (node.nodeType !== 1) return '';
+        const tag = String(node.tagName || 'div').toLowerCase();
+        if (tag === 'script' || tag === 'style') return '';
+        const attrPairs = [`data-rs-vm-nid="${node._rsNodeId}"`];
+        if (node.id && !node.attributes.has('id')) attrPairs.push(`id="${escapeHtmlAttr(node.id)}"`);
+        if (node.className && !node.attributes.has('class')) attrPairs.push(`class="${escapeHtmlAttr(node.className)}"`);
+        for (const [k, v] of node.attributes.entries()) {
+            const lower = String(k || '').toLowerCase();
+            if (!lower || /^on[a-z]+$/.test(lower) || lower === 'data-rs-vm-nid') continue;
+            if (tag === 'input' && (lower === 'value' || lower === 'checked')) continue;
+            if (tag === 'option' && lower === 'selected') continue;
+            if (lower === 'disabled') continue;
+            const escaped = escapeHtmlAttr(v);
+            attrPairs.push(v === '' ? `${k}=""` : `${k}="${escaped}"`);
+        }
+        if (node.disabled) {
+            attrPairs.push('disabled=""');
+        }
+        if (tag === 'input') {
+            const typ = String(node.attributes.get('type') || 'text').toLowerCase();
+            if (typ === 'checkbox' || typ === 'radio') {
+                if (node.attributes.has('value')) {
+                    attrPairs.push(`value="${escapeHtmlAttr(node.attributes.get('value'))}"`);
+                }
+                if (node.checked) attrPairs.push('checked=""');
+            } else {
+                const val = node._hasExplicitValue ? node._value : (node.attributes.has('value') ? node.attributes.get('value') : '');
+                attrPairs.push(`value="${escapeHtmlAttr(val)}"`);
+            }
+        } else if (tag === 'option') {
+            let selAncestor = node.parentElement;
+            while (selAncestor && selAncestor.tagName !== 'SELECT') selAncestor = selAncestor.parentElement;
+            let isSel = Boolean(node.checked || node.hasAttribute('selected'));
+            if (selAncestor && selAncestor._hasExplicitValue) {
+                const optVal = node.attributes.has('value') ? node.attributes.get('value') : String(node.textContent || '');
+                isSel = optVal === selAncestor._value;
+            }
+            if (isSel) attrPairs.push('selected=""');
+        }
+        const open = `<${tag} ${attrPairs.join(' ')}>`;
+        if (VOID_HTML_TAGS.has(tag)) return open;
+        if (tag === 'textarea') {
+            const tv = node._hasExplicitValue ? node._value : node.textContent;
+            return `${open}${escapeHtmlText(tv)}</textarea>`;
+        }
+        const list = (tag === 'template' && node.content) ? node.content.childNodes : node.childNodes;
+        if (!list.length && node._outerHTMLOverride) {
+            const parsedNodes = parseHtmlFragmentToNodes(node._outerHTMLOverride);
+            return `${open}${parsedNodes.map((n) => serializeLiveNode(n, RAW_TEXT_TAGS.has(tag))).join('')}</${tag}>`;
+        }
+        const rawChildren = RAW_TEXT_TAGS.has(tag);
+        return `${open}${list.map((c) => serializeLiveNode(c, rawChildren)).join('')}</${tag}>`;
+    }
+
+    function isTopLiveNodeVisible(ch, seenNodes = null) {
+        if (!ch || ch === chatScreen || ch === head || ch === body) return false;
+        if (seenNodes) {
+            if (seenNodes.has(ch)) return false;
+            seenNodes.add(ch);
+        }
+        if (ch.tagName === 'STYLE' || ch.tagName === 'SCRIPT') return false;
+        if (typeof ch.hasAttribute === 'function' && ch.hasAttribute('data-plugin-chat-panel')) return false;
+        if (ch.hasAttribute('hidden')) return false;
+        const stAttr = (ch.attributes && ch.attributes.get('style')) || '';
+        if (/display\s*:\s*none|visibility\s*:\s*hidden/i.test(stAttr)) return false;
+        return Boolean((ch.childNodes && ch.childNodes.length) || ch._outerHTMLOverride);
+    }
+
+    function hasVisibleLiveGuiContent() {
+        const seen = new Set();
+        for (const ch of body.children || []) {
+            if (isTopLiveNodeVisible(ch, seen)) return true;
+        }
+        for (const ch of documentElement.children || []) {
+            if (isTopLiveNodeVisible(ch, seen)) return true;
+        }
+        return false;
+    }
+
+    function serializeLiveGuiDom() {
+        const styles = [];
+        const seenStyles = new Set();
+        const pushStyle = (st) => {
+            if (!st || st.tagName !== 'STYLE') return;
+            const txt = st.textContent || st.innerHTML || '';
+            if (txt && !seenStyles.has(txt)) {
+                seenStyles.add(txt);
+                styles.push(txt);
+            }
+        };
+        const collectStyleNodes = (node) => {
+            if (!node || node.nodeType !== 1 || node === chatScreen) return;
+            if (node.tagName === 'STYLE') {
+                pushStyle(node);
+                return;
+            }
+            for (const c of node.childNodes || []) {
+                if (c && c.nodeType === 1) collectStyleNodes(c);
+            }
+        };
+        collectStyleNodes(head);
+        for (const ch of body.children || []) collectStyleNodes(ch);
+        for (const ch of documentElement.children || []) {
+            if (ch !== head && ch !== body) collectStyleNodes(ch);
+        }
+
+        const blocks = [];
+        const seenNodes = new Set();
+        const visitTop = (ch) => {
+            if (!isTopLiveNodeVisible(ch, seenNodes)) return;
+            if (!(ch.children && ch.children.length) && !String(ch.textContent || '').trim() && !ch._outerHTMLOverride) return;
+            blocks.push(serializeLiveNode(ch, false));
+        };
+        for (const ch of body.children || []) visitTop(ch);
+        for (const ch of documentElement.children || []) visitTop(ch);
+
+        const extractDataAttrs = (el) => {
+            const data = {};
+            if (!el || !el.attributes) return data;
+            for (const [ak, av] of el.attributes.entries()) {
+                const low = String(ak || '').toLowerCase();
+                if (low.startsWith('data-') && low !== 'data-rs-vm-nid') {
+                    data[low] = String(av ?? '');
+                }
+            }
+            return data;
+        };
+        const rootAttrs = {
+            htmlStyle: (documentElement.attributes && documentElement.attributes.get('style')) || documentElement._styleRaw || '',
+            htmlClass: String(documentElement.className || ''),
+            htmlData: extractDataAttrs(documentElement),
+            bodyStyle: (body.attributes && body.attributes.get('style')) || body._styleRaw || '',
+            bodyClass: String(body.className || ''),
+            bodyData: extractDataAttrs(body),
+        };
+        return { styles, html: blocks.join('\n'), rootAttrs };
+    }
+
     return {
         asyncDoc: doc,
         syncDoc,
@@ -1907,6 +3653,11 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         mountSurfaceActionElement,
         syncChatMessages,
         extractChatSurfaceProjections,
+        findElementByNodeId,
+        getDomMutationSeq: () => domMutationSeq,
+        getPerfCounters: () => ({ ...perfCounters }),
+        hasVisibleLiveGuiContent,
+        serializeLiveGuiDom,
         createMutationObserver,
         getObserverCount: () => mutationObservers.size,
         getListenerCount: () => listeners.size,
@@ -2279,6 +4030,295 @@ function createSyncWebStorage(backingMap, hooks = {}) {
 }
 
 /**
+ * Generates a lightweight sandboxed viewer iframe (`srcdoc`) that projects a plugin's
+ * live Backend VM DOM (`serializeLiveGuiDom`) and forwards user click/input/change
+ * events back to the backend adapter without executing plugin code client-side.
+ */
+function buildLiveGuiViewerSrcdoc({ plugin, theme = 'dark' }) {
+    const pName = String((plugin && plugin.name) || '');
+    const safeMetaJson = JSON.stringify({
+        name: pName,
+        displayName: String((plugin && plugin.displayName) || pName),
+        theme: theme === 'light' ? 'light' : 'dark',
+    }).replace(/<\//g, '<\\/');
+
+    return `<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<style>
+  :root {
+    color-scheme: ${theme === 'light' ? 'light' : 'dark'};
+    --bg: ${theme === 'light' ? '#ffffff' : '#0f172a'};
+    --text: ${theme === 'light' ? '#1b1c1d' : '#e2e8f0'};
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    min-height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Malgun Gothic", sans-serif;
+  }
+  #__rs_live_root {
+    min-height: 100vh;
+    position: relative;
+  }
+  #__rs_live_boot {
+    padding: 20px;
+    font-size: 13px;
+    opacity: 0.78;
+  }
+</style>
+<style id="__rs_live_styles"></style>
+</head>
+<body>
+<div id="__rs_live_root"><div id="__rs_live_boot">백엔드 VM 라이브 GUI를 불러오는 중...</div></div>
+<script id="__rs_live_meta" type="application/json">${safeMetaJson}</script>
+<script>
+(function() {
+  const meta = JSON.parse(document.getElementById('__rs_live_meta').textContent || '{}');
+  const styleEl = document.getElementById('__rs_live_styles');
+  const rootEl = document.getElementById('__rs_live_root');
+  let inputTimer = null;
+
+  function captureViewSnapshot() {
+    const scrolls = {};
+    const scrollers = rootEl.querySelectorAll('[data-rs-vm-nid]');
+    for (let i = 0; i < scrollers.length; i += 1) {
+      const el = scrollers[i];
+      if (el.scrollTop > 0 || el.scrollLeft > 0) {
+        scrolls[el.getAttribute('data-rs-vm-nid')] = { top: el.scrollTop, left: el.scrollLeft };
+      }
+    }
+    let focusInfo = null;
+    const ae = document.activeElement;
+    if (ae && ae !== document.body && rootEl.contains(ae)) {
+      const nid = ae.getAttribute('data-rs-vm-nid');
+      if (nid) {
+        focusInfo = {
+          nid: nid,
+          start: typeof ae.selectionStart === 'number' ? ae.selectionStart : null,
+          end: typeof ae.selectionEnd === 'number' ? ae.selectionEnd : null,
+        };
+      }
+    }
+    return { winTop: window.scrollY || 0, winLeft: window.scrollX || 0, scrolls: scrolls, focusInfo: focusInfo };
+  }
+
+  function restoreViewSnapshot(snap) {
+    if (!snap) return;
+    const keys = Object.keys(snap.scrolls || {});
+    for (let i = 0; i < keys.length; i += 1) {
+      const nid = keys[i];
+      const pos = snap.scrolls[nid];
+      const el = rootEl.querySelector('[data-rs-vm-nid="' + nid + '"]');
+      if (el && pos) {
+        el.scrollTop = pos.top || 0;
+        el.scrollLeft = pos.left || 0;
+      }
+    }
+    if (snap.winTop || snap.winLeft) {
+      try { window.scrollTo(snap.winLeft || 0, snap.winTop || 0); } catch (_) {}
+    }
+    if (snap.focusInfo && snap.focusInfo.nid) {
+      const fe = rootEl.querySelector('[data-rs-vm-nid="' + snap.focusInfo.nid + '"]');
+      if (fe && typeof fe.focus === 'function') {
+        try {
+          fe.focus({ preventScroll: true });
+          if (typeof fe.setSelectionRange === 'function' && snap.focusInfo.start !== null) {
+            fe.setSelectionRange(snap.focusInfo.start, snap.focusInfo.end);
+          }
+        } catch (_) {}
+      }
+    }
+  }
+
+  let appliedHtmlClasses = [];
+  let appliedHtmlDataKeys = [];
+  let appliedBodyClasses = [];
+  let appliedBodyDataKeys = [];
+  let lastStylesText = '';
+  let lastRootAttrsJson = '';
+
+  function applyRootAttrs(ra) {
+    const attrs = ra && typeof ra === 'object' ? ra : {};
+    const htmlEl = document.documentElement;
+    const bodyEl = document.body;
+    for (let i = 0; i < appliedHtmlClasses.length; i += 1) {
+      htmlEl.classList.remove(appliedHtmlClasses[i]);
+    }
+    appliedHtmlClasses = String(attrs.htmlClass || '').split(/\\s+/).filter(Boolean);
+    for (let i = 0; i < appliedHtmlClasses.length; i += 1) {
+      htmlEl.classList.add(appliedHtmlClasses[i]);
+    }
+    for (let i = 0; i < appliedHtmlDataKeys.length; i += 1) {
+      htmlEl.removeAttribute(appliedHtmlDataKeys[i]);
+    }
+    appliedHtmlDataKeys = [];
+    if (attrs.htmlData && typeof attrs.htmlData === 'object') {
+      const hKeys = Object.keys(attrs.htmlData);
+      for (let i = 0; i < hKeys.length; i += 1) {
+        const k = hKeys[i];
+        if (/^data-[a-z0-9_-]+$/i.test(k)) {
+          htmlEl.setAttribute(k, String(attrs.htmlData[k] ?? ''));
+          appliedHtmlDataKeys.push(k);
+        }
+      }
+    }
+    htmlEl.style.cssText = String(attrs.htmlStyle || '');
+
+    for (let i = 0; i < appliedBodyClasses.length; i += 1) {
+      rootEl.classList.remove(appliedBodyClasses[i]);
+      if (bodyEl) bodyEl.classList.remove(appliedBodyClasses[i]);
+    }
+    appliedBodyClasses = String(attrs.bodyClass || '').split(/\\s+/).filter(Boolean);
+    for (let i = 0; i < appliedBodyClasses.length; i += 1) {
+      rootEl.classList.add(appliedBodyClasses[i]);
+      if (bodyEl) bodyEl.classList.add(appliedBodyClasses[i]);
+    }
+    for (let i = 0; i < appliedBodyDataKeys.length; i += 1) {
+      rootEl.removeAttribute(appliedBodyDataKeys[i]);
+      if (bodyEl) bodyEl.removeAttribute(appliedBodyDataKeys[i]);
+    }
+    appliedBodyDataKeys = [];
+    if (attrs.bodyData && typeof attrs.bodyData === 'object') {
+      const bKeys = Object.keys(attrs.bodyData);
+      for (let i = 0; i < bKeys.length; i += 1) {
+        const k = bKeys[i];
+        if (/^data-[a-z0-9_-]+$/i.test(k)) {
+          const valStr = String(attrs.bodyData[k] ?? '');
+          rootEl.setAttribute(k, valStr);
+          if (bodyEl) bodyEl.setAttribute(k, valStr);
+          appliedBodyDataKeys.push(k);
+        }
+      }
+    }
+    rootEl.style.cssText = String(attrs.bodyStyle || '');
+  }
+
+  window.addEventListener('message', (ev) => {
+    const d = ev && ev.data;
+    if (!d || typeof d !== 'object') return;
+    if (d.__rsLiveGuiRender === 1) {
+      if (d.unchanged === true && !d.emptyMessage) return;
+      const snap = captureViewSnapshot();
+      const raJson = JSON.stringify(d.rootAttrs || null);
+      if (raJson !== lastRootAttrsJson) {
+        lastRootAttrsJson = raJson;
+        applyRootAttrs(d.rootAttrs);
+      }
+      if (!d.stylesUnchanged && Array.isArray(d.styles)) {
+        const joinedStyles = d.styles.join('\\n\\n');
+        if (joinedStyles !== lastStylesText && styleEl) {
+          styleEl.textContent = joinedStyles;
+          lastStylesText = joinedStyles;
+        }
+      }
+      const html = String(d.html || '');
+      if (html.trim()) {
+        rootEl.innerHTML = html;
+      } else {
+        rootEl.innerHTML = '<div id="__rs_live_boot">' + (d.emptyMessage ? String(d.emptyMessage) : '표시할 라이브 GUI DOM이 없습니다.') + '</div>';
+      }
+      restoreViewSnapshot(snap);
+    }
+  });
+
+  rootEl.addEventListener('click', (e) => {
+    const raw = e.target;
+    const target = raw && raw.closest ? raw.closest('[data-rs-vm-nid]') : null;
+    if (!target || target === rootEl) return;
+    if (target.closest && target.closest('button:disabled, fieldset:disabled')) return;
+    const tag = String(target.tagName || '').toUpperCase();
+    const typ = String(target.type || '').toLowerCase();
+    if (tag === 'INPUT' && (typ === 'checkbox' || typ === 'radio')) {
+      return;
+    }
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || tag === 'OPTION') {
+      if (typ !== 'button' && typ !== 'submit' && typ !== 'reset') {
+        return;
+      }
+    }
+    const labelWrap = raw && raw.closest ? raw.closest('label') : null;
+    if (labelWrap && labelWrap.control && !(raw.closest && raw.closest('button, a, select, textarea'))) {
+      const cTag = String(labelWrap.control.tagName || '').toUpperCase();
+      const cTyp = String(labelWrap.control.type || '').toLowerCase();
+      if (cTag === 'INPUT' && (cTyp === 'checkbox' || cTyp === 'radio') && !labelWrap.control.disabled) {
+        return;
+      }
+    }
+    if (tag === 'A' && String(target.getAttribute('href') || '').trim() === '#') {
+      e.preventDefault();
+    }
+    const nid = Number(target.getAttribute('data-rs-vm-nid') || 0);
+    if (!nid) return;
+    window.parent.postMessage({
+      __rsLiveGuiEvent: 1,
+      pluginName: meta.name,
+      eventType: 'click',
+      nodeId: nid,
+      x: Math.round(Number(e.clientX) || 24),
+      y: Math.round(Number(e.clientY) || 24),
+    }, '*');
+  });
+
+  rootEl.addEventListener('input', (e) => {
+    const target = e.target && e.target.closest ? e.target.closest('[data-rs-vm-nid]') : null;
+    if (!target || target === rootEl) return;
+    const tag = String(target.tagName || '').toUpperCase();
+    const typ = String(target.type || '').toLowerCase();
+    if (tag === 'SELECT' || typ === 'checkbox' || typ === 'radio') return;
+    const nid = Number(target.getAttribute('data-rs-vm-nid') || 0);
+    if (!nid) return;
+    const val = String(target.value ?? '');
+    if (inputTimer) clearTimeout(inputTimer);
+    inputTimer = setTimeout(() => {
+      inputTimer = null;
+      window.parent.postMessage({
+        __rsLiveGuiEvent: 1,
+        pluginName: meta.name,
+        eventType: 'input',
+        nodeId: nid,
+        value: val,
+      }, '*');
+    }, 100);
+  });
+
+  rootEl.addEventListener('change', (e) => {
+    const target = e.target && e.target.closest ? e.target.closest('[data-rs-vm-nid]') : null;
+    if (!target || target === rootEl) return;
+    if (inputTimer) {
+      clearTimeout(inputTimer);
+      inputTimer = null;
+    }
+    const nid = Number(target.getAttribute('data-rs-vm-nid') || 0);
+    if (!nid) return;
+    const typ = String(target.type || '').toLowerCase();
+    const payload = {
+      __rsLiveGuiEvent: 1,
+      pluginName: meta.name,
+      eventType: 'change',
+      nodeId: nid,
+      value: String(target.value ?? ''),
+    };
+    if (typ === 'checkbox' || typ === 'radio') {
+      payload.checked = Boolean(target.checked);
+      payload.fireClick = true;
+    }
+    window.parent.postMessage({ ...payload }, '*');
+  });
+
+  window.parent.postMessage({ __rsLiveGuiReady: 1, pluginName: meta.name }, '*');
+})();
+</script>
+</body>
+</html>`;
+}
+
+/**
  * Generates an isolated sandboxed iframe HTML (`srcdoc`) that implements RisuAI API v3
  * for rendering a plugin's real native GUI (`registerSetting` / `registerButton` / `getRootDocument`).
  */
@@ -2636,6 +4676,8 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark', webLocalSn
       setItem: (k, v) => rpcCall('localPluginStorage.setItem', [String(k ?? ''), v]),
       removeItem: (k) => rpcCall('localPluginStorage.removeItem', [String(k ?? '')]),
       keys: () => rpcCall('localPluginStorage.keys', []),
+      key: (i) => rpcCall('localPluginStorage.key', [Number(i)]),
+      length: () => rpcCall('localPluginStorage.length', []),
       clear: () => rpcCall('localPluginStorage.clear', []),
     }),
 
@@ -3325,6 +5367,23 @@ function createPluginAdapter({
     let lastActiveLocation = { charIndex: -1, chatIndex: -1 };
     let flushDirtyInFlight = null;
     let pendingChatOutputs = 0;
+    const pendingPluginAsyncOps = new Map();
+
+    async function trackPluginAsync(pluginName, fn) {
+        const key = String(pluginName || '').trim();
+        if (key) {
+            pendingPluginAsyncOps.set(key, (pendingPluginAsyncOps.get(key) || 0) + 1);
+        }
+        try {
+            return await fn();
+        } finally {
+            if (key) {
+                const next = (pendingPluginAsyncOps.get(key) || 1) - 1;
+                if (next <= 0) pendingPluginAsyncOps.delete(key);
+                else pendingPluginAsyncOps.set(key, next);
+            }
+        }
+    }
 
     function saveStorageToDiskNow() {
         if (storageSaveTimer) {
@@ -3630,166 +5689,176 @@ function createPluginAdapter({
 
     // ---- Shared Direct Host Storage & DB Primitives ----
     async function storeGet(storeKind, key, pluginName = '') {
-        const k = String(key);
-        recordStorageEvent(pluginName, { op: 'read', storeKind, key: k, ok: true });
-        const dirtyClear = dirtyStoreOps.get(`${storeKind}\0*`);
-        const dirty = dirtyStoreOps.get(`${storeKind}\0${k}`);
-        if (dirty) {
-            return dirty.op === 'remove' ? null : cloneJson(dirty.value);
-        }
-        if (dirtyClear && dirtyClear.op === 'clear') {
-            return null;
-        }
-        if (storeKind === 'pluginStorage') {
-            if (turnCache.active && turnCache.pluginStoreCache.has(k)) {
-                return cloneJson(turnCache.pluginStoreCache.get(k));
+        return trackPluginAsync(pluginName, async () => {
+            const k = String(key);
+            recordStorageEvent(pluginName, { op: 'read', storeKind, key: k, ok: true });
+            const dirtyClear = dirtyStoreOps.get(`${storeKind}\0*`);
+            const dirty = dirtyStoreOps.get(`${storeKind}\0${k}`);
+            if (dirty) {
+                return dirty.op === 'remove' ? null : cloneJson(dirty.value);
             }
-            let val;
-            if (isRpcConnected()) {
-                try {
-                    val = await cachedRpcRead(`store:pluginStorage:${k}`, () => hostRpc.invoke('pluginStorage.getItem', [k]));
-                } catch (err) {
-                    console.warn(`[PluginAdapter] pluginStorage.getItem(${k}) RPC fallback:`, err && err.message ? err.message : String(err));
+            if (dirtyClear && dirtyClear.op === 'clear') {
+                return null;
+            }
+            if (storeKind === 'pluginStorage') {
+                if (turnCache.active && turnCache.pluginStoreCache.has(k)) {
+                    return cloneJson(turnCache.pluginStoreCache.get(k));
+                }
+                let val;
+                if (isRpcConnected()) {
+                    try {
+                        val = await cachedRpcRead(`store:pluginStorage:${k}`, () => hostRpc.invoke('pluginStorage.getItem', [k]));
+                    } catch (err) {
+                        console.warn(`[PluginAdapter] pluginStorage.getItem(${k}) RPC fallback:`, err && err.message ? err.message : String(err));
+                        val = readFallbackStoreValue('pluginStorage', k);
+                    }
+                } else {
                     val = readFallbackStoreValue('pluginStorage', k);
                 }
-            } else {
-                val = readFallbackStoreValue('pluginStorage', k);
+                if (turnCache.active) {
+                    turnCache.pluginStoreCache.set(k, val === undefined ? null : cloneJson(val));
+                }
+                return val === undefined ? null : val;
             }
-            if (turnCache.active) {
-                turnCache.pluginStoreCache.set(k, val === undefined ? null : cloneJson(val));
+            const op = `${storeKind}.getItem`;
+            if (isRpcConnected()) {
+                try {
+                    const v = await cachedRpcRead(`store:${storeKind}:${k}`, () => hostRpc.invoke(op, [k]));
+                    return v === undefined ? null : v;
+                } catch (err) {
+                    console.warn(`[PluginAdapter] ${op}(${k}) RPC fallback:`, err && err.message ? err.message : String(err));
+                    return readFallbackStoreValue(storeKind, k);
+                }
             }
-            return val === undefined ? null : val;
-        }
-        const op = `${storeKind}.getItem`;
-        if (isRpcConnected()) {
-            try {
-                const v = await cachedRpcRead(`store:${storeKind}:${k}`, () => hostRpc.invoke(op, [k]));
-                return v === undefined ? null : v;
-            } catch (err) {
-                console.warn(`[PluginAdapter] ${op}(${k}) RPC fallback:`, err && err.message ? err.message : String(err));
-                return readFallbackStoreValue(storeKind, k);
-            }
-        }
-        return readFallbackStoreValue(storeKind, k);
+            return readFallbackStoreValue(storeKind, k);
+        });
     }
 
     async function storeSet(storeKind, key, value, pluginName = '') {
-        const k = String(key);
-        deleteReadCacheKey(`store:${storeKind}:${k}`);
-        deleteReadCacheKey(`storeKeys:${storeKind}`);
-        const normalizedVal = writeFallbackStoreValue(storeKind, k, value);
-        if (storeKind === 'pluginStorage' && turnCache.active) {
-            turnCache.pluginStoreCache.set(k, cloneJson(normalizedVal));
-        }
-        const dk = `${storeKind}\0${k}`;
-        if (isRpcConnected()) {
-            try {
-                if (dirtyStoreOps.size > 0) await flushDirtyStoreOps();
-                await hostRpc.invoke(`${storeKind}.setItem`, [k, normalizedVal]);
-                dirtyStoreOps.delete(dk);
+        return trackPluginAsync(pluginName, async () => {
+            const k = String(key);
+            deleteReadCacheKey(`store:${storeKind}:${k}`);
+            deleteReadCacheKey(`storeKeys:${storeKind}`);
+            const normalizedVal = writeFallbackStoreValue(storeKind, k, value);
+            if (storeKind === 'pluginStorage' && turnCache.active) {
+                turnCache.pluginStoreCache.set(k, cloneJson(normalizedVal));
+            }
+            const dk = `${storeKind}\0${k}`;
+            if (isRpcConnected()) {
+                try {
+                    if (dirtyStoreOps.size > 0) await flushDirtyStoreOps();
+                    await hostRpc.invoke(`${storeKind}.setItem`, [k, normalizedVal]);
+                    dirtyStoreOps.delete(dk);
+                    recordStorageEvent(pluginName, { op: 'write', storeKind, key: k, ok: true });
+                    scheduleSaveStorage();
+                } catch (err) {
+                    const errMsg = err && err.message ? err.message : String(err);
+                    console.warn(`[PluginAdapter] ${storeKind}.setItem(${k}) deferred:`, errMsg);
+                    dirtyStoreOps.set(dk, { storeKind, key: k, op: 'set', value: cloneJson(normalizedVal) });
+                    recordStorageEvent(pluginName, { op: 'write', storeKind, key: k, ok: false, error: errMsg });
+                    scheduleSaveStorage();
+                }
+            } else {
+                dirtyStoreOps.set(dk, { storeKind, key: k, op: 'set', value: cloneJson(normalizedVal) });
                 recordStorageEvent(pluginName, { op: 'write', storeKind, key: k, ok: true });
                 scheduleSaveStorage();
-            } catch (err) {
-                const errMsg = err && err.message ? err.message : String(err);
-                console.warn(`[PluginAdapter] ${storeKind}.setItem(${k}) deferred:`, errMsg);
-                dirtyStoreOps.set(dk, { storeKind, key: k, op: 'set', value: cloneJson(normalizedVal) });
-                recordStorageEvent(pluginName, { op: 'write', storeKind, key: k, ok: false, error: errMsg });
-                scheduleSaveStorage();
             }
-        } else {
-            dirtyStoreOps.set(dk, { storeKind, key: k, op: 'set', value: cloneJson(normalizedVal) });
-            recordStorageEvent(pluginName, { op: 'write', storeKind, key: k, ok: true });
-            scheduleSaveStorage();
-        }
-        return true;
+            return true;
+        });
     }
 
     async function storeRemove(storeKind, key, pluginName = '') {
-        const k = String(key);
-        deleteReadCacheKey(`store:${storeKind}:${k}`);
-        deleteReadCacheKey(`storeKeys:${storeKind}`);
-        if (storeKind === 'pluginStorage' && turnCache.active) {
-            turnCache.pluginStoreCache.set(k, null);
-        }
-        const fb = storeKind === 'pluginStorage' ? fallbackPluginStore : (storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin);
-        fb.delete(k);
-        const dk = `${storeKind}\0${k}`;
-        if (isRpcConnected()) {
-            try {
-                await hostRpc.invoke(`${storeKind}.removeItem`, [k]);
-                dirtyStoreOps.delete(dk);
+        return trackPluginAsync(pluginName, async () => {
+            const k = String(key);
+            deleteReadCacheKey(`store:${storeKind}:${k}`);
+            deleteReadCacheKey(`storeKeys:${storeKind}`);
+            if (storeKind === 'pluginStorage' && turnCache.active) {
+                turnCache.pluginStoreCache.set(k, null);
+            }
+            const fb = storeKind === 'pluginStorage' ? fallbackPluginStore : (storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin);
+            fb.delete(k);
+            const dk = `${storeKind}\0${k}`;
+            if (isRpcConnected()) {
+                try {
+                    await hostRpc.invoke(`${storeKind}.removeItem`, [k]);
+                    dirtyStoreOps.delete(dk);
+                    recordStorageEvent(pluginName, { op: 'write', storeKind, key: k, ok: true });
+                    scheduleSaveStorage();
+                } catch (err) {
+                    const errMsg = err && err.message ? err.message : String(err);
+                    console.warn(`[PluginAdapter] ${storeKind}.removeItem(${k}) deferred:`, errMsg);
+                    dirtyStoreOps.set(dk, { storeKind, key: k, op: 'remove' });
+                    recordStorageEvent(pluginName, { op: 'write', storeKind, key: k, ok: false, error: errMsg });
+                    scheduleSaveStorage();
+                }
+            } else {
+                dirtyStoreOps.set(dk, { storeKind, key: k, op: 'remove' });
                 recordStorageEvent(pluginName, { op: 'write', storeKind, key: k, ok: true });
                 scheduleSaveStorage();
-            } catch (err) {
-                const errMsg = err && err.message ? err.message : String(err);
-                console.warn(`[PluginAdapter] ${storeKind}.removeItem(${k}) deferred:`, errMsg);
-                dirtyStoreOps.set(dk, { storeKind, key: k, op: 'remove' });
-                recordStorageEvent(pluginName, { op: 'write', storeKind, key: k, ok: false, error: errMsg });
-                scheduleSaveStorage();
             }
-        } else {
-            dirtyStoreOps.set(dk, { storeKind, key: k, op: 'remove' });
-            recordStorageEvent(pluginName, { op: 'write', storeKind, key: k, ok: true });
-            scheduleSaveStorage();
-        }
-        return true;
+            return true;
+        });
     }
 
     async function storeClear(storeKind, pluginName = '') {
-        invalidateReadCache(`store:${storeKind}:`);
-        deleteReadCacheKey(`storeKeys:${storeKind}`);
-        if (storeKind === 'pluginStorage' && turnCache.active) {
-            turnCache.pluginStoreCache.clear();
-        }
-        const fb = storeKind === 'pluginStorage' ? fallbackPluginStore : (storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin);
-        fb.clear();
-        clearDirtyOpsForStore(storeKind);
-        if (isRpcConnected()) {
-            try {
-                await hostRpc.invoke(`${storeKind}.clear`, []);
+        return trackPluginAsync(pluginName, async () => {
+            invalidateReadCache(`store:${storeKind}:`);
+            deleteReadCacheKey(`storeKeys:${storeKind}`);
+            if (storeKind === 'pluginStorage' && turnCache.active) {
+                turnCache.pluginStoreCache.clear();
+            }
+            const fb = storeKind === 'pluginStorage' ? fallbackPluginStore : (storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin);
+            fb.clear();
+            clearDirtyOpsForStore(storeKind);
+            if (isRpcConnected()) {
+                try {
+                    await hostRpc.invoke(`${storeKind}.clear`, []);
+                    recordStorageEvent(pluginName, { op: 'write', storeKind, key: '*', ok: true });
+                    scheduleSaveStorage();
+                } catch (err) {
+                    const errMsg = err && err.message ? err.message : String(err);
+                    console.warn(`[PluginAdapter] ${storeKind}.clear deferred:`, errMsg);
+                    dirtyStoreOps.set(`${storeKind}\0*`, { storeKind, key: '*', op: 'clear' });
+                    recordStorageEvent(pluginName, { op: 'write', storeKind, key: '*', ok: false, error: errMsg });
+                    scheduleSaveStorage();
+                }
+            } else {
+                dirtyStoreOps.set(`${storeKind}\0*`, { storeKind, key: '*', op: 'clear' });
                 recordStorageEvent(pluginName, { op: 'write', storeKind, key: '*', ok: true });
                 scheduleSaveStorage();
-            } catch (err) {
-                const errMsg = err && err.message ? err.message : String(err);
-                console.warn(`[PluginAdapter] ${storeKind}.clear deferred:`, errMsg);
-                dirtyStoreOps.set(`${storeKind}\0*`, { storeKind, key: '*', op: 'clear' });
-                recordStorageEvent(pluginName, { op: 'write', storeKind, key: '*', ok: false, error: errMsg });
-                scheduleSaveStorage();
             }
-        } else {
-            dirtyStoreOps.set(`${storeKind}\0*`, { storeKind, key: '*', op: 'clear' });
-            recordStorageEvent(pluginName, { op: 'write', storeKind, key: '*', ok: true });
-            scheduleSaveStorage();
-        }
-        return true;
+            return true;
+        });
     }
 
     async function storeKeys(storeKind, pluginName = '') {
-        recordStorageEvent(pluginName, { op: 'read', storeKind, key: '*', ok: true });
-        let baseKeys = [];
-        const hasPendingClear = dirtyStoreOps.has(`${storeKind}\0*`);
-        if (!hasPendingClear) {
-            if (isRpcConnected()) {
-                try {
-                    const ks = await cachedRpcRead(`storeKeys:${storeKind}`, () => hostRpc.invoke(`${storeKind}.keys`, []));
-                    baseKeys = Array.isArray(ks) ? ks.map(String) : [];
-                } catch (_) {
+        return trackPluginAsync(pluginName, async () => {
+            recordStorageEvent(pluginName, { op: 'read', storeKind, key: '*', ok: true });
+            let baseKeys = [];
+            const hasPendingClear = dirtyStoreOps.has(`${storeKind}\0*`);
+            if (!hasPendingClear) {
+                if (isRpcConnected()) {
+                    try {
+                        const ks = await cachedRpcRead(`storeKeys:${storeKind}`, () => hostRpc.invoke(`${storeKind}.keys`, []));
+                        baseKeys = Array.isArray(ks) ? ks.map(String) : [];
+                    } catch (_) {
+                        const fb = storeKind === 'pluginStorage' ? fallbackPluginStore : (storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin);
+                        baseKeys = Array.from(fb.keys());
+                    }
+                } else {
                     const fb = storeKind === 'pluginStorage' ? fallbackPluginStore : (storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin);
                     baseKeys = Array.from(fb.keys());
                 }
-            } else {
-                const fb = storeKind === 'pluginStorage' ? fallbackPluginStore : (storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin);
-                baseKeys = Array.from(fb.keys());
             }
-        }
-        const keySet = new Set(baseKeys);
-        const prefix = `${storeKind}\0`;
-        for (const [dk, entry] of dirtyStoreOps.entries()) {
-            if (!dk.startsWith(prefix)) continue;
-            if (entry.op === 'set' && entry.key) keySet.add(entry.key);
-            else if (entry.op === 'remove' && entry.key) keySet.delete(entry.key);
-        }
-        return Array.from(keySet);
+            const keySet = new Set(baseKeys);
+            const prefix = `${storeKind}\0`;
+            for (const [dk, entry] of dirtyStoreOps.entries()) {
+                if (!dk.startsWith(prefix)) continue;
+                if (entry.op === 'set' && entry.key) keySet.add(entry.key);
+                else if (entry.op === 'remove' && entry.key) keySet.delete(entry.key);
+            }
+            return Array.from(keySet);
+        });
     }
 
     function ensureStableChatAndMessageIds(charObj, charIdx, chatObj, chatIdx) {
@@ -4284,81 +6353,202 @@ function createPluginAdapter({
         };
     }
 
-    function makePluginApiFor(entry, record, sharedMockDom) {
+    function createVmRealmHelper(sandbox) {
+        if (!sandbox) {
+            return {
+                makeObj: (pairs) => {
+                    const o = {};
+                    if (Array.isArray(pairs)) {
+                        for (const [k, v] of pairs) o[k] = v;
+                    }
+                    return o;
+                },
+                internalize: (v) => v,
+                cloneForVm: (v) => structuredClone(v),
+                toVmError: (err) => (err instanceof Error ? err : new Error(String(err ?? 'Error'))),
+                wrapVmAsync: (fn) => (...args) => Promise.resolve().then(() => fn(...args)),
+            };
+        }
+        const parseJsonInVm = vm.runInContext('(function(s){ return JSON.parse(s); })', sandbox);
+        const makeErrorInVm = vm.runInContext('(function(msg, name){ var e = new Error(String(msg == null ? "Error" : msg)); if (name) e.name = String(name); return e; })', sandbox);
+        const makeObjInVm = vm.runInContext('(function(pairs){ var o = {}; if (pairs) { for (var i = 0; i < pairs.length; i++) o[pairs[i][0]] = pairs[i][1]; } return o; })', sandbox);
+        const wrapPromiseInVm = vm.runInContext('(function(hostP, onVal, onErr){ return new Promise(function(res, rej){ Promise.resolve(hostP).then(function(v){ try { res(onVal ? onVal(v) : v); } catch (e) { rej(e); } }, function(err){ rej(onErr ? onErr(err) : err); }); }); })', sandbox);
+        const cloneInVm = vm.runInContext(`(function(){
+            function isBin(val) {
+                if (!val || typeof val !== 'object') return false;
+                var tag = Object.prototype.toString.call(val);
+                if (tag === '[object Uint8Array]' || tag === '[object ArrayBuffer]' || tag === '[object DataView]' || tag === '[object Int8Array]' || tag === '[object Uint8ClampedArray]' || tag === '[object Int16Array]' || tag === '[object Uint16Array]' || tag === '[object Int32Array]' || tag === '[object Uint32Array]' || tag === '[object Float32Array]' || tag === '[object Float64Array]') return true;
+                return typeof val.byteLength === 'number' && Boolean(val.buffer && typeof val.buffer.byteLength === 'number');
+            }
+            function cloneVal(val, seen, copyBin) {
+                if (val === null || val === undefined || typeof val !== 'object') return val;
+                if (typeof val === 'function' || typeof val.nodeType === 'number') return val;
+                if (isBin(val)) {
+                    if (!copyBin) return val;
+                    var tagB = Object.prototype.toString.call(val);
+                    if (tagB === '[object ArrayBuffer]') return val.slice ? val.slice(0) : val;
+                    if (typeof Uint8Array === 'function' && tagB === '[object Uint8Array]') return new Uint8Array(val);
+                    return val;
+                }
+                var tag = Object.prototype.toString.call(val);
+                if (tag === '[object Date]') return new Date(val.getTime());
+                if (tag === '[object RegExp]') return new RegExp(val.source, val.flags);
+                if (!seen) seen = new WeakMap();
+                if (seen.has(val)) return seen.get(val);
+                if (Array.isArray(val) || tag === '[object Array]') {
+                    var arr = new Array(val.length);
+                    seen.set(val, arr);
+                    for (var i = 0; i < val.length; i++) {
+                        if (Object.prototype.hasOwnProperty.call(val, i)) {
+                            arr[i] = cloneVal(val[i], seen, copyBin);
+                        }
+                    }
+                    return arr;
+                }
+                if (tag === '[object Map]' && typeof val.forEach === 'function') {
+                    var m = new Map();
+                    seen.set(val, m);
+                    val.forEach(function(v, k) { m.set(cloneVal(k, seen, copyBin), cloneVal(v, seen, copyBin)); });
+                    return m;
+                }
+                if (tag === '[object Set]' && typeof val.forEach === 'function') {
+                    var s = new Set();
+                    seen.set(val, s);
+                    val.forEach(function(v) { s.add(cloneVal(v, seen, copyBin)); });
+                    return s;
+                }
+                var obj = {};
+                seen.set(val, obj);
+                var keys = Object.keys(val);
+                for (var j = 0; j < keys.length; j++) {
+                    var k = keys[j];
+                    obj[k] = cloneVal(val[k], seen, copyBin);
+                }
+                return obj;
+            }
+            return function(v, copyBin) { return cloneVal(v, null, Boolean(copyBin)); };
+        })()`, sandbox);
+
+        const internalize = (v) => {
+            if (v === null || v === undefined || typeof v !== 'object') return v;
+            if (isBinaryLike(v)) return v;
+            try {
+                return cloneInVm(v, false);
+            } catch (_) {
+                try {
+                    return parseJsonInVm(JSON.stringify(v));
+                } catch (__) {
+                    return v;
+                }
+            }
+        };
+        const cloneForVm = (v) => {
+            try {
+                return cloneInVm(v, true);
+            } catch (_) {
+                return internalize(structuredClone(v));
+            }
+        };
+        const toVmError = (err) => {
+            const msg = (err && typeof err === 'object' && err.message !== undefined) ? err.message : String(err ?? 'Error');
+            const errName = (err && typeof err === 'object' && err.name) ? err.name : 'Error';
+            return makeErrorInVm(msg, errName);
+        };
+        const wrapVmAsync = (fn, { internalize: doInt = true } = {}) => (...args) => {
+            let p;
+            try {
+                p = fn(...args);
+            } catch (err) {
+                return wrapPromiseInVm(Promise.reject(toVmError(err)), null, toVmError);
+            }
+            return wrapPromiseInVm(p, doInt ? internalize : null, toVmError);
+        };
+        return { makeObj: makeObjInVm, internalize, cloneForVm, toVmError, wrapVmAsync };
+    }
+
+    function makePluginApiFor(entry, record, sharedMockDom, vmRealm = createVmRealmHelper(null)) {
         const pluginName = entry.name;
         const trackedUnloads = [];
         const { asyncDoc } = sharedMockDom;
+        const { makeObj, internalize, wrapVmAsync } = vmRealm;
         const addUnload = (fn) => {
             if (typeof fn === 'function') trackedUnloads.push(fn);
         };
+        const getArgImpl = async (key) => {
+            const args = mergePluginArgs(getPluginEntry(pluginName) || entry);
+            const k = String(key || '');
+            return Object.prototype.hasOwnProperty.call(args, k) ? args[k] : undefined;
+        };
+        const setArgImpl = async (key, val) => {
+            const k = String(key || '');
+            if (!k) return;
+            const cfgMap = getPluginConfigMap();
+            if (!cfgMap[pluginName] || typeof cfgMap[pluginName] !== 'object') {
+                cfgMap[pluginName] = { enabled: isPluginEnabled(pluginName), argOverrides: {} };
+            }
+            if (!cfgMap[pluginName].argOverrides || typeof cfgMap[pluginName].argOverrides !== 'object') {
+                cfgMap[pluginName].argOverrides = {};
+            }
+            cfgMap[pluginName].argOverrides[k] = val;
+            saveBackendConfig();
+        };
 
-        const rawApi = {
-            apiVersion: '3.0',
-            apiVersionCompatibleWith: ['3.0'],
+        const rawApi = makeObj([
+            ['apiVersion', '3.0'],
+            ['apiVersionCompatibleWith', internalize(['3.0'])],
 
-            getArgument: async (key) => {
-                const args = mergePluginArgs(getPluginEntry(pluginName) || entry);
-                const k = String(key || '');
-                return Object.prototype.hasOwnProperty.call(args, k) ? args[k] : undefined;
-            },
-            setArgument: async (key, val) => {
-                const k = String(key || '');
-                if (!k) return;
-                const cfgMap = getPluginConfigMap();
-                if (!cfgMap[pluginName] || typeof cfgMap[pluginName] !== 'object') {
-                    cfgMap[pluginName] = { enabled: isPluginEnabled(pluginName), argOverrides: {} };
-                }
-                if (!cfgMap[pluginName].argOverrides || typeof cfgMap[pluginName].argOverrides !== 'object') {
-                    cfgMap[pluginName].argOverrides = {};
-                }
-                cfgMap[pluginName].argOverrides[k] = val;
-                saveBackendConfig();
-            },
-            getArg: async (arg) => {
+            ['getArgument', wrapVmAsync(getArgImpl)],
+            ['setArgument', wrapVmAsync(setArgImpl)],
+            ['getArg', wrapVmAsync(async (arg) => {
                 const s = String(arg || '');
                 const k = s.includes('::') ? s.split('::').slice(1).join('::') : s;
-                return await rawApi.getArgument(k);
-            },
-            setArg: async (arg, val) => {
+                return await getArgImpl(k);
+            })],
+            ['setArg', wrapVmAsync(async (arg, val) => {
                 const s = String(arg || '');
                 const k = s.includes('::') ? s.split('::').slice(1).join('::') : s;
-                return await rawApi.setArgument(k, val);
-            },
+                return await setArgImpl(k, val);
+            })],
 
-            pluginStorage: {
-                getItem: (k) => storeGet('pluginStorage', k, pluginName),
-                setItem: (k, v) => storeSet('pluginStorage', k, v, pluginName),
-                removeItem: (k) => storeRemove('pluginStorage', k, pluginName),
-                clear: () => storeClear('pluginStorage', pluginName),
-                keys: () => storeKeys('pluginStorage', pluginName),
-                key: async (i) => {
+            ['pluginStorage', makeObj([
+                ['getItem', wrapVmAsync((k) => storeGet('pluginStorage', k, pluginName))],
+                ['setItem', wrapVmAsync((k, v) => storeSet('pluginStorage', k, v, pluginName))],
+                ['removeItem', wrapVmAsync((k) => storeRemove('pluginStorage', k, pluginName))],
+                ['clear', wrapVmAsync(() => storeClear('pluginStorage', pluginName))],
+                ['keys', wrapVmAsync(() => storeKeys('pluginStorage', pluginName))],
+                ['key', wrapVmAsync(async (i) => {
                     const ks = await storeKeys('pluginStorage', pluginName);
                     return ks[Number(i)] ?? null;
-                },
-                length: async () => (await storeKeys('pluginStorage', pluginName)).length,
-            },
-            safeLocalStorage: {
-                getItem: (k) => storeGet('safeLocalStorage', k, pluginName),
-                setItem: (k, v) => storeSet('safeLocalStorage', k, v, pluginName),
-                removeItem: (k) => storeRemove('safeLocalStorage', k, pluginName),
-                clear: () => storeClear('safeLocalStorage', pluginName),
-                keys: () => storeKeys('safeLocalStorage', pluginName),
-                key: async (i) => {
+                })],
+                ['length', wrapVmAsync(async () => (await storeKeys('pluginStorage', pluginName)).length)],
+            ])],
+            ['safeLocalStorage', makeObj([
+                ['getItem', wrapVmAsync((k) => storeGet('safeLocalStorage', k, pluginName))],
+                ['setItem', wrapVmAsync((k, v) => storeSet('safeLocalStorage', k, v, pluginName))],
+                ['removeItem', wrapVmAsync((k) => storeRemove('safeLocalStorage', k, pluginName))],
+                ['clear', wrapVmAsync(() => storeClear('safeLocalStorage', pluginName))],
+                ['keys', wrapVmAsync(() => storeKeys('safeLocalStorage', pluginName))],
+                ['key', wrapVmAsync(async (i) => {
                     const ks = await storeKeys('safeLocalStorage', pluginName);
                     return ks[Number(i)] ?? null;
-                },
-                length: async () => (await storeKeys('safeLocalStorage', pluginName)).length,
-            },
-            getLocalPluginStorage: async () => ({
-                __classType: 'REMOTE_REQUIRED',
-                getItem: (k) => storeGet('localPluginStorage', k, pluginName),
-                setItem: (k, v) => storeSet('localPluginStorage', k, v, pluginName),
-                removeItem: (k) => storeRemove('localPluginStorage', k, pluginName),
-                keys: () => storeKeys('localPluginStorage', pluginName),
-                clear: () => storeClear('localPluginStorage', pluginName),
-            }),
+                })],
+                ['length', wrapVmAsync(async () => (await storeKeys('safeLocalStorage', pluginName)).length)],
+            ])],
+            ['getLocalPluginStorage', wrapVmAsync(async () => makeObj([
+                ['__classType', 'REMOTE_REQUIRED'],
+                ['getItem', wrapVmAsync((k) => storeGet('localPluginStorage', k, pluginName))],
+                ['setItem', wrapVmAsync((k, v) => storeSet('localPluginStorage', k, v, pluginName))],
+                ['removeItem', wrapVmAsync((k) => storeRemove('localPluginStorage', k, pluginName))],
+                ['keys', wrapVmAsync(() => storeKeys('localPluginStorage', pluginName))],
+                ['key', wrapVmAsync(async (i) => {
+                    const ks = await storeKeys('localPluginStorage', pluginName);
+                    return ks[Number(i)] ?? null;
+                })],
+                ['length', wrapVmAsync(async () => (await storeKeys('localPluginStorage', pluginName)).length)],
+                ['clear', wrapVmAsync(() => storeClear('localPluginStorage', pluginName))],
+            ]), { internalize: false })],
 
-            addRisuReplacer: async (mode, fn) => {
+            ['addRisuReplacer', wrapVmAsync(async (mode, fn) => {
                 if (typeof fn !== 'function') return;
                 if (mode !== 'beforeRequest' && mode !== 'afterRequest') {
                     throw new Error(`replacer handler named ${mode} not found`);
@@ -4371,16 +6561,16 @@ function createPluginAdapter({
                     const idx = list.indexOf(item);
                     if (idx >= 0) list.splice(idx, 1);
                 });
-            },
-            removeRisuReplacer: async (mode, fn) => {
+            })],
+            ['removeRisuReplacer', wrapVmAsync(async (mode, fn) => {
                 const list = hookState[mode];
                 if (!Array.isArray(list)) return;
                 for (let i = list.length - 1; i >= 0; i -= 1) {
                     if (list[i].pluginName === pluginName && (!fn || list[i].fn === fn)) list.splice(i, 1);
                 }
-            },
+            })],
 
-            addRisuScriptHandler: async (mode, fn) => {
+            ['addRisuScriptHandler', wrapVmAsync(async (mode, fn) => {
                 if (typeof fn !== 'function') return;
                 const key = `edit${mode}`;
                 const list = hookState[key];
@@ -4392,36 +6582,48 @@ function createPluginAdapter({
                     const idx = list.indexOf(item);
                     if (idx >= 0) list.splice(idx, 1);
                 });
-            },
-            removeRisuScriptHandler: async (mode, fn) => {
+            })],
+            ['removeRisuScriptHandler', wrapVmAsync(async (mode, fn) => {
                 const list = hookState[`edit${mode}`];
                 if (!Array.isArray(list)) return;
                 for (let i = list.length - 1; i >= 0; i -= 1) {
                     if (list[i].pluginName === pluginName && (!fn || list[i].fn === fn)) list.splice(i, 1);
                 }
-            },
+            })],
 
-            addRisuChatListener: async (mode, fn) => {
+            ['addRisuChatListener', wrapVmAsync(async (modeOrFn, fn) => {
+                let mode = modeOrFn;
+                let listener = fn;
+                if (typeof modeOrFn === 'function' && fn === undefined) {
+                    mode = 'output';
+                    listener = modeOrFn;
+                }
                 if (mode !== 'output') throw new Error(`chat listener mode ${mode} not found`);
-                if (typeof fn !== 'function') return;
-                const item = { pluginName, fn };
+                if (typeof listener !== 'function') return;
+                const item = { pluginName, fn: listener };
                 hookState.chatOutput.push(item);
                 if (!record.hooks.chatListeners.includes('output')) record.hooks.chatListeners.push('output');
                 addUnload(() => {
                     const idx = hookState.chatOutput.indexOf(item);
                     if (idx >= 0) hookState.chatOutput.splice(idx, 1);
                 });
-            },
-            removeRisuChatListener: async (mode, fn) => {
+            })],
+            ['removeRisuChatListener', wrapVmAsync(async (modeOrFn, fn) => {
+                let mode = modeOrFn;
+                let listener = fn;
+                if (typeof modeOrFn === 'function' && fn === undefined) {
+                    mode = 'output';
+                    listener = modeOrFn;
+                }
                 if (mode !== 'output') return;
                 for (let i = hookState.chatOutput.length - 1; i >= 0; i -= 1) {
-                    if (hookState.chatOutput[i].pluginName === pluginName && (!fn || hookState.chatOutput[i].fn === fn)) {
+                    if (hookState.chatOutput[i].pluginName === pluginName && (!listener || hookState.chatOutput[i].fn === listener)) {
                         hookState.chatOutput.splice(i, 1);
                     }
                 }
-            },
+            })],
 
-            registerBodyIntercepter: async (cb) => {
+            ['registerBodyIntercepter', wrapVmAsync(async (cb) => {
                 if (typeof cb !== 'function') return { id: '' };
                 const id = `bi_${pluginName}_${++record.seq}`;
                 const item = { id, pluginName, fn: cb };
@@ -4431,41 +6633,44 @@ function createPluginAdapter({
                     if (idx >= 0) hookState.bodyIntercepter.splice(idx, 1);
                 });
                 return { id };
-            },
-            unregisterBodyIntercepter: async (id) => {
+            })],
+            ['unregisterBodyIntercepter', wrapVmAsync(async (id) => {
                 for (let i = hookState.bodyIntercepter.length - 1; i >= 0; i -= 1) {
                     if (hookState.bodyIntercepter[i].id === String(id)) hookState.bodyIntercepter.splice(i, 1);
                 }
-            },
+            })],
 
-            registerSetting: async (name, _cb, icon = '', iconType = 'none', providedId) => {
+            ['registerSetting', wrapVmAsync(async (name, _cb, icon = '', iconType = 'none', providedId) => {
                 const id = providedId || `set_${++record.seq}`;
                 const ui = { id, kind: 'setting', name: String(name || '설정'), icon: String(icon || ''), iconType: iconType || 'none', location: 'setting' };
                 const idx = record.uiItems.findIndex((u) => u.id === id);
                 if (idx >= 0) record.uiItems[idx] = ui;
                 else record.uiItems.push(ui);
+                if (typeof _cb === 'function' && record.uiCallbacks) record.uiCallbacks.set(id, _cb);
                 return { id };
-            },
-            registerButton: async (opts, _cb) => {
+            })],
+            ['registerButton', wrapVmAsync(async (opts, _cb) => {
                 const arg = opts && typeof opts === 'object' ? opts : {};
                 const id = arg.id || `btn_${++record.seq}`;
                 const ui = { id, kind: 'button', name: String(arg.name || 'GUI'), icon: String(arg.icon || ''), iconType: arg.iconType || 'none', location: arg.location || 'action' };
                 const idx = record.uiItems.findIndex((u) => u.id === id);
                 if (idx >= 0) record.uiItems[idx] = ui;
                 else record.uiItems.push(ui);
+                if (typeof _cb === 'function' && record.uiCallbacks) record.uiCallbacks.set(id, _cb);
                 return { id };
-            },
-            unregisterUIPart: async (id) => {
+            })],
+            ['unregisterUIPart', wrapVmAsync(async (id) => {
                 const targetId = String(id);
                 const idx = record.uiItems.findIndex((u) => u.id === targetId);
                 if (idx >= 0) record.uiItems.splice(idx, 1);
+                if (record.uiCallbacks) record.uiCallbacks.delete(targetId);
                 chatPanels.delete(`${pluginName}::${targetId}`);
                 try {
                     const sec = sharedMockDom.body.querySelector(`section[data-plugin-chat-panel="${targetId}"]`);
                     if (sec) sec.remove();
                 } catch (_) {}
-            },
-            setChatPanel: async (content, options = {}) => {
+            })],
+            ['setChatPanel', wrapVmAsync(async (content, options = {}) => {
                 const opts = options && typeof options === 'object' ? options : {};
                 const panelId = String(opts.id || `${pluginName}:default`);
                 const key = `${pluginName}::${panelId}`;
@@ -4500,9 +6705,9 @@ function createPluginAdapter({
                 const statusTxt = extractCleanPanelStatusText(content);
                 if (statusTxt) updateHookTaskDetail(pluginName, statusTxt, true);
                 return { id: panelId };
-            },
+            })],
 
-            addPluginChannelListener: async (channelName, cb) => {
+            ['addPluginChannelListener', wrapVmAsync(async (channelName, cb) => {
                 if (typeof cb !== 'function') return false;
                 const key = `${pluginName}\0${String(channelName)}`;
                 let set = pluginChannels.get(key);
@@ -4519,8 +6724,8 @@ function createPluginAdapter({
                     }
                 });
                 return true;
-            },
-            removePluginChannelListener: async (channelName, cb) => {
+            })],
+            ['removePluginChannelListener', wrapVmAsync(async (channelName, cb) => {
                 const key = `${pluginName}\0${String(channelName)}`;
                 if (typeof cb === 'function') {
                     const s = pluginChannels.get(key);
@@ -4532,8 +6737,8 @@ function createPluginAdapter({
                     pluginChannels.delete(key);
                 }
                 return true;
-            },
-            unregisterPluginChannelListener: async (channelName, cb) => {
+            })],
+            ['unregisterPluginChannelListener', wrapVmAsync(async (channelName, cb) => {
                 const key = `${pluginName}\0${String(channelName)}`;
                 if (typeof cb === 'function') {
                     const s = pluginChannels.get(key);
@@ -4545,13 +6750,23 @@ function createPluginAdapter({
                     pluginChannels.delete(key);
                 }
                 return true;
-            },
-            postPluginChannelMessage: (target, channel, msg) => postIpcMessage(getPluginEntry(pluginName) || entry, target, channel, msg),
+            })],
+            ['postPluginChannelMessage', wrapVmAsync((target, channel, msg) => postIpcMessage(getPluginEntry(pluginName) || entry, target, channel, msg))],
 
-            nativeFetch: (url, opts) => proxyFetchForPlugin(url, opts, false, pluginName),
-            risuFetch: (url, opts) => proxyFetchForPlugin(url, opts, true, pluginName),
+            ['nativeFetch', wrapVmAsync((url, opts) => trackPluginAsync(pluginName, () => proxyFetchForPlugin(url, opts, false, pluginName)), { internalize: false })],
+            ['risuFetch', wrapVmAsync(async (url, opts) => trackPluginAsync(pluginName, async () => {
+                const r = await proxyFetchForPlugin(url, opts, true, pluginName);
+                return makeObj([
+                    ['ok', Boolean(r && r.ok)],
+                    ['status', Number((r && r.status) || 0)],
+                    ['headers', internalize(r && r.headers)],
+                    ['data', internalize(r && r.data)],
+                    ['json', wrapVmAsync(async () => await r.json())],
+                    ['text', wrapVmAsync(async () => await r.text())],
+                ]);
+            }), { internalize: false })],
 
-            runLLMModel: async (req) => {
+            ['runLLMModel', wrapVmAsync(async (req) => trackPluginAsync(pluginName, async () => {
                 if (typeof runLLM !== 'function') {
                     return { type: 'fail', result: 'No LLM runner available in backend adapter' };
                 }
@@ -4568,38 +6783,38 @@ function createPluginAdapter({
                 } catch (err) {
                     return { type: 'fail', result: err && err.message ? err.message : String(err) };
                 }
-            },
+            }))],
 
-            getCurrentCharacterIndex: async () => (await dbGetCurrentIndices()).charIndex,
-            getCurrentChatIndex: async () => (await dbGetCurrentIndices()).chatIndex,
-            getCharacter: async () => dbGetCharacterFromIndex((await dbGetCurrentIndices()).charIndex),
-            getChar: async () => dbGetCharacterFromIndex((await dbGetCurrentIndices()).charIndex),
-            setCharacter: async (c) => dbSetCharacterToIndex((await dbGetCurrentIndices()).charIndex, c),
-            setChar: async (c) => dbSetCharacterToIndex((await dbGetCurrentIndices()).charIndex, c),
-            getCharacterFromIndex: (idx) => dbGetCharacterFromIndex(idx),
-            setCharacterToIndex: (idx, c) => dbSetCharacterToIndex(idx, c),
-            getChat: async () => {
+            ['getCurrentCharacterIndex', wrapVmAsync(() => trackPluginAsync(pluginName, async () => (await dbGetCurrentIndices()).charIndex))],
+            ['getCurrentChatIndex', wrapVmAsync(() => trackPluginAsync(pluginName, async () => (await dbGetCurrentIndices()).chatIndex))],
+            ['getCharacter', wrapVmAsync(() => trackPluginAsync(pluginName, async () => dbGetCharacterFromIndex((await dbGetCurrentIndices()).charIndex)))],
+            ['getChar', wrapVmAsync(() => trackPluginAsync(pluginName, async () => dbGetCharacterFromIndex((await dbGetCurrentIndices()).charIndex)))],
+            ['setCharacter', wrapVmAsync((c) => trackPluginAsync(pluginName, async () => dbSetCharacterToIndex((await dbGetCurrentIndices()).charIndex, c)))],
+            ['setChar', wrapVmAsync((c) => trackPluginAsync(pluginName, async () => dbSetCharacterToIndex((await dbGetCurrentIndices()).charIndex, c)))],
+            ['getCharacterFromIndex', wrapVmAsync((idx) => trackPluginAsync(pluginName, () => dbGetCharacterFromIndex(idx)))],
+            ['setCharacterToIndex', wrapVmAsync((idx, c) => trackPluginAsync(pluginName, () => dbSetCharacterToIndex(idx, c)))],
+            ['getChat', wrapVmAsync(() => trackPluginAsync(pluginName, async () => {
                 const idx = await dbGetCurrentIndices();
                 return dbGetChatFromIndex(idx.charIndex, idx.chatIndex);
-            },
-            getCurrentChat: async () => {
+            }))],
+            ['getCurrentChat', wrapVmAsync(() => trackPluginAsync(pluginName, async () => {
                 const idx = await dbGetCurrentIndices();
                 return dbGetChatFromIndex(idx.charIndex, idx.chatIndex);
-            },
-            setChat: async (chat) => {
+            }))],
+            ['setChat', wrapVmAsync((chat) => trackPluginAsync(pluginName, async () => {
                 const idx = await dbGetCurrentIndices();
                 return dbSetChatToIndex(idx.charIndex, idx.chatIndex, chat);
-            },
-            setCurrentChat: async (chat) => {
+            }))],
+            ['setCurrentChat', wrapVmAsync((chat) => trackPluginAsync(pluginName, async () => {
                 const idx = await dbGetCurrentIndices();
                 return dbSetChatToIndex(idx.charIndex, idx.chatIndex, chat);
-            },
-            getChatFromIndex: (cIdx, chIdx) => dbGetChatFromIndex(cIdx, chIdx),
-            setChatToIndex: (cIdx, chIdx, chat) => dbSetChatToIndex(cIdx, chIdx, chat),
-            getDatabase: (keys) => dbGetDatabase(keys),
-            setDatabaseLite: (patch) => dbSetDatabase('db.setDatabaseLite', patch),
-            setDatabase: (patch) => dbSetDatabase('db.setDatabase', patch),
-            loadPlugins: async () => {
+            }))],
+            ['getChatFromIndex', wrapVmAsync((cIdx, chIdx) => trackPluginAsync(pluginName, () => dbGetChatFromIndex(cIdx, chIdx)))],
+            ['setChatToIndex', wrapVmAsync((cIdx, chIdx, chat) => trackPluginAsync(pluginName, () => dbSetChatToIndex(cIdx, chIdx, chat)))],
+            ['getDatabase', wrapVmAsync((keys) => trackPluginAsync(pluginName, () => dbGetDatabase(keys)))],
+            ['setDatabaseLite', wrapVmAsync((patch) => trackPluginAsync(pluginName, () => dbSetDatabase('db.setDatabaseLite', patch)))],
+            ['setDatabase', wrapVmAsync((patch) => trackPluginAsync(pluginName, () => dbSetDatabase('db.setDatabase', patch)))],
+            ['loadPlugins', wrapVmAsync(async () => {
                 if (isRpcConnected()) {
                     await hostRpc.invoke('db.reloadPcPlugins', [], 8000).catch(() => {});
                 }
@@ -4607,8 +6822,8 @@ function createPluginAdapter({
                     reloadPlugins(pluginName).catch(() => {});
                 }, 25);
                 return true;
-            },
-            reloadPlugins: async () => {
+            })],
+            ['reloadPlugins', wrapVmAsync(async () => {
                 if (isRpcConnected()) {
                     await hostRpc.invoke('db.reloadPcPlugins', [], 8000).catch(() => {});
                 }
@@ -4616,8 +6831,8 @@ function createPluginAdapter({
                     reloadPlugins(pluginName).catch(() => {});
                 }, 25);
                 return true;
-            },
-            reload: async () => {
+            })],
+            ['reload', wrapVmAsync(async () => {
                 if (isRpcConnected()) {
                     await hostRpc.invoke('db.reloadPcPlugins', [], 8000).catch(() => {});
                 }
@@ -4625,37 +6840,55 @@ function createPluginAdapter({
                     reloadPlugins(pluginName).catch(() => {});
                 }, 25);
                 return true;
-            },
+            })],
 
-            onUnload: async (cb) => { addUnload(cb); },
-            getRootDocument: async () => asyncDoc,
-            getRootContainer: async () => asyncDoc.body,
-            getPluginRoot: async () => asyncDoc.body,
-            createMutationObserver: async (cb) => sharedMockDom.createMutationObserver(cb),
-            showContainer: async () => {
+            ['onUnload', wrapVmAsync(async (cb) => { addUnload(cb); })],
+            ['getRootDocument', wrapVmAsync(async () => asyncDoc, { internalize: false })],
+            ['getRootContainer', wrapVmAsync(async () => asyncDoc.body, { internalize: false })],
+            ['getPluginRoot', wrapVmAsync(async () => asyncDoc.body, { internalize: false })],
+            ['createMutationObserver', wrapVmAsync(async (cb) => sharedMockDom.createMutationObserver(cb), { internalize: false })],
+            ['showContainer', wrapVmAsync(async () => {
+                if (record && record.liveGui) record.liveGui.open = true;
                 if (activeActionTracker && !activeActionTracker.openedContainerPlugin) {
                     activeActionTracker.openedContainerPlugin = pluginName;
                 }
-            },
-            hideContainer: async () => {},
-            getRuntimeInfo: async () => ({ apiVersion: '3.0', platform: 'risustand-backend', saveMethod: 'local' }),
-            requestPluginPermission: async () => true,
-            unwarpSafeArray: async (a) => (Array.isArray(a) ? a : []),
-            getColorScheme: async () => ({ name: 'dark', type: 'dark', scheme: {} }),
-            getTextTheme: async () => ({ name: 'standard', customTheme: {} }),
-            changeColorScheme: async () => {},
-            setColorScheme: async () => {},
-            changeTextTheme: async () => {},
-            setCustomTextTheme: async () => {},
-            searchTranslationCache: async () => [],
-            getTranslationCache: async () => null,
-            getFetchLogs: async () => [],
-            checkCharOrder: async () => {},
-            readImage: (p) => assetReadImage(p),
-            readInlay: (id) => assetReadInlay(id),
-            saveAsset: (d) => assetSaveAsset(d),
-            createInlay: (d, opts) => assetCreateInlay(d, opts),
-            addProvider: async (name, func, options) => {
+                return true;
+            })],
+            ['hideContainer', wrapVmAsync(async () => {
+                if (record && record.liveGui) record.liveGui.open = false;
+                return true;
+            })],
+            ['getRuntimeInfo', wrapVmAsync(async () => ({ apiVersion: '3.0', platform: 'risustand-backend', saveMethod: 'local' }))],
+            ['requestPluginPermission', wrapVmAsync(async () => true)],
+            ['unwarpSafeArray', wrapVmAsync(async (a) => (Array.isArray(a) ? a : []))],
+            ['getColorScheme', wrapVmAsync(async () => ({
+                name: 'dark',
+                type: 'dark',
+                bgcolor: '#0f172a',
+                darkbg: '#0b1220',
+                borderc: '#334155',
+                selected: '#3b82f6',
+                draculared: '#ef4444',
+                textcolor: '#e2e8f0',
+                textcolor2: '#94a3b8',
+                darkBorderc: '#1e293b',
+                darkbuttonbg: '#1e293b',
+                scheme: { type: 'dark', bgcolor: '#0f172a', textcolor: '#e2e8f0' },
+            }))],
+            ['getTextTheme', wrapVmAsync(async () => ({ name: 'standard', customTheme: {} }))],
+            ['changeColorScheme', wrapVmAsync(async () => {})],
+            ['setColorScheme', wrapVmAsync(async () => {})],
+            ['changeTextTheme', wrapVmAsync(async () => {})],
+            ['setCustomTextTheme', wrapVmAsync(async () => {})],
+            ['searchTranslationCache', wrapVmAsync(async () => [])],
+            ['getTranslationCache', wrapVmAsync(async () => null)],
+            ['getFetchLogs', wrapVmAsync(async () => [])],
+            ['checkCharOrder', wrapVmAsync(async () => {})],
+            ['readImage', wrapVmAsync((p) => assetReadImage(p), { internalize: false })],
+            ['readInlay', wrapVmAsync((id) => assetReadInlay(id))],
+            ['saveAsset', wrapVmAsync((d) => assetSaveAsset(d))],
+            ['createInlay', wrapVmAsync((d, opts) => assetCreateInlay(d, opts))],
+            ['addProvider', wrapVmAsync(async (name, func, options) => {
                 const pKey = String(name || '').trim();
                 if (!pKey || typeof func !== 'function') return;
                 const rec = { pluginName, name: pKey, fn: func, options: (options && typeof options === 'object') ? cloneJson(options) : {} };
@@ -4666,14 +6899,14 @@ function createPluginAdapter({
                     const cur = providers.get(pKey);
                     if (cur === rec) providers.delete(pKey);
                 });
-            },
-            registerMCP: async () => {},
-            unregisterMCP: async () => {},
-            addTTSPreprocessor: async () => {},
-            addTTSPostprocessor: async () => {},
-            alertError: async (msg) => { console.warn(`[Plugin:${pluginName}] alertError:`, msg); },
-            log: (...args) => console.log(`[Plugin:${pluginName}]`, ...args),
-        };
+            })],
+            ['registerMCP', wrapVmAsync(async () => {})],
+            ['unregisterMCP', wrapVmAsync(async () => {})],
+            ['addTTSPreprocessor', wrapVmAsync(async () => {})],
+            ['addTTSPostprocessor', wrapVmAsync(async () => {})],
+            ['alertError', wrapVmAsync(async (msg) => { console.warn(`[Plugin:${pluginName}] alertError:`, msg); })],
+            ['log', (...args) => console.log(`[Plugin:${pluginName}]`, ...args)],
+        ]);
 
         const proxy = new Proxy(rawApi, {
             get(target, prop) {
@@ -4681,7 +6914,7 @@ function createPluginAdapter({
                 if (typeof prop === 'symbol' || prop === 'then' || prop === 'catch' || prop === 'finally' || prop === 'toJSON') {
                     return undefined;
                 }
-                return async () => undefined;
+                return wrapVmAsync(async () => undefined);
             },
         });
         return { api: proxy, trackedUnloads };
@@ -4893,6 +7126,48 @@ function createPluginAdapter({
             supports: () => true,
         };
         const noopObserver = class { observe() {} unobserve() {} disconnect() {} takeRecords() { return []; } };
+        class Storage {
+            static [Symbol.hasInstance](x) {
+                return Boolean(x && typeof x === 'object' && typeof x.getItem === 'function' && typeof x.setItem === 'function');
+            }
+        }
+        class NodeList {
+            static [Symbol.hasInstance](x) { return Array.isArray(x) || Boolean(x && typeof x === 'object' && typeof x.item === 'function'); }
+        }
+        class HTMLCollection {
+            static [Symbol.hasInstance](x) { return Array.isArray(x) || Boolean(x && typeof x === 'object' && typeof x.item === 'function'); }
+        }
+        class NamedNodeMap {
+            static [Symbol.hasInstance](x) { return Boolean(x && typeof x === 'object' && typeof x.getNamedItem === 'function'); }
+        }
+        class DOMTokenList {
+            static [Symbol.hasInstance](x) { return Boolean(x && typeof x === 'object' && typeof x.contains === 'function' && typeof x.toggle === 'function'); }
+        }
+        class CSSStyleDeclaration {
+            static [Symbol.hasInstance](x) { return Boolean(x && typeof x === 'object' && typeof x.setProperty === 'function'); }
+        }
+        const Option = function Option(text = '', value = undefined, defaultSelected = false, selected = false) {
+            const el = MockEl ? new MockEl('option') : null;
+            if (!el) return null;
+            if (text !== undefined && text !== null) el.textContent = String(text);
+            if (value !== undefined) el.setAttribute('value', String(value));
+            if (defaultSelected) el.defaultSelected = true;
+            if (selected) el.selected = true;
+            return el;
+        };
+        const Image = function Image(w, h) {
+            const el = MockEl ? new MockEl('img') : null;
+            if (!el) return null;
+            if (w !== undefined) el.setAttribute('width', String(w));
+            if (h !== undefined) el.setAttribute('height', String(h));
+            return el;
+        };
+        const Audio = function Audio(src) {
+            const el = MockEl ? new MockEl('audio') : null;
+            if (!el) return null;
+            if (src !== undefined) el.setAttribute('src', String(src));
+            return el;
+        };
         return {
             EventTarget,
             Node,
@@ -4902,11 +7177,29 @@ function createPluginAdapter({
             Text,
             Document,
             DocumentFragment,
+            Storage,
+            NodeList,
+            HTMLCollection,
+            NamedNodeMap,
+            DOMTokenList,
+            CSSStyleDeclaration,
+            Option,
+            Image,
+            Audio,
             HTMLInputElement: makeHtmlTagClass('INPUT'),
             HTMLTextAreaElement: makeHtmlTagClass('TEXTAREA'),
             HTMLButtonElement: makeHtmlTagClass('BUTTON'),
             HTMLImageElement: makeHtmlTagClass('IMG'),
             HTMLSelectElement: makeHtmlTagClass('SELECT'),
+            HTMLOptionElement: makeHtmlTagClass('OPTION'),
+            HTMLOptGroupElement: makeHtmlTagClass('OPTGROUP'),
+            HTMLLabelElement: makeHtmlTagClass('LABEL'),
+            HTMLFieldSetElement: makeHtmlTagClass('FIELDSET'),
+            HTMLTableElement: makeHtmlTagClass('TABLE'),
+            HTMLTableRowElement: makeHtmlTagClass('TR'),
+            HTMLTableCellElement: makeHtmlTagClass(['TD', 'TH']),
+            HTMLDetailsElement: makeHtmlTagClass('DETAILS'),
+            HTMLDialogElement: makeHtmlTagClass('DIALOG'),
             HTMLFormElement: makeHtmlTagClass('FORM'),
             HTMLDivElement: makeHtmlTagClass('DIV'),
             HTMLSpanElement: makeHtmlTagClass('SPAN'),
@@ -4926,6 +7219,7 @@ function createPluginAdapter({
             NodeFilter,
             DOMParser,
             CSS,
+            getSelection: () => (sharedMockDom && sharedMockDom.syncDoc ? sharedMockDom.syncDoc.getSelection() : { rangeCount: 0, isCollapsed: true, toString: () => '', removeAllRanges() {}, addRange() {}, getRangeAt: () => null }),
             getComputedStyle: (el) => (el && el.style ? el.style : {}),
             ResizeObserver: noopObserver,
             IntersectionObserver: noopObserver,
@@ -4954,6 +7248,8 @@ function createPluginAdapter({
             pluginName: name,
             seq: 0,
             uiItems: [],
+            uiCallbacks: new Map(),
+            liveGui: { open: false, activeEntryId: '', lastStylesRev: '', lastRev: '', preOpenNodes: new Set(), preOpenStates: new Map(), capturingLogs: false, capturedLogs: [] },
             providers: [],
             hooks: { replacers: [], scriptHandlers: [], chatListeners: [] },
         };
@@ -4967,7 +7263,7 @@ function createPluginAdapter({
             },
         });
         pluginDoms.set(name, sharedMockDom);
-        const { api, trackedUnloads } = makePluginApiFor(entry, record, sharedMockDom);
+        let trackedUnloads = [];
         const timers = new Set();
         const { syncDoc, asyncDoc } = sharedMockDom;
         const sandboxCrypto = createSandboxCrypto();
@@ -4994,21 +7290,30 @@ function createPluginAdapter({
             replace: () => {},
         };
 
-        const logFromPlugin = (...a) => {
+        const formatLogArgs = (a) => a.map((v) => {
+            if (typeof v === 'string') return v;
+            if (v instanceof Error || (v && typeof v === 'object' && typeof v.message === 'string' && typeof v.stack === 'string')) {
+                return v.stack || `${v.name || 'Error'}: ${v.message}`;
+            }
+            try { return JSON.stringify(v); } catch (_) { return String(v); }
+        }).join(' ');
+        const logFromPlugin = (level, ...a) => {
             if (activeHookFrame && activeHookFrame.pluginName === name) {
-                const msg = a.map((v) => {
-                    if (typeof v === 'string') return v;
-                    try { return JSON.stringify(v); } catch (_) { return String(v); }
-                }).join(' ');
-                appendHookStepLog(name, msg);
+                appendHookStepLog(name, formatLogArgs(a));
+            }
+            if ((level === 'warn' || level === 'error') && record.liveGui && record.liveGui.capturingLogs) {
+                const txt = `[${level}] ${formatLogArgs(a)}`.replace(/\s+/g, ' ').trim().slice(0, 320);
+                if (txt && record.liveGui.capturedLogs.length < 12) {
+                    record.liveGui.capturedLogs.push(txt);
+                }
             }
         };
         const sandbox = {
             console: {
-                log: (...a) => { logFromPlugin(...a); console.log(`[Plugin:${name}]`, ...a); },
-                info: (...a) => { logFromPlugin(...a); console.log(`[Plugin:${name}]`, ...a); },
-                warn: (...a) => { logFromPlugin(...a); console.warn(`[Plugin:${name}]`, ...a); },
-                error: (...a) => { logFromPlugin(...a); console.error(`[Plugin:${name}]`, ...a); },
+                log: (...a) => { logFromPlugin('log', ...a); console.log(`[Plugin:${name}]`, ...a); },
+                info: (...a) => { logFromPlugin('info', ...a); console.log(`[Plugin:${name}]`, ...a); },
+                warn: (...a) => { logFromPlugin('warn', ...a); console.warn(`[Plugin:${name}]`, ...a); },
+                error: (...a) => { logFromPlugin('error', ...a); console.error(`[Plugin:${name}]`, ...a); },
                 debug: () => {},
             },
             setTimeout: (fn, ms, ...args) => {
@@ -5058,11 +7363,11 @@ function createPluginAdapter({
             atob: (b64) => Buffer.from(String(b64), 'base64').toString('binary'),
             btoa: (bin) => Buffer.from(String(bin), 'binary').toString('base64'),
             fetch: (u, o) => proxyFetchForPlugin(u, o, false, name),
-            risuai: api,
-            Risuai: api,
-            RisuAI: api,
-            risuApi: api,
-            risuAPI: api,
+            risuai: null,
+            Risuai: null,
+            RisuAI: null,
+            risuApi: null,
+            risuAPI: null,
             document: syncDoc,
             localStorage: createSyncWebStorage(webLocalStore, {
                 onRead: (k) => recordStorageEvent(name, { op: 'read', storeKind: 'webLocalStorage', key: k, ok: true }),
@@ -5096,6 +7401,28 @@ function createPluginAdapter({
         syncDoc.defaultView = sandbox;
         asyncDoc.location = mockLocation;
         asyncDoc.defaultView = { location: mockLocation, reload: triggerSandboxReload };
+        const windowListeners = new Map();
+        sandbox.addEventListener = (ev, fn) => {
+            if (typeof fn !== 'function') return;
+            const k = String(ev);
+            let set = windowListeners.get(k);
+            if (!set) { set = new Set(); windowListeners.set(k, set); }
+            set.add(fn);
+        };
+        sandbox.removeEventListener = (ev, fn) => {
+            const set = windowListeners.get(String(ev));
+            if (set) set.delete(fn);
+        };
+        sandbox.dispatchEvent = (evObj) => {
+            const k = String((evObj && evObj.type) || '');
+            const set = windowListeners.get(k);
+            if (set) {
+                for (const fn of [...set]) {
+                    try { fn(evObj); } catch (_) {}
+                }
+            }
+            return true;
+        };
         sandbox.window = sandbox;
         sandbox.self = sandbox;
         sandbox.top = sandbox;
@@ -5104,6 +7431,12 @@ function createPluginAdapter({
 
         try {
             vm.createContext(sandbox);
+            const vmRealm = createVmRealmHelper(sandbox);
+            sandbox.structuredClone = (v) => vmRealm.cloneForVm(v);
+            sandbox.fetch = vmRealm.wrapVmAsync((u, o) => trackPluginAsync(name, () => proxyFetchForPlugin(u, o, false, name)), { internalize: false });
+            const made = makePluginApiFor(entry, record, sharedMockDom, vmRealm);
+            trackedUnloads = made.trackedUnloads;
+            sandbox.risuai = sandbox.Risuai = sandbox.RisuAI = sandbox.risuApi = sandbox.risuAPI = made.api;
             const ret = vm.runInContext(entry.script, sandbox, { filename: `${name}.js`, timeout: 5000 });
             if (ret && typeof ret.then === 'function') {
                 await Promise.race([
@@ -6266,11 +8599,12 @@ function createPluginAdapter({
         let hasObservers = false;
         for (const [pName, mockDom] of pluginDoms.entries()) {
             if (!activeHosts.has(pName) || !mockDom) continue;
-            if (typeof mockDom.syncChatMessages === 'function') {
-                mockDom.syncChatMessages(msgsWithIds);
-            }
-            if (typeof mockDom.getObserverCount === 'function' && mockDom.getObserverCount() > 0) {
+            const obsCount = typeof mockDom.getObserverCount === 'function' ? mockDom.getObserverCount() : 0;
+            if (obsCount > 0) {
                 hasObservers = true;
+                if (typeof mockDom.syncChatMessages === 'function') {
+                    mockDom.syncChatMessages(msgsWithIds);
+                }
             }
         }
 
@@ -6282,10 +8616,14 @@ function createPluginAdapter({
             const seenStyles = new Set();
             for (const [pName, mockDom] of pluginDoms.entries()) {
                 if (!activeHosts.has(pName) || !mockDom || typeof mockDom.extractChatSurfaceProjections !== 'function') continue;
-                const proj = mockDom.extractChatSurfaceProjections();
-                Object.assign(footersByChatId, proj.footersByChatId);
-                Object.assign(footersByIndex, proj.footersByIndex);
-                Object.assign(bodyHtmlByChatId, proj.bodyHtmlByChatId);
+                const obsCount = typeof mockDom.getObserverCount === 'function' ? mockDom.getObserverCount() : 0;
+                const hasRows = Boolean(mockDom.chatScreen && mockDom.chatScreen.childNodes && mockDom.chatScreen.childNodes.length > 0);
+                if (obsCount > 0 || hasRows) {
+                    const proj = mockDom.extractChatSurfaceProjections();
+                    Object.assign(footersByChatId, proj.footersByChatId);
+                    Object.assign(footersByIndex, proj.footersByIndex);
+                    Object.assign(bodyHtmlByChatId, proj.bodyHtmlByChatId);
+                }
                 for (const s of collectMockDomStyles(mockDom)) {
                     if (s && !seenStyles.has(s)) {
                         seenStyles.add(s);
@@ -6889,6 +9227,332 @@ function createPluginAdapter({
         return list;
     }
 
+    function computeStylesRev(styles) {
+        return crypto
+            .createHash('sha1')
+            .update((Array.isArray(styles) ? styles : []).join('\n\n'))
+            .digest('hex')
+            .slice(0, 12);
+    }
+
+    function computeLiveGuiRev(styles, html, rootAttrs = null) {
+        return crypto
+            .createHash('sha1')
+            .update(JSON.stringify({ styles: styles || [], html: html || '', rootAttrs: rootAttrs || null }))
+            .digest('hex')
+            .slice(0, 12);
+    }
+
+    function snapshotPreOpenState(record, mockDom) {
+        if (!record || !record.liveGui || !mockDom) return;
+        record.liveGui.preOpenNodes.clear();
+        record.liveGui.preOpenStates.clear();
+        const capture = (ch) => {
+            if (!ch || ch === mockDom.chatScreen || ch === mockDom.head || ch === mockDom.body) return;
+            record.liveGui.preOpenNodes.add(ch);
+            record.liveGui.preOpenStates.set(ch, {
+                hadHidden: typeof ch.hasAttribute === 'function' ? ch.hasAttribute('hidden') : false,
+                styleRaw: (ch.attributes && ch.attributes.has('style')) ? ch.attributes.get('style') : null,
+            });
+        };
+        if (mockDom.body) {
+            for (const ch of mockDom.body.children || []) capture(ch);
+        }
+        if (mockDom.documentElement) {
+            for (const ch of mockDom.documentElement.children || []) capture(ch);
+        }
+    }
+
+    async function settleLiveGuiDom(mockDom, {
+        pluginName = '',
+        waitForNonEmpty = false,
+        maxWaitMs = 320,
+        baselinePendingOps = 0,
+        quietMs = 20,
+        pollMs = 12,
+    } = {}) {
+        const deadline = Date.now() + maxWaitMs;
+        await new Promise((r) => setTimeout(r, 0));
+        let lastSeq = typeof mockDom.getDomMutationSeq === 'function' ? mockDom.getDomMutationSeq() : 0;
+        let lastChangeAt = Date.now();
+        while (Date.now() < deadline) {
+            const curSeq = typeof mockDom.getDomMutationSeq === 'function' ? mockDom.getDomMutationSeq() : 0;
+            if (curSeq !== lastSeq) {
+                lastSeq = curSeq;
+                lastChangeAt = Date.now();
+            }
+            const curPending = pluginName ? (pendingPluginAsyncOps.get(pluginName) || 0) : 0;
+            const hasNewPending = curPending > baselinePendingOps;
+            const hasContent = !waitForNonEmpty
+                || (typeof mockDom.hasVisibleLiveGuiContent === 'function' && mockDom.hasVisibleLiveGuiContent());
+            if (!hasNewPending && hasContent && (Date.now() - lastChangeAt) >= quietMs) {
+                break;
+            }
+            const remaining = deadline - Date.now();
+            if (remaining <= 0) break;
+            await new Promise((r) => setTimeout(r, Math.min(pollMs, remaining)));
+        }
+        return mockDom.serializeLiveGuiDom();
+    }
+
+    function closeLiveBackendGui(pluginName) {
+        const pName = String(pluginName || '').trim();
+        const inst = activeHosts.get(pName);
+        const mockDom = pluginDoms.get(pName);
+        if (!inst || !mockDom) return { ok: false };
+        const live = inst.record && inst.record.liveGui;
+        const nodes = [
+            ...((mockDom.body && mockDom.body.children) || []),
+            ...((mockDom.documentElement && mockDom.documentElement.children) || []),
+        ];
+        const visited = new Set();
+        for (const ch of nodes) {
+            if (!ch || visited.has(ch)) continue;
+            visited.add(ch);
+            if (ch === mockDom.chatScreen || ch === mockDom.head || ch === mockDom.body) continue;
+            if (ch.tagName === 'STYLE' || ch.tagName === 'SCRIPT') continue;
+            if (typeof ch.hasAttribute === 'function') {
+                if (ch.hasAttribute('data-plugin-chat-panel')) continue;
+                if (ch.hasAttribute('data-am-floating-viewport') || ch.hasAttribute('data-am-count-region') || ch.hasAttribute('data-am-toast-region')) continue;
+            }
+            if (live && !live.preOpenNodes.has(ch)) {
+                try { ch.remove(); } catch (_) {}
+            } else if (live && live.preOpenStates.has(ch)) {
+                const prev = live.preOpenStates.get(ch);
+                try {
+                    if (prev.hadHidden) ch.setAttribute('hidden', '');
+                    else ch.removeAttribute('hidden');
+                    if (prev.styleRaw !== null) {
+                        if (typeof ch.setStyleAttribute === 'function') void ch.setStyleAttribute(prev.styleRaw);
+                        else ch.setAttribute('style', prev.styleRaw);
+                    } else {
+                        ch.removeAttribute('style');
+                    }
+                } catch (_) {}
+            }
+        }
+        if (live) {
+            live.open = false;
+            live.activeEntryId = '';
+            live.lastStylesRev = '';
+            live.lastRev = '';
+            live.preOpenNodes.clear();
+            live.preOpenStates.clear();
+        }
+        return { ok: true };
+    }
+
+    async function openLiveBackendGui(pluginName, entryId = '') {
+        const pName = String(pluginName || '').trim();
+        const inst = activeHosts.get(pName);
+        const mockDom = pluginDoms.get(pName);
+        if (!inst || !mockDom) {
+            throw new Error(`플러그인 '${pName}'이(가) 백엔드 어댑터에 활성화되어 있지 않습니다.`);
+        }
+        invalidateReadCache();
+        if (inst.record.liveGui && inst.record.liveGui.open) {
+            closeLiveBackendGui(pName);
+        }
+        snapshotPreOpenState(inst.record, mockDom);
+        const uiItems = Array.isArray(inst.record.uiItems) ? inst.record.uiItems : [];
+        const pick = pickPreferredPluginGuiEntry(uiItems, entryId);
+        if (!pick) {
+            return {
+                ok: true,
+                pluginName: pName,
+                displayName: getPluginDisplayName(pName),
+                entryId: '',
+                entryName: '',
+                uiItems,
+                styles: [],
+                html: '',
+                rootAttrs: null,
+                diagnostics: [],
+                rev: computeLiveGuiRev([], ''),
+                hasContent: false,
+                closed: true,
+            };
+        }
+        inst.record.liveGui.open = true;
+        inst.record.liveGui.activeEntryId = pick.id;
+        inst.record.liveGui.lastStylesRev = '';
+        inst.record.liveGui.lastRev = '';
+        inst.record.liveGui.capturedLogs = [];
+        inst.record.liveGui.capturingLogs = true;
+        const baselinePendingOps = pendingPluginAsyncOps.get(pName) || 0;
+        const cb = inst.record.uiCallbacks ? inst.record.uiCallbacks.get(pick.id) : null;
+        let runError = '';
+        let snap = null;
+        try {
+            if (typeof cb === 'function') {
+                try {
+                    await Promise.race([
+                        Promise.resolve(cb()),
+                        new Promise((r) => setTimeout(r, 8000)),
+                    ]);
+                } catch (e) {
+                    runError = e && e.message ? e.message : String(e);
+                    console.warn(`[Plugin:${pName}] openLiveBackendGui error:`, runError);
+                }
+            }
+            snap = await settleLiveGuiDom(mockDom, {
+                pluginName: pName,
+                waitForNonEmpty: true,
+                maxWaitMs: 3500,
+                baselinePendingOps,
+                quietMs: 25,
+                pollMs: 15,
+            });
+        } finally {
+            if (inst.record.liveGui) inst.record.liveGui.capturingLogs = false;
+        }
+        const diagnostics = (inst.record.liveGui && Array.isArray(inst.record.liveGui.capturedLogs))
+            ? [...inst.record.liveGui.capturedLogs]
+            : [];
+        if (runError || diagnostics.length > 0) {
+            console.warn(`[PluginLiveGUI:${pName}]`, runError || diagnostics.join(' | '));
+        }
+        const styles = (snap && snap.styles) || [];
+        const html = (snap && snap.html) || '';
+        const rootAttrs = (snap && snap.rootAttrs) || null;
+        const stylesRev = computeStylesRev(styles);
+        const rev = computeLiveGuiRev(styles, html, rootAttrs);
+        inst.record.liveGui.lastStylesRev = stylesRev;
+        inst.record.liveGui.lastRev = rev;
+        const hasContent = Boolean(html.trim());
+        const closed = !inst.record.liveGui.open && !hasContent;
+        return {
+            ok: true,
+            pluginName: pName,
+            displayName: getPluginDisplayName(pName),
+            entryId: pick.id,
+            entryName: pick.name,
+            uiItems,
+            styles,
+            html,
+            rootAttrs,
+            diagnostics,
+            rev,
+            hasContent,
+            closed,
+            error: runError,
+        };
+    }
+
+    async function dispatchLiveBackendGuiEvent({
+        pluginName,
+        nodeId,
+        eventType = 'click',
+        value,
+        checked,
+        fireClick = false,
+        x = 24,
+        y = 24,
+    } = {}) {
+        const pName = String(pluginName || '').trim();
+        const inst = activeHosts.get(pName);
+        const mockDom = pluginDoms.get(pName);
+        if (!inst || !mockDom) {
+            throw new Error(`플러그인 '${pName}'이(가) 백엔드 어댑터에 활성화되어 있지 않습니다.`);
+        }
+        const el = typeof mockDom.findElementByNodeId === 'function'
+            ? mockDom.findElementByNodeId(nodeId)
+            : null;
+        const live = inst.record.liveGui;
+        if (live) {
+            live.capturedLogs = [];
+            live.capturingLogs = true;
+        }
+        const baselinePendingOps = pendingPluginAsyncOps.get(pName) || 0;
+        const pBefore = typeof mockDom.getPerfCounters === 'function' ? mockDom.getPerfCounters() : null;
+        const t0 = Date.now();
+        let tAfterDispatch = t0;
+        let snap = null;
+        try {
+            if (el) {
+                if (eventType === 'input' || eventType === 'change') {
+                    await mockDom.dispatchElementInput(el, { value, checked, eventType, fireClick: Boolean(fireClick) });
+                } else {
+                    await mockDom.dispatchSurfaceClick(el, Number(x) || 24, Number(y) || 24);
+                }
+            }
+            tAfterDispatch = Date.now();
+            snap = await settleLiveGuiDom(mockDom, {
+                pluginName: pName,
+                waitForNonEmpty: false,
+                maxWaitMs: 900,
+                baselinePendingOps,
+                quietMs: 18,
+                pollMs: 10,
+            });
+        } finally {
+            if (live) live.capturingLogs = false;
+        }
+        const totalMs = Date.now() - t0;
+        if (totalMs > 400) {
+            const pAfter = typeof mockDom.getPerfCounters === 'function' ? mockDom.getPerfCounters() : null;
+            const dSync = pAfter && pBefore ? pAfter.syncListenerMs - pBefore.syncListenerMs : 0;
+            const dAsync = pAfter && pBefore ? pAfter.asyncListenerMs - pBefore.asyncListenerMs : 0;
+            const dQs = pAfter && pBefore ? pAfter.qs - pBefore.qs : 0;
+            const dQsa = pAfter && pBefore ? pAfter.qsa - pBefore.qsa : 0;
+            const dId = pAfter && pBefore ? pAfter.getById - pBefore.getById : 0;
+            const dParse = pAfter && pBefore ? pAfter.parse - pBefore.parse : 0;
+            console.warn(`[PluginLiveGUI:${pName}:slow] event=${eventType} total=${totalMs}ms dispatch=${tAfterDispatch - t0}ms (syncL=${dSync}ms asyncL=${dAsync}ms) settle=${Date.now() - tAfterDispatch}ms qs=${dQs} qsa=${dQsa} id=${dId} parse=${dParse}`);
+        }
+        const diagnostics = (live && Array.isArray(live.capturedLogs))
+            ? [...live.capturedLogs]
+            : [];
+        if (diagnostics.length > 0) {
+            console.warn(`[PluginLiveGUI:${pName}:event]`, diagnostics.join(' | '));
+        }
+        const styles = (snap && snap.styles) || [];
+        const html = (snap && snap.html) || '';
+        const rootAttrs = (snap && snap.rootAttrs) || null;
+        const stylesRev = computeStylesRev(styles);
+        const rev = computeLiveGuiRev(styles, html, rootAttrs);
+        const hasContent = Boolean(html.trim());
+        const closed = !inst.record.liveGui.open || !hasContent;
+        if (live && live.lastRev && rev === live.lastRev && !closed) {
+            return {
+                ok: true,
+                matched: Boolean(el),
+                unchanged: true,
+                stylesUnchanged: true,
+                diagnostics,
+                rev,
+                hasContent,
+                closed,
+            };
+        }
+        const stylesUnchanged = Boolean(live && live.lastStylesRev && stylesRev === live.lastStylesRev);
+        if (live) {
+            live.lastStylesRev = stylesRev;
+            live.lastRev = rev;
+        }
+        return {
+            ok: true,
+            matched: Boolean(el),
+            unchanged: false,
+            stylesUnchanged,
+            ...(stylesUnchanged ? {} : { styles }),
+            html,
+            rootAttrs,
+            diagnostics,
+            rev,
+            hasContent,
+            closed,
+        };
+    }
+
+    function getLiveGuiViewerSrcdoc(pluginName, theme = 'dark') {
+        const entry = getPluginEntry(pluginName);
+        if (!entry) return null;
+        return {
+            plugin: { name: entry.name, displayName: entry.displayName, version: entry.version },
+            srcdoc: buildLiveGuiViewerSrcdoc({ plugin: entry, theme }),
+        };
+    }
+
     function getGuiSrcdoc(pluginName, entryId = '', theme = 'dark') {
         const entry = getPluginEntry(pluginName);
         if (!entry) return null;
@@ -6965,6 +9629,10 @@ function createPluginAdapter({
         invalidateReadCache,
         getPluginRuntimeRecall,
         getGuiSrcdoc,
+        getLiveGuiViewerSrcdoc,
+        openLiveBackendGui,
+        dispatchLiveBackendGuiEvent,
+        closeLiveBackendGui,
         dispose,
         _debug: { hookState, providers, pluginDoms, pluginRuntimeLedger, fallbackPluginStore, fallbackSafeLocal, fallbackLocalPlugin, webLocalStore, webSessionStore, dirtyStoreOps, fallbackAssetStore, fallbackInlayStore, getAllKnownEntries },
     };
@@ -6976,6 +9644,7 @@ module.exports = {
     diffPluginPromptInjection,
     pickPreferredPluginGuiEntry,
     createSyncWebStorage,
+    buildLiveGuiViewerSrcdoc,
     buildPluginGuiSrcdoc,
     createPluginAdapter,
 };
