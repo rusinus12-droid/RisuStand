@@ -9,6 +9,8 @@
 (async function risustandPluginMain() {
     // Kept in sync with //@version by tools/release_version.cjs
     const RISUSTAND_VERSION = '1.2.0';
+    // Brand mark glyph (source: docs/brand/risustand-mark.svg), tinted via currentColor.
+    const RS_MARK_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true" focusable="false" fill="currentColor"><g transform="translate(0 -2.5)"><g fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M27.76 20.26 A6 6 0 0 1 36.24 20.26"/><path d="M24.22 16.72 A11 11 0 0 1 39.78 16.72" opacity="0.6"/></g><path d="M30.8 26.3C24.6 22.8 18.2 22.3 13 23.2V41C18.5 40.4 24.9 41.1 30.8 44.3Z"/><path d="M33.2 26.3C39.4 22.8 45.8 22.3 51 23.2V41C45.5 40.4 39.1 41.1 33.2 44.3Z"/><g fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.5 43.5L32 49L53.5 43.5"/><path d="M32 49V54"/><path d="M25 54H39"/></g></g></svg>';
     const STORAGE_KEY = 'risustand_v1';
     const LEGACY_STORAGE_KEY = 'risu_ultra_custom_shell_v2';
     const STYLE_ATTR = 'x-risustand-style';
@@ -3355,7 +3357,8 @@
                     background: linear-gradient(180deg, var(--acc-soft), transparent 140%);
                 }
                 .header h1 { margin: 0; font-size: 16px; font-weight: 800; letter-spacing: -0.01em; display: flex; align-items: center; gap: 10px; white-space: nowrap; }
-                .header h1 .logo { width: 30px; height: 30px; border-radius: 9px; display: inline-flex; align-items: center; justify-content: center; background: var(--acc-soft); border: 1px solid var(--acc-line); font-size: 16px; }
+                .header h1 .logo { width: 30px; height: 30px; border-radius: 9px; display: inline-flex; align-items: center; justify-content: center; background: var(--acc-soft); border: 1px solid var(--acc-line); font-size: 16px; color: var(--acc); }
+                .header h1 .logo svg { width: 24px; height: 24px; display: block; }
                 .header h1 .ver { font-size: 11px; font-weight: 700; color: var(--tx3); padding: 2px 7px; border: 1px solid var(--line2); border-radius: 999px; }
                 .hdr-actions { display: flex; gap: 8px; min-width: 0; }
                 .close-btn { display: inline-flex; align-items: center; gap: 6px; background: var(--bg2); color: var(--tx); border: 1px solid var(--line2); border-radius: 10px; padding: 0 13px; min-height: 36px; cursor: pointer; font-weight: 700; font-size: 13px; white-space: nowrap; }
@@ -3473,7 +3476,7 @@
             </style>
             <div class="shell">
                 <div class="header">
-                    <h1><span class="logo">📖</span>RisuStand <span class="ver">v${RISUSTAND_VERSION}</span></h1>
+                    <h1><span class="logo">${RS_MARK_SVG}</span>RisuStand <span class="ver">v${RISUSTAND_VERSION}</span></h1>
                     <div class="hdr-actions">
                         <button class="close-btn" id="btn-open-clone">🖥️ <span class="lbl-long">공홈 · EPUB </span>전용 뷰</button>
                         <button class="close-btn" id="btn-close" aria-label="닫기">✕<span class="lbl-long"> 닫기</span></button>

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="RisuStand" fill="currentColor">
+  <g transform="translate(0 -2.5)">
+  <g fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round">
+    <path d="M27.76 20.26 A6 6 0 0 1 36.24 20.26"/>
+    <path d="M24.22 16.72 A11 11 0 0 1 39.78 16.72" opacity="0.6"/>
+  </g>
+  <path d="M30.8 26.3C24.6 22.8 18.2 22.3 13 23.2V41C18.5 40.4 24.9 41.1 30.8 44.3Z"/>
+  <path d="M33.2 26.3C39.4 22.8 45.8 22.3 51 23.2V41C45.5 40.4 39.1 41.1 33.2 44.3Z"/>
+  <g fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M10.5 43.5L32 49L53.5 43.5"/>
+    <path d="M32 49V54"/>
+    <path d="M25 54H39"/>
+  </g>
+  </g>
+</svg>

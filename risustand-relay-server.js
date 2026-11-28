@@ -43,6 +43,9 @@ const { createModuleAdapter } = require('./risustand-module-adapter.cjs');
 
 // Kept in sync with VERSION by tools/release_version.cjs
 const RELAY_VERSION = '1.2.0';
+// Brand mark (source: docs/brand/*.svg). Full-color tile for favicon, mono glyph (currentColor) for in-app UI.
+const RS_LOGO_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="RisuStand"><defs><linearGradient id="rs-tile" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#a86b38"/><stop offset="1" stop-color="#6a3c1a"/></linearGradient><linearGradient id="rs-page" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fffaf0"/><stop offset="1" stop-color="#f3e3c6"/></linearGradient></defs><rect width="64" height="64" rx="16" fill="url(#rs-tile)"/><g transform="translate(0 -2.5)"><g fill="none" stroke="#f6c66e" stroke-width="3" stroke-linecap="round"><path d="M27.76 20.26 A6 6 0 0 1 36.24 20.26"/><path d="M24.22 16.72 A11 11 0 0 1 39.78 16.72" opacity="0.7"/></g><path d="M32 27C25.5 23 18.5 22.4 13 23.2V41C18.5 40.4 25.5 41.2 32 45Z" fill="url(#rs-page)"/><path d="M32 27C38.5 23 45.5 22.4 51 23.2V41C45.5 40.4 38.5 41.2 32 45Z" fill="url(#rs-page)"/><path d="M32 27V45" stroke="#c99a63" stroke-width="1.4"/><g fill="none" stroke="#fffaf0" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.5 43.5L32 49L53.5 43.5"/><path d="M32 49V54"/><path d="M25 54H39"/></g></g></svg>';
+const RS_MARK_SVG = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" aria-hidden="true" focusable="false" fill="currentColor"><g transform="translate(0 -2.5)"><g fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M27.76 20.26 A6 6 0 0 1 36.24 20.26"/><path d="M24.22 16.72 A11 11 0 0 1 39.78 16.72" opacity="0.6"/></g><path d="M30.8 26.3C24.6 22.8 18.2 22.3 13 23.2V41C18.5 40.4 24.9 41.1 30.8 44.3Z"/><path d="M33.2 26.3C39.4 22.8 45.8 22.3 51 23.2V41C45.5 40.4 39.1 41.1 33.2 44.3Z"/><g fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.5 43.5L32 49L53.5 43.5"/><path d="M32 49V54"/><path d="M25 54H39"/></g></g></svg>';
 const ROOT_DIR = __dirname;
 const TOKEN_PATH = path.join(ROOT_DIR, '.risustand-token');
 const CONFIG_PATH = path.join(ROOT_DIR, '.risustand-config.json');
@@ -5998,6 +6001,7 @@ function renderWebApp() {
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <meta name="theme-color" id="themeColorMeta" content="#ffffff" />
 <title>RisuStand Remote v${RELAY_VERSION}</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,${encodeURIComponent(RS_LOGO_SVG)}" />
 <style>
   /* ===== Design tokens (light defaults) ===== */
   :root {
@@ -7048,6 +7052,7 @@ function renderWebApp() {
   .send-btn:disabled { opacity:0.4; cursor:default; }
 
   /* ===== Bottom Nav ===== */
+  nav.tabbar .nav-logo { display:none; }
   nav.tabbar {
     grid-area: nav; position:relative; z-index:30; display:grid; grid-template-columns:repeat(4, 1fr);
     border-top:1px solid var(--border); background: var(--header-bg);
@@ -7230,7 +7235,10 @@ function renderWebApp() {
   /* ===== Login ===== */
   #login { position:fixed; inset:0; background: var(--bg-grad), var(--bg); display:flex; align-items:center; justify-content:center; padding:20px; z-index:99; }
   .login-card { width:100%; max-width:380px; background:var(--elev); border:1px solid var(--border); border-radius:22px; padding:28px 24px 24px; box-shadow: var(--shadow); }
-  .login-mark { width:52px; height:52px; border-radius:16px; display:flex; align-items:center; justify-content:center; font-size:26px; background: var(--accent-soft); margin-bottom:16px; }
+  .login-mark { width:56px; height:56px; border-radius:17px; display:flex; align-items:center; justify-content:center; margin-bottom:16px; color: var(--on-accent);
+    background: linear-gradient(145deg, color-mix(in srgb, var(--accent) 82%, #fff) 0%, var(--accent) 45%, color-mix(in srgb, var(--accent) 70%, #000) 100%);
+    box-shadow: 0 8px 18px -8px color-mix(in srgb, var(--accent) 70%, transparent), inset 0 1px 0 rgba(255,255,255,0.18); }
+  .login-mark svg { width:42px; height:42px; display:block; }
   .login-card h2 { margin:0 0 6px; font-size:20px; font-weight:800; letter-spacing:-0.02em; }
   .login-card p { margin:0 0 18px; font-size:13.5px; color:var(--sub); line-height:1.6; }
 
@@ -7279,11 +7287,14 @@ function renderWebApp() {
       border-top:none; border-right:1px solid var(--border);
       padding: calc(14px + env(safe-area-inset-top)) 8px 14px max(8px, env(safe-area-inset-left));
     }
-    nav.tabbar::before {
-      content:'📖'; display:flex; align-items:center; justify-content:center;
-      width:44px; height:44px; margin:0 auto 14px; border-radius:14px; font-size:22px;
-      background: var(--accent-soft);
+    nav.tabbar .nav-logo {
+      display:flex; align-items:center; justify-content:center;
+      width:46px; height:46px; margin:0 auto 14px; border-radius:15px;
+      color: var(--on-accent);
+      background: linear-gradient(145deg, color-mix(in srgb, var(--accent) 82%, #fff) 0%, var(--accent) 45%, color-mix(in srgb, var(--accent) 70%, #000) 100%);
+      box-shadow: 0 6px 14px -6px color-mix(in srgb, var(--accent) 70%, transparent), inset 0 1px 0 rgba(255,255,255,0.18);
     }
+    nav.tabbar .nav-logo svg { width:34px; height:34px; display:block; }
     .tab-btn { min-height:64px; border-radius:14px; font-size:11.5px; gap:5px; }
     .tab-btn:hover { color: var(--text); }
     .tab-btn:hover .ic { background: var(--surface); }
@@ -7295,6 +7306,17 @@ function renderWebApp() {
       --content-w: 1160px;
     }
     #tab-modules .panel-title, #tab-router .panel-title { grid-column: 1 / -1; }
+    /* Masonry: JS (layoutSettingsMasonry) gives each card a row span matching its height,
+       so short cards no longer leave holes under them. Only enabled once JS has measured. */
+    #tab-modules.active.rs-masonry, #tab-router.active.rs-masonry {
+      grid-auto-rows: 4px; row-gap: 0; column-gap: 16px; grid-auto-flow: row dense;
+    }
+    #tab-modules.rs-masonry > *, #tab-router.rs-masonry > * { align-self:start; }
+    /* TTS card is ~3x taller than any other card: give it two grid columns and split its body in two. */
+    #tab-router.rs-masonry #ttsConfigCard { grid-column: span 2; }
+    #tab-router.rs-masonry #ttsConfigCard .tts-layout { display:grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 18px; align-items:start; }
+    #tab-router.rs-masonry #ttsConfigCard .tts-col + .tts-col > .tts-subbox:first-child { margin-top: 4px; }
+    #chatVarsBody { max-height: min(64vh, 620px); overflow-y:auto; overscroll-behavior: contain; margin-right:-6px; padding-right:6px; }
     #reqLogCard { grid-column: 1 / -1; }
     #tab-home { --content-w: 760px; }
     .composer { margin-bottom: 16px; }
@@ -7389,7 +7411,7 @@ function renderWebApp() {
 
 <div id="login">
   <div class="login-card">
-    <div class="login-mark">📖</div>
+    <div class="login-mark">${RS_MARK_SVG}</div>
     <h2>RisuStand Remote</h2>
     <p>PC 터미널에 출력된 보안 토큰을 입력하세요.<br>한 번 로그인하면 이 기기에 저장됩니다.</p>
     <input class="f-inp" id="tokInput" type="password" placeholder="보안 토큰 입력" autocomplete="current-password" style="margin-bottom:10px;" />
@@ -7826,6 +7848,7 @@ function renderWebApp() {
           <input type="checkbox" id="ttsEnabledChk" checked />
         </label>
       </h3>
+      <div class="tts-layout"><div class="tts-col">
       <label class="f-label" style="margin-top:4px;">간편 엔드포인트 프리셋 · 로컬 서버 탐색</label>
       <div style="display:flex; gap:6px; align-items:center;">
         <select class="f-inp" id="ttsEndpointPresetSel" style="flex:1; min-width:0;">
@@ -7951,6 +7974,7 @@ function renderWebApp() {
         <input class="f-inp" id="ttsNarInstr" placeholder="차분한 나레이터 톤" />
       </div>
 
+      </div><div class="tts-col">
       <div class="tts-subbox">
         <div class="tts-subbox-title"><span>👥 기본 성별 보이스 풀 (미등록 캐릭터 자동 배정)</span></div>
         <label class="f-label" style="margin-top:2px;">👩 여성 기본 Voice ID (영역 → 레퍼런스)</label>
@@ -8062,6 +8086,7 @@ function renderWebApp() {
         <audio id="ttsTestAudio" controls style="display:none; width:100%; margin-top:6px; height:36px;"></audio>
       </div>
 
+      </div></div>
       <div class="btn-row">
         <button type="button" class="btn" id="saveTtsBtn">💾 TTS 설정 저장</button>
       </div>
@@ -8124,6 +8149,7 @@ function renderWebApp() {
   </section>
 
   <nav class="tabbar">
+    <div class="nav-logo" title="RisuStand">${RS_MARK_SVG}</div>
     <button class="tab-btn active" data-tab="home" onclick="switchTab('home')"><span class="ic">🏠</span>홈</button>
     <button class="tab-btn" data-tab="chat" onclick="switchTab('chat')"><span class="ic">📖</span>독서/채팅</button>
     <button class="tab-btn" data-tab="modules" onclick="switchTab('modules')"><span class="ic">🧩<span class="nd"></span></span>모듈/설정</button>
@@ -9009,6 +9035,54 @@ function renderWebApp() {
       t.style.display = 'none';
     }
   }, true);
+
+  // ===== Settings-tab masonry (desktop >= 900px) =====
+  const SETTINGS_MASONRY_ROW = 4;
+  const SETTINGS_MASONRY_GAP = 16;
+  const settingsMasonryMq = window.matchMedia ? window.matchMedia('(min-width: 900px)') : null;
+  function layoutSettingsMasonry(panel) {
+    if (!panel) return;
+    const on = !!(settingsMasonryMq && settingsMasonryMq.matches) && typeof ResizeObserver !== 'undefined';
+    if (!on) {
+      if (panel.classList.contains('rs-masonry')) {
+        panel.classList.remove('rs-masonry');
+        Array.from(panel.children).forEach((el) => { el.style.gridRowEnd = ''; });
+      }
+      return;
+    }
+    if (!panel.classList.contains('active')) return;
+    Array.from(panel.children).forEach((el) => {
+      const h = el.offsetHeight;
+      if (!h) return;
+      const span = Math.max(1, Math.ceil((h + SETTINGS_MASONRY_GAP) / SETTINGS_MASONRY_ROW));
+      const next = 'span ' + span;
+      if (el.style.gridRowEnd !== next) el.style.gridRowEnd = next;
+    });
+    panel.classList.add('rs-masonry');
+  }
+  function initSettingsMasonry() {
+    if (typeof ResizeObserver === 'undefined') return;
+    ['tab-modules', 'tab-router'].forEach((id) => {
+      const panel = document.getElementById(id);
+      if (!panel) return;
+      let raf = 0;
+      const schedule = () => {
+        if (raf) return;
+        raf = requestAnimationFrame(() => { raf = 0; layoutSettingsMasonry(panel); });
+      };
+      const ro = new ResizeObserver(schedule);
+      const watch = () => Array.from(panel.children).forEach((el) => ro.observe(el));
+      watch();
+      new MutationObserver(() => { watch(); schedule(); }).observe(panel, { childList: true });
+      if (settingsMasonryMq) {
+        const onMq = () => schedule();
+        if (settingsMasonryMq.addEventListener) settingsMasonryMq.addEventListener('change', onMq);
+        else if (settingsMasonryMq.addListener) settingsMasonryMq.addListener(onMq);
+      }
+      schedule();
+    });
+  }
+  initSettingsMasonry();
 
   function switchTab(tab, opts = {}) {
     if (tab === 'bots') tab = 'home';
