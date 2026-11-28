@@ -2167,10 +2167,122 @@ function diffPluginPromptInjection(beforeMsgs, afterMsgs) {
 }
 
 /**
+ * Selects the preferred GUI entry when a plugin registers multiple UI items
+ * (e.g. a chat-input action button alongside a main setting/dashboard GUI).
+ */
+function pickPreferredPluginGuiEntry(items, targetId = '') {
+    const list = Array.isArray(items) ? items : [];
+    if (!list.length) return null;
+    const wanted = String(targetId || '').trim();
+    if (wanted) {
+        const exact = list.find((u) => u && (u.id === wanted || u.name === wanted));
+        if (exact) return exact;
+    }
+    const scoreEntry = (u) => {
+        if (!u || typeof u !== 'object') return -999;
+        let score = 0;
+        const kind = String(u.kind || '').toLowerCase();
+        const loc = String(u.location || '').toLowerCase();
+        const name = String(u.name || '');
+        if (kind === 'setting') score += 100;
+        else if (kind === 'button' && /^(?:setting|settings|hamburger|sidebar|menu|drawer|global)$/.test(loc)) score += 60;
+        else score += 20;
+        if (/(?:설정|setting|config|main|메인|대시보드|dashboard|관리|manager|studio|스튜디오|panel|패널|gui|옵션|option|열기|open)/i.test(name)) {
+            score += 25;
+        }
+        if (/(?:인풋|input|작성|compose|이어가기|continue|확장|expand|전송|send|리롤|reroll|생성|generate|번역|translate)/i.test(name)) {
+            score -= 50;
+        }
+        return score;
+    };
+    let best = list[0];
+    let bestScore = scoreEntry(best);
+    for (let i = 1; i < list.length; i += 1) {
+        const sc = scoreEntry(list[i]);
+        if (sc > bestScore) {
+            best = list[i];
+            bestScore = sc;
+        }
+    }
+    return best;
+}
+
+/**
+ * Creates a synchronous Web Storage (localStorage/sessionStorage) shim backed by a Map.
+ */
+function createSyncWebStorage(backingMap, hooks = {}) {
+    const map = backingMap instanceof Map ? backingMap : new Map();
+    const methods = {
+        getItem(k) {
+            const key = String(k);
+            if (typeof hooks.onRead === 'function') hooks.onRead(key);
+            return map.has(key) ? map.get(key) : null;
+        },
+        setItem(k, v) {
+            const key = String(k);
+            const val = String(v);
+            map.set(key, val);
+            if (typeof hooks.onSet === 'function') hooks.onSet(key, val);
+        },
+        removeItem(k) {
+            const key = String(k);
+            map.delete(key);
+            if (typeof hooks.onRemove === 'function') hooks.onRemove(key);
+        },
+        clear() {
+            map.clear();
+            if (typeof hooks.onClear === 'function') hooks.onClear();
+        },
+        key(i) {
+            const idx = Number(i);
+            const ks = Array.from(map.keys());
+            return (Number.isInteger(idx) && idx >= 0 && idx < ks.length) ? ks[idx] : null;
+        },
+    };
+    return new Proxy(methods, {
+        get(target, prop) {
+            if (prop === 'length') return map.size;
+            if (Reflect.has(target, prop)) return Reflect.get(target, prop);
+            if (typeof prop === 'string') {
+                if (typeof hooks.onRead === 'function') hooks.onRead(prop);
+                return map.has(prop) ? map.get(prop) : undefined;
+            }
+            return undefined;
+        },
+        set(target, prop, value) {
+            if (typeof prop === 'string' && prop !== 'length' && !Reflect.has(target, prop)) {
+                target.setItem(prop, value);
+                return true;
+            }
+            return Reflect.set(target, prop, value);
+        },
+        deleteProperty(target, prop) {
+            if (typeof prop === 'string' && prop !== 'length' && !Reflect.has(target, prop)) {
+                target.removeItem(prop);
+                return true;
+            }
+            return false;
+        },
+        has(target, prop) {
+            return Reflect.has(target, prop) || (typeof prop === 'string' && (prop === 'length' || map.has(prop)));
+        },
+        ownKeys() {
+            return Array.from(map.keys());
+        },
+        getOwnPropertyDescriptor(target, prop) {
+            if (typeof prop === 'string' && map.has(prop)) {
+                return { enumerable: true, configurable: true, writable: true, value: map.get(prop) };
+            }
+            return Reflect.getOwnPropertyDescriptor(target, prop);
+        },
+    });
+}
+
+/**
  * Generates an isolated sandboxed iframe HTML (`srcdoc`) that implements RisuAI API v3
  * for rendering a plugin's real native GUI (`registerSetting` / `registerButton` / `getRootDocument`).
  */
-function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
+function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark', webLocalSnapshot = {}, webSessionSnapshot = {} }) {
     const pName = String((plugin && plugin.name) || '');
     const pScript = String((plugin && plugin.script) || '');
     const pUiItems = Array.isArray(plugin && plugin.uiItems) ? plugin.uiItems : [];
@@ -2181,6 +2293,8 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
         entryId: String(entryId || ''),
         knownUiItems: pUiItems,
         theme: theme === 'light' ? 'light' : 'dark',
+        webLocalSnapshot: (webLocalSnapshot && typeof webLocalSnapshot === 'object') ? webLocalSnapshot : {},
+        webSessionSnapshot: (webSessionSnapshot && typeof webSessionSnapshot === 'object') ? webSessionSnapshot : {},
     }).replace(/<\//g, '<\\/');
 
     return `<!doctype html>
@@ -2220,7 +2334,7 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
   let rpcSeq = 0;
   const pendingRpc = new Map();
   const chatListeners = new Set();
-  const BATCHABLE_RPC_RX = /^(?:pluginStorage|safeLocalStorage|localPluginStorage)\\.|^db\\.|^getArg(?:ument)?$|^ipc\\.poll$/;
+  const BATCHABLE_RPC_RX = /^(?:pluginStorage|safeLocalStorage|localPluginStorage|webStorage)\\.|^db\\.|^getArg(?:ument)?$|^ipc\\.poll$/;
   let rpcBatchQueue = [];
   let rpcBatchTimer = null;
 
@@ -2292,6 +2406,9 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
         if (r.ok) p.resolve(r.value);
         else p.reject(new Error(r.error || 'RPC error'));
       }
+      if (!autoOpened && !meta.entryId && uiRegistry.length > 0 && pendingRpc.size === 0) {
+        scheduleAutoOpen(180);
+      }
       return;
     }
     if (d.__rsGuiRpcRes === 1 && d.reqId && pendingRpc.has(d.reqId)) {
@@ -2300,6 +2417,9 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
       clearTimeout(p.timer);
       if (d.ok) p.resolve(d.value);
       else p.reject(new Error(d.error || 'RPC error'));
+      if (!autoOpened && !meta.entryId && uiRegistry.length > 0 && pendingRpc.size === 0) {
+        scheduleAutoOpen(180);
+      }
       return;
     }
     if (d.__rsGuiInvokeEntry === 1) {
@@ -2355,11 +2475,51 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
   let uiSeq = 0;
   let invokerTimer = null;
   let autoOpened = false;
+  let activeEntryId = '';
+  const bootStartedAt = Date.now();
+  const MAX_AUTO_OPEN_WAIT_MS = 1600;
+
+  function pickPreferredEntry(targetId) {
+    if (!uiRegistry.length) return null;
+    const wanted = String(targetId || '').trim();
+    if (wanted) {
+      const exact = uiRegistry.find((u) => u && (u.id === wanted || u.name === wanted));
+      if (exact) return exact;
+    }
+    const scoreEntry = (u) => {
+      if (!u || typeof u !== 'object') return -999;
+      let score = 0;
+      const kind = String(u.kind || '').toLowerCase();
+      const loc = String(u.location || '').toLowerCase();
+      const name = String(u.name || '');
+      if (kind === 'setting') score += 100;
+      else if (kind === 'button' && /^(?:setting|settings|hamburger|sidebar|menu|drawer|global)$/.test(loc)) score += 60;
+      else score += 20;
+      if (/(?:설정|setting|config|main|메인|대시보드|dashboard|관리|manager|studio|스튜디오|panel|패널|gui|옵션|option|열기|open)/i.test(name)) {
+        score += 25;
+      }
+      if (/(?:인풋|input|작성|compose|이어가기|continue|확장|expand|전송|send|리롤|reroll|생성|generate|번역|translate)/i.test(name)) {
+        score -= 50;
+      }
+      return score;
+    };
+    let best = uiRegistry[0];
+    let bestScore = scoreEntry(best);
+    for (let i = 1; i < uiRegistry.length; i += 1) {
+      const sc = scoreEntry(uiRegistry[i]);
+      if (sc > bestScore) {
+        best = uiRegistry[i];
+        bestScore = sc;
+      }
+    }
+    return best;
+  }
 
   function reportUiItems() {
     window.parent.postMessage({
       __rsGuiItems: 1,
       pluginName: meta.name,
+      activeEntryId,
       items: uiRegistry.map((u) => ({
         id: u.id,
         name: u.name,
@@ -2372,13 +2532,19 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
   }
 
   async function invokeEntry(targetId) {
-    const pick = targetId
-      ? uiRegistry.find((u) => u.id === targetId || u.name === targetId)
-      : (uiRegistry[0] || null);
+    const pick = pickPreferredEntry(targetId);
     if (!pick || typeof pick.callback !== 'function') return false;
     const boot = document.getElementById('__rs_boot_state');
     if (boot) boot.remove();
     autoOpened = true;
+    activeEntryId = pick.id;
+    window.parent.postMessage({
+      __rsGuiActiveEntry: 1,
+      pluginName: meta.name,
+      entryId: pick.id,
+      name: pick.name,
+    }, '*');
+    reportUiItems();
     try {
       await pick.callback();
     } catch (e) {
@@ -2390,11 +2556,21 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
     return true;
   }
 
-  function scheduleAutoOpen() {
+  function scheduleAutoOpen(delayMs) {
+    if (autoOpened) return;
     if (invokerTimer) clearTimeout(invokerTimer);
+    const reqDelay = typeof delayMs === 'number' && delayMs >= 0 ? delayMs : 200;
+    const elapsed = Date.now() - bootStartedAt;
+    const wait = elapsed >= MAX_AUTO_OPEN_WAIT_MS
+      ? 20
+      : Math.min(reqDelay, Math.max(20, MAX_AUTO_OPEN_WAIT_MS - elapsed));
     invokerTimer = setTimeout(() => {
       if (autoOpened) return;
       if (uiRegistry.length) {
+        if (pendingRpc.size > 0 && !meta.entryId && (Date.now() - bootStartedAt) < MAX_AUTO_OPEN_WAIT_MS) {
+          scheduleAutoOpen(180);
+          return;
+        }
         invokeEntry(meta.entryId);
       } else {
         const boot = document.getElementById('__rs_boot_state');
@@ -2402,7 +2578,7 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
           boot.textContent = '이 플러그인은 별도의 GUI 설정 화면(registerSetting/registerButton)을 등록하지 않았습니다.';
         }
       }
-    }, 350);
+    }, uiRegistry.length ? wait : 450);
   }
 
   function decodeBase64ToBytes(b64) {
@@ -2525,10 +2701,10 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
       if (idx >= 0) uiRegistry[idx] = item;
       else uiRegistry.push(item);
       reportUiItems();
-      if (!autoOpened && (meta.entryId ? id === meta.entryId : uiRegistry.length === 1)) {
-        setTimeout(() => { if (!autoOpened) invokeEntry(meta.entryId); }, 40);
+      if (!autoOpened && meta.entryId && (id === meta.entryId || item.name === meta.entryId)) {
+        setTimeout(() => { if (!autoOpened) invokeEntry(meta.entryId); }, 30);
       } else {
-        scheduleAutoOpen();
+        scheduleAutoOpen(200);
       }
       return { id };
     },
@@ -2540,10 +2716,10 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
       if (idx >= 0) uiRegistry[idx] = item;
       else uiRegistry.push(item);
       reportUiItems();
-      if (!autoOpened && (meta.entryId ? id === meta.entryId : uiRegistry.length === 1)) {
-        setTimeout(() => { if (!autoOpened) invokeEntry(meta.entryId); }, 40);
+      if (!autoOpened && meta.entryId && (id === meta.entryId || item.name === meta.entryId)) {
+        setTimeout(() => { if (!autoOpened) invokeEntry(meta.entryId); }, 30);
       } else {
-        scheduleAutoOpen();
+        scheduleAutoOpen(200);
       }
       return { id };
     },
@@ -2700,11 +2876,82 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
     },
   });
 
+  function makeIframeWebStorage(scope, initialObj) {
+    const map = new Map();
+    if (initialObj && typeof initialObj === 'object') {
+      for (const [k, v] of Object.entries(initialObj)) {
+        map.set(String(k), String(v ?? ''));
+      }
+    }
+    const methods = {
+      getItem: (k) => (map.has(String(k)) ? map.get(String(k)) : null),
+      setItem: (k, v) => {
+        const key = String(k);
+        const val = String(v);
+        map.set(key, val);
+        rpcCall('webStorage.setItem', [scope, key, val]).catch(() => {});
+      },
+      removeItem: (k) => {
+        const key = String(k);
+        map.delete(key);
+        rpcCall('webStorage.removeItem', [scope, key]).catch(() => {});
+      },
+      clear: () => {
+        map.clear();
+        rpcCall('webStorage.clear', [scope]).catch(() => {});
+      },
+      key: (i) => {
+        const idx = Number(i);
+        const ks = Array.from(map.keys());
+        return (Number.isInteger(idx) && idx >= 0 && idx < ks.length) ? ks[idx] : null;
+      },
+    };
+    return new Proxy(methods, {
+      get(target, prop) {
+        if (prop === 'length') return map.size;
+        if (Reflect.has(target, prop)) return Reflect.get(target, prop);
+        if (typeof prop === 'string') return map.has(prop) ? map.get(prop) : undefined;
+        return undefined;
+      },
+      set(target, prop, value) {
+        if (typeof prop === 'string' && prop !== 'length' && !Reflect.has(target, prop)) {
+          target.setItem(prop, value);
+          return true;
+        }
+        return Reflect.set(target, prop, value);
+      },
+      deleteProperty(target, prop) {
+        if (typeof prop === 'string' && prop !== 'length' && !Reflect.has(target, prop)) {
+          target.removeItem(prop);
+          return true;
+        }
+        return false;
+      },
+      has(target, prop) {
+        return Reflect.has(target, prop) || (typeof prop === 'string' && (prop === 'length' || map.has(prop)));
+      },
+      ownKeys() {
+        return Array.from(map.keys());
+      },
+      getOwnPropertyDescriptor(target, prop) {
+        if (typeof prop === 'string' && map.has(prop)) {
+          return { enumerable: true, configurable: true, writable: true, value: map.get(prop) };
+        }
+        return Reflect.getOwnPropertyDescriptor(target, prop);
+      },
+    });
+  }
+
+  const syncLocalStorage = makeIframeWebStorage('local', meta.webLocalSnapshot);
+  const syncSessionStorage = makeIframeWebStorage('session', meta.webSessionSnapshot);
+  try { Object.defineProperty(window, 'localStorage', { configurable: true, get: () => syncLocalStorage }); } catch (_) {}
+  try { Object.defineProperty(window, 'sessionStorage', { configurable: true, get: () => syncSessionStorage }); } catch (_) {}
+
   window.Risuai = window.RisuAI = window.risuai = window.risuApi = window.risuAPI = apiProxy;
 
   try {
-    const fn = new Function(pluginCode);
-    const maybePromise = fn();
+    const fn = new Function('localStorage', 'sessionStorage', pluginCode);
+    const maybePromise = fn(syncLocalStorage, syncSessionStorage);
     if (maybePromise && typeof maybePromise.catch === 'function') {
       maybePromise.catch((err) => {
         console.error('[Plugin GUI Async Error]', err);
@@ -2739,6 +2986,8 @@ function computePluginScriptSig(script) {
 
 function createPluginAdapter({
     pluginsPath,
+    storagePath = '',
+    ledgerPath = '',
     persistDisabled = false,
     getBackendConfig = () => ({}),
     saveBackendConfig = () => {},
@@ -2775,10 +3024,16 @@ function createPluginAdapter({
                 bodyIntercepterRuns: 0,
                 afterRequestRuns: 0,
                 outputRuns: 0,
+                storageReads: 0,
+                storageWrites: 0,
+                storageErrors: 0,
                 lastBeforeRequestAt: 0,
                 lastBodyIntercepterAt: 0,
                 lastAfterRequestAt: 0,
                 lastOutputAt: 0,
+                lastStorageWriteAt: 0,
+                lastStorageError: '',
+                recentStorageKeys: [],
                 lastAfterRequest: null,
                 lastOutput: null,
                 history: [],
@@ -2787,6 +3042,134 @@ function createPluginAdapter({
         }
         return rec;
     }
+
+    let storageSaveTimer = null;
+    let ledgerSaveTimer = null;
+    let storageDirtyForDisk = false;
+    let ledgerDirtyForDisk = false;
+
+    function atomicWriteJson(filePath, data) {
+        if (!filePath || persistDisabled) return;
+        const tmp = `${filePath}.rs-tmp-${crypto.randomBytes(6).toString('hex')}`;
+        try {
+            fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { encoding: 'utf8', mode: 0o600 });
+            fs.renameSync(tmp, filePath);
+        } catch (e) {
+            try { fs.rmSync(tmp, { force: true }); } catch (_) {}
+            console.warn(`[PluginAdapter] 파일 저장 실패 (${path.basename(filePath)}):`, e.message);
+        }
+    }
+
+    function scheduleSaveLedger() {
+        ledgerDirtyForDisk = true;
+        if (!ledgerPath || persistDisabled || ledgerSaveTimer) return;
+        ledgerSaveTimer = setTimeout(() => {
+            ledgerSaveTimer = null;
+            saveLedgerToDiskNow();
+        }, 300);
+        if (typeof ledgerSaveTimer.unref === 'function') ledgerSaveTimer.unref();
+    }
+
+    function saveLedgerToDiskNow() {
+        if (ledgerSaveTimer) {
+            clearTimeout(ledgerSaveTimer);
+            ledgerSaveTimer = null;
+        }
+        if (!ledgerPath || persistDisabled || !ledgerDirtyForDisk) return;
+        ledgerDirtyForDisk = false;
+        const payload = {};
+        for (const [pName, rec] of pluginRuntimeLedger.entries()) {
+            if (!pName || !rec) continue;
+            payload[pName] = {
+                pluginName: rec.pluginName,
+                beforeRequestRuns: rec.beforeRequestRuns || 0,
+                bodyIntercepterRuns: rec.bodyIntercepterRuns || 0,
+                afterRequestRuns: rec.afterRequestRuns || 0,
+                outputRuns: rec.outputRuns || 0,
+                storageReads: rec.storageReads || 0,
+                storageWrites: rec.storageWrites || 0,
+                storageErrors: rec.storageErrors || 0,
+                lastBeforeRequestAt: rec.lastBeforeRequestAt || 0,
+                lastBodyIntercepterAt: rec.lastBodyIntercepterAt || 0,
+                lastAfterRequestAt: rec.lastAfterRequestAt || 0,
+                lastOutputAt: rec.lastOutputAt || 0,
+                lastStorageWriteAt: rec.lastStorageWriteAt || 0,
+                lastStorageError: rec.lastStorageError || '',
+                recentStorageKeys: Array.isArray(rec.recentStorageKeys) ? rec.recentStorageKeys.slice(0, 24) : [],
+                lastAfterRequest: rec.lastAfterRequest ? cloneJson(rec.lastAfterRequest) : null,
+                lastOutput: rec.lastOutput ? cloneJson(rec.lastOutput) : null,
+                history: Array.isArray(rec.history) ? rec.history.slice(-12).map((h) => cloneJson(h)) : [],
+            };
+        }
+        atomicWriteJson(ledgerPath, { version: 1, runtimeRecallSeq, plugins: payload });
+    }
+
+    function loadLedgerFromDisk() {
+        if (!ledgerPath || persistDisabled) return;
+        try {
+            if (!fs.existsSync(ledgerPath)) return;
+            const parsed = JSON.parse(fs.readFileSync(ledgerPath, 'utf8'));
+            if (!parsed || typeof parsed !== 'object') return;
+            let maxId = Number(parsed.runtimeRecallSeq) || 0;
+            const pluginsObj = parsed.plugins && typeof parsed.plugins === 'object' ? parsed.plugins : {};
+            for (const [pName, raw] of Object.entries(pluginsObj)) {
+                if (!pName || !raw || typeof raw !== 'object') continue;
+                const rec = ensureRuntimeLedger(pName);
+                rec.beforeRequestRuns = Number(raw.beforeRequestRuns) || 0;
+                rec.bodyIntercepterRuns = Number(raw.bodyIntercepterRuns) || 0;
+                rec.afterRequestRuns = Number(raw.afterRequestRuns) || 0;
+                rec.outputRuns = Number(raw.outputRuns) || 0;
+                rec.storageReads = Number(raw.storageReads) || 0;
+                rec.storageWrites = Number(raw.storageWrites) || 0;
+                rec.storageErrors = Number(raw.storageErrors) || 0;
+                rec.lastBeforeRequestAt = Number(raw.lastBeforeRequestAt) || 0;
+                rec.lastBodyIntercepterAt = Number(raw.lastBodyIntercepterAt) || 0;
+                rec.lastAfterRequestAt = Number(raw.lastAfterRequestAt) || 0;
+                rec.lastOutputAt = Number(raw.lastOutputAt) || 0;
+                rec.lastStorageWriteAt = Number(raw.lastStorageWriteAt) || 0;
+                rec.lastStorageError = String(raw.lastStorageError || '');
+                rec.recentStorageKeys = Array.isArray(raw.recentStorageKeys) ? raw.recentStorageKeys.map(String).slice(0, 24) : [];
+                rec.lastAfterRequest = raw.lastAfterRequest || null;
+                rec.lastOutput = raw.lastOutput || null;
+                rec.history = Array.isArray(raw.history) ? raw.history.slice(-12) : [];
+                for (const h of rec.history) {
+                    if (h && Number(h.id) > maxId) maxId = Number(h.id);
+                }
+            }
+            if (maxId > runtimeRecallSeq) runtimeRecallSeq = maxId;
+        } catch (e) {
+            console.warn('[PluginAdapter] 런타임 원장 파일 로드 실패:', e.message);
+        }
+    }
+
+    function recordStorageEvent(pluginName, { op, storeKind, key = '', ok = true, error = '' } = {}) {
+        const pName = String(pluginName || '').trim();
+        if (!pName) return;
+        const rec = ensureRuntimeLedger(pName);
+        if (op === 'read') {
+            rec.storageReads = (rec.storageReads || 0) + 1;
+            return;
+        }
+        if (op === 'write') {
+            if (ok) {
+                rec.storageWrites = (rec.storageWrites || 0) + 1;
+                rec.lastStorageWriteAt = Date.now();
+            } else {
+                rec.storageErrors = (rec.storageErrors || 0) + 1;
+                rec.lastStorageError = String(error || 'storage write error').slice(0, 240);
+            }
+            if (key) {
+                const tag = `${storeKind}:${String(key)}`.slice(0, 120);
+                const list = Array.isArray(rec.recentStorageKeys) ? rec.recentStorageKeys : [];
+                const filtered = list.filter((x) => x !== tag);
+                filtered.unshift(tag);
+                rec.recentStorageKeys = filtered.slice(0, 24);
+            }
+            scheduleSaveLedger();
+        }
+    }
+
+    loadLedgerFromDisk();
 
     function pickPrimaryRecallIndex(reversedHistory) {
         const list = Array.isArray(reversedHistory) ? reversedHistory : [];
@@ -2933,14 +3316,92 @@ function createPluginAdapter({
     const fallbackPluginStore = new Map();
     const fallbackSafeLocal = new Map();
     const fallbackLocalPlugin = new Map();
+    const webLocalStore = new Map();
+    const webSessionStore = new Map();
+    const dirtyStoreOps = new Map(); // `${storeKind}\0${key}` -> { storeKind, key, op: 'set'|'remove'|'clear', value? }
     const fallbackAssetStore = new Map();
     const fallbackInlayStore = new Map();
     const fallbackCharCache = new Map();
     let lastActiveLocation = { charIndex: -1, chatIndex: -1 };
+    let flushDirtyInFlight = null;
+    let pendingChatOutputs = 0;
+
+    function saveStorageToDiskNow() {
+        if (storageSaveTimer) {
+            clearTimeout(storageSaveTimer);
+            storageSaveTimer = null;
+        }
+        if (!storagePath || persistDisabled || !storageDirtyForDisk) return;
+        storageDirtyForDisk = false;
+        atomicWriteJson(storagePath, {
+            version: 1,
+            webLocal: Object.fromEntries(webLocalStore.entries()),
+            fallbackPluginStore: Object.fromEntries(fallbackPluginStore.entries()),
+            fallbackSafeLocal: Object.fromEntries(fallbackSafeLocal.entries()),
+            fallbackLocalPlugin: Object.fromEntries(fallbackLocalPlugin.entries()),
+            dirtyStoreOps: Array.from(dirtyStoreOps.values()),
+        });
+    }
+
+    function scheduleSaveStorage() {
+        storageDirtyForDisk = true;
+        if (!storagePath || persistDisabled || storageSaveTimer) return;
+        storageSaveTimer = setTimeout(() => {
+            storageSaveTimer = null;
+            saveStorageToDiskNow();
+        }, 120);
+        if (typeof storageSaveTimer.unref === 'function') storageSaveTimer.unref();
+    }
+
+    function loadStorageFromDisk() {
+        if (!storagePath || persistDisabled) return;
+        try {
+            if (!fs.existsSync(storagePath)) return;
+            const parsed = JSON.parse(fs.readFileSync(storagePath, 'utf8'));
+            if (!parsed || typeof parsed !== 'object') return;
+            if (parsed.webLocal && typeof parsed.webLocal === 'object') {
+                for (const [k, v] of Object.entries(parsed.webLocal)) {
+                    webLocalStore.set(String(k), String(v ?? ''));
+                }
+            }
+            if (parsed.fallbackPluginStore && typeof parsed.fallbackPluginStore === 'object') {
+                for (const [k, v] of Object.entries(parsed.fallbackPluginStore)) {
+                    fallbackPluginStore.set(String(k), String(v ?? 'null'));
+                }
+            }
+            if (parsed.fallbackSafeLocal && typeof parsed.fallbackSafeLocal === 'object') {
+                for (const [k, v] of Object.entries(parsed.fallbackSafeLocal)) {
+                    fallbackSafeLocal.set(String(k), String(v ?? ''));
+                }
+            }
+            if (parsed.fallbackLocalPlugin && typeof parsed.fallbackLocalPlugin === 'object') {
+                for (const [k, v] of Object.entries(parsed.fallbackLocalPlugin)) {
+                    fallbackLocalPlugin.set(String(k), cloneJson(v));
+                }
+            }
+            if (Array.isArray(parsed.dirtyStoreOps)) {
+                for (const op of parsed.dirtyStoreOps) {
+                    if (!op || !op.storeKind || !op.op) continue;
+                    const keyStr = String(op.key ?? '');
+                    dirtyStoreOps.set(`${op.storeKind}\0${keyStr}`, {
+                        storeKind: String(op.storeKind),
+                        key: keyStr,
+                        op: String(op.op),
+                        ...(op.op === 'set' ? { value: cloneJson(op.value) } : {}),
+                    });
+                }
+            }
+        } catch (e) {
+            console.warn('[PluginAdapter] 플러그인 스토리지 파일 로드 실패:', e.message);
+        }
+    }
+
+    loadStorageFromDisk();
 
     // Per-turn coherent cache (never acts as a separate persistent DB)
     let turnCache = {
         active: false,
+        deferredEnd: false,
         charIndex: -1,
         chatIndex: -1,
         charObj: null,
@@ -3106,18 +3567,93 @@ function createPluginAdapter({
         return out;
     }
 
+    function readFallbackStoreValue(storeKind, k) {
+        if (storeKind === 'pluginStorage') {
+            return fallbackPluginStore.has(k) ? JSON.parse(fallbackPluginStore.get(k)) : null;
+        }
+        const fb = storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin;
+        return fb.has(k) ? cloneJson(fb.get(k)) : null;
+    }
+
+    function writeFallbackStoreValue(storeKind, k, value) {
+        if (storeKind === 'pluginStorage') {
+            const jsonStr = JSON.stringify(value) ?? 'null';
+            const normalized = JSON.parse(jsonStr);
+            fallbackPluginStore.set(k, jsonStr);
+            return normalized;
+        }
+        const normalizedVal = storeKind === 'safeLocalStorage' ? String(value ?? '') : cloneJson(value);
+        const fb = storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin;
+        fb.set(k, normalizedVal);
+        return normalizedVal;
+    }
+
+    function clearDirtyOpsForStore(storeKind) {
+        const prefix = `${storeKind}\0`;
+        for (const dk of [...dirtyStoreOps.keys()]) {
+            if (dk.startsWith(prefix)) dirtyStoreOps.delete(dk);
+        }
+    }
+
+    async function flushDirtyStoreOps() {
+        if (!isRpcConnected() || dirtyStoreOps.size === 0) return { flushed: 0, remaining: dirtyStoreOps.size };
+        if (flushDirtyInFlight) return flushDirtyInFlight;
+        flushDirtyInFlight = (async () => {
+            let flushed = 0;
+            for (const [dk, entry] of [...dirtyStoreOps.entries()]) {
+                if (!isRpcConnected()) break;
+                try {
+                    if (entry.op === 'clear') {
+                        await hostRpc.invoke(`${entry.storeKind}.clear`, []);
+                    } else if (entry.op === 'remove') {
+                        await hostRpc.invoke(`${entry.storeKind}.removeItem`, [entry.key]);
+                    } else if (entry.op === 'set') {
+                        await hostRpc.invoke(`${entry.storeKind}.setItem`, [entry.key, entry.value]);
+                    }
+                    dirtyStoreOps.delete(dk);
+                    deleteReadCacheKey(`store:${entry.storeKind}:${entry.key}`);
+                    deleteReadCacheKey(`storeKeys:${entry.storeKind}`);
+                    flushed += 1;
+                } catch (err) {
+                    const errMsg = err && err.message ? err.message : String(err);
+                    console.warn(`[PluginAdapter] dirty storage replay failed (${entry.storeKind}.${entry.op}:${entry.key}):`, errMsg);
+                    break;
+                }
+            }
+            if (flushed > 0) scheduleSaveStorage();
+            return { flushed, remaining: dirtyStoreOps.size };
+        })().finally(() => {
+            flushDirtyInFlight = null;
+        });
+        return flushDirtyInFlight;
+    }
+
     // ---- Shared Direct Host Storage & DB Primitives ----
-    async function storeGet(storeKind, key) {
+    async function storeGet(storeKind, key, pluginName = '') {
         const k = String(key);
+        recordStorageEvent(pluginName, { op: 'read', storeKind, key: k, ok: true });
+        const dirtyClear = dirtyStoreOps.get(`${storeKind}\0*`);
+        const dirty = dirtyStoreOps.get(`${storeKind}\0${k}`);
+        if (dirty) {
+            return dirty.op === 'remove' ? null : cloneJson(dirty.value);
+        }
+        if (dirtyClear && dirtyClear.op === 'clear') {
+            return null;
+        }
         if (storeKind === 'pluginStorage') {
             if (turnCache.active && turnCache.pluginStoreCache.has(k)) {
                 return cloneJson(turnCache.pluginStoreCache.get(k));
             }
             let val;
             if (isRpcConnected()) {
-                val = await cachedRpcRead(`store:pluginStorage:${k}`, () => hostRpc.invoke('pluginStorage.getItem', [k]));
+                try {
+                    val = await cachedRpcRead(`store:pluginStorage:${k}`, () => hostRpc.invoke('pluginStorage.getItem', [k]));
+                } catch (err) {
+                    console.warn(`[PluginAdapter] pluginStorage.getItem(${k}) RPC fallback:`, err && err.message ? err.message : String(err));
+                    val = readFallbackStoreValue('pluginStorage', k);
+                }
             } else {
-                val = fallbackPluginStore.has(k) ? JSON.parse(fallbackPluginStore.get(k)) : null;
+                val = readFallbackStoreValue('pluginStorage', k);
             }
             if (turnCache.active) {
                 turnCache.pluginStoreCache.set(k, val === undefined ? null : cloneJson(val));
@@ -3126,78 +3662,134 @@ function createPluginAdapter({
         }
         const op = `${storeKind}.getItem`;
         if (isRpcConnected()) {
-            const v = await cachedRpcRead(`store:${storeKind}:${k}`, () => hostRpc.invoke(op, [k]));
-            return v === undefined ? null : v;
+            try {
+                const v = await cachedRpcRead(`store:${storeKind}:${k}`, () => hostRpc.invoke(op, [k]));
+                return v === undefined ? null : v;
+            } catch (err) {
+                console.warn(`[PluginAdapter] ${op}(${k}) RPC fallback:`, err && err.message ? err.message : String(err));
+                return readFallbackStoreValue(storeKind, k);
+            }
         }
-        const fb = storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin;
-        return fb.has(k) ? fb.get(k) : null;
+        return readFallbackStoreValue(storeKind, k);
     }
 
-    async function storeSet(storeKind, key, value) {
+    async function storeSet(storeKind, key, value, pluginName = '') {
         const k = String(key);
         deleteReadCacheKey(`store:${storeKind}:${k}`);
         deleteReadCacheKey(`storeKeys:${storeKind}`);
-        if (storeKind === 'pluginStorage') {
-            const jsonStr = JSON.stringify(value) ?? 'null';
-            const normalized = JSON.parse(jsonStr);
-            if (turnCache.active) {
-                turnCache.pluginStoreCache.set(k, cloneJson(normalized));
-            }
-            if (isRpcConnected()) {
-                await hostRpc.invoke('pluginStorage.setItem', [k, normalized]);
-            } else {
-                fallbackPluginStore.set(k, jsonStr);
-            }
-            return true;
+        const normalizedVal = writeFallbackStoreValue(storeKind, k, value);
+        if (storeKind === 'pluginStorage' && turnCache.active) {
+            turnCache.pluginStoreCache.set(k, cloneJson(normalizedVal));
         }
-        const normalizedVal = storeKind === 'safeLocalStorage' ? String(value ?? '') : cloneJson(value);
+        const dk = `${storeKind}\0${k}`;
         if (isRpcConnected()) {
-            await hostRpc.invoke(`${storeKind}.setItem`, [k, normalizedVal]);
+            try {
+                if (dirtyStoreOps.size > 0) await flushDirtyStoreOps();
+                await hostRpc.invoke(`${storeKind}.setItem`, [k, normalizedVal]);
+                dirtyStoreOps.delete(dk);
+                recordStorageEvent(pluginName, { op: 'write', storeKind, key: k, ok: true });
+                scheduleSaveStorage();
+            } catch (err) {
+                const errMsg = err && err.message ? err.message : String(err);
+                console.warn(`[PluginAdapter] ${storeKind}.setItem(${k}) deferred:`, errMsg);
+                dirtyStoreOps.set(dk, { storeKind, key: k, op: 'set', value: cloneJson(normalizedVal) });
+                recordStorageEvent(pluginName, { op: 'write', storeKind, key: k, ok: false, error: errMsg });
+                scheduleSaveStorage();
+            }
         } else {
-            const fb = storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin;
-            fb.set(k, normalizedVal);
+            dirtyStoreOps.set(dk, { storeKind, key: k, op: 'set', value: cloneJson(normalizedVal) });
+            recordStorageEvent(pluginName, { op: 'write', storeKind, key: k, ok: true });
+            scheduleSaveStorage();
         }
         return true;
     }
 
-    async function storeRemove(storeKind, key) {
+    async function storeRemove(storeKind, key, pluginName = '') {
         const k = String(key);
         deleteReadCacheKey(`store:${storeKind}:${k}`);
         deleteReadCacheKey(`storeKeys:${storeKind}`);
         if (storeKind === 'pluginStorage' && turnCache.active) {
             turnCache.pluginStoreCache.set(k, null);
         }
+        const fb = storeKind === 'pluginStorage' ? fallbackPluginStore : (storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin);
+        fb.delete(k);
+        const dk = `${storeKind}\0${k}`;
         if (isRpcConnected()) {
-            await hostRpc.invoke(`${storeKind}.removeItem`, [k]);
+            try {
+                await hostRpc.invoke(`${storeKind}.removeItem`, [k]);
+                dirtyStoreOps.delete(dk);
+                recordStorageEvent(pluginName, { op: 'write', storeKind, key: k, ok: true });
+                scheduleSaveStorage();
+            } catch (err) {
+                const errMsg = err && err.message ? err.message : String(err);
+                console.warn(`[PluginAdapter] ${storeKind}.removeItem(${k}) deferred:`, errMsg);
+                dirtyStoreOps.set(dk, { storeKind, key: k, op: 'remove' });
+                recordStorageEvent(pluginName, { op: 'write', storeKind, key: k, ok: false, error: errMsg });
+                scheduleSaveStorage();
+            }
         } else {
-            const fb = storeKind === 'pluginStorage' ? fallbackPluginStore : (storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin);
-            fb.delete(k);
+            dirtyStoreOps.set(dk, { storeKind, key: k, op: 'remove' });
+            recordStorageEvent(pluginName, { op: 'write', storeKind, key: k, ok: true });
+            scheduleSaveStorage();
         }
         return true;
     }
 
-    async function storeClear(storeKind) {
+    async function storeClear(storeKind, pluginName = '') {
         invalidateReadCache(`store:${storeKind}:`);
         deleteReadCacheKey(`storeKeys:${storeKind}`);
         if (storeKind === 'pluginStorage' && turnCache.active) {
             turnCache.pluginStoreCache.clear();
         }
+        const fb = storeKind === 'pluginStorage' ? fallbackPluginStore : (storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin);
+        fb.clear();
+        clearDirtyOpsForStore(storeKind);
         if (isRpcConnected()) {
-            await hostRpc.invoke(`${storeKind}.clear`, []);
+            try {
+                await hostRpc.invoke(`${storeKind}.clear`, []);
+                recordStorageEvent(pluginName, { op: 'write', storeKind, key: '*', ok: true });
+                scheduleSaveStorage();
+            } catch (err) {
+                const errMsg = err && err.message ? err.message : String(err);
+                console.warn(`[PluginAdapter] ${storeKind}.clear deferred:`, errMsg);
+                dirtyStoreOps.set(`${storeKind}\0*`, { storeKind, key: '*', op: 'clear' });
+                recordStorageEvent(pluginName, { op: 'write', storeKind, key: '*', ok: false, error: errMsg });
+                scheduleSaveStorage();
+            }
         } else {
-            const fb = storeKind === 'pluginStorage' ? fallbackPluginStore : (storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin);
-            fb.clear();
+            dirtyStoreOps.set(`${storeKind}\0*`, { storeKind, key: '*', op: 'clear' });
+            recordStorageEvent(pluginName, { op: 'write', storeKind, key: '*', ok: true });
+            scheduleSaveStorage();
         }
         return true;
     }
 
-    async function storeKeys(storeKind) {
-        if (isRpcConnected()) {
-            const ks = await cachedRpcRead(`storeKeys:${storeKind}`, () => hostRpc.invoke(`${storeKind}.keys`, []));
-            return Array.isArray(ks) ? ks : [];
+    async function storeKeys(storeKind, pluginName = '') {
+        recordStorageEvent(pluginName, { op: 'read', storeKind, key: '*', ok: true });
+        let baseKeys = [];
+        const hasPendingClear = dirtyStoreOps.has(`${storeKind}\0*`);
+        if (!hasPendingClear) {
+            if (isRpcConnected()) {
+                try {
+                    const ks = await cachedRpcRead(`storeKeys:${storeKind}`, () => hostRpc.invoke(`${storeKind}.keys`, []));
+                    baseKeys = Array.isArray(ks) ? ks.map(String) : [];
+                } catch (_) {
+                    const fb = storeKind === 'pluginStorage' ? fallbackPluginStore : (storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin);
+                    baseKeys = Array.from(fb.keys());
+                }
+            } else {
+                const fb = storeKind === 'pluginStorage' ? fallbackPluginStore : (storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin);
+                baseKeys = Array.from(fb.keys());
+            }
         }
-        const fb = storeKind === 'pluginStorage' ? fallbackPluginStore : (storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin);
-        return Array.from(fb.keys());
+        const keySet = new Set(baseKeys);
+        const prefix = `${storeKind}\0`;
+        for (const [dk, entry] of dirtyStoreOps.entries()) {
+            if (!dk.startsWith(prefix)) continue;
+            if (entry.op === 'set' && entry.key) keySet.add(entry.key);
+            else if (entry.op === 'remove' && entry.key) keySet.delete(entry.key);
+        }
+        return Array.from(keySet);
     }
 
     function ensureStableChatAndMessageIds(charObj, charIdx, chatObj, chatIdx) {
@@ -3734,36 +4326,36 @@ function createPluginAdapter({
             },
 
             pluginStorage: {
-                getItem: (k) => storeGet('pluginStorage', k),
-                setItem: (k, v) => storeSet('pluginStorage', k, v),
-                removeItem: (k) => storeRemove('pluginStorage', k),
-                clear: () => storeClear('pluginStorage'),
-                keys: () => storeKeys('pluginStorage'),
+                getItem: (k) => storeGet('pluginStorage', k, pluginName),
+                setItem: (k, v) => storeSet('pluginStorage', k, v, pluginName),
+                removeItem: (k) => storeRemove('pluginStorage', k, pluginName),
+                clear: () => storeClear('pluginStorage', pluginName),
+                keys: () => storeKeys('pluginStorage', pluginName),
                 key: async (i) => {
-                    const ks = await storeKeys('pluginStorage');
+                    const ks = await storeKeys('pluginStorage', pluginName);
                     return ks[Number(i)] ?? null;
                 },
-                length: async () => (await storeKeys('pluginStorage')).length,
+                length: async () => (await storeKeys('pluginStorage', pluginName)).length,
             },
             safeLocalStorage: {
-                getItem: (k) => storeGet('safeLocalStorage', k),
-                setItem: (k, v) => storeSet('safeLocalStorage', k, v),
-                removeItem: (k) => storeRemove('safeLocalStorage', k),
-                clear: () => storeClear('safeLocalStorage'),
-                keys: () => storeKeys('safeLocalStorage'),
+                getItem: (k) => storeGet('safeLocalStorage', k, pluginName),
+                setItem: (k, v) => storeSet('safeLocalStorage', k, v, pluginName),
+                removeItem: (k) => storeRemove('safeLocalStorage', k, pluginName),
+                clear: () => storeClear('safeLocalStorage', pluginName),
+                keys: () => storeKeys('safeLocalStorage', pluginName),
                 key: async (i) => {
-                    const ks = await storeKeys('safeLocalStorage');
+                    const ks = await storeKeys('safeLocalStorage', pluginName);
                     return ks[Number(i)] ?? null;
                 },
-                length: async () => (await storeKeys('safeLocalStorage')).length,
+                length: async () => (await storeKeys('safeLocalStorage', pluginName)).length,
             },
             getLocalPluginStorage: async () => ({
                 __classType: 'REMOTE_REQUIRED',
-                getItem: (k) => storeGet('localPluginStorage', k),
-                setItem: (k, v) => storeSet('localPluginStorage', k, v),
-                removeItem: (k) => storeRemove('localPluginStorage', k),
-                keys: () => storeKeys('localPluginStorage'),
-                clear: () => storeClear('localPluginStorage'),
+                getItem: (k) => storeGet('localPluginStorage', k, pluginName),
+                setItem: (k, v) => storeSet('localPluginStorage', k, v, pluginName),
+                removeItem: (k) => storeRemove('localPluginStorage', k, pluginName),
+                keys: () => storeKeys('localPluginStorage', pluginName),
+                clear: () => storeClear('localPluginStorage', pluginName),
             }),
 
             addRisuReplacer: async (mode, fn) => {
@@ -4472,7 +5064,27 @@ function createPluginAdapter({
             risuApi: api,
             risuAPI: api,
             document: syncDoc,
-            localStorage: api.safeLocalStorage,
+            localStorage: createSyncWebStorage(webLocalStore, {
+                onRead: (k) => recordStorageEvent(name, { op: 'read', storeKind: 'webLocalStorage', key: k, ok: true }),
+                onSet: (k) => {
+                    recordStorageEvent(name, { op: 'write', storeKind: 'webLocalStorage', key: k, ok: true });
+                    scheduleSaveStorage();
+                },
+                onRemove: (k) => {
+                    recordStorageEvent(name, { op: 'write', storeKind: 'webLocalStorage', key: k, ok: true });
+                    scheduleSaveStorage();
+                },
+                onClear: () => {
+                    recordStorageEvent(name, { op: 'write', storeKind: 'webLocalStorage', key: '*', ok: true });
+                    scheduleSaveStorage();
+                },
+            }),
+            sessionStorage: createSyncWebStorage(webSessionStore, {
+                onRead: (k) => recordStorageEvent(name, { op: 'read', storeKind: 'webSessionStorage', key: k, ok: true }),
+                onSet: (k) => recordStorageEvent(name, { op: 'write', storeKind: 'webSessionStorage', key: k, ok: true }),
+                onRemove: (k) => recordStorageEvent(name, { op: 'write', storeKind: 'webSessionStorage', key: k, ok: true }),
+                onClear: () => recordStorageEvent(name, { op: 'write', storeKind: 'webSessionStorage', key: '*', ok: true }),
+            }),
             MutationObserver: class { observe() {} disconnect() {} takeRecords() { return []; } },
             matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
             requestAnimationFrame: (fn) => sandbox.setTimeout(fn, 16),
@@ -4642,6 +5254,7 @@ function createPluginAdapter({
 
     async function syncPcPlugins() {
         if (!isRpcConnected()) return listPlugins();
+        void flushDirtyStoreOps().catch(() => {});
         if (syncPcInFlight) return syncPcInFlight;
         syncPcInFlight = runSyncPcPlugins().finally(() => {
             syncPcInFlight = null;
@@ -4762,6 +5375,7 @@ function createPluginAdapter({
         invalidateReadCache();
         turnCache = {
             active: true,
+            deferredEnd: false,
             turnRunId: ++runtimeTurnRunSeq,
             charIndex: Number(charIndex),
             chatIndex: Number(chatIndex),
@@ -4792,8 +5406,13 @@ function createPluginAdapter({
         }
     }
 
-    function endTurn() {
+    function endTurn({ force = false } = {}) {
+        if (!force && pendingChatOutputs > 0 && turnCache.active) {
+            turnCache.deferredEnd = true;
+            return;
+        }
         turnCache.active = false;
+        turnCache.deferredEnd = false;
         turnCache.stagedUserIdx = -1;
         turnCache.stagedUserChatId = '';
         turnCache.pluginStoreCache.clear();
@@ -4906,6 +5525,8 @@ function createPluginAdapter({
                             msgs = res;
                         } else if (res && typeof res === 'object' && Array.isArray(res.content)) {
                             msgs = res.content;
+                        } else if (res === undefined) {
+                            msgs = inputCopy;
                         }
                     } catch (e) {
                         stepErr = e && e.message ? e.message : String(e);
@@ -4995,6 +5616,7 @@ function createPluginAdapter({
                     rec.history.splice(0, rec.history.length - 12);
                 }
             }
+            scheduleSaveLedger();
         }
         return msgs;
     }
@@ -5003,80 +5625,104 @@ function createPluginAdapter({
         let current = bodyObj;
         const effectiveTurnRunId = (turnCache.active && turnCache.turnRunId) ? turnCache.turnRunId : 0;
         const activeChatUuid = String((turnCache.chatObj && turnCache.chatObj.id) || '');
-        for (const h of [...hookState.bodyIntercepter]) {
-            const beforeBodyMsgs = extractMessagesFromRequestBody(current, type);
-            const startedAt = Date.now();
-            let stepErr = '';
-            try {
-                const res = await h.fn(cloneJson(current), type);
-                if (res && typeof res === 'object' && !Array.isArray(res)) {
-                    current = res;
+        const list = [...hookState.bodyIntercepter];
+        const total = list.length;
+        for (let idx = 0; idx < total; idx += 1) {
+            const h = list[idx];
+            await runHookStepWithActivity({
+                stage: 'bodyIntercepter',
+                step: idx + 1,
+                total,
+                pluginName: h.pluginName,
+                initialTask: '요청 바디 인터셉트 중',
+            }, async () => {
+                const beforeBodyMsgs = extractMessagesFromRequestBody(current, type);
+                const startedAt = Date.now();
+                const draft = cloneJson(current);
+                let stepErr = '';
+                try {
+                    const res = await h.fn(draft, type);
+                    if (res && typeof res === 'object' && !Array.isArray(res)) {
+                        current = res;
+                    } else if (res === undefined && draft && typeof draft === 'object' && !Array.isArray(draft)) {
+                        current = draft;
+                    }
+                } catch (e) {
+                    stepErr = e && e.message ? e.message : String(e);
+                    console.warn(`[Plugin:${h.pluginName}] bodyIntercepter error:`, stepErr);
                 }
-            } catch (e) {
-                stepErr = e && e.message ? e.message : String(e);
-                console.warn(`[Plugin:${h.pluginName}] bodyIntercepter error:`, stepErr);
-            }
-            const afterBodyMsgs = extractMessagesFromRequestBody(current, type);
-            const diff = diffPluginPromptInjection(beforeBodyMsgs, afterBodyMsgs);
-            if (diff.changed || stepErr) {
+                const afterBodyMsgs = extractMessagesFromRequestBody(current, type);
+                const diff = diffPluginPromptInjection(beforeBodyMsgs, afterBodyMsgs);
                 const rec = ensureRuntimeLedger(h.pluginName);
                 const now = Date.now();
                 rec.bodyIntercepterRuns += 1;
                 rec.lastBodyIntercepterAt = now;
                 const durationMs = Math.max(0, now - startedAt);
-                const prev = rec.history.length ? rec.history[rec.history.length - 1] : null;
-                if (
-                    prev &&
-                    effectiveTurnRunId > 0 &&
-                    prev.turnRunId === effectiveTurnRunId &&
-                    String(prev.chatUuid || '') === activeChatUuid
-                ) {
-                    prev.at = now;
-                    prev.durationMs = (Number(prev.durationMs) || 0) + durationMs;
-                    if (prev.kind === 'beforeRequest') prev.kind = 'beforeRequest+bodyIntercepter';
-                    for (const blk of diff.injectedBlocks) {
-                        if (prev.injectedBlocks.length >= 32) break;
-                        prev.injectedBlocks.push(blk);
-                    }
-                    prev.injectedCount = prev.injectedBlocks.length;
-                    prev.totalInjectedChars = prev.injectedBlocks.reduce((acc, b) => acc + (Number(b.addedChars) || 0), 0);
-                    prev.strippedCount = (Number(prev.strippedCount) || 0) + (diff.strippedCount || 0);
-                    prev.totalRemovedChars = (Number(prev.totalRemovedChars) || 0) + (diff.totalRemovedChars || 0);
-                    if (diff.afterCount) prev.afterCount = Math.max(Number(prev.afterCount) || 0, diff.afterCount);
-                    if (stepErr) {
-                        prev.error = prev.error ? `${prev.error}; ${stepErr}` : stepErr;
-                    }
-                } else {
-                    rec.history.push({
-                        id: ++runtimeRecallSeq,
-                        at: now,
-                        durationMs,
-                        kind: 'bodyIntercepter',
-                        mode: String(type || 'openai'),
-                        turnRunId: effectiveTurnRunId,
-                        charIndex: turnCache.active ? turnCache.charIndex : lastActiveLocation.charIndex,
-                        chatIndex: turnCache.active ? turnCache.chatIndex : lastActiveLocation.chatIndex,
-                        chatUuid: activeChatUuid,
-                        charName: String((turnCache.charObj && turnCache.charObj.name) || ''),
-                        chatName: String((turnCache.chatObj && turnCache.chatObj.name) || ''),
-                        userPreview: extractLastUserPreview(beforeBodyMsgs),
-                        beforeCount: diff.beforeCount,
-                        afterCount: diff.afterCount,
-                        injectedCount: diff.injectedCount,
-                        totalInjectedChars: diff.totalInjectedChars,
-                        strippedCount: diff.strippedCount || 0,
-                        totalRemovedChars: diff.totalRemovedChars || 0,
-                        injectedBlocks: diff.injectedBlocks,
-                        fetchCount: 0,
-                        llmCount: 0,
-                        stepLogs: [],
-                        error: stepErr,
-                    });
-                    if (rec.history.length > 12) {
-                        rec.history.splice(0, rec.history.length - 12);
+                const stepFetchCount = (activeHookFrame && activeHookFrame.fetchCount) || 0;
+                const stepLlmCount = (activeHookFrame && activeHookFrame.llmCount) || 0;
+                const stepLogs = (activeHookFrame && Array.isArray(activeHookFrame.logs)) ? [...activeHookFrame.logs] : [];
+                if (diff.changed || stepErr || stepFetchCount > 0 || stepLlmCount > 0 || stepLogs.length > 0) {
+                    const prev = rec.history.length ? rec.history[rec.history.length - 1] : null;
+                    if (
+                        prev &&
+                        effectiveTurnRunId > 0 &&
+                        prev.turnRunId === effectiveTurnRunId &&
+                        String(prev.chatUuid || '') === activeChatUuid
+                    ) {
+                        prev.at = now;
+                        prev.durationMs = (Number(prev.durationMs) || 0) + durationMs;
+                        if (prev.kind === 'beforeRequest') prev.kind = 'beforeRequest+bodyIntercepter';
+                        for (const blk of diff.injectedBlocks) {
+                            if (prev.injectedBlocks.length >= 32) break;
+                            prev.injectedBlocks.push(blk);
+                        }
+                        prev.injectedCount = prev.injectedBlocks.length;
+                        prev.totalInjectedChars = prev.injectedBlocks.reduce((acc, b) => acc + (Number(b.addedChars) || 0), 0);
+                        prev.strippedCount = (Number(prev.strippedCount) || 0) + (diff.strippedCount || 0);
+                        prev.totalRemovedChars = (Number(prev.totalRemovedChars) || 0) + (diff.totalRemovedChars || 0);
+                        if (diff.afterCount) prev.afterCount = Math.max(Number(prev.afterCount) || 0, diff.afterCount);
+                        prev.fetchCount = (Number(prev.fetchCount) || 0) + stepFetchCount;
+                        prev.llmCount = (Number(prev.llmCount) || 0) + stepLlmCount;
+                        for (const lg of stepLogs) {
+                            if (prev.stepLogs.length >= 20) break;
+                            if (!prev.stepLogs.length || prev.stepLogs[prev.stepLogs.length - 1] !== lg) prev.stepLogs.push(lg);
+                        }
+                        if (stepErr) {
+                            prev.error = prev.error ? `${prev.error}; ${stepErr}` : stepErr;
+                        }
+                    } else {
+                        rec.history.push({
+                            id: ++runtimeRecallSeq,
+                            at: now,
+                            durationMs,
+                            kind: 'bodyIntercepter',
+                            mode: String(type || 'openai'),
+                            turnRunId: effectiveTurnRunId,
+                            charIndex: turnCache.active ? turnCache.charIndex : lastActiveLocation.charIndex,
+                            chatIndex: turnCache.active ? turnCache.chatIndex : lastActiveLocation.chatIndex,
+                            chatUuid: activeChatUuid,
+                            charName: String((turnCache.charObj && turnCache.charObj.name) || ''),
+                            chatName: String((turnCache.chatObj && turnCache.chatObj.name) || ''),
+                            userPreview: extractLastUserPreview(beforeBodyMsgs),
+                            beforeCount: diff.beforeCount,
+                            afterCount: diff.afterCount,
+                            injectedCount: diff.injectedCount,
+                            totalInjectedChars: diff.totalInjectedChars,
+                            strippedCount: diff.strippedCount || 0,
+                            totalRemovedChars: diff.totalRemovedChars || 0,
+                            injectedBlocks: diff.injectedBlocks,
+                            fetchCount: stepFetchCount,
+                            llmCount: stepLlmCount,
+                            stepLogs,
+                            error: stepErr,
+                        });
+                        if (rec.history.length > 12) {
+                            rec.history.splice(0, rec.history.length - 12);
+                        }
                     }
                 }
-            }
+                scheduleSaveLedger();
+            });
         }
         return current;
     }
@@ -5135,6 +5781,7 @@ function createPluginAdapter({
                         stepLogs: (activeHookFrame && Array.isArray(activeHookFrame.logs)) ? [...activeHookFrame.logs] : [],
                         error: stepErr,
                     };
+                    scheduleSaveLedger();
                 }
             });
         }
@@ -5881,38 +6528,49 @@ function createPluginAdapter({
     async function dispatchChatOutput({ charIndex, chatIndex, messageIndex }) {
         const list = [...hookState.chatOutput];
         if (!list.length) return;
-        const charSnap = await dbGetCharacterFromIndex(charIndex);
-        const chatSnap = await dbGetChatFromIndex(charIndex, chatIndex);
-        const work = Promise.all(list.map(async (h) => {
-            const startedAt = Date.now();
-            let errMsg = '';
-            try {
-                await h.fn({
-                    char: cloneJson(charSnap),
-                    chat: cloneJson(chatSnap),
-                    characterIndex: Number(charIndex),
-                    chatIndex: Number(chatIndex),
-                    messageIndex: Number(messageIndex),
-                });
-            } catch (e) {
-                errMsg = e && e.message ? e.message : String(e);
-                console.warn(`[Plugin:${h.pluginName}] chatOutput error:`, errMsg);
-            } finally {
-                const rec = ensureRuntimeLedger(h.pluginName);
-                const now = Date.now();
-                rec.outputRuns += 1;
-                rec.lastOutputAt = now;
-                rec.lastOutput = {
-                    at: now,
-                    durationMs: Math.max(0, now - startedAt),
-                    charIndex: Number(charIndex),
-                    chatIndex: Number(chatIndex),
-                    messageIndex: Number(messageIndex),
-                    error: errMsg,
-                };
+        const capturedRunId = turnCache.active ? turnCache.turnRunId : 0;
+        pendingChatOutputs += 1;
+        const work = (async () => {
+            const charSnap = await dbGetCharacterFromIndex(charIndex);
+            const chatSnap = await dbGetChatFromIndex(charIndex, chatIndex);
+            await Promise.all(list.map(async (h) => {
+                const startedAt = Date.now();
+                let errMsg = '';
+                try {
+                    await h.fn({
+                        char: cloneJson(charSnap),
+                        chat: cloneJson(chatSnap),
+                        characterIndex: Number(charIndex),
+                        chatIndex: Number(chatIndex),
+                        messageIndex: Number(messageIndex),
+                    });
+                } catch (e) {
+                    errMsg = e && e.message ? e.message : String(e);
+                    console.warn(`[Plugin:${h.pluginName}] chatOutput error:`, errMsg);
+                } finally {
+                    const rec = ensureRuntimeLedger(h.pluginName);
+                    const now = Date.now();
+                    rec.outputRuns += 1;
+                    rec.lastOutputAt = now;
+                    rec.lastOutput = {
+                        at: now,
+                        durationMs: Math.max(0, now - startedAt),
+                        charIndex: Number(charIndex),
+                        chatIndex: Number(chatIndex),
+                        messageIndex: Number(messageIndex),
+                        error: errMsg,
+                    };
+                }
+            }));
+        })().finally(() => {
+            pendingChatOutputs = Math.max(0, pendingChatOutputs - 1);
+            scheduleSaveLedger();
+            if (pendingChatOutputs === 0 && turnCache.active && turnCache.deferredEnd && turnCache.turnRunId === capturedRunId) {
+                endTurn({ force: true });
+                invalidateReadCache();
             }
-        }));
-        await Promise.race([work, new Promise((r) => setTimeout(r, 1500))]);
+        });
+        await Promise.race([work, new Promise((r) => setTimeout(r, 5000))]);
     }
 
     async function handleGuiRpc({ pluginName, method, args = [] }) {
@@ -5933,19 +6591,50 @@ function createPluginAdapter({
             return true;
         }
 
+        if (String(method || '').startsWith('webStorage.')) {
+            const op = String(method).slice(11);
+            const scope = String(a[0] || 'local');
+            const targetMap = scope === 'session' ? webSessionStore : webLocalStore;
+            const storeKind = scope === 'session' ? 'webSessionStorage' : 'webLocalStorage';
+            if (op === 'getAll') {
+                return Object.fromEntries(targetMap.entries());
+            }
+            if (op === 'setItem') {
+                const key = String(a[1] ?? '');
+                targetMap.set(key, String(a[2] ?? ''));
+                recordStorageEvent(pluginName, { op: 'write', storeKind, key, ok: true });
+                if (scope !== 'session') scheduleSaveStorage();
+                return true;
+            }
+            if (op === 'removeItem') {
+                const key = String(a[1] ?? '');
+                targetMap.delete(key);
+                recordStorageEvent(pluginName, { op: 'write', storeKind, key, ok: true });
+                if (scope !== 'session') scheduleSaveStorage();
+                return true;
+            }
+            if (op === 'clear') {
+                targetMap.clear();
+                recordStorageEvent(pluginName, { op: 'write', storeKind, key: '*', ok: true });
+                if (scope !== 'session') scheduleSaveStorage();
+                return true;
+            }
+            return null;
+        }
+
         const storageMatch = String(method || '').match(/^(pluginStorage|safeLocalStorage|localPluginStorage)\.(.+)$/);
         if (storageMatch) {
             const [, kind, op] = storageMatch;
-            if (op === 'getItem') return await storeGet(kind, a[0]);
-            if (op === 'setItem') return await storeSet(kind, a[0], a[1]);
-            if (op === 'removeItem') return await storeRemove(kind, a[0]);
-            if (op === 'clear') return await storeClear(kind);
-            if (op === 'keys') return await storeKeys(kind);
+            if (op === 'getItem') return await storeGet(kind, a[0], pluginName);
+            if (op === 'setItem') return await storeSet(kind, a[0], a[1], pluginName);
+            if (op === 'removeItem') return await storeRemove(kind, a[0], pluginName);
+            if (op === 'clear') return await storeClear(kind, pluginName);
+            if (op === 'keys') return await storeKeys(kind, pluginName);
             if (op === 'key') {
-                const ks = await storeKeys(kind);
+                const ks = await storeKeys(kind, pluginName);
                 return ks[Number(a[0])] ?? null;
             }
-            if (op === 'length') return (await storeKeys(kind)).length;
+            if (op === 'length') return (await storeKeys(kind, pluginName)).length;
         }
 
         if (method === 'db.getCurrentCharacterIndex') return (await dbGetCurrentIndices()).charIndex;
@@ -6109,10 +6798,17 @@ function createPluginAdapter({
             bodyIntercepterRuns: rec.bodyIntercepterRuns || 0,
             afterRequestRuns: rec.afterRequestRuns || 0,
             outputRuns: rec.outputRuns || 0,
+            storageReads: rec.storageReads || 0,
+            storageWrites: rec.storageWrites || 0,
+            storageErrors: rec.storageErrors || 0,
             lastBeforeRequestAt: rec.lastBeforeRequestAt || 0,
             lastBodyIntercepterAt: rec.lastBodyIntercepterAt || 0,
             lastAfterRequestAt: rec.lastAfterRequestAt || 0,
             lastOutputAt: rec.lastOutputAt || 0,
+            lastStorageWriteAt: rec.lastStorageWriteAt || 0,
+            lastStorageError: rec.lastStorageError || '',
+            recentStorageKeys: Array.isArray(rec.recentStorageKeys) ? [...rec.recentStorageKeys] : [],
+            pendingDirtyCount: dirtyStoreOps.size,
             lastAfterRequest: rec.lastAfterRequest ? cloneJson(rec.lastAfterRequest) : null,
             lastOutput: rec.lastOutput ? cloneJson(rec.lastOutput) : null,
             recommendedIndex: pickPrimaryRecallIndex(history),
@@ -6130,10 +6826,16 @@ function createPluginAdapter({
                 bodyIntercepterRuns: 0,
                 afterRequestRuns: 0,
                 outputRuns: 0,
+                storageReads: 0,
+                storageWrites: 0,
+                storageErrors: 0,
                 lastBeforeRequestAt: 0,
                 lastBodyIntercepterAt: 0,
                 lastAfterRequestAt: 0,
                 lastOutputAt: 0,
+                lastStorageWriteAt: 0,
+                lastStorageError: '',
+                recentStorageKeys: [],
                 lastAfterRequest: null,
                 lastOutput: null,
                 history: [],
@@ -6168,10 +6870,16 @@ function createPluginAdapter({
                 bodyIntercepterRuns: rec ? (rec.bodyIntercepterRuns || 0) : 0,
                 afterRequestRuns: rec ? (rec.afterRequestRuns || 0) : 0,
                 outputRuns: rec ? (rec.outputRuns || 0) : 0,
+                storageReads: rec ? (rec.storageReads || 0) : 0,
+                storageWrites: rec ? (rec.storageWrites || 0) : 0,
+                storageErrors: rec ? (rec.storageErrors || 0) : 0,
                 lastBeforeRequestAt: rec ? (rec.lastBeforeRequestAt || 0) : 0,
                 lastBodyIntercepterAt: rec ? (rec.lastBodyIntercepterAt || 0) : 0,
                 lastAfterRequestAt: rec ? (rec.lastAfterRequestAt || 0) : 0,
                 lastOutputAt: rec ? (rec.lastOutputAt || 0) : 0,
+                lastStorageWriteAt: rec ? (rec.lastStorageWriteAt || 0) : 0,
+                lastStorageError: rec ? (rec.lastStorageError || '') : '',
+                recentStorageKeys: rec && Array.isArray(rec.recentStorageKeys) ? [...rec.recentStorageKeys] : [],
                 latestInjectedCount: primaryCount,
                 latestInjectedChars: primaryChars,
                 latestChatUuid: primary ? (primary.chatUuid || '') : '',
@@ -6190,11 +6898,19 @@ function createPluginAdapter({
             : { ...entry, uiItems: [] };
         return {
             plugin: { name: entry.name, displayName: entry.displayName, version: entry.version },
-            srcdoc: buildPluginGuiSrcdoc({ plugin: pluginWithUi, entryId, theme }),
+            srcdoc: buildPluginGuiSrcdoc({
+                plugin: pluginWithUi,
+                entryId,
+                theme,
+                webLocalSnapshot: Object.fromEntries(webLocalStore.entries()),
+                webSessionSnapshot: Object.fromEntries(webSessionStore.entries()),
+            }),
         };
     }
 
     async function dispose() {
+        saveStorageToDiskNow();
+        saveLedgerToDiskNow();
         for (const name of [...activeHosts.keys()]) {
             await unloadPlugin(name);
         }
@@ -6245,11 +6961,12 @@ function createPluginAdapter({
         dispatchChatOutput,
         handleGuiRpc,
         handleGuiRpcBatch,
+        flushDirtyStoreOps,
         invalidateReadCache,
         getPluginRuntimeRecall,
         getGuiSrcdoc,
         dispose,
-        _debug: { hookState, providers, pluginDoms, pluginRuntimeLedger, fallbackPluginStore, fallbackSafeLocal, fallbackLocalPlugin, fallbackAssetStore, fallbackInlayStore, getAllKnownEntries },
+        _debug: { hookState, providers, pluginDoms, pluginRuntimeLedger, fallbackPluginStore, fallbackSafeLocal, fallbackLocalPlugin, webLocalStore, webSessionStore, dirtyStoreOps, fallbackAssetStore, fallbackInlayStore, getAllKnownEntries },
     };
 }
 
@@ -6257,6 +6974,8 @@ module.exports = {
     URL_BLACKLIST,
     parsePluginHeader,
     diffPluginPromptInjection,
+    pickPreferredPluginGuiEntry,
+    createSyncWebStorage,
     buildPluginGuiSrcdoc,
     createPluginAdapter,
 };

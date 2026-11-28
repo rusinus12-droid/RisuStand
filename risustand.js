@@ -8966,6 +8966,109 @@
             return list;
         }
 
+        const SL_FALLBACK_PREFIX = '__rs_sl_fb__:';
+        const LPS_FALLBACK_PREFIX = '__rs_lps_fb__:';
+
+        async function readStoreLength(store) {
+            if (!store) return 0;
+            if (typeof store.length === 'function') {
+                return Number(await store.length()) || 0;
+            }
+            if (typeof store.length === 'number') {
+                return Number(store.length) || 0;
+            }
+            if (typeof store.keys === 'function') {
+                const ks = await store.keys();
+                return Array.isArray(ks) ? ks.length : 0;
+            }
+            return 0;
+        }
+
+        async function readStoreKeys(store) {
+            if (!store) return [];
+            if (typeof store.keys === 'function') {
+                const ks = await store.keys();
+                return Array.isArray(ks) ? ks.map((k) => String(k)) : [];
+            }
+            if (typeof store.key === 'function') {
+                const len = await readStoreLength(store);
+                const out = [];
+                for (let i = 0; i < len; i += 1) {
+                    const k = await Promise.resolve(store.key(i)).catch(() => null);
+                    if (k !== null && k !== undefined) out.push(String(k));
+                }
+                return out;
+            }
+            return [];
+        }
+
+        async function prefixedStoreKeys(prefix) {
+            const ps = risuai.pluginStorage;
+            if (!ps) return [];
+            const allKeys = await readStoreKeys(ps);
+            const out = [];
+            for (const k of allKeys) {
+                if (typeof k === 'string' && k.startsWith(prefix)) {
+                    out.push(k.slice(prefix.length));
+                }
+            }
+            return out;
+        }
+
+        async function prefixedStoreCall(prefix, op, args) {
+            const a = Array.isArray(args) ? args : [];
+            const ps = risuai.pluginStorage;
+            if (op === 'getMany') {
+                const out = {};
+                const ks = Array.isArray(a[0]) ? [...new Set(a[0].map((k) => String(k ?? '')))] : [];
+                if (ps && typeof ps.getItem === 'function') {
+                    const CHUNK = 16;
+                    for (let i = 0; i < ks.length; i += CHUNK) {
+                        const slice = ks.slice(i, i + CHUNK);
+                        const vals = await Promise.all(slice.map((k) => Promise.resolve(ps.getItem(prefix + k)).catch(() => null)));
+                        for (let j = 0; j < slice.length; j += 1) out[slice[j]] = vals[j] === undefined ? null : vals[j];
+                    }
+                }
+                return out;
+            }
+            if (op === 'getItem') {
+                if (!ps || typeof ps.getItem !== 'function') return null;
+                const v = await ps.getItem(prefix + String(a[0] ?? ''));
+                return v === undefined ? null : v;
+            }
+            if (op === 'setItem') {
+                if (!ps || typeof ps.setItem !== 'function') {
+                    throw new Error('risuai.pluginStorage unavailable');
+                }
+                await ps.setItem(prefix + String(a[0] ?? ''), a[1]);
+                return true;
+            }
+            if (op === 'removeItem') {
+                if (!ps || typeof ps.removeItem !== 'function') {
+                    throw new Error('risuai.pluginStorage unavailable');
+                }
+                await ps.removeItem(prefix + String(a[0] ?? ''));
+                return true;
+            }
+            if (op === 'clear') {
+                if (!ps || typeof ps.removeItem !== 'function') {
+                    throw new Error('risuai.pluginStorage unavailable');
+                }
+                const ks = await prefixedStoreKeys(prefix);
+                for (const k of ks) {
+                    await ps.removeItem(prefix + k);
+                }
+                return true;
+            }
+            if (op === 'keys') return await prefixedStoreKeys(prefix);
+            if (op === 'key') {
+                const ks = await prefixedStoreKeys(prefix);
+                return ks[Number(a[0] || 0)] ?? null;
+            }
+            if (op === 'length') return (await prefixedStoreKeys(prefix)).length;
+            return null;
+        }
+
         async function getSharedLocalPluginStore() {
             if (!cachedLocalPluginStore && typeof risuai.getLocalPluginStorage === 'function') {
                 try {
@@ -8999,86 +9102,120 @@
                 return out;
             }
             if (kindOp === 'pluginStorage.setItem') {
-                if (risuai.pluginStorage && risuai.pluginStorage.setItem) await risuai.pluginStorage.setItem(String(a[0] ?? ''), a[1]);
+                if (!risuai.pluginStorage || typeof risuai.pluginStorage.setItem !== 'function') {
+                    throw new Error('risuai.pluginStorage unavailable');
+                }
+                await risuai.pluginStorage.setItem(String(a[0] ?? ''), a[1]);
                 return true;
             }
             if (kindOp === 'pluginStorage.setMany') {
+                if (!risuai.pluginStorage || typeof risuai.pluginStorage.setItem !== 'function') {
+                    throw new Error('risuai.pluginStorage unavailable');
+                }
                 const pairs = Array.isArray(a[0]) ? a[0] : [];
-                if (risuai.pluginStorage && risuai.pluginStorage.setItem) {
-                    for (const pair of pairs) {
-                        if (Array.isArray(pair)) await risuai.pluginStorage.setItem(String(pair[0] ?? ''), pair[1]);
-                    }
+                for (const pair of pairs) {
+                    if (Array.isArray(pair)) await risuai.pluginStorage.setItem(String(pair[0] ?? ''), pair[1]);
                 }
                 return true;
             }
             if (kindOp === 'pluginStorage.removeItem') {
-                if (risuai.pluginStorage && risuai.pluginStorage.removeItem) await risuai.pluginStorage.removeItem(String(a[0] ?? ''));
+                if (!risuai.pluginStorage || typeof risuai.pluginStorage.removeItem !== 'function') {
+                    throw new Error('risuai.pluginStorage unavailable');
+                }
+                await risuai.pluginStorage.removeItem(String(a[0] ?? ''));
                 return true;
             }
             if (kindOp === 'pluginStorage.clear') {
-                if (risuai.pluginStorage && risuai.pluginStorage.clear) await risuai.pluginStorage.clear();
+                if (!risuai.pluginStorage || typeof risuai.pluginStorage.clear !== 'function') {
+                    throw new Error('risuai.pluginStorage unavailable');
+                }
+                await risuai.pluginStorage.clear();
                 return true;
             }
             if (kindOp === 'pluginStorage.keys') {
-                return risuai.pluginStorage && risuai.pluginStorage.keys ? await risuai.pluginStorage.keys() : [];
+                return await readStoreKeys(risuai.pluginStorage);
             }
             if (kindOp === 'pluginStorage.key') {
-                return risuai.pluginStorage && risuai.pluginStorage.key ? await risuai.pluginStorage.key(Number(a[0] || 0)) : null;
+                const ps = risuai.pluginStorage;
+                if (ps && typeof ps.key === 'function') return await ps.key(Number(a[0] || 0));
+                const ks = await readStoreKeys(ps);
+                return ks[Number(a[0] || 0)] ?? null;
             }
             if (kindOp === 'pluginStorage.length') {
-                return risuai.pluginStorage && risuai.pluginStorage.length ? await risuai.pluginStorage.length() : 0;
+                return await readStoreLength(risuai.pluginStorage);
             }
 
-            // 2) Shared safeLocalStorage
+            // 2) Shared safeLocalStorage (falls back to prefixed pluginStorage if unavailable)
             if (kindOp === 'safeLocalStorage.getMany') {
+                const sl = risuai.safeLocalStorage;
+                if (!sl || typeof sl.getItem !== 'function') {
+                    return await prefixedStoreCall(SL_FALLBACK_PREFIX, 'getMany', a);
+                }
                 const out = {};
                 const ks = Array.isArray(a[0]) ? [...new Set(a[0].map((k) => String(k ?? '')))] : [];
-                const sl = risuai.safeLocalStorage;
-                if (sl && typeof sl.getItem === 'function') {
-                    const CHUNK = 16;
-                    for (let i = 0; i < ks.length; i += CHUNK) {
-                        const slice = ks.slice(i, i + CHUNK);
-                        const vals = await Promise.all(slice.map((k) => Promise.resolve(sl.getItem(k)).catch(() => null)));
-                        for (let j = 0; j < slice.length; j++) out[slice[j]] = vals[j] === undefined ? null : vals[j];
-                    }
+                const CHUNK = 16;
+                for (let i = 0; i < ks.length; i += CHUNK) {
+                    const slice = ks.slice(i, i + CHUNK);
+                    const vals = await Promise.all(slice.map((k) => Promise.resolve(sl.getItem(k)).catch(() => null)));
+                    for (let j = 0; j < slice.length; j++) out[slice[j]] = vals[j] === undefined ? null : vals[j];
                 }
                 return out;
             }
             if (kindOp.startsWith('safeLocalStorage.')) {
                 const m = kindOp.slice(17);
                 const sl = risuai.safeLocalStorage;
-                if (sl && typeof sl[m] === 'function') {
-                    return m === 'setItem' ? (await sl.setItem(String(a[0] ?? ''), String(a[1] ?? '')), true) : await sl[m](...a);
+                if (!sl || typeof sl.getItem !== 'function' || typeof sl.setItem !== 'function') {
+                    return await prefixedStoreCall(SL_FALLBACK_PREFIX, m, a);
                 }
-                if (m === 'keys') return [];
-                if (m === 'length') return 0;
+                if (m === 'keys') return await readStoreKeys(sl);
+                if (m === 'length') return await readStoreLength(sl);
+                if (m === 'key') {
+                    if (typeof sl.key === 'function') return await sl.key(Number(a[0] || 0));
+                    const ks = await readStoreKeys(sl);
+                    return ks[Number(a[0] || 0)] ?? null;
+                }
+                if (typeof sl[m] === 'function') {
+                    if (m === 'setItem') { await sl.setItem(String(a[0] ?? ''), String(a[1] ?? '')); return true; }
+                    if (m === 'removeItem' || m === 'clear') { await sl[m](...a); return true; }
+                    return await sl[m](...a);
+                }
                 return null;
             }
 
-            // 3) Shared getLocalPluginStorage()
+            // 3) Shared getLocalPluginStorage() (falls back to prefixed pluginStorage if unavailable)
             if (kindOp === 'localPluginStorage.getMany') {
+                const lps = await getSharedLocalPluginStore();
+                if (!lps || typeof lps.getItem !== 'function') {
+                    return await prefixedStoreCall(LPS_FALLBACK_PREFIX, 'getMany', a);
+                }
                 const out = {};
                 const ks = Array.isArray(a[0]) ? [...new Set(a[0].map((k) => String(k ?? '')))] : [];
-                const lps = await getSharedLocalPluginStore();
-                if (lps && typeof lps.getItem === 'function') {
-                    const CHUNK = 16;
-                    for (let i = 0; i < ks.length; i += CHUNK) {
-                        const slice = ks.slice(i, i + CHUNK);
-                        const vals = await Promise.all(slice.map((k) => Promise.resolve(lps.getItem(k)).catch(() => null)));
-                        for (let j = 0; j < slice.length; j++) out[slice[j]] = vals[j] === undefined ? null : vals[j];
-                    }
+                const CHUNK = 16;
+                for (let i = 0; i < ks.length; i += CHUNK) {
+                    const slice = ks.slice(i, i + CHUNK);
+                    const vals = await Promise.all(slice.map((k) => Promise.resolve(lps.getItem(k)).catch(() => null)));
+                    for (let j = 0; j < slice.length; j++) out[slice[j]] = vals[j] === undefined ? null : vals[j];
                 }
                 return out;
             }
             if (kindOp.startsWith('localPluginStorage.')) {
                 const m = kindOp.slice(19);
                 const lps = await getSharedLocalPluginStore();
-                if (lps && typeof lps[m] === 'function') {
+                if (!lps || typeof lps.getItem !== 'function' || typeof lps.setItem !== 'function') {
+                    return await prefixedStoreCall(LPS_FALLBACK_PREFIX, m, a);
+                }
+                if (m === 'keys') return await readStoreKeys(lps);
+                if (m === 'length') return await readStoreLength(lps);
+                if (m === 'key') {
+                    if (typeof lps.key === 'function') return await lps.key(Number(a[0] || 0));
+                    const ks = await readStoreKeys(lps);
+                    return ks[Number(a[0] || 0)] ?? null;
+                }
+                if (typeof lps[m] === 'function') {
                     if (m === 'setItem') { await lps.setItem(String(a[0] ?? ''), a[1]); return true; }
                     if (m === 'removeItem' || m === 'clear') { await lps[m](...a); return true; }
                     return await lps[m](...a);
                 }
-                if (m === 'keys') return [];
                 return null;
             }
 

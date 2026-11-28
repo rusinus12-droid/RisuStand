@@ -63,6 +63,8 @@ const CONFIG_PATH = path.join(ROOT_DIR, '.risustand-config.json');
 const PRESETS_PATH = path.join(ROOT_DIR, '.risustand-presets.json');
 const TTS_SCRIPTS_PATH = path.join(ROOT_DIR, '.risustand-tts-scripts.json');
 const PLUGINS_PATH = path.join(ROOT_DIR, '.risustand-plugins.json');
+const PLUGIN_STORAGE_PATH = path.join(ROOT_DIR, '.risustand-plugin-storage.json');
+const PLUGIN_LEDGER_PATH = path.join(ROOT_DIR, '.risustand-plugin-ledger.json');
 const THUMBS_DIR = process.env.RISUSTAND_THUMBS_DIR || path.join(ROOT_DIR, '.risustand-thumbs');
 let configPersistDisabled = false;
 
@@ -6623,13 +6625,20 @@ async function runDirectRemoteChat(charIndex, chatIndex, userText, snapView = st
                 messageIndex = tCtxPre.chatObj.message.length - 1;
             }
             if (modAdapter) {
+                if (typeof modAdapter.syncTurnObjects === 'function') {
+                    modAdapter.syncTurnObjects({ charObj: tCtxPre.charObj, chatObj: tCtxPre.chatObj });
+                }
                 await modAdapter.runTriggerMode('output');
-                if (tCtxPre.chatObj && messageIndex >= 0 && tCtxPre.chatObj.message[messageIndex]) {
-                    finalReply = String(tCtxPre.chatObj.message[messageIndex].data ?? finalReply);
+                const tCtxPostMod = adapter.getTurnContext();
+                const latestChat = (tCtxPostMod && tCtxPostMod.chatObj) || tCtxPre.chatObj;
+                if (latestChat && messageIndex >= 0 && Array.isArray(latestChat.message) && latestChat.message[messageIndex]) {
+                    finalReply = String(latestChat.message[messageIndex].data ?? finalReply);
                 }
             }
-            const committed = (activeHostRpc && activeHostRpc.isConnected() && tCtxPre.chatObj)
-                ? (await activeHostRpc.invoke('db.setChat', [Number(charIndex), Number(chatIndex), JSON.parse(JSON.stringify(tCtxPre.chatObj))]), { committedViaRpc: true, messageIndex })
+            const tCtxCommit = adapter.getTurnContext();
+            const commitChatObj = (tCtxCommit && tCtxCommit.chatObj) || tCtxPre.chatObj;
+            const committed = (activeHostRpc && activeHostRpc.isConnected() && commitChatObj)
+                ? (await activeHostRpc.invoke('db.setChat', [Number(charIndex), Number(chatIndex), JSON.parse(JSON.stringify(commitChatObj))]), adapter.invalidateReadCache(), { committedViaRpc: true, messageIndex })
                 : { committedViaRpc: false, messageIndex };
             if (!committed.committedViaRpc) {
                 const appended = [];
@@ -6749,14 +6758,22 @@ async function runDirectRemoteReroll(charIndex, chatIndex, msgIndex, snapView = 
                 }
             }
             if (modAdapter) {
+                if (typeof modAdapter.syncTurnObjects === 'function') {
+                    modAdapter.syncTurnObjects({ charObj: tCtxPre.charObj, chatObj: tCtxPre.chatObj });
+                }
                 await modAdapter.runTriggerMode('output');
-                if (tCtxPre.chatObj && tCtxPre.chatObj.message[msgIndex]) {
-                    finalReply = String(tCtxPre.chatObj.message[msgIndex].data ?? finalReply);
+                const tCtxPostMod = adapter.getTurnContext();
+                const latestChat = (tCtxPostMod && tCtxPostMod.chatObj) || tCtxPre.chatObj;
+                if (latestChat && Array.isArray(latestChat.message) && latestChat.message[msgIndex]) {
+                    finalReply = String(latestChat.message[msgIndex].data ?? finalReply);
                 }
             }
-            const committedViaRpc = Boolean(activeHostRpc && activeHostRpc.isConnected() && tCtxPre.chatObj);
+            const tCtxCommit = adapter.getTurnContext();
+            const commitChatObj = (tCtxCommit && tCtxCommit.chatObj) || tCtxPre.chatObj;
+            const committedViaRpc = Boolean(activeHostRpc && activeHostRpc.isConnected() && commitChatObj);
             if (committedViaRpc) {
-                await activeHostRpc.invoke('db.setChat', [Number(charIndex), Number(chatIndex), JSON.parse(JSON.stringify(tCtxPre.chatObj))]);
+                await activeHostRpc.invoke('db.setChat', [Number(charIndex), Number(chatIndex), JSON.parse(JSON.stringify(commitChatObj))]);
+                adapter.invalidateReadCache();
             } else {
                 queueCommand('replace_message_with_swipe', { charIndex, chatIndex, msgIndex, newData: finalReply });
             }
@@ -7767,6 +7784,16 @@ function renderWebApp() {
   .plg-gui-head {
     display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
     padding:10px 14px; border-bottom:1px solid var(--border); background:var(--surface); flex-shrink:0;
+  }
+  .plg-gui-entries {
+    display:flex; align-items:center; gap:6px; overflow-x:auto; flex-wrap:nowrap;
+    padding:6px 12px; border-bottom:1px solid var(--border); background:var(--elev);
+    flex-shrink:0; scrollbar-width:none;
+  }
+  .plg-gui-entries::-webkit-scrollbar { display:none; }
+  .plg-gui-entries .pill { flex-shrink:0; font-size:11.5px; min-height:28px; padding:4px 10px; }
+  .plg-gui-entries .pill.active {
+    background:var(--accent); color:var(--on-accent); border-color:var(--accent);
   }
   #pluginGuiFrame {
     flex:1; width:100%; min-height:0; border:none; background:#0f172a;
@@ -18305,7 +18332,16 @@ function renderWebApp() {
     const activeItem = history.length ? history[idx] : null;
     const activeCount = getRecallItemCount(activeItem);
     const activeChars = getRecallItemChars(activeItem);
-    const totalHookRuns = ((rec && rec.beforeRequestRuns) || 0) + ((rec && rec.bodyIntercepterRuns) || 0);
+    const totalHookRuns = ((rec && rec.beforeRequestRuns) || 0)
+      + ((rec && rec.bodyIntercepterRuns) || 0)
+      + ((rec && rec.afterRequestRuns) || 0)
+      + ((rec && rec.outputRuns) || 0);
+    const storageReads = (rec && rec.storageReads) || 0;
+    const storageWrites = (rec && rec.storageWrites) || 0;
+    const storageErrors = (rec && rec.storageErrors) || 0;
+    const lastStorageError = (rec && rec.lastStorageError) || '';
+    const recentStorageKeys = (rec && Array.isArray(rec.recentStorageKeys)) ? rec.recentStorageKeys : [];
+    const pendingDirtyCount = (rec && rec.pendingDirtyCount) || 0;
     const isRecallView = pluginGuiState.viewMode === 'recall';
 
     if (toggleBtn) {
@@ -18318,6 +18354,9 @@ function renderWebApp() {
       } else if (totalHookRuns > 0 || history.length > 0) {
         toggleBtn.textContent = '🧠 백엔드 실행 기록 (' + Math.max(totalHookRuns, history.length) + '회)';
         toggleBtn.className = 'pill';
+      } else if (storageWrites > 0) {
+        toggleBtn.textContent = '🧠 스토리지 기록 (' + storageWrites + '회)';
+        toggleBtn.className = 'pill';
       } else {
         toggleBtn.textContent = '🧠 백엔드 회상 기록 (0)';
         toggleBtn.className = 'pill';
@@ -18328,14 +18367,14 @@ function renderWebApp() {
       if (!isRecallView && !pluginGuiState.bannerDismissed && (totalHookRuns > 0 || history.length > 0)) {
         const summaryTxt = (activeItem && activeChars > 0)
           ? '<b>🧠 백엔드에서 최근 회상·주입 완료</b> (' + activeCount + '블록 · ' + activeChars.toLocaleString() + '자)'
-          : '<b>🧠 백엔드 훅 ' + Math.max(totalHookRuns, history.length) + '회 실행됨</b> (최근 주입 0자)';
+          : '<b>🧠 백엔드 훅 ' + Math.max(totalHookRuns, history.length) + '회 실행됨</b> (주입 0자 · 저장 ' + storageWrites + '회)';
         barEl.innerHTML =
           '<div style="min-width:0; flex:1 1 260px;">' +
             summaryTxt +
-            ' <span style="color:var(--sub);">· 원격 GUI 내부 "이번 회상"은 별도 브라우저 샌드박스라 0으로 표시됩니다.</span>' +
+            ' <span style="color:var(--sub);">· 원격 GUI의 메모리 내 실행 이력은 백엔드 VM과 RAM이 분리되어 비어 보일 수 있으나, 스토리지 데이터는 공유·저장됩니다.</span>' +
           '</div>' +
           '<div style="display:flex; gap:6px; align-items:center;">' +
-            '<button type="button" class="pill active" data-plg-gui-open-recall="1">주입 내역 보기</button>' +
+            '<button type="button" class="pill active" data-plg-gui-open-recall="1">실행·저장 내역 보기</button>' +
             '<button type="button" class="pill" data-plg-gui-dismiss-bar="1" aria-label="배너 닫기">✕</button>' +
           '</div>';
         barEl.style.display = 'flex';
@@ -18354,18 +18393,22 @@ function renderWebApp() {
 
     const noticeHtml =
       '<div class="plg-recall-notice">' +
-        '<div>💡 RisuStand에서는 플러그인 본체(<code>beforeRequest</code> / <code>afterRequest</code> / <code>chatOutput</code>)가 <b>PC 백엔드 VM</b>에서 실행되고, GUI 화면은 별도 iframe 샌드박스에서 열립니다. 따라서 실제 회상·프롬프트 주입 내역은 아래 백엔드 기록에 저장됩니다.</div>' +
+        '<div>💡 RisuStand에서는 플러그인 본체(<code>beforeRequest</code> / <code>afterRequest</code> / <code>chatOutput</code>)가 <b>PC 백엔드 VM</b>에서 실행되고, GUI 화면은 별도 iframe 샌드박스에서 열립니다. 두 환경은 <code>pluginStorage</code>·<code>safeLocalStorage</code>·<code>localPluginStorage</code>·<code>localStorage</code>·<code>DB</code>를 공유하며, 훅 실행 및 스토리지 기록이 아래에 집계됩니다.</div>' +
         '<div style="display:flex; gap:6px; align-items:center;">' +
           '<button type="button" class="pill" data-plg-gui-recall-refresh="1">↻ 기록 새로고침</button>' +
           (blocks.length ? '<button type="button" class="pill" data-plg-recall-copy-all="1">📋 전체 주입 텍스트 복사</button>' : '') +
         '</div>' +
       '</div>';
 
+    const storageSub = '최근: ' + formatRecallTime(rec && rec.lastStorageWriteAt)
+      + (storageErrors > 0 ? ' · 오류 ' + storageErrors + '회' : '')
+      + (pendingDirtyCount > 0 ? ' · 대기 ' + pendingDirtyCount + '건' : '');
+
     const statsHtml =
       '<div class="plg-recall-stats">' +
         '<div class="plg-recall-stat">' +
           '<div class="plg-recall-stat-label">beforeRequest (회상·주입)</div>' +
-          '<div class="plg-recall-stat-val">' + Math.max((rec && rec.beforeRequestRuns) || 0, totalHookRuns) + '회</div>' +
+          '<div class="plg-recall-stat-val">' + Math.max((rec && rec.beforeRequestRuns) || 0, (rec && rec.bodyIntercepterRuns) || 0) + '회</div>' +
           '<div class="plg-recall-stat-sub">최근: ' + formatRecallTime(Math.max((rec && rec.lastBeforeRequestAt) || 0, (rec && rec.lastBodyIntercepterAt) || 0)) + '</div>' +
         '</div>' +
         '<div class="plg-recall-stat">' +
@@ -18383,13 +18426,27 @@ function renderWebApp() {
           '<div class="plg-recall-stat-val">' + (item ? (activeCount + '블록 · ' + activeChars.toLocaleString() + '자') : '-') + '</div>' +
           '<div class="plg-recall-stat-sub">' + (item ? ('소요 ' + item.durationMs + 'ms · API ' + (item.fetchCount || 0) + '회 · LLM ' + (item.llmCount || 0) + '회') : '실행 기록 없음') + '</div>' +
         '</div>' +
+        '<div class="plg-recall-stat">' +
+          '<div class="plg-recall-stat-label">스토리지 기록 상태</div>' +
+          '<div class="plg-recall-stat-val">쓰기 ' + storageWrites + ' · 읽기 ' + storageReads + '</div>' +
+          '<div class="plg-recall-stat-sub">' + esc(storageSub) + '</div>' +
+        '</div>' +
       '</div>';
+
+    const storageDetailHtml = (lastStorageError || recentStorageKeys.length)
+      ? '<div style="border:1px solid var(--border); border-radius:10px; padding:8px 12px; background:var(--surface); font-size:12px; color:var(--sub); display:flex; flex-direction:column; gap:6px;">' +
+          (lastStorageError ? '<div style="color:#fca5a5;"><b>최근 스토리지 오류:</b> ' + esc(lastStorageError) + '</div>' : '') +
+          (recentStorageKeys.length ? '<div><b>최근 기록 키 (' + recentStorageKeys.length + '개):</b> ' + recentStorageKeys.slice(0, 12).map((k) => '<code>' + esc(k) + '</code>').join(' ') + '</div>' : '') +
+        '</div>'
+      : '';
 
     let bodyHtml = '';
     if (!item) {
       bodyHtml =
         '<div style="padding:20px; border:1px dashed var(--border); border-radius:12px; color:var(--sub); font-size:13px; text-align:center;">' +
-          '현재 릴레이 서버 세션에서 아직 백엔드 요청(채팅 전송/생성)이 실행되지 않았습니다.<br/>메시지를 한 번 전송한 뒤 다시 확인하면 실제로 프롬프트에 주입된 기억 텍스트를 그대로 볼 수 있습니다.' +
+          (storageWrites > 0
+            ? '현재 턴 주입 이력은 비어 있으나, 플러그인 스토리지 쓰기가 <b>' + storageWrites + '회</b> 기록되었습니다.'
+            : '현재 릴레이 서버 세션에서 아직 백엔드 요청(채팅 전송/생성)이 실행되지 않았습니다.<br/>메시지를 한 번 전송한 뒤 다시 확인하면 실제로 프롬프트에 주입된 기억 텍스트를 그대로 볼 수 있습니다.') +
         '</div>';
     } else {
       const turnsHtml =
@@ -18454,7 +18511,7 @@ function renderWebApp() {
       bodyHtml = turnsHtml + metaLine + errHtml + blocksHtml + detailsHtml;
     }
 
-    paneEl.innerHTML = noticeHtml + statsHtml + bodyHtml;
+    paneEl.innerHTML = noticeHtml + statsHtml + storageDetailHtml + bodyHtml;
   }
 
   async function loadPluginGuiRecall(pluginName) {
@@ -18495,6 +18552,45 @@ function renderWebApp() {
     }
   }
 
+  function renderPluginGuiEntriesBar() {
+    const barEl = document.getElementById('pluginGuiEntriesBar');
+    if (!barEl) return;
+    const rawItems = Array.isArray(pluginGuiState.uiItems) ? pluginGuiState.uiItems : [];
+    const activeTarget = String(pluginGuiState.entryId || '');
+    const byLabel = new Map();
+    const dedupItems = [];
+    for (const u of rawItems) {
+      if (!u) continue;
+      const rawLabel = String(u.name || u.id || 'GUI').trim();
+      const key = rawLabel.toLowerCase();
+      const isCurActive = Boolean(activeTarget && (u.id === activeTarget || u.name === activeTarget));
+      const rank = (u.kind === 'setting' ? 2 : 0) + (isCurActive ? 4 : 0);
+      const prev = byLabel.get(key);
+      if (!prev) {
+        const rec = { item: u, rank, idx: dedupItems.length };
+        byLabel.set(key, rec);
+        dedupItems.push(u);
+      } else if (rank > prev.rank) {
+        prev.item = u;
+        prev.rank = rank;
+        dedupItems[prev.idx] = u;
+      }
+    }
+    if (dedupItems.length <= 1) {
+      barEl.style.display = 'none';
+      barEl.innerHTML = '';
+      return;
+    }
+    barEl.innerHTML = dedupItems.map((u) => {
+      const val = String((u && (u.id || u.name)) || '');
+      const label = String((u && (u.name || u.id)) || 'GUI');
+      const iconPrefix = (u && u.kind === 'setting') ? '⚙️ ' : '✨ ';
+      const isActive = Boolean(activeTarget && u && (u.id === activeTarget || u.name === activeTarget));
+      return '<button type="button" class="pill' + (isActive ? ' active' : '') + '" data-plg-gui-entry="' + esc(val) + '">' + esc(iconPrefix + label) + '</button>';
+    }).join('');
+    barEl.style.display = 'flex';
+  }
+
   async function openPluginGuiModal(pluginName, entryId = '') {
     const modal = document.getElementById('pluginGuiModal');
     if (!modal || !pluginName) return;
@@ -18521,12 +18617,14 @@ function renderWebApp() {
             '<button type="button" class="pill" data-plg-gui-close="1">✕ 닫기</button>' +
           '</div>' +
         '</div>' +
+        '<div id="pluginGuiEntriesBar" class="plg-gui-entries" style="display:none;"></div>' +
         '<div id="pluginGuiRecallBar" class="plg-gui-recall-bar" style="display:none;"></div>' +
         '<iframe id="pluginGuiFrame" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads"></iframe>' +
         '<div id="pluginGuiRecallPane" class="plg-gui-recall-pane" style="display:none;"></div>' +
       '</div>';
     modal.style.display = 'flex';
 
+    renderPluginGuiEntriesBar();
     void loadPluginGuiRecall(pluginName);
 
     try {
@@ -18548,6 +18646,17 @@ function renderWebApp() {
     if (!d || typeof d !== 'object') return;
     if (d.__rsGuiClose === 1) {
       closePluginGuiModal();
+      return;
+    }
+    if (d.__rsGuiItems === 1 && Array.isArray(d.items)) {
+      pluginGuiState.uiItems = d.items;
+      if (d.activeEntryId) pluginGuiState.entryId = d.activeEntryId;
+      renderPluginGuiEntriesBar();
+      return;
+    }
+    if (d.__rsGuiActiveEntry === 1) {
+      if (d.entryId) pluginGuiState.entryId = d.entryId;
+      renderPluginGuiEntriesBar();
       return;
     }
     if (d.__rsGuiReloadPlugin === 1) {
@@ -18617,6 +18726,12 @@ function renderWebApp() {
       }
       if (e.target.closest('[data-plg-gui-reload]')) {
         openPluginGuiModal(pluginGuiState.pluginName, pluginGuiState.entryId);
+        return;
+      }
+      const entryBtn = e.target.closest('[data-plg-gui-entry]');
+      if (entryBtn) {
+        const targetId = entryBtn.getAttribute('data-plg-gui-entry') || '';
+        openPluginGuiModal(pluginGuiState.pluginName, targetId);
         return;
       }
       if (e.target.closest('[data-plg-gui-recall-toggle]')) {
@@ -20295,6 +20410,8 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
 
     const pluginAdapter = createPluginAdapter({
         pluginsPath: PLUGINS_PATH,
+        storagePath: PLUGIN_STORAGE_PATH,
+        ledgerPath: PLUGIN_LEDGER_PATH,
         persistDisabled: configPersistDisabled,
         getBackendConfig: () => config,
         saveBackendConfig: () => saveConfig(),
@@ -20873,6 +20990,8 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                             .then(() => scheduleSurfaceSnapshotRefresh(80))
                             .catch(() => {});
                     }, 20);
+                } else {
+                    void pluginAdapter.flushDirtyStoreOps().catch(() => {});
                 }
                 if (rpcState.queue.length) {
                     return sendJson(res, 200, { ok: true, calls: rpcState.queue.splice(0, 64) }, req);

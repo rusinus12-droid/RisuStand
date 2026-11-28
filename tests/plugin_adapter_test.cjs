@@ -91,9 +91,9 @@ function bootRisuStandInVm({
     const clone = (v) => (v === undefined ? undefined : JSON.parse(JSON.stringify(v)));
 
     const risuai = {
-        pluginStorage: pluginStore.api,
-        safeLocalStorage: safeLocalStore.api,
-        getLocalPluginStorage: () => localPluginStore.api,
+        pluginStorage: pluginStore ? pluginStore.api : null,
+        safeLocalStorage: safeLocalStore ? safeLocalStore.api : null,
+        getLocalPluginStorage: () => (localPluginStore ? localPluginStore.api : null),
         async getRootDocument() { return null; },
         async changeColorScheme() {},
         async changeTextTheme() {},
@@ -1926,6 +1926,391 @@ risuai.addRisuReplacer('beforeRequest', async (msgs) => {
         assert.equal(scopedSummary.latestInjectedCount, 1);
         assert.ok(scopedSummary.latestInjectedChars > 0);
         assert.equal(scopedSummary.matchesCurrentChat, true);
+    } finally {
+        await adapter.dispose();
+    }
+});
+
+test('pickPreferredPluginGuiEntry prioritizes main GUI / setting entries over input-compose action buttons', () => {
+    // 1) registerButton(action: 인풋 작성하기) registered BEFORE registerSetting(GRADIA 설정)
+    const entries1 = [
+        { id: 'ui_btn_1', kind: 'button', location: 'action', name: 'GRADIA로 인풋 작성하기' },
+        { id: 'ui_set_1', kind: 'setting', location: 'setting', name: 'GRADIA 설정' },
+    ];
+    assert.equal(adapterMod.pickPreferredPluginGuiEntry(entries1, '').id, 'ui_set_1');
+
+    // 2) Two registerButton entries: action input compose vs hamburger main GUI
+    const entries2 = [
+        { id: 'ui_btn_1', kind: 'button', location: 'action', name: 'GRADIA로 인풋 작성하기' },
+        { id: 'ui_btn_2', kind: 'button', location: 'hamburger', name: 'GRADIA' },
+    ];
+    assert.equal(adapterMod.pickPreferredPluginGuiEntry(entries2, '').id, 'ui_btn_2');
+
+    // 3) Explicit targetId (by id or name) overrides default heuristic
+    assert.equal(adapterMod.pickPreferredPluginGuiEntry(entries1, 'ui_btn_1').id, 'ui_btn_1');
+    assert.equal(adapterMod.pickPreferredPluginGuiEntry(entries1, 'GRADIA로 인풋 작성하기').id, 'ui_btn_1');
+
+    // 4) Generated srcdoc includes pickPreferredEntry & __rsGuiActiveEntry and compiles cleanly
+    const html = adapterMod.buildPluginGuiSrcdoc({
+        plugin: {
+            name: 'GRADIA',
+            displayName: 'GRADIA v1.3.0',
+            script: 'Risuai.registerButton({ name: "GRADIA로 인풋 작성하기", location: "action" }, () => {}); Risuai.registerSetting("GRADIA 설정", () => {});',
+            uiItems: entries1,
+        },
+        entryId: '',
+        theme: 'dark',
+    });
+    assert.ok(html.includes('pickPreferredEntry'));
+    assert.ok(html.includes('__rsGuiActiveEntry'));
+    assert.ok(html.includes('MAX_AUTO_OPEN_WAIT_MS'));
+    const scripts = [];
+    const re = /<script(?:\s+([^>]*))?>([\s\S]*?)<\/script>/gi;
+    let m;
+    while ((m = re.exec(html)) !== null) {
+        if (!(m[1] || '').includes('__rs_')) scripts.push(m[2]);
+    }
+    assert.equal(scripts.length, 1);
+    new vm.Script(scripts[0], { filename: 'plugin-gui-runtime-gradia.js' });
+});
+
+test('synchronous localStorage & sessionStorage work in Backend VM and GUI iframe srcdoc with webStorage RPC', async () => {
+    const pluginStore = makeMapStore();
+    const adapter = adapterMod.createPluginAdapter({
+        persistDisabled: true,
+        hostRpc: {
+            isConnected: () => false,
+            async invoke() { throw new Error('offline'); },
+        },
+    });
+    try {
+        await adapter.addCustomPlugin({
+            filename: 'sync_web_storage_test.js',
+            enabled: true,
+            script: `
+//@name sync_web_storage_test
+//@display-name Sync Web Storage Test
+//@api 3.0
+//@version 1.0.0
+(async () => {
+  localStorage.setItem('gradia_run_log', JSON.stringify({ step: 1, label: 'ok' }));
+  localStorage.gradia_prop = 'prop-val';
+  sessionStorage.setItem('gradia_session', 'sess-42');
+  const parsed = JSON.parse(localStorage.getItem('gradia_run_log'));
+  if (parsed.step === 1 && localStorage.gradia_prop === 'prop-val' && localStorage.length === 2 && sessionStorage.getItem('gradia_session') === 'sess-42') {
+    await risuai.pluginStorage.setItem('sync_ok', true);
+  }
+})();
+`,
+        });
+
+        await waitUntil(async () => (await adapter._debug.fallbackPluginStore.get('sync_ok')) === 'true');
+        assert.equal(adapter._debug.webLocalStore.get('gradia_run_log'), JSON.stringify({ step: 1, label: 'ok' }));
+        assert.equal(adapter._debug.webLocalStore.get('gradia_prop'), 'prop-val');
+        assert.equal(adapter._debug.webSessionStore.get('gradia_session'), 'sess-42');
+
+        const { srcdoc } = adapter.getGuiSrcdoc('sync_web_storage_test', '', 'dark');
+        assert.ok(srcdoc.includes('webLocalSnapshot'));
+        assert.ok(srcdoc.includes('gradia_run_log'));
+        assert.ok(srcdoc.includes('gradia_session'));
+        assert.ok(srcdoc.includes('makeIframeWebStorage'));
+
+        const scripts = [];
+        const re = /<script(?:\s+([^>]*))?>([\s\S]*?)<\/script>/gi;
+        let m;
+        while ((m = re.exec(srcdoc)) !== null) {
+            if (!(m[1] || '').includes('__rs_')) scripts.push(m[2]);
+        }
+        assert.equal(scripts.length, 1);
+        new vm.Script(scripts[0], { filename: 'plugin-gui-webstorage.js' });
+
+        await adapter.handleGuiRpc({
+            pluginName: 'sync_web_storage_test',
+            method: 'webStorage.setItem',
+            args: ['local', 'from_gui', 'gui-val'],
+        });
+        assert.equal(adapter._debug.webLocalStore.get('from_gui'), 'gui-val');
+    } finally {
+        await adapter.dispose();
+    }
+});
+
+test('offline storage persistence, dirty replay on PC reconnect, in-place bodyIntercepter mutation, and persistDisabled safety', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rs-plg-persist-'));
+    const storagePath = path.join(tmpDir, 'storage.json');
+    const ledgerPath = path.join(tmpDir, 'ledger.json');
+    const replayed = [];
+    let rpcConnected = false;
+
+    const adapter1 = adapterMod.createPluginAdapter({
+        storagePath,
+        ledgerPath,
+        persistDisabled: false,
+        hostRpc: {
+            isConnected: () => rpcConnected,
+            async invoke(op, args) {
+                if (!rpcConnected) throw new Error('RPC offline');
+                replayed.push({ op, args });
+                if (op === 'pluginStorage.getItem') return null;
+                if (op === 'pluginStorage.keys') return [];
+                if (op === 'db.getCharacter') return { name: 'Char', chats: [{ id: 'c1', message: [] }] };
+                if (op === 'db.getChat') return { id: 'c1', message: [] };
+                return true;
+            },
+        },
+    });
+    try {
+        await adapter1.addCustomPlugin({
+            filename: 'offline_persist_test.js',
+            enabled: true,
+            script: `
+//@name offline_persist_test
+//@display-name Offline Persist
+//@api 3.0
+(async () => {
+  await risuai.pluginStorage.setItem('offline_key', { count: 7 });
+  localStorage.setItem('ls_key', 'ls_val');
+  await risuai.registerBodyIntercepter(async (body) => {
+    body.messages.push({ role: 'system', content: '[INPLACE_BODY]' });
+    // returns undefined intentionally to test in-place mutation preservation
+  });
+})();
+`,
+        });
+        await waitUntil(() => adapter1._debug.dirtyStoreOps.has('pluginStorage\0offline_key'));
+
+        await adapter1.prepareTurn(0, 0);
+        const bodyOut = await adapter1.runBodyIntercepters({ messages: [{ role: 'user', content: 'hi' }] }, 'openai');
+        assert.ok(bodyOut.messages.some((m) => m.content === '[INPLACE_BODY]'), 'In-place mutation by bodyIntercepter returning undefined must be preserved');
+        adapter1.endTurn();
+
+        const recall1 = adapter1.getPluginRuntimeRecall('offline_persist_test');
+        assert.equal(recall1.bodyIntercepterRuns, 1);
+        assert.ok(recall1.storageWrites >= 2);
+        assert.ok(recall1.recentStorageKeys.includes('pluginStorage:offline_key'));
+    } finally {
+        await adapter1.dispose();
+    }
+
+    assert.equal(fs.existsSync(storagePath), true);
+    assert.equal(fs.existsSync(ledgerPath), true);
+
+    // Boot second adapter from disk and replay when RPC connects
+    const adapter2 = adapterMod.createPluginAdapter({
+        storagePath,
+        ledgerPath,
+        persistDisabled: false,
+        hostRpc: {
+            isConnected: () => rpcConnected,
+            async invoke(op, args) {
+                replayed.push({ op, args });
+                return op === 'pluginStorage.getItem' ? null : true;
+            },
+        },
+    });
+    try {
+        const recall2 = adapter2.getPluginRuntimeRecall('offline_persist_test');
+        assert.equal(recall2.bodyIntercepterRuns, 1);
+        assert.ok(recall2.storageWrites >= 2);
+        assert.equal(adapter2._debug.webLocalStore.get('ls_key'), 'ls_val');
+        assert.equal(JSON.parse(adapter2._debug.fallbackPluginStore.get('offline_key')).count, 7);
+
+        rpcConnected = true;
+        const flushRes = await adapter2.flushDirtyStoreOps();
+        assert.ok(flushRes.flushed >= 1);
+        assert.equal(flushRes.remaining, 0);
+        assert.ok(replayed.some((x) => x.op === 'pluginStorage.setItem' && x.args[0] === 'offline_key' && x.args[1].count === 7));
+    } finally {
+        await adapter2.dispose();
+    }
+
+    // Verify persistDisabled: true never creates files on disk
+    const noDiskStorage = path.join(tmpDir, 'nodisk-storage.json');
+    const noDiskLedger = path.join(tmpDir, 'nodisk-ledger.json');
+    const adapter3 = adapterMod.createPluginAdapter({
+        storagePath: noDiskStorage,
+        ledgerPath: noDiskLedger,
+        persistDisabled: true,
+        hostRpc: { isConnected: () => false, async invoke() { throw new Error('offline'); } },
+    });
+    try {
+        await adapter3.addCustomPlugin({
+            filename: 'nodisk.js',
+            enabled: true,
+            script: `//@name nodisk\n//@api 3.0\nrisuai.pluginStorage.setItem('k', 'v');`,
+        });
+        await waitUntil(() => adapter3._debug.fallbackPluginStore.has('k'));
+    } finally {
+        await adapter3.dispose();
+    }
+    assert.equal(fs.existsSync(noDiskStorage), false);
+    assert.equal(fs.existsSync(noDiskLedger), false);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('risustand.js PC Host RPC storage resilience: numeric length getter, key(i) enumeration, and prefixed fallback when safeLocalStorage/localPluginStorage unavailable', async () => {
+    const psMap = new Map();
+    const slMap = new Map([['sl_k1', 'sl_v1'], ['sl_k2', 'sl_v2']]);
+    const numericPluginStore = {
+        map: psMap,
+        api: {
+            async getItem(k) { return psMap.has(String(k)) ? psMap.get(String(k)) : null; },
+            async setItem(k, v) { psMap.set(String(k), v); },
+            async removeItem(k) { psMap.delete(String(k)); },
+            async clear() { psMap.clear(); },
+            async keys() { return Array.from(psMap.keys()); },
+            async key(i) { return Array.from(psMap.keys())[Number(i)] ?? null; },
+            get length() { return psMap.size; }, // numeric getter instead of async function
+        },
+    };
+    const keyOnlySafeLocal = {
+        map: slMap,
+        api: {
+            async getItem(k) { return slMap.has(String(k)) ? slMap.get(String(k)) : null; },
+            async setItem(k, v) { slMap.set(String(k), String(v)); },
+            async removeItem(k) { slMap.delete(String(k)); },
+            async clear() { slMap.clear(); },
+            // intentionally omit keys() to verify key(i) fallback
+            async key(i) { return Array.from(slMap.keys())[Number(i)] ?? null; },
+            get length() { return slMap.size; },
+        },
+    };
+    const mockDb = { characters: [{ name: 'C', desc: '', chats: [{ message: [], note: '' }] }], plugins: [] };
+    const tok = 'rpc-resilience-tok';
+    const server = relay.createRelayServer({ token: tok, configOverride: { backendPlugins: {} } });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const relayPort = server.address().port;
+    const vmBridge = bootRisuStandInVm({
+        relayPort,
+        token: tok,
+        mockDb,
+        pluginStore: numericPluginStore,
+        safeLocalStore: keyOnlySafeLocal,
+        localPluginStore: null, // unavailable -> falls back to prefixed pluginStorage
+    });
+    try {
+        const authHeaders = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+        await waitUntil(async () => {
+            const st = JSON.parse((await requestHttp(relayPort, { path: '/api/plugins', headers: authHeaders })).body);
+            return st.pcConnected && st.rpcConnected;
+        });
+
+        // 1) numeric length getter on pluginStorage + key(i) on safeLocalStorage
+        const upRes = await requestHttp(relayPort, {
+            method: 'POST',
+            path: '/api/plugins/upload',
+            headers: authHeaders,
+            body: JSON.stringify({
+                filename: 'rpc_res_test.js',
+                enabled: true,
+                script: '//@name rpc_res_test\n//@api 3.0\nrisuai.registerSetting("R", () => {});',
+            }),
+        });
+        assert.equal(upRes.status, 200);
+
+        await requestHttp(relayPort, {
+            method: 'POST',
+            path: '/api/plugins/gui-rpc',
+            headers: authHeaders,
+            body: JSON.stringify({ pluginName: 'rpc_res_test', method: 'pluginStorage.setItem', args: ['k_num', 'v_num'] }),
+        });
+        const psLenRes = await requestHttp(relayPort, {
+            method: 'POST',
+            path: '/api/plugins/gui-rpc',
+            headers: authHeaders,
+            body: JSON.stringify({ pluginName: 'rpc_res_test', method: 'pluginStorage.length', args: [] }),
+        });
+        assert.ok(JSON.parse(psLenRes.body).value >= 1);
+
+        const slKeysRes = await requestHttp(relayPort, {
+            method: 'POST',
+            path: '/api/plugins/gui-rpc',
+            headers: authHeaders,
+            body: JSON.stringify({ pluginName: 'rpc_res_test', method: 'safeLocalStorage.keys', args: [] }),
+        });
+        assert.deepEqual(JSON.parse(slKeysRes.body).value, ['sl_k1', 'sl_k2']);
+
+        // 2) localPluginStorage unavailable -> fallback to prefixed pluginStorage (does not silently drop writes)
+        const lpsSetRes = await requestHttp(relayPort, {
+            method: 'POST',
+            path: '/api/plugins/gui-rpc',
+            headers: authHeaders,
+            body: JSON.stringify({ pluginName: 'rpc_res_test', method: 'localPluginStorage.setItem', args: ['lps_fb_key', { ok: 123 }] }),
+        });
+        assert.equal(lpsSetRes.status, 200);
+        const lpsGetRes = await requestHttp(relayPort, {
+            method: 'POST',
+            path: '/api/plugins/gui-rpc',
+            headers: authHeaders,
+            body: JSON.stringify({ pluginName: 'rpc_res_test', method: 'localPluginStorage.getItem', args: ['lps_fb_key'] }),
+        });
+        assert.deepEqual(JSON.parse(lpsGetRes.body).value, { ok: 123 });
+        const lpsKeysRes = await requestHttp(relayPort, {
+            method: 'POST',
+            path: '/api/plugins/gui-rpc',
+            headers: authHeaders,
+            body: JSON.stringify({ pluginName: 'rpc_res_test', method: 'localPluginStorage.keys', args: [] }),
+        });
+        assert.deepEqual(JSON.parse(lpsKeysRes.body).value, ['lps_fb_key']);
+        assert.ok(psMap.has('__rs_lps_fb__:lps_fb_key'));
+    } finally {
+        await vmBridge.shutdown();
+        if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+        await new Promise((r) => server.close(r));
+    }
+});
+
+test('dispatchChatOutput defers endTurn while async chatOutput writes pluginStorage and moduleAdapter.syncTurnObjects preserves setChat mutations', async () => {
+    const modAdapterMod = require('../risustand-module-adapter.cjs');
+    const modAdapter = modAdapterMod.createModuleAdapter();
+    const initialChar = { name: 'Char', chats: [{ id: 'c1', message: [], note: 'initial' }] };
+    await modAdapter.prepareTurn({
+        charIndex: 0,
+        chatIndex: 0,
+        charObj: JSON.parse(JSON.stringify(initialChar)),
+        chatObj: JSON.parse(JSON.stringify(initialChar.chats[0])),
+        modulesOverride: [],
+        globalVarsOverride: {},
+    });
+    const updatedChat = { id: 'c1', message: [{ role: 'char', data: 'hi' }], note: 'updated-by-plugin' };
+    modAdapter.syncTurnObjects({ chatObj: updatedChat });
+    const outTrig = await modAdapter.runTriggerMode('output');
+    assert.equal(outTrig.handled, false);
+    assert.equal(updatedChat.note, 'updated-by-plugin');
+    modAdapter.endTurn();
+    modAdapter.dispose();
+
+    let slowFinished = false;
+    const adapter = adapterMod.createPluginAdapter({
+        persistDisabled: true,
+        hostRpc: {
+            isConnected: () => false,
+            async invoke() { throw new Error('offline'); },
+        },
+        getFallbackSnapshot: () => ({ charIndex: 0, chatIndex: 0, charName: 'Char', messages: [] }),
+    });
+    try {
+        await adapter.addCustomPlugin({
+            filename: 'slow_chat_output.js',
+            enabled: true,
+            script: `
+//@name slow_chat_output
+//@api 3.0
+risuai.addRisuChatListener('output', async () => {
+  await new Promise((r) => setTimeout(r, 80));
+  await risuai.pluginStorage.setItem('after_slow_output', 'persisted');
+});
+`,
+        });
+        await adapter.prepareTurn(0, 0);
+        const dispProm = adapter.dispatchChatOutput({ charIndex: 0, chatIndex: 0, messageIndex: 0 }).then(() => {
+            slowFinished = true;
+        });
+        adapter.endTurn(); // deferred while pendingChatOutputs > 0
+        assert.equal(adapter.getTurnContext().active, true, 'endTurn must defer while chatOutput is in flight');
+        await dispProm;
+        await waitUntil(() => slowFinished && !adapter.getTurnContext().active);
+        assert.equal(JSON.parse(adapter._debug.fallbackPluginStore.get('after_slow_output')), 'persisted');
     } finally {
         await adapter.dispose();
     }

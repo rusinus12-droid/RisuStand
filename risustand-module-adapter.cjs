@@ -1101,6 +1101,12 @@ function createModuleAdapter({
         activeCtx.syncToSharedTurn = null;
     }
 
+    function syncTurnObjects({ charObj, chatObj } = {}) {
+        if (!activeCtx.active) return;
+        if (charObj) activeCtx.charObj = charObj;
+        if (chatObj) activeCtx.chatObj = chatObj;
+    }
+
     function commitCtxSync() {
         if (typeof activeCtx.syncToSharedTurn === 'function') {
             activeCtx.syncToSharedTurn({ charObj: activeCtx.charObj, chatObj: activeCtx.chatObj });
@@ -1639,6 +1645,7 @@ function createModuleAdapter({
     return {
         prepareTurn,
         endTurn,
+        syncTurnObjects,
         runTriggerMode,
         runEditPhase,
         runDisplayLuaForSnapshot,

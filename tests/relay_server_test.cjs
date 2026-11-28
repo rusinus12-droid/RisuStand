@@ -3724,3 +3724,54 @@ test('Leave lorebook expands {{user}}/{{char}} in comments & variables and preve
     assert.ok(dynamicMsg.content.includes('Character Sheet: Cheon Hayeon'), 'On-scene keyword entry 천하연 must activate');
     assert.ok(dynamicMsg.content.includes('Location Detail: 천호동 자매 아파트.'), 'Keyword-to-keyword recursive lorebook chain must still activate');
 });
+
+test('Relay web UI includes multi-entry plugin GUI switcher bar and compiles cleanly', async () => {
+    const server = relay.createRelayServer({ token: 'plg-gui-switcher-tok' });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    try {
+        const htmlRes = await requestHttp(port, { path: '/' });
+        assert.equal(htmlRes.status, 200);
+        const html = htmlRes.body;
+        for (const marker of [
+            'pluginGuiEntriesBar',
+            'renderPluginGuiEntriesBar',
+            '__rsGuiItems',
+            '__rsGuiActiveEntry',
+            'data-plg-gui-entry',
+            '스토리지 기록 상태',
+            'storageWrites',
+            'recentStorageKeys',
+        ]) {
+            assert.ok(html.includes(marker), `Expected ${marker} in relay web UI`);
+        }
+        const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(scriptMatch);
+        new vm.Script(scriptMatch[1], { filename: 'webapp-plugin-gui-switcher-inline.js' });
+
+        // Verify renderPluginGuiEntriesBar deduplicates identical labels (e.g. 3x 'GRADIA 설정' -> 1)
+        const fnMatch = scriptMatch[1].match(/function renderPluginGuiEntriesBar\(\)\s*\{[\s\S]*?\n  \}/);
+        assert.ok(fnMatch, 'Expected renderPluginGuiEntriesBar function in inline script');
+        const barMock = { style: {}, innerHTML: '' };
+        const sandbox = {
+            document: { getElementById: (id) => (id === 'pluginGuiEntriesBar' ? barMock : null) },
+            esc: (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;'),
+            pluginGuiState: {
+                entryId: 'ui_set_1',
+                uiItems: [
+                    { id: 'ui_btn_1', kind: 'button', location: 'action', name: 'GRADIA로 인풋 작성하기' },
+                    { id: 'ui_set_1', kind: 'setting', location: 'setting', name: 'GRADIA 설정' },
+                    { id: 'ui_btn_2', kind: 'button', location: 'hamburger', name: 'GRADIA 설정' },
+                    { id: 'ui_btn_3', kind: 'button', location: 'action', name: 'GRADIA 설정' },
+                ],
+            },
+        };
+        vm.runInNewContext(`${fnMatch[0]}\nrenderPluginGuiEntriesBar();`, sandbox);
+        const btnMatches = barMock.innerHTML.match(/data-plg-gui-entry=/g) || [];
+        assert.equal(btnMatches.length, 2, 'Duplicate GRADIA 설정 entries must collapse into 1 pill');
+        assert.ok(barMock.innerHTML.includes('data-plg-gui-entry="ui_set_1"'));
+    } finally {
+        if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+        await new Promise((r) => server.close(r));
+    }
+});
