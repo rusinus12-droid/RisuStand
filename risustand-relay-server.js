@@ -166,7 +166,6 @@ function defaultConfig() {
             enabled: false,
             useActiveProfile: true,
             profileId: '',
-            profileModelOverride: '',
             autoTranslateOutput: false,
             autoTranslateInput: false,
             targetLang: 'Korean',
@@ -4062,7 +4061,6 @@ async function handleOpenAIProxy(req, res) {
 function resolveTranslatorProfile() {
     const tr = config.translator || {};
     const pid = typeof tr.profileId === 'string' ? tr.profileId.trim() : '';
-    const overrideModel = typeof tr.profileModelOverride === 'string' ? tr.profileModelOverride.trim() : '';
 
     if (pid && pid !== 'active' && pid !== 'custom') {
         const found = (config.profiles || []).find((p) => p && p.id === pid);
@@ -4070,16 +4068,13 @@ function resolveTranslatorProfile() {
             return {
                 ...found,
                 name: `${found.name || 'Profile'} (Translator)`,
-                model: overrideModel || found.model,
             };
         }
     }
     if (pid === 'active' || (!pid && tr.useActiveProfile)) {
         const active = getActiveProfile();
         if (active) {
-            return overrideModel
-                ? { ...active, name: `${active.name || 'Active'} (Translator)`, model: overrideModel }
-                : active;
+            return active;
         }
     }
     return {
@@ -5374,6 +5369,7 @@ function parseLoreDecorators(rawContent) {
                     out.recursive = true;
                     break;
                 case 'unrecursive':
+                case 'dont_activate_recursive':
                     out.recursive = false;
                     break;
                 case 'no_recursive_search':
@@ -5424,6 +5420,57 @@ function isModuleLoreEntry(entry) {
     return String(entry.source || '').toLowerCase() === 'module' || String(entry.uid || '').startsWith('module:');
 }
 
+function expandIdentityCbs(text, cbsCtx = {}) {
+    const str = String(text ?? '');
+    if (!str.includes('{{')) return str;
+    const userName = String((cbsCtx && cbsCtx.personaName) || 'User');
+    const charName = String((cbsCtx && cbsCtx.charName) || 'Character');
+    return str
+        .replace(/\{\{\s*user\s*\}\}/gi, userName)
+        .replace(/\{\{\s*char\s*\}\}/gi, charName);
+}
+
+function stripAuxBlocksForLoreScan(text) {
+    return String(text || '')
+        .replace(/<statusdata\b[^>]*>[\s\S]*?<\/statusdata>/gi, '')
+        .replace(/<!--\s*HAYAKU_STATE_PACKET_START[\s\S]*?HAYAKU_STATE_PACKET_END\s*-->/gi, '')
+        .replace(/HAYAKU_STATE_PACKET_START[\s\S]*?HAYAKU_STATE_PACKET_END/gi, '')
+        .replace(/<(?:thinking|Thoughts|think|thought|reasoning)\b[^>]*>[\s\S]*?<\/(?:thinking|Thoughts|think|thought|reasoning)>/gi, '');
+}
+
+function isDynamicLoreContent(content, cbsCtx = {}) {
+    const src = String(content || '');
+    if (/\{\{(?:getvar|getchatvar|chat_index|lastmessageid|previous_chat_log|time|date|isodate|isotime|unixtime|idle_duration|idleduration|random|roll|pick|position|#if)\b/i.test(src)) {
+        return true;
+    }
+    if (/\{\{#when\b/i.test(src)) {
+        const chatVars = (cbsCtx && cbsCtx.chatVars && typeof cbsCtx.chatVars === 'object') ? cbsCtx.chatVars : {};
+        const whenRe = /\{\{#when(?:\s+|::)([^}]+)\}\}/gi;
+        let wm;
+        let sawWhen = false;
+        while ((wm = whenRe.exec(src)) !== null) {
+            sawWhen = true;
+            const expr = String(wm[1] || '').trim();
+            if (!expr || /\b(?:keep|eval)\b/i.test(expr) || expr.includes('{{')) return true;
+            const tokens = expr.split('::').map((t) => t.trim()).filter(Boolean);
+            if (!tokens.length) return true;
+            for (const tok of tokens) {
+                if (/^(?:not|!|var|toggle|is|tis|isnot|vis|and|or|gt|lt|gte|lte|>=|<=|>|<|==|!=|true|false|-?\d+(?:\.\d+)?)$/i.test(tok)) continue;
+                const stripped = tok.startsWith('toggle_') ? tok.slice(7) : tok;
+                if (
+                    Object.prototype.hasOwnProperty.call(chatVars, tok) ||
+                    Object.prototype.hasOwnProperty.call(chatVars, stripped) ||
+                    Object.prototype.hasOwnProperty.call(chatVars, `toggle_${stripped}`)
+                ) {
+                    return true;
+                }
+            }
+        }
+        if (!sawWhen) return true;
+    }
+    return false;
+}
+
 function evaluateLorebookEntries({
     loreEntries = [],
     chatList = [],
@@ -5469,6 +5516,7 @@ function evaluateLorebookEntries({
         });
     }
 
+    const sanitizedChatTexts = chatList.map((m) => stripAuxBlocksForLoreScan(String((m && m.content) || '')));
     const activeMap = new Map();
     const recursiveTexts = [];
     const maxPasses = loreRecursive ? 3 : 1;
@@ -5482,7 +5530,7 @@ function evaluateLorebookEntries({
             if (pass > 0 && (item.dec.recursive === false || item.dec.noRecursiveSearch)) continue;
             const { raw, dec } = item;
             const depth = Math.max(1, Number(dec.scanDepth || loreDepth || 10));
-            const baseCorpus = chatList.slice(-depth).map((m) => String((m && m.content) || '')).join('\n');
+            const baseCorpus = sanitizedChatTexts.slice(-depth).join('\n');
             const corpus = (pass > 0 && recursiveChunk) ? `${baseCorpus}\n${recursiveChunk}` : baseCorpus;
             const fw = dec.fullWord !== null ? dec.fullWord : Boolean(loreFullWord);
             const useRegex = Boolean(raw.useRegex);
@@ -5508,12 +5556,14 @@ function evaluateLorebookEntries({
             }
             if (!hit) continue;
 
-            const evaluated = cleanPresetPromptText(evalPresetCbs(dec.content, cbsCtx));
+            const evaluated = cleanPresetPromptText(expandIdentityCbs(evalPresetCbs(dec.content, cbsCtx), cbsCtx));
             if (!evaluated) continue;
 
-            const isDynamicMacroContent = /\{\{(?:getvar|getchatvar|chat_index|lastmessageid|previous_chat_log|time|date|idle_duration|random|roll|position|#when|#if)\b/i.test(String(dec.content || ''));
-            const isStaticAlwaysActive = Boolean((raw.alwaysActive || item.pinned) && !isDynamicMacroContent);
-            const formatted = raw.comment ? `[${raw.comment}]\n${evaluated}` : evaluated;
+            const isStaticAlwaysActive = Boolean((raw.alwaysActive || item.pinned) && !isDynamicLoreContent(dec.content, cbsCtx));
+            const commentTitle = raw.comment
+                ? cleanPresetPromptText(expandIdentityCbs(evalPresetCbs(String(raw.comment), cbsCtx), cbsCtx))
+                : '';
+            const formatted = commentTitle ? `[${commentTitle}]\n${evaluated}` : evaluated;
             activeMap.set(item.idx, {
                 idx: item.idx,
                 insertorder: item.insertorder,
@@ -5526,7 +5576,9 @@ function evaluateLorebookEntries({
                 rawEvaluated: evaluated,
             });
             addedInPass = true;
-            if (dec.recursive !== false) {
+            const isAlwaysOrPinned = Boolean(raw.alwaysActive || item.pinned || dec.forceState === 'activate');
+            const allowRecursiveEmit = isAlwaysOrPinned ? (dec.recursive === true) : (dec.recursive !== false);
+            if (allowRecursiveEmit) {
                 recursiveTexts.push(evaluated);
             }
         }
@@ -6038,7 +6090,7 @@ function buildDirectPromptMessages({
         mainPrompt: preset ? String(preset.mainPrompt || '') : '',
         jailbreak: preset ? String(preset.jailbreak || '') : '',
     };
-    const evalField = (val) => cleanPresetPromptText(evalPresetCbs(String(val || ''), baseCtx));
+    const evalField = (val) => cleanPresetPromptText(expandIdentityCbs(evalPresetCbs(String(val || ''), baseCtx), baseCtx));
     const sysPromptText = evalField(rawCtx.systemPrompt);
     baseCtx.desc = evalField(rawCtx.desc);
     baseCtx.personality = evalField(rawCtx.personality);
@@ -6871,46 +6923,10 @@ function renderWebApp() {
     min-width:0; overflow:hidden; white-space:nowrap; margin-top:1px;
   }
   .h-sub { font-size:11.5px; line-height:18px; color:var(--sub); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; flex:0 1 auto; }
-  .hdr-act-bar {
-    display:inline-flex; align-items:center; gap:4px; flex-wrap:nowrap;
-    height:19px; min-width:0; max-width:none; flex:1 1 auto; overflow:hidden;
-  }
-  .hdr-act-bar:empty { display:none; }
-  .hdr-act-pill {
-    display:inline-flex; align-items:center; gap:5px; height:18px; padding:0 7px 0 5px; border-radius:999px;
-    font-size:10.5px; font-weight:600; line-height:1; letter-spacing:-0.01em;
-    background:color-mix(in srgb, var(--accent) 13%, var(--surface));
-    color:var(--text); border:1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
-    max-width:100%; min-width:0; cursor:pointer;
-  }
-  .hdr-act-pill:hover { border-color: color-mix(in srgb, var(--accent) 60%, var(--border)); }
-  .hdr-act-pill.recent {
-    background:color-mix(in srgb, var(--ok) 12%, var(--surface));
-    border-color:color-mix(in srgb, var(--ok) 34%, var(--border));
-    color:var(--sub);
-  }
-  .hdr-act-stage {
-    flex-shrink:0; padding:1px 5px; border-radius:999px; font-size:9.5px; font-weight:800; line-height:1.15;
-    background:color-mix(in srgb, var(--accent) 22%, transparent); color:var(--accent);
-  }
-  .hdr-act-pill.recent .hdr-act-stage {
-    background:color-mix(in srgb, var(--ok) 20%, transparent); color:var(--ok);
-  }
-  .hdr-act-text { min-width:0; flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .hdr-act-meta { flex-shrink:0; font-size:9.5px; font-weight:700; opacity:0.86; font-variant-numeric:tabular-nums; }
   .hdr-act-dot {
     width:6px; height:6px; border-radius:50%; background:var(--accent); flex-shrink:0;
     animation: rsPulseDot 1.1s ease-in-out infinite;
   }
-  .hdr-act-pop {
-    position:fixed; top:calc(58px + env(safe-area-inset-top)); left:12px; right:12px; max-width:480px; z-index:48;
-    background:var(--elev); border:1px solid var(--border); border-radius:16px; padding:11px 13px;
-    box-shadow:var(--shadow); display:none; flex-direction:column; gap:8px; font-size:12px; line-height:1.45;
-  }
-  .hdr-act-pop.open { display:flex; }
-  .hdr-act-pop-row { display:flex; flex-direction:column; gap:2px; padding:6px 8px; border-radius:10px; background:var(--surface); border:1px solid var(--border); }
-  .hdr-act-pop-head { display:flex; align-items:center; justify-content:space-between; gap:6px; font-weight:700; font-size:11.5px; }
-  .hdr-act-pop-sub { font-size:11px; color:var(--sub); overflow-wrap:anywhere; }
   .live-gen-bar {
     position:absolute; left:0; right:0; bottom:calc(100% + 8px); z-index:32;
     display:flex; flex-direction:column; gap:5px; padding:8px 12px; border-radius:16px;
@@ -7112,7 +7128,7 @@ function renderWebApp() {
     background:linear-gradient(90deg, transparent, var(--book-spine) 50%, transparent);
   }
   .book-viewport {
-    flex:1; min-height:0; overflow:hidden; margin: clamp(18px, 3vw, 34px) auto; padding:0; position:relative;
+    flex:1; min-height:0; overflow:hidden; margin: clamp(8px, 2vw, 22px) auto; padding:12px 0; box-sizing:border-box; position:relative;
   }
   .book-tap-zone {
     position:absolute; top:0; bottom:0; width:12%; min-width:44px; max-width:100px;
@@ -7122,13 +7138,18 @@ function renderWebApp() {
   .book-tap-right { right:0; }
   .book-tap-zone.disabled { cursor:default; }
   .book-columns {
-    height:100%; column-fill:auto;
+    height:100%; column-fill:auto; box-sizing:border-box;
     font-family: var(--font); font-size:var(--fsize); line-height:var(--lh);
     white-space:pre-wrap; word-break:keep-all; overflow-wrap:anywhere; text-align:justify;
+    orphans:2; widows:2;
+  }
+  .book-columns p, .book-columns li, .book-columns blockquote { orphans:2; widows:2; }
+  .book-columns h1, .book-columns h2, .book-columns h3, .book-columns h4, .book-columns h5, .book-columns h6 {
+    break-after:avoid; page-break-after:avoid; break-inside:avoid;
   }
   .book-frame.single-page .book-columns { text-align:left; }
-  .book-columns .msg-img-wrap { break-inside:avoid; max-width:100%; margin:10px auto; }
-  .book-columns .msg-img { max-height:38vh; max-width:100%; width:auto; height:auto; }
+  .book-columns .msg-img-wrap { break-inside:avoid; page-break-inside:avoid; -webkit-column-break-inside:avoid; max-width:100%; margin:10px auto; }
+  .book-columns .msg-img { max-height:min(46vh, calc(var(--book-col-h, 540px) - 72px)); max-width:100%; width:auto; height:auto; break-inside:avoid; page-break-inside:avoid; -webkit-column-break-inside:avoid; }
   .book-turn-tag { font-family: var(--ui-font); font-size:11px; color:var(--accent); margin-bottom:6px; font-weight:700; letter-spacing:0.04em; break-after:avoid; display:inline-flex; align-items:center; gap:6px; position:relative; z-index:8; }
   .turn-tts-btn {
     display:inline-flex; align-items:center; justify-content:center;
@@ -7195,8 +7216,8 @@ function renderWebApp() {
   .rs-bot-html .image-container { max-width:100% !important; min-height:200px; background-size:cover; background-position:center 15%; border-radius:14px; }
   .book-columns .rs-bot-html .image-container {
     width:100% !important; max-width:100% !important;
-    height:min(38vh, 360px) !important; min-height:180px !important; max-height:46vh !important;
-    padding-bottom:0 !important; break-inside:avoid; margin:10px auto; cursor:pointer;
+    height:min(38vh, 360px, calc(var(--book-col-h, 540px) - 96px)) !important; min-height:min(180px, calc(var(--book-col-h, 540px) - 96px)) !important; max-height:min(46vh, calc(var(--book-col-h, 540px) - 96px)) !important;
+    padding-bottom:0 !important; break-inside:avoid; page-break-inside:avoid; -webkit-column-break-inside:avoid; margin:10px auto; cursor:pointer;
   }
   body.asset-fit-compact .rs-bot-html [data-rs-asset-fit-box="1"] {
     width:fit-content !important; max-width:min(320px, 100%) !important;
@@ -7223,11 +7244,52 @@ function renderWebApp() {
     border-radius:12px !important;
   }
   body.asset-fit-compact .book-columns .rs-bot-html img[data-rs-asset-fit-img="1"] {
-    max-width:100% !important; max-height:min(34vh, 250px) !important;
+    max-width:100% !important; max-height:min(34vh, 250px, calc(var(--book-col-h, 540px) - 96px)) !important;
   }
   body.asset-fit-compact .book-columns .rs-bot-html [data-rs-asset-fit-bg="1"] {
-    max-width:100% !important; height:min(34vh, 250px) !important; max-height:min(34vh, 250px) !important;
+    max-width:100% !important; height:min(34vh, 250px, calc(var(--book-col-h, 540px) - 96px)) !important; max-height:min(34vh, 250px, calc(var(--book-col-h, 540px) - 96px)) !important;
   }
+  .book-columns .rs-bot-html img {
+    max-height:min(56vh, calc(var(--book-col-h, 540px) - 96px)) !important;
+    max-width:100% !important;
+    break-inside:avoid !important; page-break-inside:avoid !important; -webkit-column-break-inside:avoid !important;
+  }
+  .book-columns .rs-bot-html [data-rs-bg-img="1"] {
+    max-height:calc(var(--book-col-h, 540px) - 96px) !important;
+    break-inside:avoid !important; page-break-inside:avoid !important; -webkit-column-break-inside:avoid !important;
+  }
+  .book-columns [data-rs-book-atomic="1"],
+  .book-columns .rs-bot-html figure,
+  .book-columns .rs-bot-html picture,
+  .book-columns .rs-bot-html video,
+  .book-columns .rs-bot-html canvas,
+  .book-columns .rs-bot-html svg,
+  .book-columns .rs-bot-html [data-rs-asset-fit-box="1"],
+  .book-columns .rs-bot-html [data-rs-asset-fit-bg="1"],
+  .book-columns .rs-bot-html .am-illustration-projection,
+  .book-columns .rs-bot-html .x-risu-am-illustration-projection,
+  .book-columns .rs-bot-html .x-risu-am-illustration-slot,
+  .book-columns .rs-bot-html .am-image,
+  .book-columns .rs-bot-html .x-risu-am-image,
+  .book-columns .rs-bot-html .am-generated-image,
+  .book-columns .rs-bot-html .x-risu-am-generated-image,
+  .book-columns .rs-am-footer-host,
+  .book-columns .rs-plugin-bubble-bar,
+  .book-columns .msg-actions {
+    break-inside:avoid !important; page-break-inside:avoid !important; -webkit-column-break-inside:avoid !important;
+    max-width:100% !important; box-sizing:border-box;
+  }
+  .book-columns [data-rs-book-inline-block="1"] { display:inline-block !important; }
+  .book-columns [data-rs-book-breakable="1"] {
+    break-inside:auto !important; page-break-inside:auto !important; -webkit-column-break-inside:auto !important;
+    overflow:visible !important; max-height:none !important;
+  }
+  .book-columns [data-rs-book-flow="1"] {
+    overflow:visible !important; contain:none !important;
+    break-inside:auto !important; page-break-inside:auto !important; -webkit-column-break-inside:auto !important;
+    max-height:none !important;
+  }
+  .book-columns [data-rs-book-flow-block="1"] { display:block !important; }
   .book-img-preview {
     position:absolute; z-index:16; display:none;
     background-size:cover; background-position:center 10%; background-repeat:no-repeat;
@@ -7301,6 +7363,18 @@ function renderWebApp() {
   .book-columns .rs-bot-html details,
   .book-columns .rs-bot-html table,
   .book-columns .rs-bot-html pre,
+  .book-columns .rs-bot-html p,
+  .book-columns .rs-bot-html blockquote,
+  .book-columns .rs-bot-html figure { min-width:0 !important; }
+  .book-columns .rs-bot-html div,
+  .book-columns .rs-bot-html section,
+  .book-columns .rs-bot-html article,
+  .book-columns .rs-bot-html details,
+  .book-columns .rs-bot-html table,
+  .book-columns .rs-bot-html pre,
+  .book-columns .rs-bot-html p,
+  .book-columns .rs-bot-html blockquote,
+  .book-columns .rs-bot-html figure,
   .book-columns .rs-bot-html img,
   .book-columns .rs-bot-html svg { max-width:100% !important; box-sizing:border-box; }
   .book-columns .rs-bot-html table { display:block; overflow-x:auto; }
@@ -8510,11 +8584,9 @@ function renderWebApp() {
         <div class="h-title" id="hdrChar">연결 중...</div>
         <div class="h-sub-row">
           <div class="h-sub" id="hdrSub">-</div>
-          <div class="hdr-act-bar" id="hdrActivityBar" onclick="event.stopPropagation(); toggleHdrActPopover();" title="클릭하여 전체 상태 보기"></div>
         </div>
       </div>
     </div>
-    <div id="hdrActPopover" class="hdr-act-pop" onclick="event.stopPropagation()"></div>
     <div class="h-right">
       <button class="pill icon-pill" id="sceneCtrlQuickBtn" title="장면·삽화 제어함" aria-label="장면·삽화 제어함">🎨</button>
       <button class="pill icon-pill" id="reqLogQuickBtn" title="리퀘스트 로그 보기" aria-label="리퀘스트 로그">📜</button>
@@ -9198,15 +9270,6 @@ function renderWebApp() {
       <label class="f-label">번역에 사용할 모델</label>
       <select class="f-inp" id="trProfileSel"></select>
       <div class="hint" id="trActiveModelHint" style="margin-top:4px; margin-bottom:8px;"></div>
-      <div id="trProfileOverrideBox" style="margin-bottom:8px;">
-        <label class="f-label">번역 전용 모델 ID 지정 (선택 · 비우면 선택한 프로필 모델 그대로 사용)</label>
-        <div style="display:flex; gap:6px; align-items:center;">
-          <input class="f-inp" id="trProfileModelOverride" style="flex:1; min-width:0;" placeholder="예: gemini-2.5-flash, deepseek-v4.1-flash:1017-cloud (비우면 프로필 모델)" />
-          <button type="button" class="btn sec" id="trProfLoadModelsBtn" style="flex-shrink:0;">🔄 모델 불러오기</button>
-        </div>
-        <select class="f-inp" id="trProfModelPick" style="display:none; margin-top:6px;"></select>
-        <div class="hint" id="trProfModelStatus" style="margin-top:4px;"></div>
-      </div>
       <label class="chk-row"><span>AI 응답 자동 한국어 번역 표시</span><input type="checkbox" id="trAutoOut" /></label>
       <label class="chk-row"><span>내 입력 자동 한→영 번역 후 전송</span><input type="checkbox" id="trAutoIn" /></label>
       <div id="trCustomBox">
@@ -9318,6 +9381,15 @@ function renderWebApp() {
   let bookFlipEndTimer = null;
   let bookWheelLock = false;
   let bookResizeTimer = null;
+  let bookFrameResizeObserver = null;
+  let bookRelayoutRaf = 0;
+  function scheduleBookRelayout() {
+    if (bookRelayoutRaf) return;
+    bookRelayoutRaf = requestAnimationFrame(() => {
+      bookRelayoutRaf = 0;
+      if (isBookMode() && typeof layoutBookSpreads === 'function') layoutBookSpreads(false);
+    });
+  }
   const localTranslations = new Map();
   const shownTranslations = new Set();
 
@@ -9538,11 +9610,6 @@ function renderWebApp() {
   document.addEventListener('click', (e) => {
     const bar = document.getElementById('readBar');
     if (bar.classList.contains('open') && !bar.contains(e.target)) setReadBar(false);
-    const actPop = document.getElementById('hdrActPopover');
-    const actBar = document.getElementById('hdrActivityBar');
-    if (actPop && actPop.classList.contains('open') && !actPop.contains(e.target) && (!actBar || !actBar.contains(e.target))) {
-      actPop.classList.remove('open');
-    }
     const jBar = document.getElementById('bookJumpBar');
     const jBtn = document.getElementById('bookPageJumpBtn');
     if (jBar && jBar.style.display !== 'none' && !jBar.contains(e.target) && (!jBtn || !jBtn.contains(e.target))) {
@@ -10638,38 +10705,6 @@ function renderWebApp() {
     const elapsedText = (elapsedMs / 1000).toFixed(1) + 's';
     return { tokText, rateText, elapsedText };
   }
-  window.toggleHdrActPopover = function (forceState) {
-    const pop = document.getElementById('hdrActPopover');
-    if (!pop) return;
-    const open = forceState !== undefined ? Boolean(forceState) : !pop.classList.contains('open');
-    pop.classList.toggle('open', open);
-    if (open) renderHdrActPopover();
-  };
-  function renderHdrActPopover() {
-    const pop = document.getElementById('hdrActPopover');
-    if (!pop || !pop.classList.contains('open')) return;
-    const active = Array.isArray(lastActivityPayload.active) ? lastActivityPayload.active : [];
-    const recent = Array.isArray(lastActivityPayload.recent) ? lastActivityPayload.recent : [];
-    const gen = lastActivityPayload.generation;
-    const rows = [];
-    if (gen) {
-      const st = fmtLiveGenStats(gen);
-      const badgeTxt = gen.active ? '✨ 생성 중' : (gen.status === 'error' ? '⚠ 오류' : '✓ 완료');
-      const parts = [gen.provider, gen.model, st.tokText, st.rateText, st.elapsedText].filter(Boolean).join(' · ');
-      rows.push('<div class="hdr-act-pop-row"><div class="hdr-act-pop-head"><span>' + esc(badgeTxt) + '</span><span>' + esc(st.elapsedText) + '</span></div><div class="hdr-act-pop-sub">' + esc(parts) + '</div></div>');
-    }
-    for (const item of active) {
-      const stg = fmtStageShort(item.stage) + (item.total > 0 ? ' ' + item.step + '/' + item.total : '');
-      const elp = fmtElapsedSec(item.startedAt, 0);
-      rows.push('<div class="hdr-act-pop-row"><div class="hdr-act-pop-head"><span>' + esc((stg ? stg + ' · ' : '') + item.name) + '</span><span>' + esc(elp) + '</span></div>' + (item.phase ? '<div class="hdr-act-pop-sub">' + esc(item.phase) + '</div>' : '') + '</div>');
-    }
-    for (let i = recent.length - 1; i >= 0; i--) {
-      const r = recent[i];
-      const stg = fmtStageShort(r.stage);
-      rows.push('<div class="hdr-act-pop-row"><div class="hdr-act-pop-head"><span>✓ ' + esc((stg ? stg + ' 완료 · ' : '') + r.name) + '</span></div>' + (r.phase ? '<div class="hdr-act-pop-sub">' + esc(r.phase) + '</div>' : '') + '</div>');
-    }
-    pop.innerHTML = rows.length ? rows.join('') : '<div class="hdr-act-pop-sub">진행 중인 작업이 없습니다.</div>';
-  }
   function renderLiveGenBar() {
     const el = document.getElementById('liveGenBar');
     if (!el) return;
@@ -10730,7 +10765,6 @@ function renderWebApp() {
     el.classList.toggle('is-done', barStateCls === 'is-done');
     el.classList.toggle('is-err', barStateCls === 'is-err');
     el.innerHTML = rows.join('');
-    renderHdrActPopover();
   }
   function syncLiveGenTicker() {
     const hasRunning = Boolean(
@@ -10741,11 +10775,6 @@ function renderWebApp() {
     if (hasRunning && !liveGenTicker) {
       liveGenTicker = setInterval(() => {
         renderLiveGenBar();
-        if (lastActivityPayload.active && lastActivityPayload.active.length) {
-          const first = lastActivityPayload.active[0];
-          const metaEl = document.querySelector('#hdrActivityBar .hdr-act-meta');
-          if (metaEl && first && first.startedAt) metaEl.textContent = fmtElapsedSec(first.startedAt, 0);
-        }
       }, 250);
     } else if (!hasRunning && liveGenTicker) {
       clearInterval(liveGenTicker);
@@ -10753,8 +10782,6 @@ function renderWebApp() {
     }
   }
   function renderHdrActivity(actData) {
-    const bar = document.getElementById('hdrActivityBar');
-    if (!bar) return;
     if (actData && typeof actData.seq === 'number') {
       if (actData.seq < lastActivitySeq) return;
       lastActivitySeq = actData.seq;
@@ -10763,58 +10790,8 @@ function renderWebApp() {
     const recent = Array.isArray(actData && actData.recent) ? actData.recent : [];
     const gen = (actData && actData.generation && typeof actData.generation === 'object') ? actData.generation : null;
     lastActivityPayload = { active, recent, generation: gen };
-    const sig = JSON.stringify([
-      active.map((x) => [x.kind, x.stage, x.step, x.total, x.name, x.phase]),
-      recent.map((x) => [x.kind, x.stage, x.step, x.total, x.name, x.phase]),
-      gen ? [gen.id, gen.active, gen.status, gen.provider, gen.model, gen.outputTokens, gen.tokenEstimated, gen.tokPerSec] : null,
-    ]);
     renderLiveGenBar();
     syncLiveGenTicker();
-    if (sig === lastActivitySig) return;
-    lastActivitySig = sig;
-    if (!active.length && !recent.length && !gen) {
-      bar.innerHTML = '';
-      bar.removeAttribute('title');
-      const pop = document.getElementById('hdrActPopover');
-      if (pop) pop.classList.remove('open');
-      return;
-    }
-    const fmtTooltip = (item) => {
-      const stageTag = item.stage
-        ? (fmtStageShort(item.stage) + (item.total > 0 ? ' ' + item.step + '/' + item.total : '') + ' · ')
-        : '';
-      return stageTag + item.name + (item.phase ? ' · ' + item.phase : '');
-    };
-    if (active.length) {
-      const first = active[0];
-      const stg = fmtStageShort(first.stage) + (first.total > 0 ? ' ' + first.step + '/' + first.total : '');
-      const textPart = first.name + (first.phase ? ' · ' + first.phase : '');
-      const metaPart = fmtElapsedSec(first.startedAt, 0) + (active.length > 1 ? ' +' + (active.length - 1) : '');
-      bar.title = active.map(fmtTooltip).join('\\n');
-      bar.innerHTML = '<span class="hdr-act-pill"><span class="hdr-act-dot"></span>'
-        + (stg ? '<span class="hdr-act-stage">' + esc(stg) + '</span>' : '')
-        + '<span class="hdr-act-text">' + esc(textPart) + '</span>'
-        + (metaPart ? '<span class="hdr-act-meta">' + esc(metaPart) + '</span>' : '')
-        + '</span>';
-    } else if (gen) {
-      const st = fmtLiveGenStats(gen);
-      const isRecent = !gen.active;
-      const stg = gen.active ? '생성' : (gen.status === 'error' ? '오류' : '완료');
-      const textPart = [gen.provider, gen.model].filter(Boolean).join(' · ') || 'LLM';
-      const metaPart = [st.tokText, st.rateText].filter(Boolean).join(' · ');
-      bar.title = [stg, textPart, st.tokText, st.rateText, st.elapsedText].filter(Boolean).join(' · ');
-      bar.innerHTML = '<span class="hdr-act-pill' + (isRecent ? ' recent' : '') + '">'
-        + (gen.active ? '<span class="hdr-act-dot"></span>' : '<span>✓</span>')
-        + '<span class="hdr-act-stage">' + esc(stg) + '</span>'
-        + '<span class="hdr-act-text">' + esc(textPart) + '</span>'
-        + (metaPart ? '<span class="hdr-act-meta">' + esc(metaPart) + '</span>' : '')
-        + '</span>';
-    } else {
-      const latest = recent[recent.length - 1];
-      const stg = latest.stage ? (fmtStageShort(latest.stage) + ' 완료') : '완료';
-      bar.title = recent.map(fmtTooltip).join('\\n');
-      bar.innerHTML = '<span class="hdr-act-pill recent"><span>✓</span><span class="hdr-act-stage">' + esc(stg) + '</span><span class="hdr-act-text">' + esc(latest.name) + '</span></span>';
-    }
   }
   function disconnectActivityStream() {
     if (activityRetryTimer) { clearTimeout(activityRetryTimer); activityRetryTimer = null; }
@@ -10823,8 +10800,6 @@ function renderWebApp() {
     lastActivitySig = '';
     lastActivitySeq = -1;
     lastActivityPayload = { active: [], recent: [], generation: null };
-    const bar = document.getElementById('hdrActivityBar');
-    if (bar) { bar.innerHTML = ''; bar.removeAttribute('title'); }
     const lgb = document.getElementById('liveGenBar');
     if (lgb) { lgb.innerHTML = ''; lgb.classList.remove('is-done', 'is-err'); }
   }
@@ -11943,6 +11918,127 @@ function renderWebApp() {
     }
   }
 
+  function prepareBookPaginationBlocks(cols, colH) {
+    if (!cols || !cols.querySelectorAll || !(colH > 0)) return;
+    cols.querySelectorAll('[data-rs-book-atomic], [data-rs-book-inline-block], [data-rs-book-breakable], [data-rs-book-flow], [data-rs-book-flow-block], [data-rs-book-scaled]').forEach((el) => {
+      el.removeAttribute('data-rs-book-atomic');
+      el.removeAttribute('data-rs-book-inline-block');
+      el.removeAttribute('data-rs-book-breakable');
+      el.removeAttribute('data-rs-book-flow');
+      el.removeAttribute('data-rs-book-flow-block');
+      if (el.hasAttribute('data-rs-book-scaled')) {
+        el.removeAttribute('data-rs-book-scaled');
+        el.style.zoom = '';
+      }
+    });
+
+    const mediaSel = 'img, picture, figure, video, canvas, svg, .msg-img-wrap, .image-container, [data-rs-bg-img="1"], [data-rs-asset-fit-box="1"], [data-rs-asset-fit-bg="1"], .am-illustration-projection, .x-risu-am-illustration-projection, .x-risu-am-illustration-slot, .am-image, .x-risu-am-image, .am-generated-image, .x-risu-am-generated-image';
+    const mediaAnchors = Array.from(cols.querySelectorAll(mediaSel));
+    cols.querySelectorAll('.rs-bot-html div, .rs-bot-html span, .rs-bot-html a, .rs-bot-html section, .rs-bot-html article').forEach((el) => {
+      if (el.querySelector && el.querySelector('img, picture, video, canvas, svg')) return;
+      if ((el.textContent || '').trim().length > 80) return;
+      let cs = null;
+      try { cs = typeof getComputedStyle === 'function' ? getComputedStyle(el) : null; } catch (_) {}
+      if (cs && extractCssBgImageUrl(cs.backgroundImage)) {
+        mediaAnchors.push(el);
+      }
+    });
+
+    const isBoundary = (el) => !el || el === cols || (el.classList && (
+      el.classList.contains('rs-bot-html') ||
+      el.classList.contains('book-char-block') ||
+      el.classList.contains('book-user-block') ||
+      el.classList.contains('book-columns')
+    ));
+    const majorMediaSel = 'img, picture, video, canvas, .image-container, [data-rs-bg-img="1"], [data-rs-asset-fit-bg="1"]';
+
+    for (const anchor of mediaAnchors) {
+      if (anchor.closest && anchor.closest('.turn-tts-btn, .msg-actions, .book-turn-tag, button')) continue;
+      let cardRoot = anchor;
+      let anc = anchor.parentElement;
+      for (let hops = 0; hops < 5 && anc && !isBoundary(anc); hops += 1) {
+        if (!anc.tagName || !/^(DIV|FIGURE|SECTION|ARTICLE|A|ASIDE|SPAN|P|LI)$/.test(anc.tagName)) break;
+        if (anc.querySelector && anc.querySelector('hr, .book-turn-tag, .msg-actions')) break;
+        if ((anc.textContent || '').trim().length > 160) break;
+        let hasLongProse = false;
+        if (anc.querySelectorAll) {
+          for (const seg of anc.querySelectorAll('.rs-prose-seg')) {
+            if ((seg.textContent || '').trim().length > 40) { hasLongProse = true; break; }
+          }
+          if (!hasLongProse) {
+            for (const pEl of anc.querySelectorAll('p')) {
+              if ((pEl.textContent || '').trim().length > 80) { hasLongProse = true; break; }
+            }
+          }
+        }
+        if (hasLongProse) break;
+        const majorMedia = anc.querySelectorAll
+          ? Array.from(anc.querySelectorAll(majorMediaSel)).filter((m) => !(m.closest && m.closest('.turn-tts-btn, .msg-actions, .book-turn-tag, button')))
+          : [];
+        if (majorMedia.length > 1) {
+          let ancCs = null;
+          try { ancCs = typeof getComputedStyle === 'function' ? getComputedStyle(anc) : null; } catch (_) {}
+          const isRow = ancCs && (ancCs.display === 'flex' || ancCs.display === 'inline-flex' || ancCs.display === 'grid' || ancCs.display === 'inline-grid') && !/^column/i.test(ancCs.flexDirection || '');
+          if (!isRow || (anc.offsetHeight || 0) > colH * 0.78) break;
+        }
+        cardRoot = anc;
+        anc = anc.parentElement;
+      }
+      cardRoot.setAttribute('data-rs-book-atomic', '1');
+      if (typeof getComputedStyle === 'function') {
+        try {
+          if (getComputedStyle(cardRoot).display === 'inline') {
+            cardRoot.setAttribute('data-rs-book-inline-block', '1');
+          }
+        } catch (_) {}
+      }
+    }
+
+    cols.querySelectorAll('.book-user-block, .leave-hud-card, .leave-ooc-card, .rs-bot-html details').forEach((el) => {
+      if (Math.max(el.offsetHeight || 0, el.scrollHeight || 0) > colH * 0.82) {
+        el.setAttribute('data-rs-book-breakable', '1');
+      }
+    });
+
+    cols.querySelectorAll('.rs-bot-html div, .rs-bot-html section, .rs-bot-html article, .rs-bot-html blockquote, .rs-bot-html main').forEach((el) => {
+      if (el.getAttribute('data-rs-book-atomic') === '1') return;
+      if (el.closest && el.closest('[data-rs-book-atomic="1"], [data-rs-asset-fit-box="1"], .leave-hud-card, .leave-ooc-card')) return;
+      const txtLen = (el.textContent || '').trim().length;
+      const boxH = Math.max(el.offsetHeight || 0, el.scrollHeight || 0);
+      if (txtLen <= 140 && boxH <= colH * 0.78) return;
+      let cs = null;
+      try { cs = typeof getComputedStyle === 'function' ? getComputedStyle(el) : null; } catch (_) {}
+      if (!cs) return;
+      const ovBlocked = /^(hidden|clip|auto|scroll)$/.test(cs.overflow || '') || /^(hidden|clip|auto|scroll)$/.test(cs.overflowY || '');
+      const containBlocked = Boolean(cs.contain && cs.contain !== 'none');
+      if (ovBlocked || containBlocked) {
+        el.setAttribute('data-rs-book-flow', '1');
+      }
+      if ((cs.display === 'flex' || cs.display === 'inline-flex') && /^column/i.test(cs.flexDirection || '') && boxH > colH * 0.78) {
+        el.setAttribute('data-rs-book-flow', '1');
+        el.setAttribute('data-rs-book-flow-block', '1');
+      }
+    });
+
+    cols.querySelectorAll('[data-rs-book-atomic="1"]').forEach((el) => {
+      if (el.parentElement && el.parentElement.closest && el.parentElement.closest('[data-rs-book-atomic="1"]')) return;
+      let totalH = Math.max(el.offsetHeight || 0, el.scrollHeight || 0);
+      if (el.getClientRects) {
+        const rects = el.getClientRects();
+        if (rects.length > 1) {
+          let rectSum = 0;
+          for (let i = 0; i < rects.length; i += 1) rectSum += rects[i].height || 0;
+          totalH = Math.max(totalH, rectSum);
+        }
+      }
+      if (totalH > colH - 12) {
+        const scale = Math.max(0.45, Math.min(0.98, (colH - 16) / totalH));
+        el.style.zoom = scale.toFixed(3);
+        el.setAttribute('data-rs-book-scaled', '1');
+      }
+    });
+  }
+
   function layoutBookSpreads(jumpAuto = false) {
     const frame = document.getElementById('bookFrame');
     const vp = document.getElementById('bookViewport');
@@ -11964,26 +12060,35 @@ function renderWebApp() {
 
     vp.style.width = evenW + 'px';
     cols.style.width = evenW + 'px';
-    cols.style.height = '100%';
+    const vpCs = typeof getComputedStyle === 'function' ? getComputedStyle(vp) : null;
+    const vpPadY = vpCs ? ((parseFloat(vpCs.paddingTop) || 0) + (parseFloat(vpCs.paddingBottom) || 0)) : 0;
+    const colH = Math.max(160, Math.floor(vp.clientHeight - vpPadY));
+    cols.style.height = colH + 'px';
+    cols.style.setProperty('--book-col-h', colH + 'px');
     cols.style.columnWidth = colW + 'px';
     cols.style.columnCount = String(colsPerSpread);
     cols.style.columnGap = colGap + 'px';
     cols.style.columnFill = 'auto';
 
+    prepareBookPaginationBlocks(cols, colH);
+
     const theoColStep = colW + colGap;
     const vpRect = vp.getBoundingClientRect();
     const measured = [];
     let maxMeasuredCol = 0;
+    let maxContentCol = 0;
     cols.querySelectorAll('.book-char-block, .book-user-block, .rs-chat-end-float').forEach((el) => {
       const rects = el.getClientRects ? el.getClientRects() : [el.getBoundingClientRect()];
       for (let i = 0; i < rects.length; i++) {
         const r = rects[i];
-        if (!r || r.width < colW * 0.45 || r.height < 2) continue;
+        if (!r || r.width < 2 || r.height < 2) continue;
         const absLeft = (r.left - vpRect.left) + vp.scrollLeft;
         if (absLeft < -8) continue;
         const cIdx = Math.round(absLeft / theoColStep);
         if (cIdx < 0) continue;
-        if (Math.abs(absLeft - cIdx * theoColStep) > theoColStep * 0.35) continue;
+        if (cIdx > maxContentCol) maxContentCol = cIdx;
+        if (r.width < colW * 0.65) continue;
+        if (Math.abs(absLeft - cIdx * theoColStep) > Math.max(4, cIdx * 1.5)) continue;
         const floored = Math.max(0, Math.floor(absLeft));
         if (measured[cIdx] === undefined || floored < measured[cIdx]) measured[cIdx] = floored;
         if (cIdx > maxMeasuredCol) maxMeasuredCol = cIdx;
@@ -11993,12 +12098,12 @@ function renderWebApp() {
     let actualColStep = theoColStep;
     if (maxMeasuredCol > 0 && typeof measured[maxMeasuredCol] === 'number' && measured[maxMeasuredCol] > 0) {
       const est = measured[maxMeasuredCol] / maxMeasuredCol;
-      if (Math.abs(est - theoColStep) <= theoColStep * 0.04) actualColStep = est;
+      if (Math.abs(est - theoColStep) <= 2) actualColStep = est;
     }
     bookColStep = actualColStep;
     bookSpreadStride = actualColStep * colsPerSpread;
-    const estPagesFromWidth = Math.max(1, Math.round((cols.scrollWidth + colGap) / actualColStep));
-    bookTotalPages = Math.max(1, maxMeasuredCol + 1, estPagesFromWidth);
+    const estPagesFromWidth = Math.max(1, Math.ceil((cols.scrollWidth - 4) / actualColStep));
+    bookTotalPages = Math.max(1, maxContentCol + 1, estPagesFromWidth);
     bookTotalSpreads = Math.max(1, Math.ceil(bookTotalPages / colsPerSpread));
 
     if (!bookSinglePage && (bookTotalPages % 2 === 1)) {
@@ -12479,15 +12584,42 @@ function renderWebApp() {
       };
       frame.querySelectorAll('img').forEach((img) => {
         if (!img.complete) {
-          img.addEventListener('load', () => layoutBookSpreads(false), { once: true });
-          img.addEventListener('error', () => layoutBookSpreads(false), { once: true });
+          img.addEventListener('load', scheduleBookRelayout, { once: true });
+          img.addEventListener('error', scheduleBookRelayout, { once: true });
         }
       });
+      if (bookFrameResizeObserver) {
+        try { bookFrameResizeObserver.disconnect(); } catch (_) {}
+        bookFrameResizeObserver = null;
+      }
+      if (typeof ResizeObserver === 'function') {
+        let lastFrameW = frame.clientWidth;
+        let lastFrameH = frame.clientHeight;
+        bookFrameResizeObserver = new ResizeObserver(() => {
+          const cw = frame.clientWidth;
+          const ch = frame.clientHeight;
+          if (cw === lastFrameW && ch === lastFrameH) return;
+          lastFrameW = cw;
+          lastFrameH = ch;
+          scheduleBookRelayout();
+        });
+        bookFrameResizeObserver.observe(frame);
+      }
+      if (document.fonts && document.fonts.ready) {
+        document.fonts.ready.then(() => {
+          if (isBookMode()) scheduleBookRelayout();
+        });
+      }
 
       requestAnimationFrame(() => layoutBookSpreads(true));
       setTimeout(() => layoutBookSpreads(false), 80);
       setTimeout(() => layoutBookSpreads(false), 260);
       return;
+    }
+
+    if (bookFrameResizeObserver) {
+      try { bookFrameResizeObserver.disconnect(); } catch (_) {}
+      bookFrameResizeObserver = null;
     }
 
     // Standard Scroll Mode (Gemini / Claude / ChatGPT / EPUB 1p / Glass / Sakura / Moss)
@@ -15607,8 +15739,6 @@ function renderWebApp() {
         trSel.value = 'active';
       }
     }
-    const trOverrideEl = document.getElementById('trProfileModelOverride');
-    if (trOverrideEl) trOverrideEl.value = tr.profileModelOverride || '';
     document.getElementById('trAutoOut').checked = Boolean(tr.autoTranslateOutput);
     document.getElementById('trAutoIn').checked = Boolean(tr.autoTranslateInput);
     document.getElementById('trProvider').value = trPid;
@@ -15767,20 +15897,15 @@ function renderWebApp() {
     return profs.find((p) => p && p.id === activeId) || profs[0] || null;
   }
 
-  let lastTrProfSeedKey = '';
   function syncTranslatorModeUI() {
     const selEl = document.getElementById('trProfileSel');
-    const overrideBox = document.getElementById('trProfileOverrideBox');
     const customBox = document.getElementById('trCustomBox');
     const hintEl = document.getElementById('trActiveModelHint');
-    const overrideInp = document.getElementById('trProfileModelOverride');
     const customModelInp = document.getElementById('trModel');
     const customProvSel = document.getElementById('trProvider');
     const val = selEl ? selEl.value : 'active';
     const isCustom = val === 'custom';
-    if (overrideBox) overrideBox.style.display = isCustom ? 'none' : 'block';
     if (customBox) customBox.style.display = isCustom ? 'block' : 'none';
-    const overrideModel = overrideInp ? overrideInp.value.trim() : '';
 
     if (isCustom) {
       const cm = (customModelInp && customModelInp.value.trim()) || 'gemini-2.5-flash';
@@ -15790,77 +15915,20 @@ function renderWebApp() {
     }
 
     const targetProf = getSelectedTranslatorTargetProfile();
-    const seedKey = val + ':' + (targetProf ? (targetProf.id + ':' + targetProf.provider + ':' + targetProf.baseUrl) : 'none');
-    if (seedKey !== lastTrProfSeedKey) {
-      lastTrProfSeedKey = seedKey;
-      if (targetProf) {
-        const meta = getProviderMeta(inferClientProviderId(targetProf.provider, targetProf.providerType, targetProf.baseUrl));
-        if (meta && Array.isArray(meta.builtinModels) && meta.builtinModels.length) {
-          setModelPickList('trProfModelPick', 'trProfModelStatus', meta.builtinModels, meta.label + ' 내장 모델 ' + meta.builtinModels.length + '개 (선택하거나 위 입력창에 직접 입력)');
-        } else {
-          setModelPickList('trProfModelPick', 'trProfModelStatus', [], '🔄 모델 불러오기 버튼 또는 모델 ID 직접 입력이 가능합니다.');
-        }
-      } else {
-        setModelPickList('trProfModelPick', 'trProfModelStatus', [], '저장된 모델 프로필이 없습니다.');
-      }
-    }
-
     if (hintEl) {
       if (!targetProf) {
         hintEl.textContent = '현재 적용: 활성 모델 프로필 없음 (프로필을 추가하거나 전용 설정을 선택하세요)';
       } else {
-        const effModel = overrideModel || targetProf.model || targetProf.providerType || '-';
-        hintEl.textContent = '현재 적용: ' + (targetProf.name || targetProf.id) + ' · ' + effModel + (overrideModel ? ' (번역 전용 지정)' : ' (프로필 기본)');
+        const effModel = targetProf.model || targetProf.providerType || '-';
+        hintEl.textContent = '현재 적용: ' + (targetProf.name || targetProf.id) + ' · ' + effModel;
       }
     }
   }
 
   const trProfileSelEl = document.getElementById('trProfileSel');
   if (trProfileSelEl) trProfileSelEl.onchange = () => syncTranslatorModeUI();
-  const trProfileModelOverrideEl = document.getElementById('trProfileModelOverride');
-  if (trProfileModelOverrideEl) trProfileModelOverrideEl.oninput = () => syncTranslatorModeUI();
   const trModelInpEl = document.getElementById('trModel');
   if (trModelInpEl) trModelInpEl.oninput = () => syncTranslatorModeUI();
-  const trProfModelPickEl = document.getElementById('trProfModelPick');
-  if (trProfModelPickEl) {
-    trProfModelPickEl.onchange = (e) => {
-      const val = e.target.value;
-      if (!val || !trProfileModelOverrideEl) return;
-      trProfileModelOverrideEl.value = val;
-      syncTranslatorModeUI();
-      toast('번역 모델 선택됨: ' + val);
-    };
-  }
-  const trProfLoadBtnEl = document.getElementById('trProfLoadModelsBtn');
-  if (trProfLoadBtnEl) {
-    trProfLoadBtnEl.onclick = async () => {
-      const targetProf = getSelectedTranslatorTargetProfile();
-      if (!targetProf) return toast('먼저 저장된 모델 프로필을 선택해 주세요.');
-      const st = document.getElementById('trProfModelStatus');
-      trProfLoadBtnEl.disabled = true;
-      if (st) st.textContent = '선택한 프로필의 모델 목록을 불러오는 중...';
-      try {
-        const r = await api('/api/router/models', {
-          method: 'POST',
-          body: JSON.stringify({
-            provider: targetProf.provider || '',
-            providerType: targetProf.providerType || 'openai_compat',
-            baseUrl: targetProf.baseUrl || '',
-            profileId: targetProf.id,
-            target: 'profile',
-          }),
-        });
-        const models = r.models || [];
-        setModelPickList('trProfModelPick', 'trProfModelStatus', models, models.length + '개 모델을 불러왔습니다. 아래에서 선택하면 자동 입력됩니다.');
-        toast(models.length + '개 모델 불러옴');
-      } catch (e) {
-        if (st) st.textContent = '⚠️ ' + (e && e.message ? e.message : '불러오기 실패');
-        toast('모델 불러오기 실패: ' + (e && e.message ? e.message : '오류'));
-      } finally {
-        trProfLoadBtnEl.disabled = false;
-      }
-    };
-  }
   window.activateProfile = async (id) => {
     routerCfg.activeProfileId = id;
     routerCfg = await api('/api/router/config', { method: 'POST', body: JSON.stringify(routerCfg) });
@@ -17351,12 +17419,10 @@ function renderWebApp() {
     const isCustom = selVal === 'custom';
     const isActive = selVal === 'active';
     const profileId = isCustom ? 'custom' : (selVal.startsWith('profile:') ? selVal.slice(8) : 'active');
-    const overrideEl = document.getElementById('trProfileModelOverride');
     routerCfg.translator = {
       ...routerCfg.translator,
       useActiveProfile: isActive,
       profileId,
-      profileModelOverride: overrideEl ? overrideEl.value.trim() : '',
       autoTranslateOutput: document.getElementById('trAutoOut').checked,
       autoTranslateInput: document.getElementById('trAutoIn').checked,
       provider: document.getElementById('trProvider').value,
@@ -22000,9 +22066,9 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                         ...config.translator,
                         ...body.translator,
                         profileId: body.translator.profileId !== undefined ? String(body.translator.profileId || '').trim() : String((config.translator && config.translator.profileId) || ''),
-                        profileModelOverride: body.translator.profileModelOverride !== undefined ? String(body.translator.profileModelOverride || '').trim() : String((config.translator && config.translator.profileModelOverride) || ''),
                         apiKey: body.translator.apiKey ? String(body.translator.apiKey) : config.translator.apiKey,
                     };
+                    delete config.translator.profileModelOverride;
                     translationCache.clear();
                 }
                 saveConfig();

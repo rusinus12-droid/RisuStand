@@ -3383,3 +3383,344 @@ test('select_target prioritizes ahead of sync_all, supports fast Host RPC switch
         await new Promise((r) => server.close(r));
     }
 });
+
+test('2-page book pagination guards atomic polaroid assets, relaxes tall text blocks, and fixes risustand.js spreadIdx', async () => {
+    const server = relay.createRelayServer({ token: 'book-pagination-token' });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    try {
+        const htmlRes = await requestHttp(port, { path: '/' });
+        assert.equal(htmlRes.status, 200);
+        const html = htmlRes.body;
+
+        for (const marker of [
+            '--book-col-h',
+            'prepareBookPaginationBlocks',
+            'data-rs-book-atomic',
+            'data-rs-book-breakable',
+            'data-rs-book-flow',
+            'orphans:2; widows:2;',
+            'padding:12px 0',
+            'ResizeObserver',
+        ]) {
+            assert.ok(html.includes(marker), `Expected ${marker} in relay web UI`);
+        }
+
+        const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(scriptMatch);
+        new vm.Script(scriptMatch[1], { filename: 'webapp-book-pagination-inline.js' });
+
+        const bgFnMatch = scriptMatch[1].match(/function extractCssBgImageUrl[\s\S]*?function ensureBotAssetRatio/);
+        const prepFnMatch = scriptMatch[1].match(/function prepareBookPaginationBlocks[\s\S]*?function layoutBookSpreads/);
+        assert.ok(bgFnMatch && prepFnMatch, 'Expected extractCssBgImageUrl and prepareBookPaginationBlocks functions');
+
+        const makeEl = (tag, opts = {}) => {
+            const attrs = new Map();
+            const classes = (opts.className || '').split(/\s+/).filter(Boolean);
+            const el = {
+                tagName: tag.toUpperCase(),
+                children: [],
+                parentElement: null,
+                style: { ...(opts.style || {}) },
+                offsetHeight: opts.offsetHeight || 0,
+                scrollHeight: opts.scrollHeight || opts.offsetHeight || 0,
+                _text: opts.text || '',
+                _cs: opts.cs || {},
+                classList: {
+                    contains: (c) => classes.includes(c),
+                },
+                getAttribute: (k) => (attrs.has(k) ? attrs.get(k) : null),
+                setAttribute: (k, v) => attrs.set(k, String(v)),
+                removeAttribute: (k) => attrs.delete(k),
+                hasAttribute: (k) => attrs.has(k),
+                append(...kids) {
+                    for (const k of kids) {
+                        k.parentElement = el;
+                        el.children.push(k);
+                    }
+                    return el;
+                },
+                get textContent() {
+                    return el._text + el.children.map((c) => c.textContent).join('');
+                },
+            };
+            if (opts.attrs) {
+                for (const [k, v] of Object.entries(opts.attrs)) attrs.set(k, String(v));
+            }
+            const matchSimple = (node, simple) => {
+                let s = simple.trim();
+                if (!s) return false;
+                const tagM = s.match(/^[a-zA-Z0-9_-]+/);
+                if (tagM) {
+                    if (node.tagName.toLowerCase() !== tagM[0].toLowerCase()) return false;
+                    s = s.slice(tagM[0].length);
+                }
+                while (s.length) {
+                    if (s[0] === '.') {
+                        const cm = s.slice(1).match(/^[a-zA-Z0-9_-]+/);
+                        if (!cm || !node.classList.contains(cm[0])) return false;
+                        s = s.slice(1 + cm[0].length);
+                    } else if (s[0] === '[') {
+                        const end = s.indexOf(']');
+                        if (end < 0) return false;
+                        const inner = s.slice(1, end);
+                        const eqIdx = inner.indexOf('=');
+                        if (eqIdx >= 0) {
+                            const attrName = inner.slice(0, eqIdx).trim();
+                            const attrVal = inner.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, '');
+                            if (node.getAttribute(attrName) !== attrVal) return false;
+                        } else if (!node.hasAttribute(inner.trim())) {
+                            return false;
+                        }
+                        s = s.slice(end + 1);
+                    } else {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            const matchSingle = (node, sel) => {
+                const parts = sel.trim().split(/\s+/).filter(Boolean);
+                if (!parts.length) return false;
+                if (!matchSimple(node, parts[parts.length - 1])) return false;
+                let cur = node.parentElement;
+                for (let i = parts.length - 2; i >= 0; i -= 1) {
+                    while (cur && !matchSimple(cur, parts[i])) cur = cur.parentElement;
+                    if (!cur) return false;
+                    cur = cur.parentElement;
+                }
+                return true;
+            };
+            el.matches = (selList) => selList.split(',').some((s) => matchSingle(el, s));
+            el.closest = (selList) => {
+                let cur = el;
+                while (cur) {
+                    if (cur.matches(selList)) return cur;
+                    cur = cur.parentElement;
+                }
+                return null;
+            };
+            el.querySelectorAll = (selList) => {
+                const out = [];
+                const walk = (node) => {
+                    for (const ch of node.children) {
+                        if (ch.matches(selList)) out.push(ch);
+                        walk(ch);
+                    }
+                };
+                walk(el);
+                return out;
+            };
+            el.querySelector = (selList) => el.querySelectorAll(selList)[0] || null;
+            return el;
+        };
+
+        const cols = makeEl('div', { className: 'book-columns' });
+        const botBlock = makeEl('div', { className: 'book-char-block' });
+        const botHtml = makeEl('div', { className: 'rs-bot-html' });
+
+        // 1) CLAUGEM-style polaroid card with <img>, tape, and footer
+        const polaroidWrap = makeEl('div', { className: 'polaroid-wrap', offsetHeight: 280 });
+        const polaroidCard = makeEl('div', { className: 'polaroid-card', offsetHeight: 260 });
+        const tape = makeEl('div', { className: 'polaroid-tape' });
+        const img = makeEl('img', { attrs: { src: '/api/asset/a.webp' }, offsetHeight: 190 });
+        const footer = makeEl('div', { className: 'polaroid-footer', text: 'CLAUGEM' });
+        polaroidCard.append(tape, img, footer);
+        polaroidWrap.append(polaroidCard);
+
+        // Prose & divider inside the same .rs-bot-html
+        const hr = makeEl('hr');
+        const proseSeg = makeEl('span', { className: 'rs-prose-seg', text: '욕조 가장자리에서 하연이 일어섰다. '.repeat(8) });
+
+        // 2) CSS background-image polaroid card
+        const bgWrap = makeEl('div', { className: 'bg-polaroid-wrap', offsetHeight: 240 });
+        const bgCard = makeEl('div', { className: 'bg-polaroid-photo', cs: { backgroundImage: 'url("/api/asset/b.webp")' }, offsetHeight: 200 });
+        const bgFooter = makeEl('div', { className: 'polaroid-footer', text: 'CLAUGEM' });
+        bgWrap.append(bgCard, bgFooter);
+
+        // 3) Tall overflow:hidden prose wrapper
+        const tallProseWrap = makeEl('div', {
+            className: 'prose-shell',
+            text: '긴 본문 텍스트 '.repeat(30),
+            offsetHeight: 540,
+            scrollHeight: 680,
+            cs: { overflow: 'hidden', overflowY: 'hidden', display: 'block' },
+        });
+
+        // 4) Oversized polaroid taller than column
+        const giantWrap = makeEl('div', { className: 'giant-polaroid', offsetHeight: 620, scrollHeight: 620 });
+        const giantImg = makeEl('img', { attrs: { src: '/api/asset/giant.webp' }, offsetHeight: 580 });
+        giantWrap.append(giantImg);
+
+        botHtml.append(polaroidWrap, hr, proseSeg, bgWrap, tallProseWrap, giantWrap);
+        botBlock.append(botHtml);
+
+        // 5) Tall .book-user-block
+        const tallUserBlock = makeEl('div', {
+            className: 'book-user-block',
+            text: '유저 입력 '.repeat(40),
+            offsetHeight: 520,
+            scrollHeight: 520,
+        });
+
+        cols.append(botBlock, tallUserBlock);
+
+        const ctx = {
+            getComputedStyle: (el) => ({ display: 'block', overflow: 'visible', overflowY: 'visible', contain: 'none', flexDirection: 'row', ...(el._cs || {}) }),
+        };
+        vm.runInNewContext(
+            bgFnMatch[0].replace(/function ensureBotAssetRatio$/, '') + '\n' +
+            prepFnMatch[0].replace(/function layoutBookSpreads$/, ''),
+            ctx
+        );
+
+        const colH = 540;
+        ctx.prepareBookPaginationBlocks(cols, colH);
+
+        assert.equal(polaroidWrap.getAttribute('data-rs-book-atomic'), '1', 'Polaroid wrapper around <img> + tape + CLAUGEM footer should be atomic');
+        assert.equal(botHtml.getAttribute('data-rs-book-atomic'), null, '.rs-bot-html boundary must not be marked atomic');
+        assert.equal(proseSeg.getAttribute('data-rs-book-atomic'), null, 'Prose segment must not be marked atomic');
+        assert.equal(bgWrap.getAttribute('data-rs-book-atomic'), '1', 'CSS background-image polaroid wrapper should be atomic');
+        assert.equal(tallUserBlock.getAttribute('data-rs-book-breakable'), '1', 'Tall .book-user-block must become breakable');
+        assert.equal(tallProseWrap.getAttribute('data-rs-book-flow'), '1', 'Tall overflow:hidden prose wrapper must become breakable flow');
+        assert.equal(giantWrap.getAttribute('data-rs-book-scaled'), '1', 'Oversized atomic polaroid must be scaled down to fit colH');
+        assert.ok(Number(giantWrap.style.zoom) > 0 && Number(giantWrap.style.zoom) < 1, 'Oversized atomic polaroid zoom must be < 1');
+    } finally {
+        if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+        await new Promise((r) => server.close(r));
+    }
+
+    const pluginSrc = fs.readFileSync(path.join(REPO, 'risustand.js'), 'utf8');
+    assert.ok(pluginSrc.includes('prepareEpubPaginationBlocks'), 'risustand.js must include prepareEpubPaginationBlocks');
+    assert.ok(pluginSrc.includes('--epub-col-h'), 'risustand.js must set --epub-col-h');
+    assert.ok(!/\bspreadIdx\b/.test(pluginSrc), 'risustand.js must not reference undefined spreadIdx');
+});
+
+test('Leave lorebook expands {{user}}/{{char}} in comments & variables and prevents alwaysActive/statusdata cascade bloat', () => {
+    const leave = relay.loadBundledLeavePreset();
+    const loreEntries = [
+        {
+            key: '',
+            comment: '{{user}}',
+            alwaysActive: true,
+            insertorder: 200,
+            content: 'Member {{user}} travels with {{char}}.',
+        },
+        {
+            key: '',
+            comment: 'Quick Ref',
+            alwaysActive: true,
+            insertorder: 190,
+            content: 'Cast: 정현석, 이지원, 천하연.',
+        },
+        {
+            key: '',
+            comment: '🖼️ ASSET',
+            alwaysActive: true,
+            insertorder: 180,
+            content: '{{#when::toggle_asset_nsfw::is::1}}NSFW_ASSET_TAG{{/when}}',
+        },
+        {
+            key: '',
+            comment: '✈️ TRIP',
+            alwaysActive: true,
+            insertorder: 170,
+            content: 'Plan: {{getvar::trip_plan}}',
+        },
+        {
+            key: '정현석,현석',
+            comment: '정현석',
+            alwaysActive: false,
+            insertorder: 120,
+            content: 'Character Sheet: Jeong Hyeonseok (off-scene member).',
+        },
+        {
+            key: '이지원,지원',
+            comment: '이지원',
+            alwaysActive: false,
+            insertorder: 110,
+            content: 'Character Sheet: Lee Jiwon.',
+        },
+        {
+            key: '천하연,하연',
+            comment: '천하연',
+            alwaysActive: false,
+            insertorder: 100,
+            content: 'Character Sheet: Cheon Hayeon (lives in 천호동).',
+        },
+        {
+            key: '천호동',
+            comment: '천호동 장소',
+            alwaysActive: false,
+            insertorder: 90,
+            content: 'Location Detail: 천호동 자매 아파트.',
+        },
+    ];
+
+    const messages = [
+        {
+            index: 0,
+            role: 'user',
+            raw: '지원과 하연과 함께 방에 있었다.',
+        },
+        {
+            index: 1,
+            role: 'char',
+            raw: '하연이 웃으며 지원의 어깨를 쳤다.\n\n<statusdata>\n📖 Leave HUD · 09:00 · 방\n• 현장: 지원, 하연\n• 장면 밖: 정현석 — 1층 추정\n</statusdata>',
+        },
+    ];
+
+    const snap = {
+        charIndex: 0,
+        chatIndex: 0,
+        charName: '클로젬 여행동아리',
+        chatName: 'Chat 1',
+        isPcActive: false,
+        chatVariables: { trip_plan: "Follow {{user}}'s lead with {{char}}" },
+        useLocallySetGlobalVariables: false,
+        globalToggleValues: { toggle_asset_nsfw: '1' },
+        localToggleValues: {},
+        charContext: {
+            name: '클로젬 여행동아리',
+            desc: 'Ensemble simulation.',
+            personaName: '푸딩',
+            personaPrompt: 'Member.',
+            loreEntries,
+            loreDepth: 10,
+            loreTokenBudget: 16000,
+            loreRecursive: true,
+        },
+        messages,
+    };
+
+    const built = relay.buildDirectPromptMessages({
+        preset: leave,
+        snap,
+        historyMessages: messages,
+        userText: '계속 진행하자.',
+        remoteToggleValues: {},
+    });
+
+    const staticMsg = built.find((m) => m.role === 'system' && m.content.startsWith('[Static World Lorebook]'));
+    const dynamicMsg = built.find((m) => m.role === 'system' && m.content.startsWith('[World / Module Lorebook]'));
+    assert.ok(staticMsg, 'Static World Lorebook message must be emitted');
+    assert.ok(dynamicMsg, 'World / Module Lorebook message must be emitted');
+
+    // 1) {{user}} & {{char}} expanded in comment header and getvar-returned text
+    assert.ok(staticMsg.content.includes('[푸딩]\nMember 푸딩 travels with 클로젬 여행동아리.'), 'alwaysActive comment {{user}} and content must expand');
+    assert.ok(dynamicMsg.content.includes("Plan: Follow 푸딩's lead with 클로젬 여행동아리"), 'Variable-returned {{user}} and {{char}} must expand');
+    assert.ok(!staticMsg.content.includes('{{user}}') && !dynamicMsg.content.includes('{{user}}'), 'No unexpanded {{user}} may remain in lorebooks');
+    assert.ok(!staticMsg.content.includes('{{char}}') && !dynamicMsg.content.includes('{{char}}'), 'No unexpanded {{char}} may remain in lorebooks');
+
+    // 2) Static toggle-gated alwaysActive entry stays cached in [Static World Lorebook]
+    assert.ok(staticMsg.content.includes('NSFW_ASSET_TAG'), 'Static global-toggle #when entry must stay in [Static World Lorebook]');
+    assert.ok(!dynamicMsg.content.includes('NSFW_ASSET_TAG'), 'Static global-toggle #when entry must not leak into [World / Module Lorebook]');
+
+    // 3) Off-scene 정현석 mentioned only in [Quick Ref] and <statusdata> must NOT activate
+    assert.ok(!dynamicMsg.content.includes('Character Sheet: Jeong Hyeonseok'), 'alwaysActive [Quick Ref] and <statusdata> off-scene lines must not trigger off-scene character sheet');
+
+    // 4) On-scene 지원, 하연 and recursive keyword 천호동 DO activate
+    assert.ok(dynamicMsg.content.includes('Character Sheet: Lee Jiwon.'), 'On-scene keyword entry 이지원 must activate');
+    assert.ok(dynamicMsg.content.includes('Character Sheet: Cheon Hayeon'), 'On-scene keyword entry 천하연 must activate');
+    assert.ok(dynamicMsg.content.includes('Location Detail: 천호동 자매 아파트.'), 'Keyword-to-keyword recursive lorebook chain must still activate');
+});

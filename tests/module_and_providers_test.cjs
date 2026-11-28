@@ -1045,9 +1045,10 @@ test('StatusPanel Lua LLM/axLLM without :await(), instant /api/triggers/run, flo
 
         // 5) Web UI markup & script verification (RisuStand mini-bar + popup controls without main-DOM GUI buttons + bot menu dedup)
         const html = await fetch(`${baseUrl}/`).then((r) => r.text());
-        assert.ok(html.includes('id="hdrActivityBar"'));
+        assert.ok(!html.includes('id="hdrActivityBar"'), 'Top bar duplicate activity indicator must be removed');
+        assert.ok(!html.includes('id="hdrActPopover"'), 'Top bar activity popover must be removed');
+        assert.ok(html.includes('id="liveGenBar"'));
         assert.ok(html.includes('class="h-sub-row"'));
-        assert.ok(html.includes('event.stopPropagation()'));
         assert.ok(html.includes('id="rsMiniBar"'));
         assert.ok(html.includes('id="zenModeBtn"'));
         assert.ok(!html.includes('id="rsMiniBarToggleBtn"'));
@@ -2816,7 +2817,7 @@ test('Relay evalPresetCbs and rebuildDisplayedSnapshot evaluate {{source::user}}
     }
 });
 
-test('Live SSE generation telemetry streams provider, model, output tokens, tok/s and UI renders non-clipping liveGenBar & hdrActPopover', async () => {
+test('Live SSE generation telemetry streams provider, model, output tokens, tok/s and UI renders bottom liveGenBar without top-bar duplicate', async () => {
     const tmpCfgPath = path.join(os.tmpdir(), `rs-live-gen-cfg-${Date.now()}.json`);
     const tmpPluginsPath = path.join(os.tmpdir(), `rs-live-gen-plg-${Date.now()}.json`);
     const mockLLM = http.createServer(async (req, res) => {
@@ -2916,8 +2917,8 @@ test('Live SSE generation telemetry streams provider, model, output tokens, tok/
 
         const uiHtml = await fetch(`${baseUrl}/`).then((r) => r.text());
         assert.ok(uiHtml.includes('id="liveGenBar"'));
-        assert.ok(uiHtml.includes('id="hdrActPopover"'));
-        assert.ok(uiHtml.includes('hdr-act-stage'));
+        assert.ok(!uiHtml.includes('id="hdrActivityBar"'));
+        assert.ok(!uiHtml.includes('id="hdrActPopover"'));
         assert.ok(uiHtml.includes("fmtStageShort"));
         const scriptMatch = uiHtml.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
         assert.ok(scriptMatch && scriptMatch[1]);
@@ -3269,7 +3270,7 @@ test('Leave preset templateDefaultVariables are exposed in /api/router/config an
     }
 });
 
-test('Translator supports saved profile selection, per-profile model override, standalone custom model, and cache isolation', async () => {
+test('Translator supports saved profile selection, active profile switching, standalone custom model, and cache isolation', async () => {
     const trCalls = [];
     const mockLLM = http.createServer(async (req, res) => {
         let raw = '';
@@ -3318,7 +3319,6 @@ test('Translator supports saved profile selection, per-profile model override, s
             translator: {
                 useActiveProfile: true,
                 profileId: 'active',
-                profileModelOverride: '',
             },
         },
     });
@@ -3331,7 +3331,7 @@ test('Translator supports saved profile selection, per-profile model override, s
             method: 'POST',
             headers,
             body: JSON.stringify({
-                translator: { useActiveProfile: false, profileId: 'prof-tr', profileModelOverride: '' },
+                translator: { useActiveProfile: false, profileId: 'prof-tr' },
             }),
         }).then((r) => assert.equal(r.status, 200));
         const r1 = await fetch(`${baseUrl}/api/translate`, {
@@ -3342,7 +3342,7 @@ test('Translator supports saved profile selection, per-profile model override, s
         assert.equal(r1.ok, true);
         assert.equal(r1.translated, 'TRANSLATED[saved-tr-model|Bearer key-tr]');
 
-        // 2) Active profile with separate model override + same input text must bypass old model cache
+        // 2) Switching to active profile (even if legacy profileModelOverride is passed) uses active profile model & bypasses old model cache
         await fetch(`${baseUrl}/api/router/config`, {
             method: 'POST',
             headers,
@@ -3356,7 +3356,7 @@ test('Translator supports saved profile selection, per-profile model override, s
             body: JSON.stringify({ text: 'Hello world', direction: 'to_target' }),
         }).then((r) => r.json());
         assert.equal(r2.ok, true);
-        assert.equal(r2.translated, 'TRANSLATED[fast-override-model|Bearer key-main]');
+        assert.equal(r2.translated, 'TRANSLATED[main-model|Bearer key-main]');
 
         // 3) Standalone custom translator configuration
         await fetch(`${baseUrl}/api/router/config`, {
@@ -3366,7 +3366,6 @@ test('Translator supports saved profile selection, per-profile model override, s
                 translator: {
                     useActiveProfile: false,
                     profileId: 'custom',
-                    profileModelOverride: '',
                     providerType: 'openai_compat',
                     baseUrl: `${llmUrl}/v1/chat/completions`,
                     apiKey: 'key-custom',
@@ -3385,9 +3384,10 @@ test('Translator supports saved profile selection, per-profile model override, s
         // 4) UI markup & embedded JS compilation
         const uiHtml = await fetch(`${baseUrl}/`).then((r) => r.text());
         assert.ok(uiHtml.includes('id="trProfileSel"'));
-        assert.ok(uiHtml.includes('id="trProfileModelOverride"'));
-        assert.ok(uiHtml.includes('id="trProfLoadModelsBtn"'));
         assert.ok(uiHtml.includes('id="trCustomBox"'));
+        assert.ok(!uiHtml.includes('id="trProfileModelOverride"'));
+        assert.ok(!uiHtml.includes('id="trProfileOverrideBox"'));
+        assert.ok(!uiHtml.includes('id="trProfLoadModelsBtn"'));
         assert.ok(!uiHtml.includes('trUseActive'));
         const scriptMatch = uiHtml.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
         assert.ok(scriptMatch && scriptMatch[1]);

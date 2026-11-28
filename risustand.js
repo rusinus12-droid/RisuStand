@@ -2415,7 +2415,7 @@
                 .epub-viewport {
                     flex: 1; min-height: 0;
                     overflow: ${twoPage ? 'hidden' : 'auto'};
-                    ${twoPage ? 'margin: 30px auto; padding: 0;' : 'padding: 30px 42px;'}
+                    ${twoPage ? 'margin: 18px auto; padding: 12px 0; box-sizing: border-box;' : 'padding: 30px 42px;'}
                     scrollbar-width: none;
                     position: relative;
                 }
@@ -2440,7 +2440,7 @@
                 .epub-columns {
                     ${
                         twoPage
-                            ? `height: 100%; column-fill: auto;`
+                            ? `height: 100%; column-fill: auto; box-sizing: border-box; orphans: 2; widows: 2;`
                             : `max-width: 660px; margin: 0 auto;`
                     }
                     font-size: ${Math.max(15, config.theme.fontSize)}px;
@@ -2450,7 +2450,12 @@
                     overflow-wrap: break-word;
                     text-align: justify;
                 }
-                .epub-columns img, .epub-columns table, .epub-columns pre, .epub-columns div { max-width: 100%; }
+                .epub-columns p, .epub-columns li, .epub-columns blockquote { orphans: 2; widows: 2; }
+                .epub-columns h1, .epub-columns h2, .epub-columns h3, .epub-columns h4, .epub-columns h5, .epub-columns h6 {
+                    break-after: avoid; page-break-after: avoid; break-inside: avoid;
+                }
+                .epub-columns img, .epub-columns table, .epub-columns pre, .epub-columns div, .epub-columns section, .epub-columns article, .epub-columns details, .epub-columns figure, .epub-columns svg { max-width: 100%; box-sizing: border-box; }
+                .epub-columns div, .epub-columns section, .epub-columns article, .epub-columns details, .epub-columns table, .epub-columns pre, .epub-columns p, .epub-columns blockquote, .epub-columns figure { min-width: 0; }
                 .epub-columns p { margin: 0 0 0.85em; }
                 .epub-status-card {
                     background: ${preset.userBubbleBg};
@@ -2495,15 +2500,47 @@
                 }
                 .epub-columns img {
                     max-width: 100% !important;
-                    max-height: 42vh !important;
+                    max-height: min(46vh, calc(var(--epub-col-h, 540px) - 88px)) !important;
                     width: auto !important;
                     height: auto !important;
                     object-fit: contain;
                     display: block;
                     margin: 12px auto;
                     border-radius: 8px;
-                    break-inside: avoid;
+                    break-inside: avoid !important;
+                    page-break-inside: avoid !important;
+                    -webkit-column-break-inside: avoid !important;
                 }
+                .epub-columns [data-rs-book-atomic="1"],
+                .epub-columns figure,
+                .epub-columns picture,
+                .epub-columns video,
+                .epub-columns canvas,
+                .epub-columns svg,
+                .epub-columns .image-container {
+                    break-inside: avoid !important;
+                    page-break-inside: avoid !important;
+                    -webkit-column-break-inside: avoid !important;
+                    max-width: 100% !important;
+                    box-sizing: border-box;
+                }
+                .epub-columns [data-rs-book-inline-block="1"] { display: inline-block !important; }
+                .epub-columns [data-rs-book-breakable="1"] {
+                    break-inside: auto !important;
+                    page-break-inside: auto !important;
+                    -webkit-column-break-inside: auto !important;
+                    overflow: visible !important;
+                    max-height: none !important;
+                }
+                .epub-columns [data-rs-book-flow="1"] {
+                    overflow: visible !important;
+                    contain: none !important;
+                    break-inside: auto !important;
+                    page-break-inside: auto !important;
+                    -webkit-column-break-inside: auto !important;
+                    max-height: none !important;
+                }
+                .epub-columns [data-rs-book-flow-block="1"] { display: block !important; }
                 .epub-user-block {
                     background: ${preset.userBubbleBg};
                     border: 1px solid ${preset.borderColor};
@@ -2946,10 +2983,135 @@
                 }
             };
 
+            const extractEpubBgUrl = (bgVal) => {
+                const s = String(bgVal || '');
+                if (!s || s === 'none') return '';
+                const m = s.match(/url\(\s*(?:"([^"]+)"|'([^']+)'|([^)"'\s]+))\s*\)/i);
+                if (!m) return '';
+                const u = (m[1] || m[2] || m[3] || '').trim();
+                if (!u || /^data:image\/svg\+xml/i.test(u)) return '';
+                return u;
+            };
+
+            const prepareEpubPaginationBlocks = (colsEl, colH) => {
+                if (!colsEl || !colsEl.querySelectorAll || !(colH > 0)) return;
+                colsEl.querySelectorAll('[data-rs-book-atomic], [data-rs-book-inline-block], [data-rs-book-breakable], [data-rs-book-flow], [data-rs-book-flow-block], [data-rs-book-scaled]').forEach((el) => {
+                    el.removeAttribute('data-rs-book-atomic');
+                    el.removeAttribute('data-rs-book-inline-block');
+                    el.removeAttribute('data-rs-book-breakable');
+                    el.removeAttribute('data-rs-book-flow');
+                    el.removeAttribute('data-rs-book-flow-block');
+                    if (el.hasAttribute('data-rs-book-scaled')) {
+                        el.removeAttribute('data-rs-book-scaled');
+                        el.style.zoom = '';
+                    }
+                });
+
+                const mediaSel = 'img, picture, figure, video, canvas, svg, .image-container';
+                const mediaAnchors = Array.from(colsEl.querySelectorAll(mediaSel));
+                colsEl.querySelectorAll('.epub-turn-body div, .epub-turn-body span, .epub-turn-body a, .epub-turn-body section, .epub-turn-body article').forEach((el) => {
+                    if (el.querySelector && el.querySelector('img, picture, video, canvas, svg')) return;
+                    if ((el.textContent || '').trim().length > 80) return;
+                    let cs = null;
+                    try { cs = window.getComputedStyle(el); } catch (_) {}
+                    if (cs && extractEpubBgUrl(cs.backgroundImage)) {
+                        mediaAnchors.push(el);
+                    }
+                });
+
+                const isBoundary = (el) => !el || el === colsEl || (el.classList && (
+                    el.classList.contains('epub-turn-body') ||
+                    el.classList.contains('epub-bot-block') ||
+                    el.classList.contains('epub-user-block') ||
+                    el.classList.contains('epub-columns')
+                ));
+                const majorMediaSel = 'img, picture, video, canvas, .image-container';
+
+                for (const anchor of mediaAnchors) {
+                    if (anchor.closest && anchor.closest('button, .epub-turn-tag, .epub-turn-divider')) continue;
+                    let cardRoot = anchor;
+                    let anc = anchor.parentElement;
+                    for (let hops = 0; hops < 5 && anc && !isBoundary(anc); hops += 1) {
+                        if (!anc.tagName || !/^(DIV|FIGURE|SECTION|ARTICLE|A|ASIDE|SPAN|P|LI)$/.test(anc.tagName)) break;
+                        if (anc.querySelector && anc.querySelector('hr, .epub-turn-tag, .epub-turn-divider')) break;
+                        if ((anc.textContent || '').trim().length > 160) break;
+                        let hasLongProse = false;
+                        if (anc.querySelectorAll) {
+                            for (const pEl of anc.querySelectorAll('p')) {
+                                if ((pEl.textContent || '').trim().length > 80) { hasLongProse = true; break; }
+                            }
+                        }
+                        if (hasLongProse) break;
+                        const majorMedia = anc.querySelectorAll
+                            ? Array.from(anc.querySelectorAll(majorMediaSel)).filter((m) => !(m.closest && m.closest('button')))
+                            : [];
+                        if (majorMedia.length > 1) {
+                            let ancCs = null;
+                            try { ancCs = window.getComputedStyle(anc); } catch (_) {}
+                            const isRow = ancCs && (ancCs.display === 'flex' || ancCs.display === 'inline-flex' || ancCs.display === 'grid' || ancCs.display === 'inline-grid') && !/^column/i.test(ancCs.flexDirection || '');
+                            if (!isRow || (anc.offsetHeight || 0) > colH * 0.78) break;
+                        }
+                        cardRoot = anc;
+                        anc = anc.parentElement;
+                    }
+                    cardRoot.setAttribute('data-rs-book-atomic', '1');
+                    try {
+                        if (window.getComputedStyle(cardRoot).display === 'inline') {
+                            cardRoot.setAttribute('data-rs-book-inline-block', '1');
+                        }
+                    } catch (_) {}
+                }
+
+                colsEl.querySelectorAll('.epub-user-block, .epub-status-card, .epub-hud-wrap, .leave-hud-card, .epub-turn-body details').forEach((el) => {
+                    if (Math.max(el.offsetHeight || 0, el.scrollHeight || 0) > colH * 0.82) {
+                        el.setAttribute('data-rs-book-breakable', '1');
+                    }
+                });
+
+                colsEl.querySelectorAll('.epub-turn-body div, .epub-turn-body section, .epub-turn-body article, .epub-turn-body blockquote, .epub-turn-body main').forEach((el) => {
+                    if (el.getAttribute('data-rs-book-atomic') === '1') return;
+                    if (el.closest && el.closest('[data-rs-book-atomic="1"], .epub-status-card, .epub-hud-wrap, .leave-hud-card')) return;
+                    const txtLen = (el.textContent || '').trim().length;
+                    const boxH = Math.max(el.offsetHeight || 0, el.scrollHeight || 0);
+                    if (txtLen <= 140 && boxH <= colH * 0.78) return;
+                    let cs = null;
+                    try { cs = window.getComputedStyle(el); } catch (_) {}
+                    if (!cs) return;
+                    const ovBlocked = /^(hidden|clip|auto|scroll)$/.test(cs.overflow || '') || /^(hidden|clip|auto|scroll)$/.test(cs.overflowY || '');
+                    const containBlocked = Boolean(cs.contain && cs.contain !== 'none');
+                    if (ovBlocked || containBlocked) {
+                        el.setAttribute('data-rs-book-flow', '1');
+                    }
+                    if ((cs.display === 'flex' || cs.display === 'inline-flex') && /^column/i.test(cs.flexDirection || '') && boxH > colH * 0.78) {
+                        el.setAttribute('data-rs-book-flow', '1');
+                        el.setAttribute('data-rs-book-flow-block', '1');
+                    }
+                });
+
+                colsEl.querySelectorAll('[data-rs-book-atomic="1"]').forEach((el) => {
+                    if (el.parentElement && el.parentElement.closest && el.parentElement.closest('[data-rs-book-atomic="1"]')) return;
+                    let totalH = Math.max(el.offsetHeight || 0, el.scrollHeight || 0);
+                    if (el.getClientRects) {
+                        const rects = el.getClientRects();
+                        if (rects.length > 1) {
+                            let rectSum = 0;
+                            for (let i = 0; i < rects.length; i += 1) rectSum += rects[i].height || 0;
+                            totalH = Math.max(totalH, rectSum);
+                        }
+                    }
+                    if (totalH > colH - 12) {
+                        const scale = Math.max(0.45, Math.min(0.98, (colH - 16) / totalH));
+                        el.style.zoom = scale.toFixed(3);
+                        el.setAttribute('data-rs-book-scaled', '1');
+                    }
+                });
+            };
+
             const layoutSpreads = (jumpToLast) => {
                 if (!vp || !cols) return;
                 const frame = vp.parentElement;
                 const frameW = frame ? frame.clientWidth : vp.clientWidth;
+                if (!frameW || frameW < 100) return;
                 const isNarrow = frameW < 760;
                 colsPerSpread = isNarrow ? 1 : 2;
                 colGap = isNarrow ? 36 : 96;
@@ -2959,19 +3121,24 @@
                     frame.classList.toggle('mobile-single-page', isNarrow);
                 }
 
-                const rawInnerW = Math.max(220, frameW - sideMargin);
-                const evenW = Math.floor(rawInnerW / 2) * 2;
+                const colW = Math.floor(Math.max(180, (frameW - sideMargin - colGap * (colsPerSpread - 1)) / colsPerSpread) / 4) * 4;
+                const evenW = colW * colsPerSpread + colGap * (colsPerSpread - 1);
                 vp.style.width = `${evenW}px`;
                 cols.style.width = `${evenW}px`;
+                const vpCs = typeof window.getComputedStyle === 'function' ? window.getComputedStyle(vp) : null;
+                const vpPadY = vpCs ? ((parseFloat(vpCs.paddingTop) || 0) + (parseFloat(vpCs.paddingBottom) || 0)) : 0;
+                const colH = Math.max(160, Math.floor(vp.clientHeight - vpPadY));
                 cols.style.margin = '0';
                 cols.style.padding = '0';
                 cols.style.boxSizing = 'border-box';
-                cols.style.columnWidth = 'auto';
+                cols.style.columnWidth = `${colW}px`;
                 cols.style.columnCount = String(colsPerSpread);
                 cols.style.columnGap = `${colGap}px`;
                 cols.style.columnFill = 'auto';
-                cols.style.height = '100%';
-                spreadStride = evenW + colGap;
+                cols.style.height = `${colH}px`;
+                cols.style.setProperty('--epub-col-h', `${colH}px`);
+                prepareEpubPaginationBlocks(cols, colH);
+                spreadStride = (colW + colGap) * colsPerSpread;
                 totalSpreads = Math.max(1, Math.ceil((cols.scrollWidth - 4) / spreadStride));
                 if (jumpToLast && typeof options.targetSpread === 'number') {
                     goToSpread(options.targetSpread, false);
@@ -3017,7 +3184,29 @@
                 goToSpread(nextSpread, true);
             };
 
+            let epubRelayoutRaf = 0;
+            const scheduleEpubRelayout = () => {
+                if (epubRelayoutRaf) return;
+                epubRelayoutRaf = requestAnimationFrame(() => {
+                    epubRelayoutRaf = 0;
+                    layoutSpreads(false);
+                });
+            };
+
             setTimeout(() => layoutSpreads(true), 60);
+            if (cols) {
+                cols.querySelectorAll('img').forEach((img) => {
+                    if (!img.complete) {
+                        img.addEventListener('load', scheduleEpubRelayout, { once: true });
+                        img.addEventListener('error', scheduleEpubRelayout, { once: true });
+                    }
+                });
+            }
+            if (document.fonts && document.fonts.ready) {
+                document.fonts.ready.then(() => {
+                    if (document.getElementById('epub-columns') === cols) scheduleEpubRelayout();
+                });
+            }
             let resizeTimer = null;
             window.onresize = () => {
                 if (resizeTimer) clearTimeout(resizeTimer);
@@ -3027,6 +3216,19 @@
             let touchStartX = 0;
             let touchStartY = 0;
             const bookFrameEl = vp ? vp.parentElement : null;
+            if (bookFrameEl && typeof ResizeObserver === 'function') {
+                let lastFW = bookFrameEl.clientWidth;
+                let lastFH = bookFrameEl.clientHeight;
+                const epubRo = new ResizeObserver(() => {
+                    const cw = bookFrameEl.clientWidth;
+                    const ch = bookFrameEl.clientHeight;
+                    if (cw === lastFW && ch === lastFH) return;
+                    lastFW = cw;
+                    lastFH = ch;
+                    scheduleEpubRelayout();
+                });
+                epubRo.observe(bookFrameEl);
+            }
             if (bookFrameEl) {
                 bookFrameEl.ontouchstart = (e) => {
                     if (e.touches && e.touches.length === 1) {
@@ -3080,8 +3282,8 @@
                         const rect = epubFrame.getBoundingClientRect();
                         const zoneW = Math.max(48, Math.min(110, rect.width * 0.12));
                         const relX = e.clientX - rect.left;
-                        const inPrev = relX <= zoneW && spreadIdx > 0;
-                        const inNext = relX >= rect.width - zoneW && spreadIdx < totalSpreads - 1;
+                        const inPrev = relX <= zoneW && curSpread > 0;
+                        const inNext = relX >= rect.width - zoneW && curSpread < totalSpreads - 1;
                         epubFrame.style.cursor = ((inPrev || inNext) && !isInteractiveEpubTarget(e.target, epubFrame)) ? 'pointer' : '';
                     });
                     epubFrame.addEventListener('mouseleave', () => {
@@ -5781,7 +5983,7 @@
             const depth = Number((charObj && charObj.loreSettings && charObj.loreSettings.scanDepth) || 10);
             const recentText = (Array.isArray(recentMessages) ? recentMessages : [])
                 .slice(-Math.max(1, depth))
-                .map((m) => String(m && m.data ? m.data : ''))
+                .map((m) => String(m && m.data ? m.data : '').replace(/<statusdata\b[^>]*>[\s\S]*?<\/statusdata>/gi, ''))
                 .join('\n')
                 .toLowerCase();
             const candidates = [];
