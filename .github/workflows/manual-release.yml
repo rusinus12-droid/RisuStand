@@ -16,6 +16,7 @@ jobs:
     name: manual-release
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     concurrency:
       group: risustand-manual-release
       cancel-in-progress: false
@@ -217,6 +218,7 @@ jobs:
           OUT="$RUNNER_TEMP/risustand-release"
           ASSETS=("$OUT/RisuStand-${NEXT_VERSION}.zip" "$OUT/RisuStand-${NEXT_VERSION}.build-report.json")
           TAG="v${NEXT_VERSION}"
+          mkdir -p "$RUNNER_TEMP/risustand-release-existing"
           if gh release view "$TAG" --json tagName,url,assets >/tmp/risustand-release.json 2>/dev/null; then
             RELEASE_URL=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("/tmp/risustand-release.json", "utf8")).url)')
             RELEASE_TAG=$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("/tmp/risustand-release.json", "utf8")).tagName)')
@@ -254,6 +256,7 @@ jobs:
               --title "RisuStand v${NEXT_VERSION}" \
               --generate-notes \
               --latest)
+            [[ -n "$RELEASE_URL" ]] || { echo "Error: gh release create returned empty URL."; exit 1; }
           fi
           echo "url=${RELEASE_URL}" >> "$GITHUB_OUTPUT"
 

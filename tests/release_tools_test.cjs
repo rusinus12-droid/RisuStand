@@ -7,7 +7,7 @@ const path = require('node:path');
 const { REPO, makeInstall, tmpDir } = require('./helpers.cjs');
 const rv = require('../tools/release_version.cjs');
 const rt = require('../tools/release_transaction.cjs');
-const { build, UPDATE_URL } = require('../tools/build_release.cjs');
+const { build, assertPayloadDependencies, UPDATE_URL } = require('../tools/build_release.cjs');
 const updater = require('../risustand-updater.cjs');
 
 test('repo version is consistent across every declared location', () => {
@@ -97,4 +97,71 @@ test('prebuilt CI release (if provided) passes updater verification', { skip: !p
     const v = updater.parseAssetVersion(zipName);
     assert.equal(v, rv.readCurrentVersion(REPO));
     updater.verifyReleaseArchive(fs.readFileSync(path.join(dir, zipName)), { expectedVersion: v });
+});
+
+test('assertPayloadDependencies rejects missing relative require targets', () => {
+    assert.doesNotThrow(() => {
+        assertPayloadDependencies([
+            { rel: 'a.js', data: Buffer.from("require('./b.cjs');\n") },
+            { rel: 'b.cjs', data: Buffer.from('module.exports = {};\n') },
+        ]);
+    });
+    assert.throws(
+        () => assertPayloadDependencies([{ rel: 'a.js', data: Buffer.from("require('./missing.cjs');\n") }]),
+        /payload_missing_dependency:a\.js->\.\/missing\.cjs/
+    );
+});
+
+test('extracted release ZIP boots standalone relay server, Leave preset, and Lua WASM engine', async () => {
+    const { spawnSync } = require('node:child_process');
+    const prebuiltDir = process.env.RISUSTAND_PREBUILT_RELEASE_DIR;
+    let zipBuf;
+    let v;
+    if (prebuiltDir) {
+        const zipName = fs.readdirSync(prebuiltDir).find((n) => updater.parseAssetVersion(n));
+        v = updater.parseAssetVersion(zipName);
+        zipBuf = fs.readFileSync(path.join(prebuiltDir, zipName));
+    } else {
+        const outDir = tmpDir('rs-smoke-build-');
+        const built = build({ check: true, outputDir: outDir });
+        v = built.report.packageVersion;
+        zipBuf = fs.readFileSync(built.zipPath);
+        fs.rmSync(outDir, { recursive: true, force: true });
+    }
+    const verified = updater.verifyReleaseArchive(zipBuf, { expectedVersion: v });
+    const appDir = tmpDir('rs-smoke-app-');
+    try {
+        for (const [rel, data] of verified.files) {
+            if (updater.META_FILES.includes(rel)) continue;
+            const dest = path.join(appDir, rel);
+            fs.mkdirSync(path.dirname(dest), { recursive: true });
+            fs.writeFileSync(dest, data);
+        }
+        const smokeScript = [
+            "const relay = require('./risustand-relay-server.js');",
+            "const mod = require('./risustand-module-adapter.cjs');",
+            "(async () => {",
+            "  const srv = relay.createRelayServer({ token: 'smoke-test-token-1234' });",
+            "  await new Promise((r) => srv.listen(0, '127.0.0.1', r));",
+            "  const port = srv.address().port;",
+            "  const status = await fetch('http://127.0.0.1:' + port + '/api/update/status', {",
+            "    headers: { 'X-RisuStand-Token': 'smoke-test-token-1234' },",
+            "  }).then((r) => r.json());",
+            `  if (!status || status.available !== true || status.relayVersion !== ${JSON.stringify(v)}) throw new Error('update_status_invalid');`,
+            "  const leave = await fetch('http://127.0.0.1:' + port + '/api/presets/leave', {",
+            "    headers: { 'X-RisuStand-Token': 'smoke-test-token-1234' },",
+            "  }).then((r) => r.json());",
+            "  if (!leave || leave.ok !== true || leave.filename !== 'Leave_RisuAI_Preset.risup') throw new Error('leave_preset_unavailable');",
+            "  const ma = mod.createModuleAdapter({ hostRpc: null });",
+            "  await ma.prepareTurn({ charIndex: 0, chatIndex: 0, charObj: { name: 'Bot', triggerscript: [{ effect: [{ type: 'triggerlua', code: 'function onStart() return true end' }] }] }, chatObj: { message: [] } });",
+            "  await ma.runTriggerMode('start');",
+            "  ma.dispose();",
+            "  await new Promise((r) => srv.close(r));",
+            "})().catch((e) => { console.error(e); process.exit(1); });",
+        ].join('\n');
+        const res = spawnSync(process.execPath, ['-e', smokeScript], { cwd: appDir, encoding: 'utf8', timeout: 30000 });
+        assert.equal(res.status, 0, res.stderr || res.stdout);
+    } finally {
+        fs.rmSync(appDir, { recursive: true, force: true });
+    }
 });

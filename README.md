@@ -38,6 +38,10 @@ RisuAI 원본 소스는 한 줄도 고치지 않습니다. 공식 **Plugin API v
 |---|---|
 | `risustand.js` | PC RisuAI에 설치하는 플러그인 (API v3.0). RisuAI가 자동 업데이트를 확인합니다. |
 | `risustand-relay-server.js` | PC에서 켜 두는 중계 서버 · 모바일 웹앱 · 모델 라우터 (Node.js 18+, 외부 패키지 없음) |
+| `risustand-plugin-adapter.cjs` | 백엔드 RisuAI v3 플러그인 실행기 · 원격 GUI 브릿지 · 회상 주입 뷰어 |
+| `risustand-module-adapter.cjs` · `vendor/wasmoon/` | Lua 5.4(WASM) · 정규식 모듈 실행기 |
+| `risustand-image-provider.cjs` | 원격 이미지 생성 프로바이더 (NovelAI · ComfyUI 등) |
+| `risustand-tts-provider.cjs` | 멀티 화자 TTS 분석·합성 프로바이더 및 대본 저장소 |
 | `risustand-updater.cjs` | 공식 릴리즈 검증 · 설치 · 롤백을 맡는 업데이터 |
 | `risustand-admin.cjs` | 보안 토큰 폐기·재발급 및 서버 포트 설정 유틸리티 |
 | `start-risustand-remote.bat` / `.sh` | 중계 서버 실행 런처 (토큰 자동 생성 + Tailscale IP 표시) |
@@ -105,7 +109,7 @@ Tailscale은 내 기기끼리만 보이는 사설 네트워크를 만들어 줍�
 
 > ⚠️ **PC 활성 vs 원격 라우팅 안내 (다른 플러그인 동작 제한)**
 > - **`PC 활성`** (PC RisuAI 화면에 현재 열려 있는 봇): `risuai.sendChat()` 경로를 사용하므로 PC RisuAI의 **다른 플러그인(메모리·로어북·외부 플러그인 등)이 모두 정상 작동**합니다.
-> - **`원격 라우팅`** (PC가 홈 화면이거나 다른 봇을 열어 둔 상태에서 전환한 봇): RisuAI Plugin API v3 보안 정책상 원격에서 PC RisuAI의 열린 봇을 바꿀 수 없어 릴레이 서버가 LLM을 직접 호출하고 RisuAI DB에 반영합니다. 따라서 **이 모드에서는 다른 RisuAI 플러그인들은 동작하지 않으며**, 대신 **`⚡ 모델/번역`** 탭의 **원격 직접 요청 프롬프트 프리셋**(기본 내장 **Leave r1.1** 또는 `.risup`/`.json` 업로드)과 **`🧩 모듈/설정`** 탭의 프리셋/로컬 토글이 실시간 CBS로 평가·적용됩니다. 다른 플러그인까지 함께 사용하려면 PC RisuAI에서 해당 봇을 열어 두세요.
+> - **`원격 라우팅`** (PC가 홈 화면이거나 다른 봇을 열어 둔 상태에서 전환한 봇): RisuAI Plugin API v3 보안 정책상 원격에서 PC RisuAI의 열린 봇을 바꿀 수 없어 릴레이 서버가 LLM을 직접 호출하고 RisuAI DB에 반영합니다. 이 모드에서는 **`🧩 모듈/설정`**에 켠 RisuAI v3 플러그인과 Lua/정규식 모듈이 **백엔드 플러그인·모듈 어댑터**를 통해 동작하며, **`⚡ 모델/번역`** 탭의 **원격 직접 요청 프롬프트 프리셋**(기본 내장 **Leave r1.1** 또는 `.risup`/`.json` 업로드) 및 프리셋/로컬 토글도 함께 평가·적용됩니다. 백엔드 어댑터에 켜지 않은 다른 RisuAI 플러그인까지 사용하려면 PC RisuAI에서 해당 봇을 열어 두세요.
 
 ### 5단계 — (선택) 프롬프트 프리셋 토글 등록 (Leave r1.1 내장)
 RisuAI 보안 정책상 프롬프트 프리셋의 커스텀 토글 정의는 플러그인이 직접 읽을 수 없습니다.
@@ -130,7 +134,7 @@ RisuAI 보안 정책상 프롬프트 프리셋의 커스텀 토글 정의는 플
 
 검증을 통과하면 기존 파일을 `.update/backups/`에 백업한 뒤 교체하고, 서버를 같은 창 · 같은 토큰으로 다시 시작합니다.
 **교체 도중 오류가 발생하거나 새 버전이 정상적으로 켜지지 않으면 자동으로 이전 버전으로 되돌립니다.**
-`.risustand-token`과 `.risustand-config.json`은 읽지도 바꾸지도 않습니다. 실행 중인 런처(`.bat`/`.sh`)가 바뀐 경우에는 덮어쓰지 않고 `파일명.new`로 옆에 둡니다.
+`.risustand-token`, `.risustand-config.json`, `.risustand-presets.json`, `.risustand-tts-scripts.json` 등 사용자 데이터 파일은 읽지도 바꾸지도 않습니다. 실행 중인 런처(`.bat`/`.sh`)가 바뀐 경우에는 덮어쓰지 않고 `파일명.new`로 옆에 둡니다.
 
 ---
 

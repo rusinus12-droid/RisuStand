@@ -82,6 +82,28 @@ const LAUNCHER_FILES = Object.freeze([
 const PAYLOAD_FILES = Object.freeze([...PROGRAM_FILES, ...LAUNCHER_FILES]);
 const META_FILES = Object.freeze(['update-manifest.json', 'SHA256SUMS.txt']);
 const EXECUTABLE_FILES = new Set(['start-risustand-remote.sh', 'stop-risustand-remote.sh', 'rotate-risustand-token.sh', 'change-risustand-port.sh', 'update-risustand.sh']);
+const CORE_REQUIRED_FILES = Object.freeze([
+    'risustand-relay-server.js',
+    'risustand-updater.cjs',
+    'risustand.js',
+    'VERSION',
+    'release-policy.json',
+    'LICENSE',
+    'README.md',
+]);
+const ALLOWED_EXTRA_PAYLOAD_RE = /^(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+\.(?:js|cjs|mjs|json|txt|md|html|css|svg|risup|wasm|lua|bat|sh)$/i;
+
+function isAllowedPayloadRel(rel) {
+    if (!rel || typeof rel !== 'string') return false;
+    if (/^\.risustand-|(^|\/)\.env(\.|$)|\.(pem|key)$/i.test(rel) || /^\.update\/|^\.git\//i.test(rel)) return false;
+    if (rel.split('/').some((seg) => !seg || seg.startsWith('.'))) return false;
+    if (PAYLOAD_FILES.includes(rel) || rel === 'LICENSE' || rel === 'VERSION') return true;
+    return ALLOWED_EXTRA_PAYLOAD_RE.test(rel);
+}
+
+function isLauncherRel(rel) {
+    return LAUNCHER_FILES.includes(rel) || /\.(bat|sh)$/i.test(String(rel || ''));
+}
 
 const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
@@ -288,7 +310,7 @@ function parseSums(text) {
 }
 
 function syntaxCheck(rel, data, workDir) {
-    if (!/\.(c?js)$/.test(rel)) return;
+    if (!/\.(c|m)?js$/i.test(rel)) return;
     fs.mkdirSync(workDir, { recursive: true });
     const tmp = path.join(workDir, `check-${crypto.randomBytes(6).toString('hex')}-${path.basename(rel)}`);
     fs.writeFileSync(tmp, data);
@@ -314,11 +336,10 @@ function verifyReleaseArchive(buf, { expectedVersion, workDir = path.join(requir
         if (!e.name.startsWith(prefix)) throw new UpdateError('release_layout_invalid', `ZIP 최상위 폴더가 ${prefix} 가 아닙니다: ${e.name}`);
         const rel = e.name.slice(prefix.length);
         if (!rel) throw new UpdateError('release_layout_invalid', `예상하지 못한 하위 경로: ${e.name}`);
-        if (!PAYLOAD_FILES.includes(rel) && !META_FILES.includes(rel)) throw new UpdateError('release_unexpected_file', `예상하지 못한 파일: ${rel}`);
         files.set(rel, e.data);
         modes.set(rel, e.mode);
     }
-    for (const req of [...META_FILES, ...PROGRAM_FILES]) {
+    for (const req of META_FILES) {
         if (!files.has(req)) throw new UpdateError('release_file_missing', `필수 파일이 없습니다: ${req}`);
     }
 
@@ -343,6 +364,19 @@ function verifyReleaseArchive(buf, { expectedVersion, workDir = path.join(requir
     if (Number(manifest.updaterContract || 0) > UPDATER_CONTRACT) {
         throw new UpdateError('updater_contract_newer', '이 업데이트는 더 새로운 업데이터가 필요합니다. 릴리즈 페이지에서 직접 받아 주세요.');
     }
+    if (!manifest.files || typeof manifest.files !== 'object' || Array.isArray(manifest.files)) {
+        throw new UpdateError('manifest_files_mismatch', 'update-manifest.json의 files 항목이 올바르지 않습니다.');
+    }
+
+    for (const rel of files.keys()) {
+        if (META_FILES.includes(rel)) continue;
+        if (!Object.prototype.hasOwnProperty.call(manifest.files, rel) || !isAllowedPayloadRel(rel)) {
+            throw new UpdateError('release_unexpected_file', `예상하지 못한 파일: ${rel}`);
+        }
+    }
+    for (const req of CORE_REQUIRED_FILES) {
+        if (!files.has(req)) throw new UpdateError('release_file_missing', `필수 파일이 없습니다: ${req}`);
+    }
 
     const sums = parseSums(files.get('SHA256SUMS.txt').toString('utf8'));
     for (const [rel, data] of files) {
@@ -355,9 +389,6 @@ function verifyReleaseArchive(buf, { expectedVersion, workDir = path.join(requir
         if (!files.has(rel)) throw new UpdateError('checksum_extra', `SHA256SUMS.txt의 ${rel} 파일이 ZIP에 없습니다.`);
     }
 
-    if (!manifest.files || typeof manifest.files !== 'object' || Array.isArray(manifest.files)) {
-        throw new UpdateError('manifest_files_mismatch', 'update-manifest.json의 files 항목이 올바르지 않습니다.');
-    }
     const payloadRels = [...files.keys()].filter((rel) => !META_FILES.includes(rel));
     const manifestKeys = Object.keys(manifest.files);
     if (manifestKeys.length !== payloadRels.length) {
@@ -470,7 +501,11 @@ function installRelease(root, verified, { currentVersion = readInstalledVersion(
         const backupDir = path.join(updateDir(root), 'backups', `v${currentVersion}-${stamp}`);
         fs.mkdirSync(backupDir, { recursive: true });
 
-        const program = PROGRAM_FILES.filter((rel) => verified.files.has(rel));
+        const payloadRels = [...verified.files.keys()].filter((rel) => !META_FILES.includes(rel));
+        const program = [
+            ...PROGRAM_FILES.filter((rel) => verified.files.has(rel) && !isLauncherRel(rel)),
+            ...payloadRels.filter((rel) => !isLauncherRel(rel) && !PROGRAM_FILES.includes(rel)).sort(),
+        ];
         const files = program.map((rel) => ({ rel, hadOriginal: fs.existsSync(path.join(root, rel)) }));
         const journal = { schema: 'risustand.update-journal.v1', state: 'installing', from: currentVersion, to: verified.version, backupDir, files, startedAt: new Date().toISOString() };
         writeJournal(root, journal);
@@ -489,12 +524,16 @@ function installRelease(root, verified, { currentVersion = readInstalledVersion(
                 writeFileAtomic(path.join(root, f.rel), verified.files.get(f.rel));
             }
 
+            const launchers = [
+                ...LAUNCHER_FILES.filter((rel) => verified.files.has(rel)),
+                ...payloadRels.filter((rel) => isLauncherRel(rel) && !LAUNCHER_FILES.includes(rel)).sort(),
+            ];
             const stagedLaunchers = [];
-            for (const rel of LAUNCHER_FILES) {
+            for (const rel of launchers) {
                 if (!verified.files.has(rel)) continue;
                 const data = verified.files.get(rel);
                 const target = path.join(root, rel);
-                const mode = EXECUTABLE_FILES.has(rel) ? 0o755 : undefined;
+                const mode = EXECUTABLE_FILES.has(rel) || /\.sh$/i.test(rel) ? 0o755 : undefined;
                 if (!fs.existsSync(target)) {
                     writeFileAtomic(target, data, mode);
                 } else if (!fs.readFileSync(target).equals(data)) {
@@ -631,7 +670,8 @@ if (require.main === module) {
 
 module.exports = {
     REPOSITORY, MANIFEST_SCHEMA, UPDATER_CONTRACT,
-    PROGRAM_FILES, LAUNCHER_FILES, PAYLOAD_FILES, META_FILES, EXECUTABLE_FILES,
+    PROGRAM_FILES, LAUNCHER_FILES, PAYLOAD_FILES, META_FILES, EXECUTABLE_FILES, CORE_REQUIRED_FILES,
+    isAllowedPayloadRel, isLauncherRel,
     UpdateError, expectedAssetName, parseAssetVersion, compareVersions, normalizeDigest, sha256, crc32,
     readZip, parseSums, checkLatest, downloadAsset, verifyReleaseArchive,
     readInstalledVersion, readJournal, installRelease, rollback, recoverIfNeeded, commitInstalled, updateToLatest,

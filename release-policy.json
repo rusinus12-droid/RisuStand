@@ -3,5 +3,5 @@
   "version": "1.2.0",
   "channel": "stable",
   "updatePolicy": "program_only",
-  "minimumSourceVersion": "1.0.0"
+  "minimumSourceVersion": "1.2.0"
 }

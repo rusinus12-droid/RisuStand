@@ -98,10 +98,49 @@ function writeZip(entries, { mtime = '1980-01-01T00:00:00Z' } = {}) {
 function checkPluginHeader(source) {
     const lines = source.match(/^\/\/@update-url\b[^\r\n]*$/gm) || [];
     if (lines.length !== 1 || lines[0] !== `//@update-url ${UPDATE_URL}`) throw new Error('plugin_update_url_invalid');
-    if (!source.startsWith('//@name risustand\n')) throw new Error('plugin_header_must_start_file');
+    if (!/^\/\/@name risustand\r?\n/.test(source)) throw new Error('plugin_header_must_start_file');
     const versionAt = source.indexOf('//@version');
     const line = source.slice(versionAt).split('\n')[0];
     if (Buffer.byteLength(source.slice(0, versionAt) + line) > 500) throw new Error('plugin_version_beyond_512_bytes');
+}
+
+function collectSecretValues(node, out) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+        for (const item of node) collectSecretValues(item, out);
+        return;
+    }
+    for (const [k, v] of Object.entries(node)) {
+        if (typeof v === 'string') {
+            if (/apiKey|token|secret/i.test(k) && v.trim().length >= 8) out.push(v.trim());
+        } else if (v && typeof v === 'object') {
+            collectSecretValues(v, out);
+        }
+    }
+}
+
+function assertPayloadDependencies(payload) {
+    const payloadSet = new Set(payload.map((p) => p.rel));
+    for (const p of payload) {
+        if (!/\.(c|m)?js$/i.test(p.rel)) continue;
+        const text = p.data.toString('utf8');
+        const dir = path.posix.dirname(p.rel);
+        for (const m of text.matchAll(/\brequire\s*\(\s*['"](\.\.?\/[^'"]+)['"]\s*\)/g)) {
+            const spec = m[1];
+            const resolved = path.posix.normalize(dir === '.' ? spec : path.posix.join(dir, spec));
+            const candidates = [
+                resolved,
+                `${resolved}.js`,
+                `${resolved}.cjs`,
+                `${resolved}.json`,
+                `${resolved}/index.js`,
+                `${resolved}/index.cjs`,
+            ];
+            if (!candidates.some((c) => payloadSet.has(c))) {
+                throw new Error(`payload_missing_dependency:${p.rel}->${spec}`);
+            }
+        }
+    }
 }
 
 // Defense in depth: the payload is an explicit allowlist, but never let a secret ride along.
@@ -115,13 +154,7 @@ function assertNoSecrets(root, payload) {
     } catch (_) {}
     try {
         const cfg = JSON.parse(fs.readFileSync(path.join(root, '.risustand-config.json'), 'utf8'));
-        const keys = [
-            ...(cfg.profiles || []).map((p) => p && p.apiKey),
-            cfg.translator && cfg.translator.apiKey,
-            cfg.imageGen && cfg.imageGen.apiKey,
-            cfg.tts && cfg.tts.apiKey,
-        ];
-        for (const k of keys) if (typeof k === 'string' && k.trim().length >= 8) localSecrets.push(k.trim());
+        collectSecretValues(cfg, localSecrets);
     } catch (_) {}
     for (const p of payload) {
         const text = p.data.toString('utf8');
@@ -164,6 +197,7 @@ function build({ check, version, outputDir, root = ROOT, generatedAt = process.e
         if (!fs.existsSync(file)) throw new Error(`payload_missing:${rel}`);
         payload.push({ rel, data: fs.readFileSync(file), mode: updater.EXECUTABLE_FILES.has(rel) ? 0o755 : 0o644 });
     }
+    assertPayloadDependencies(payload);
     assertNoSecrets(root, payload);
     const manifest = {
         schema: updater.MANIFEST_SCHEMA,
@@ -234,4 +268,4 @@ if (require.main === module) {
     }
 }
 
-module.exports = { build, writeZip, checkPluginHeader, UPDATE_URL };
+module.exports = { build, writeZip, checkPluginHeader, assertPayloadDependencies, UPDATE_URL };

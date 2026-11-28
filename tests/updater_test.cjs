@@ -203,3 +203,66 @@ test('installRelease automatically rolls back if file replacement fails mid-inst
     assert.ok(fs.readFileSync(path.join(dir, 'risustand-relay-server.js')).equals(relayBefore));
     assert.equal(updater.readJournal(dir).state, 'rolled_back');
 });
+
+test('forward compatibility: new declared modules install and roll back cleanly, disallowed extensions fail, and newer contract errors clearly', () => {
+    const { version, zip } = buildNext();
+    const entries = updater.readZip(zip);
+    const prefix = `RisuStand-${version}/`;
+    const crypto = require('node:crypto');
+    const sha = (d) => crypto.createHash('sha256').update(d).digest('hex');
+
+    const buildCustomZip = (mutateFiles, mutateManifest = (m) => m) => {
+        const files = new Map(entries.map((e) => [e.name.slice(prefix.length), e.data]));
+        const manifest = JSON.parse(files.get('update-manifest.json'));
+        mutateFiles(files, manifest);
+        const nextManifest = mutateManifest(manifest);
+        files.set('update-manifest.json', Buffer.from(`${JSON.stringify(nextManifest, null, 2)}\n`));
+        files.set(
+            'SHA256SUMS.txt',
+            Buffer.from(
+                [...files]
+                    .filter(([r]) => r !== 'SHA256SUMS.txt')
+                    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+                    .map(([r, d]) => `${sha(d)}  ${r}`)
+                    .join('\n') + '\n'
+            )
+        );
+        return writeZip([...files].map(([r, d]) => ({ name: prefix + r, data: d })));
+    };
+
+    const extraModuleZip = buildCustomZip((files, manifest) => {
+        const extraData = Buffer.from("'use strict'; module.exports = { ok: true };\n");
+        files.set('risustand-future-helper.cjs', extraData);
+        manifest.files['risustand-future-helper.cjs'] = sha(extraData);
+    });
+    const dir = installWithSecrets();
+    const verified = updater.verifyReleaseArchive(extraModuleZip, { expectedVersion: version });
+    const installed = updater.installRelease(dir, verified);
+    assert.equal(installed.to, version);
+    assert.ok(fs.existsSync(path.join(dir, 'risustand-future-helper.cjs')));
+    assert.equal(updater.rollback(dir).rolledBack, true);
+    assert.ok(!fs.existsSync(path.join(dir, 'risustand-future-helper.cjs')));
+
+    const badExtZip = buildCustomZip((files, manifest) => {
+        const exeData = Buffer.from('MZ');
+        files.set('evil.exe', exeData);
+        manifest.files['evil.exe'] = sha(exeData);
+    });
+    assert.throws(
+        () => updater.verifyReleaseArchive(badExtZip, { expectedVersion: version }),
+        (e) => e.code === 'release_unexpected_file'
+    );
+
+    const newerContractZip = buildCustomZip(
+        (files, manifest) => {
+            const unknownData = Buffer.from('future');
+            files.set('future.bin', unknownData);
+            manifest.files['future.bin'] = sha(unknownData);
+        },
+        (manifest) => ({ ...manifest, updaterContract: 99 })
+    );
+    assert.throws(
+        () => updater.verifyReleaseArchive(newerContractZip, { expectedVersion: version }),
+        (e) => e.code === 'updater_contract_newer'
+    );
+});
