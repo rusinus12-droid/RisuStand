@@ -3212,6 +3212,8 @@ test('diffPluginPromptInjection & /api/plugins/runtime-recall attribute recalled
         assert.ok(/\.plg-gui-recall-pane\s*>\s*\*\s*\{[^}]*flex-shrink:\s*0/i.test(uiHtml), 'recall pane children must not flex-shrink collapse');
         assert.ok(/\.plg-recall-block\s*\{[^}]*flex-shrink:\s*0/i.test(uiHtml), 'recall block cards must not flex-shrink collapse');
         assert.ok(uiHtml.includes('data-plg-recall-toggle-block'));
+        assert.ok(uiHtml.includes('pickPreferredRecallIdx'));
+        assert.ok(uiHtml.includes('getRecallItemChars'));
         const scriptMatch = uiHtml.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
         assert.ok(scriptMatch && scriptMatch[1]);
         assert.doesNotThrow(() => new Function(scriptMatch[1]));

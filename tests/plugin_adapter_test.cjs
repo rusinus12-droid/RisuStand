@@ -1731,3 +1731,202 @@ test('inline floating toolbar toggle does not trigger activeOverlay while explic
         await adapter.dispose();
     }
 });
+
+test('runtime recall aggregates multi-hook injections, skips non-model no-ops, tracks bodyIntercepter, and recommends current-chat recall', async () => {
+    const fakeDb = {
+        characters: [
+            {
+                name: '지원',
+                chats: [
+                    { id: 'chat-a-uuid', name: 'Chat A', message: [{ role: 'user', data: '안녕', chatId: 'm1' }] },
+                    { id: 'chat-b-uuid', name: 'Chat B', message: [{ role: 'user', data: '다른 방', chatId: 'm2' }] },
+                ],
+            },
+        ],
+    };
+    const adapter = adapterMod.createPluginAdapter({
+        persistDisabled: true,
+        getBackendConfig: () => ({ backendPlugins: {} }),
+        saveBackendConfig: () => {},
+        hostRpc: {
+            isConnected: () => true,
+            invoke: async (method, args) => {
+                if (method === 'db.getCharacter') return fakeDb.characters[args[0]];
+                if (method === 'db.getChat') return fakeDb.characters[args[0]].chats[args[1]];
+                return null;
+            },
+        },
+    });
+
+    try {
+        // 1) Multi-hook plugin (2 beforeRequest hooks, second returns unchanged) + non-model call
+        await adapter.addCustomPlugin({
+            filename: 'hayaku_multi_hook.js',
+            enabled: true,
+            script: `
+//@name hayaku_multi_hook
+//@display-name HAYAKU Multi
+//@api 3.0
+risuai.addRisuReplacer('beforeRequest', async (msgs, mode) => {
+  if (mode !== 'model') return msgs;
+  const out = msgs.map((m) => ({ ...m }));
+  out.splice(0, 0, { role: 'system', content: '[HAYAKU_HEAD]\\n장면 헤드' });
+  out.splice(1, 0, { role: 'system', content: '[HAYAKU_MEM]\\n회상 기억 1' });
+  out.splice(2, 0, { role: 'system', content: '[HAYAKU_CONSTRAINTS]\\n제약 조건' });
+  return out;
+});
+risuai.addRisuReplacer('beforeRequest', async (msgs) => {
+  // Second hook intentionally leaves messages unchanged
+  return msgs;
+});
+`,
+        });
+
+        // 2) Body-intercepter-only plugin + paired beforeRequest+bodyIntercepter plugin
+        await adapter.addCustomPlugin({
+            filename: 'body_only_plugin.js',
+            enabled: true,
+            script: `
+//@name body_only_plugin
+//@display-name Body Only
+//@api 3.0
+risuai.registerBodyIntercepter(async (body, type) => {
+  if (type === 'anthropic') {
+    const sys = Array.isArray(body.system) ? [...body.system] : [{ type: 'text', text: String(body.system || '') }];
+    sys.push({ type: 'text', text: '[BODY_ANTHROPIC_RECALL]\\n기억 주입' });
+    return { ...body, system: sys };
+  }
+  if (type === 'gemini') {
+    const contents = Array.isArray(body.contents) ? [...body.contents] : [];
+    contents.unshift({ role: 'user', parts: [{ text: '[BODY_GEMINI_RECALL]\\n제미니 기억' }] });
+    return { ...body, contents };
+  }
+  const messages = Array.isArray(body.messages) ? [...body.messages] : [];
+  messages.splice(0, 0, { role: 'system', content: '[BODY_OPENAI_RECALL]\\n오픈AI 기억' });
+  return { ...body, messages };
+});
+`,
+        });
+
+        await adapter.addCustomPlugin({
+            filename: 'hybrid_plugin.js',
+            enabled: true,
+            script: `
+//@name hybrid_plugin
+//@display-name Hybrid
+//@api 3.0
+risuai.addRisuReplacer('beforeRequest', async (msgs, mode) => {
+  if (mode !== 'model') return msgs;
+  return [{ role: 'system', content: '[HYBRID_BEFORE]\\n전처리 주입' }, ...msgs];
+});
+risuai.registerBodyIntercepter(async (body, type) => {
+  if (type !== 'openai') return body;
+  const messages = Array.isArray(body.messages) ? [...body.messages] : [];
+  messages.push({ role: 'system', content: '[HYBRID_BODY]\\n본문 인터셉트 주입' });
+  return { ...body, messages };
+});
+`,
+        });
+
+        // Turn on Chat A
+        await adapter.prepareTurn(0, 0);
+        const baseMsgs = [
+            { role: 'system', content: 'System base' },
+            { role: 'user', content: [{ type: 'text', text: '오늘 어땠어?' }] },
+        ];
+        const afterBefore = await adapter.runBeforeRequest(baseMsgs, 'model');
+        assert.ok(afterBefore.some((m) => String(m.content).includes('[HAYAKU_HEAD]')));
+
+        // Non-'model' call (e.g. auxiliary submodel) must NOT overwrite Chat A's recall with 0 chars
+        await adapter.runBeforeRequest([{ role: 'user', content: 'aux prompt' }], 'submodel');
+
+        // Body intercepter on OpenAI in the same turn
+        await adapter.runBodyIntercepters({
+            model: 'gpt-test',
+            messages: afterBefore.map((m) => ({ role: m.role, content: typeof m.content === 'string' ? m.content : '오늘 어땠어?' })),
+        }, 'openai');
+        adapter.endTurn();
+
+        // Check multi-hook aggregation on hayaku_multi_hook
+        const hayakuChatA = adapter.getPluginRuntimeRecall('hayaku_multi_hook', { chatUuid: 'chat-a-uuid' });
+        assert.equal(hayakuChatA.beforeRequestRuns, 2);
+        assert.equal(hayakuChatA.history.length, 1, '2 hooks in one model request aggregate to 1 entry and submodel no-op is skipped');
+        assert.equal(hayakuChatA.history[0].injectedCount, 3);
+        assert.ok(hayakuChatA.history[0].totalInjectedChars > 30);
+        assert.equal(hayakuChatA.recommendedIndex, 0);
+
+        // Check hybrid_plugin merged beforeRequest + bodyIntercepter in same turn
+        const hybridRecall = adapter.getPluginRuntimeRecall('hybrid_plugin', { chatUuid: 'chat-a-uuid' });
+        assert.equal(hybridRecall.history.length, 1);
+        assert.equal(hybridRecall.history[0].kind, 'beforeRequest+bodyIntercepter');
+        assert.equal(hybridRecall.history[0].injectedCount, 2);
+        assert.ok(hybridRecall.history[0].injectedBlocks.some((b) => b.text.includes('[HYBRID_BEFORE]')));
+        assert.ok(hybridRecall.history[0].injectedBlocks.some((b) => b.text.includes('[HYBRID_BODY]')));
+
+        // Check body_only_plugin across OpenAI, Anthropic, Gemini
+        await adapter.prepareTurn(0, 0);
+        await adapter.runBodyIntercepters({
+            system: [{ type: 'text', text: 'Anthropic sys' }],
+            messages: [{ role: 'user', content: 'hi' }],
+        }, 'anthropic');
+        await adapter.runBodyIntercepters({
+            systemInstruction: { parts: [{ text: 'Gemini sys' }] },
+            contents: [{ role: 'user', parts: [{ text: 'hi' }] }],
+        }, 'gemini');
+        adapter.endTurn();
+
+        const bodyOnlyRecall = adapter.getPluginRuntimeRecall('body_only_plugin', { chatUuid: 'chat-a-uuid' });
+        assert.equal(bodyOnlyRecall.bodyIntercepterRuns, 3);
+        assert.equal(bodyOnlyRecall.history.length, 2);
+        assert.equal(bodyOnlyRecall.history[0].injectedCount, 2);
+        assert.ok(bodyOnlyRecall.history[0].injectedBlocks.some((b) => b.text.includes('[BODY_ANTHROPIC_RECALL]')));
+        assert.ok(bodyOnlyRecall.history[0].injectedBlocks.some((b) => b.text.includes('[BODY_GEMINI_RECALL]')));
+        assert.equal(bodyOnlyRecall.history[1].injectedCount, 1);
+        assert.ok(bodyOnlyRecall.history[1].injectedBlocks.some((b) => b.text.includes('[BODY_OPENAI_RECALL]')));
+
+        // Simulate a newer 0-char run on Chat B: Chat A must still recommend & report non-zero for chat-a-uuid
+        await adapter.prepareTurn(0, 1);
+        await adapter.runBeforeRequest([{ role: 'user', content: 'empty' }], 'other');
+        // Force a 0-char 'model' entry on Chat B by disabling injection via custom script? Instead invoke model with a 0-char plugin:
+        adapter.endTurn();
+        // Also test direct 0-char model turn on Chat B with a plugin that skips Chat B
+        await adapter.addCustomPlugin({
+            filename: 'chat_scoped_plugin.js',
+            enabled: true,
+            script: `
+//@name chat_scoped_plugin
+//@display-name Chat Scoped
+//@api 3.0
+risuai.addRisuReplacer('beforeRequest', async (msgs) => {
+  const ch = await risuai.getChat();
+  if (ch && ch.id === 'chat-a-uuid') {
+    return [{ role: 'system', content: '[SCOPED_RECALL]\\nChat A 기억' }, ...msgs];
+  }
+  return msgs;
+});
+`,
+        });
+        await adapter.prepareTurn(0, 0);
+        await adapter.runBeforeRequest([{ role: 'user', content: 'A' }], 'model');
+        adapter.endTurn();
+        await adapter.prepareTurn(0, 1);
+        await adapter.runBeforeRequest([{ role: 'user', content: 'B' }], 'model');
+        adapter.endTurn();
+
+        const scopedForA = adapter.getPluginRuntimeRecall('chat_scoped_plugin', { chatUuid: 'chat-a-uuid' });
+        assert.equal(scopedForA.history.length, 2);
+        assert.equal(scopedForA.history[0].totalInjectedChars, 0);
+        assert.equal(scopedForA.history[1].matchesCurrentChat, true);
+        assert.ok(scopedForA.history[1].totalInjectedChars > 0);
+        assert.equal(scopedForA.recommendedIndex, 1);
+
+        const listForA = adapter.getPluginRuntimeRecall('', { chatUuid: 'chat-a-uuid' });
+        const scopedSummary = listForA.find((p) => p.pluginName === 'chat_scoped_plugin');
+        assert.ok(scopedSummary);
+        assert.equal(scopedSummary.latestInjectedCount, 1);
+        assert.ok(scopedSummary.latestInjectedChars > 0);
+        assert.equal(scopedSummary.matchesCurrentChat, true);
+    } finally {
+        await adapter.dispose();
+    }
+});

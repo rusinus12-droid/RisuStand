@@ -1913,10 +1913,80 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
     };
 }
 
+function extractMessageText(m) {
+    if (typeof m === 'string') return m;
+    if (!m || typeof m !== 'object') return '';
+    if (typeof m.content === 'string') return m.content;
+    if (Array.isArray(m.content)) {
+        return m.content.map((part) => {
+            if (typeof part === 'string') return part;
+            if (!part || typeof part !== 'object') return '';
+            if (typeof part.text === 'string') return part.text;
+            if (typeof part.content === 'string') return part.content;
+            return '';
+        }).filter(Boolean).join('\n');
+    }
+    if (Array.isArray(m.parts)) {
+        return m.parts.map((part) => {
+            if (typeof part === 'string') return part;
+            if (part && typeof part === 'object' && typeof part.text === 'string') return part.text;
+            return '';
+        }).filter(Boolean).join('\n');
+    }
+    if (typeof m.text === 'string') return m.text;
+    return String(m.content ?? '');
+}
+
+function extractMessagesFromRequestBody(bodyObj, type = 'openai') {
+    if (!bodyObj || typeof bodyObj !== 'object') return [];
+    const kind = String(type || 'openai').toLowerCase();
+    const out = [];
+    if (kind === 'anthropic') {
+        if (typeof bodyObj.system === 'string') {
+            out.push({ role: 'system', content: bodyObj.system });
+        } else if (Array.isArray(bodyObj.system)) {
+            for (const blk of bodyObj.system) {
+                const txt = typeof blk === 'string'
+                    ? blk
+                    : (blk && typeof blk === 'object' && typeof blk.text === 'string' ? blk.text : extractMessageText(blk));
+                if (txt) out.push({ role: 'system', content: txt });
+            }
+        }
+        if (Array.isArray(bodyObj.messages)) {
+            for (const m of bodyObj.messages) {
+                out.push({ role: String((m && m.role) || ''), content: extractMessageText(m) });
+            }
+        }
+        return out;
+    }
+    if (kind === 'gemini') {
+        const sysInst = bodyObj.systemInstruction ?? bodyObj.system_instruction;
+        if (typeof sysInst === 'string') {
+            out.push({ role: 'system', content: sysInst });
+        } else if (sysInst && typeof sysInst === 'object') {
+            const sysTxt = extractMessageText(sysInst);
+            if (sysTxt) out.push({ role: 'system', content: sysTxt });
+        }
+        if (Array.isArray(bodyObj.contents)) {
+            for (const c of bodyObj.contents) {
+                out.push({ role: String((c && c.role) || 'user'), content: extractMessageText(c) });
+            }
+        }
+        return out;
+    }
+    const list = Array.isArray(bodyObj.messages)
+        ? bodyObj.messages
+        : (Array.isArray(bodyObj.input) ? bodyObj.input : []);
+    for (const m of list) {
+        out.push({ role: String((m && m.role) || ''), content: extractMessageText(m) });
+    }
+    return out;
+}
+
 function diffPluginPromptInjection(beforeMsgs, afterMsgs) {
     const normalize = (arr) => (Array.isArray(arr) ? arr : []).map((m) => ({
         role: String((m && m.role) || ''),
-        content: String((m && m.content) ?? ''),
+        content: extractMessageText(m),
     }));
     const before = normalize(beforeMsgs);
     const after = normalize(afterMsgs);
@@ -2004,7 +2074,7 @@ function diffPluginPromptInjection(beforeMsgs, afterMsgs) {
 
         for (const bi of bGap) {
             let bestAi = -1;
-            let bestScore = -1;
+            let bestScore = 0;
             for (const ai of aGap) {
                 if (usedA.has(ai)) continue;
                 if (before[bi].role !== after[ai].role) continue;
@@ -2691,6 +2761,7 @@ function createPluginAdapter({
     let guiIpcSeq = 0;
     const pluginRuntimeLedger = new Map(); // pluginName -> runtime hook & prompt-injection recall ledger
     let runtimeRecallSeq = 0;
+    let runtimeTurnRunSeq = 0;
     let activeHookFrame = null; // { stage, step, total, pluginName, explicit, handle, logs, fetchCount, llmCount }
     let activeActionTracker = null; // { dbMutated, surfaceMutated, openedContainerPlugin }
 
@@ -2701,9 +2772,11 @@ function createPluginAdapter({
             rec = {
                 pluginName: key,
                 beforeRequestRuns: 0,
+                bodyIntercepterRuns: 0,
                 afterRequestRuns: 0,
                 outputRuns: 0,
                 lastBeforeRequestAt: 0,
+                lastBodyIntercepterAt: 0,
                 lastAfterRequestAt: 0,
                 lastOutputAt: 0,
                 lastAfterRequest: null,
@@ -2713,6 +2786,18 @@ function createPluginAdapter({
             pluginRuntimeLedger.set(key, rec);
         }
         return rec;
+    }
+
+    function pickPrimaryRecallIndex(reversedHistory) {
+        const list = Array.isArray(reversedHistory) ? reversedHistory : [];
+        if (!list.length) return -1;
+        let idx = list.findIndex((h) => h && h.matchesCurrentChat && (Number(h.totalInjectedChars) || 0) > 0);
+        if (idx >= 0) return idx;
+        idx = list.findIndex((h) => h && h.matchesCurrentChat);
+        if (idx >= 0) return idx;
+        idx = list.findIndex((h) => h && (Number(h.totalInjectedChars) || 0) > 0);
+        if (idx >= 0) return idx;
+        return 0;
     }
 
     function appendHookStepLog(pluginName, text) {
@@ -4677,6 +4762,7 @@ function createPluginAdapter({
         invalidateReadCache();
         turnCache = {
             active: true,
+            turnRunId: ++runtimeTurnRunSeq,
             charIndex: Number(charIndex),
             chatIndex: Number(chatIndex),
             charObj: null,
@@ -4781,6 +4867,11 @@ function createPluginAdapter({
             ...hookState.beforeRequest.map((h) => ({ kind: 'beforeRequest', h })),
         ];
         const total = steps.length;
+        const effectiveTurnRunId = (turnCache.active && turnCache.turnRunId)
+            ? turnCache.turnRunId
+            : (++runtimeTurnRunSeq);
+        const modeStr = String(mode || 'model');
+        const perPluginBatch = new Map();
         for (let idx = 0; idx < total; idx += 1) {
             const { kind, h } = steps[idx];
             const initialTask = kind === 'editprocess' ? '요청 텍스트 전처리 중' : '프롬프트·컨텍스트 구성 중';
@@ -4794,7 +4885,7 @@ function createPluginAdapter({
                 const startedAt = Date.now();
                 const beforeSnap = msgs.map((m) => ({
                     role: String((m && m.role) || ''),
-                    content: String((m && m.content) ?? ''),
+                    content: extractMessageText(m),
                 }));
                 let stepErr = '';
                 if (kind === 'editprocess') {
@@ -4822,17 +4913,20 @@ function createPluginAdapter({
                     }
                 }
                 const diff = diffPluginPromptInjection(beforeSnap, msgs);
-                if (kind === 'beforeRequest' || diff.changed || stepErr) {
-                    const rec = ensureRuntimeLedger(h.pluginName);
-                    const now = Date.now();
-                    rec.beforeRequestRuns += 1;
-                    rec.lastBeforeRequestAt = now;
-                    rec.history.push({
-                        id: ++runtimeRecallSeq,
+                const now = Date.now();
+                const stepDurationMs = Math.max(0, now - startedAt);
+                const stepFetchCount = (activeHookFrame && activeHookFrame.fetchCount) || 0;
+                const stepLlmCount = (activeHookFrame && activeHookFrame.llmCount) || 0;
+                const stepLogs = (activeHookFrame && Array.isArray(activeHookFrame.logs)) ? [...activeHookFrame.logs] : [];
+
+                let entry = perPluginBatch.get(h.pluginName);
+                if (!entry) {
+                    entry = {
                         at: now,
-                        durationMs: Math.max(0, now - startedAt),
+                        durationMs: 0,
                         kind,
-                        mode: String(mode || 'model'),
+                        mode: modeStr,
+                        turnRunId: effectiveTurnRunId,
                         charIndex: turnCache.active ? turnCache.charIndex : lastActiveLocation.charIndex,
                         chatIndex: turnCache.active ? turnCache.chatIndex : lastActiveLocation.chatIndex,
                         chatUuid: String((turnCache.chatObj && turnCache.chatObj.id) || ''),
@@ -4841,35 +4935,147 @@ function createPluginAdapter({
                         userPreview: extractLastUserPreview(beforeSnap),
                         beforeCount: diff.beforeCount,
                         afterCount: diff.afterCount,
-                        injectedCount: diff.injectedCount,
-                        totalInjectedChars: diff.totalInjectedChars,
-                        strippedCount: diff.strippedCount || 0,
-                        totalRemovedChars: diff.totalRemovedChars || 0,
-                        injectedBlocks: diff.injectedBlocks,
-                        fetchCount: (activeHookFrame && activeHookFrame.fetchCount) || 0,
-                        llmCount: (activeHookFrame && activeHookFrame.llmCount) || 0,
-                        stepLogs: (activeHookFrame && Array.isArray(activeHookFrame.logs)) ? [...activeHookFrame.logs] : [],
-                        error: stepErr,
-                    });
-                    if (rec.history.length > 12) {
-                        rec.history.splice(0, rec.history.length - 12);
+                        injectedCount: 0,
+                        totalInjectedChars: 0,
+                        strippedCount: 0,
+                        totalRemovedChars: 0,
+                        injectedBlocks: [],
+                        fetchCount: 0,
+                        llmCount: 0,
+                        stepLogs: [],
+                        error: '',
+                        _hadBeforeRequest: false,
+                        _hasChanged: false,
+                    };
+                    perPluginBatch.set(h.pluginName, entry);
+                }
+                entry.at = now;
+                entry.durationMs += stepDurationMs;
+                entry.afterCount = diff.afterCount;
+                if (kind === 'beforeRequest') {
+                    entry._hadBeforeRequest = true;
+                    entry.kind = 'beforeRequest';
+                }
+                if (diff.changed) entry._hasChanged = true;
+                if (diff.injectedBlocks.length) {
+                    for (const blk of diff.injectedBlocks) {
+                        if (entry.injectedBlocks.length >= 32) break;
+                        entry.injectedBlocks.push(blk);
+                    }
+                    entry.injectedCount = entry.injectedBlocks.length;
+                    entry.totalInjectedChars = entry.injectedBlocks.reduce((acc, b) => acc + (Number(b.addedChars) || 0), 0);
+                }
+                entry.strippedCount += diff.strippedCount || 0;
+                entry.totalRemovedChars += diff.totalRemovedChars || 0;
+                entry.fetchCount += stepFetchCount;
+                entry.llmCount += stepLlmCount;
+                for (const lg of stepLogs) {
+                    if (entry.stepLogs.length >= 20) break;
+                    if (!entry.stepLogs.length || entry.stepLogs[entry.stepLogs.length - 1] !== lg) {
+                        entry.stepLogs.push(lg);
                     }
                 }
+                if (stepErr) {
+                    entry.error = entry.error ? `${entry.error}; ${stepErr}` : stepErr;
+                }
             });
+        }
+        for (const [pluginName, batch] of perPluginBatch.entries()) {
+            if (!batch._hadBeforeRequest && !batch._hasChanged && !batch.error) continue;
+            const rec = ensureRuntimeLedger(pluginName);
+            rec.beforeRequestRuns += 1;
+            rec.lastBeforeRequestAt = batch.at;
+            if (modeStr === 'model' || batch._hasChanged || Boolean(batch.error)) {
+                const { _hadBeforeRequest, _hasChanged, ...cleanEntry } = batch;
+                rec.history.push({
+                    id: ++runtimeRecallSeq,
+                    ...cleanEntry,
+                });
+                if (rec.history.length > 12) {
+                    rec.history.splice(0, rec.history.length - 12);
+                }
+            }
         }
         return msgs;
     }
 
     async function runBodyIntercepters(bodyObj, type = 'openai') {
         let current = bodyObj;
+        const effectiveTurnRunId = (turnCache.active && turnCache.turnRunId) ? turnCache.turnRunId : 0;
+        const activeChatUuid = String((turnCache.chatObj && turnCache.chatObj.id) || '');
         for (const h of [...hookState.bodyIntercepter]) {
+            const beforeBodyMsgs = extractMessagesFromRequestBody(current, type);
+            const startedAt = Date.now();
+            let stepErr = '';
             try {
                 const res = await h.fn(cloneJson(current), type);
                 if (res && typeof res === 'object' && !Array.isArray(res)) {
                     current = res;
                 }
             } catch (e) {
-                console.warn(`[Plugin:${h.pluginName}] bodyIntercepter error:`, e.message);
+                stepErr = e && e.message ? e.message : String(e);
+                console.warn(`[Plugin:${h.pluginName}] bodyIntercepter error:`, stepErr);
+            }
+            const afterBodyMsgs = extractMessagesFromRequestBody(current, type);
+            const diff = diffPluginPromptInjection(beforeBodyMsgs, afterBodyMsgs);
+            if (diff.changed || stepErr) {
+                const rec = ensureRuntimeLedger(h.pluginName);
+                const now = Date.now();
+                rec.bodyIntercepterRuns += 1;
+                rec.lastBodyIntercepterAt = now;
+                const durationMs = Math.max(0, now - startedAt);
+                const prev = rec.history.length ? rec.history[rec.history.length - 1] : null;
+                if (
+                    prev &&
+                    effectiveTurnRunId > 0 &&
+                    prev.turnRunId === effectiveTurnRunId &&
+                    String(prev.chatUuid || '') === activeChatUuid
+                ) {
+                    prev.at = now;
+                    prev.durationMs = (Number(prev.durationMs) || 0) + durationMs;
+                    if (prev.kind === 'beforeRequest') prev.kind = 'beforeRequest+bodyIntercepter';
+                    for (const blk of diff.injectedBlocks) {
+                        if (prev.injectedBlocks.length >= 32) break;
+                        prev.injectedBlocks.push(blk);
+                    }
+                    prev.injectedCount = prev.injectedBlocks.length;
+                    prev.totalInjectedChars = prev.injectedBlocks.reduce((acc, b) => acc + (Number(b.addedChars) || 0), 0);
+                    prev.strippedCount = (Number(prev.strippedCount) || 0) + (diff.strippedCount || 0);
+                    prev.totalRemovedChars = (Number(prev.totalRemovedChars) || 0) + (diff.totalRemovedChars || 0);
+                    if (diff.afterCount) prev.afterCount = Math.max(Number(prev.afterCount) || 0, diff.afterCount);
+                    if (stepErr) {
+                        prev.error = prev.error ? `${prev.error}; ${stepErr}` : stepErr;
+                    }
+                } else {
+                    rec.history.push({
+                        id: ++runtimeRecallSeq,
+                        at: now,
+                        durationMs,
+                        kind: 'bodyIntercepter',
+                        mode: String(type || 'openai'),
+                        turnRunId: effectiveTurnRunId,
+                        charIndex: turnCache.active ? turnCache.charIndex : lastActiveLocation.charIndex,
+                        chatIndex: turnCache.active ? turnCache.chatIndex : lastActiveLocation.chatIndex,
+                        chatUuid: activeChatUuid,
+                        charName: String((turnCache.charObj && turnCache.charObj.name) || ''),
+                        chatName: String((turnCache.chatObj && turnCache.chatObj.name) || ''),
+                        userPreview: extractLastUserPreview(beforeBodyMsgs),
+                        beforeCount: diff.beforeCount,
+                        afterCount: diff.afterCount,
+                        injectedCount: diff.injectedCount,
+                        totalInjectedChars: diff.totalInjectedChars,
+                        strippedCount: diff.strippedCount || 0,
+                        totalRemovedChars: diff.totalRemovedChars || 0,
+                        injectedBlocks: diff.injectedBlocks,
+                        fetchCount: 0,
+                        llmCount: 0,
+                        stepLogs: [],
+                        error: stepErr,
+                    });
+                    if (rec.history.length > 12) {
+                        rec.history.splice(0, rec.history.length - 12);
+                    }
+                }
             }
         }
         return current;
@@ -5886,21 +6092,31 @@ function createPluginAdapter({
 
     function formatRuntimeLedgerEntry(rec, targetChatUuid = '') {
         if (!rec) return null;
+        const history = [...rec.history].reverse().map((item) => {
+            const copy = cloneJson(item);
+            const blocks = Array.isArray(copy.injectedBlocks) ? copy.injectedBlocks : [];
+            if (blocks.length > 0) {
+                copy.injectedCount = blocks.length;
+                copy.totalInjectedChars = blocks.reduce((acc, b) => acc + (Number(b && b.addedChars) || String((b && b.text) || '').length), 0);
+            }
+            copy.matchesCurrentChat = Boolean(targetChatUuid && copy.chatUuid && copy.chatUuid === targetChatUuid);
+            return copy;
+        });
         return {
             pluginName: rec.pluginName,
             displayName: getPluginDisplayName(rec.pluginName),
-            beforeRequestRuns: rec.beforeRequestRuns,
-            afterRequestRuns: rec.afterRequestRuns,
-            outputRuns: rec.outputRuns,
-            lastBeforeRequestAt: rec.lastBeforeRequestAt,
-            lastAfterRequestAt: rec.lastAfterRequestAt,
-            lastOutputAt: rec.lastOutputAt,
+            beforeRequestRuns: rec.beforeRequestRuns || 0,
+            bodyIntercepterRuns: rec.bodyIntercepterRuns || 0,
+            afterRequestRuns: rec.afterRequestRuns || 0,
+            outputRuns: rec.outputRuns || 0,
+            lastBeforeRequestAt: rec.lastBeforeRequestAt || 0,
+            lastBodyIntercepterAt: rec.lastBodyIntercepterAt || 0,
+            lastAfterRequestAt: rec.lastAfterRequestAt || 0,
+            lastOutputAt: rec.lastOutputAt || 0,
             lastAfterRequest: rec.lastAfterRequest ? cloneJson(rec.lastAfterRequest) : null,
             lastOutput: rec.lastOutput ? cloneJson(rec.lastOutput) : null,
-            history: [...rec.history].reverse().map((item) => ({
-                ...cloneJson(item),
-                matchesCurrentChat: Boolean(targetChatUuid && item.chatUuid && item.chatUuid === targetChatUuid),
-            })),
+            recommendedIndex: pickPrimaryRecallIndex(history),
+            history,
         };
     }
 
@@ -5911,9 +6127,11 @@ function createPluginAdapter({
             const rec = pluginRuntimeLedger.get(target) || {
                 pluginName: target,
                 beforeRequestRuns: 0,
+                bodyIntercepterRuns: 0,
                 afterRequestRuns: 0,
                 outputRuns: 0,
                 lastBeforeRequestAt: 0,
+                lastBodyIntercepterAt: 0,
                 lastAfterRequestAt: 0,
                 lastOutputAt: 0,
                 lastAfterRequest: null,
@@ -5930,20 +6148,34 @@ function createPluginAdapter({
         const list = [];
         for (const name of names) {
             const rec = pluginRuntimeLedger.get(name);
-            const latest = rec && rec.history.length ? rec.history[rec.history.length - 1] : null;
+            const revHist = rec && Array.isArray(rec.history)
+                ? [...rec.history].reverse().map((item) => ({
+                    ...item,
+                    matchesCurrentChat: Boolean(targetChatUuid && item.chatUuid && item.chatUuid === targetChatUuid),
+                }))
+                : [];
+            const pickIdx = pickPrimaryRecallIndex(revHist);
+            const primary = pickIdx >= 0 ? revHist[pickIdx] : null;
+            const primaryBlocks = primary && Array.isArray(primary.injectedBlocks) ? primary.injectedBlocks : [];
+            const primaryCount = primaryBlocks.length > 0 ? primaryBlocks.length : (primary ? (Number(primary.injectedCount) || 0) : 0);
+            const primaryChars = primaryBlocks.length > 0
+                ? primaryBlocks.reduce((acc, b) => acc + (Number(b && b.addedChars) || String((b && b.text) || '').length), 0)
+                : (primary ? (Number(primary.totalInjectedChars) || 0) : 0);
             list.push({
                 pluginName: name,
                 displayName: getPluginDisplayName(name),
-                beforeRequestRuns: rec ? rec.beforeRequestRuns : 0,
-                afterRequestRuns: rec ? rec.afterRequestRuns : 0,
-                outputRuns: rec ? rec.outputRuns : 0,
-                lastBeforeRequestAt: rec ? rec.lastBeforeRequestAt : 0,
-                lastAfterRequestAt: rec ? rec.lastAfterRequestAt : 0,
-                lastOutputAt: rec ? rec.lastOutputAt : 0,
-                latestInjectedCount: latest ? latest.injectedCount : 0,
-                latestInjectedChars: latest ? latest.totalInjectedChars : 0,
-                latestChatUuid: latest ? latest.chatUuid : '',
-                matchesCurrentChat: Boolean(targetChatUuid && latest && latest.chatUuid && latest.chatUuid === targetChatUuid),
+                beforeRequestRuns: rec ? (rec.beforeRequestRuns || 0) : 0,
+                bodyIntercepterRuns: rec ? (rec.bodyIntercepterRuns || 0) : 0,
+                afterRequestRuns: rec ? (rec.afterRequestRuns || 0) : 0,
+                outputRuns: rec ? (rec.outputRuns || 0) : 0,
+                lastBeforeRequestAt: rec ? (rec.lastBeforeRequestAt || 0) : 0,
+                lastBodyIntercepterAt: rec ? (rec.lastBodyIntercepterAt || 0) : 0,
+                lastAfterRequestAt: rec ? (rec.lastAfterRequestAt || 0) : 0,
+                lastOutputAt: rec ? (rec.lastOutputAt || 0) : 0,
+                latestInjectedCount: primaryCount,
+                latestInjectedChars: primaryChars,
+                latestChatUuid: primary ? (primary.chatUuid || '') : '',
+                matchesCurrentChat: Boolean(primary && primary.matchesCurrentChat),
             });
         }
         return list;

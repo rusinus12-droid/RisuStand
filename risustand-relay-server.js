@@ -11140,6 +11140,9 @@ function renderWebApp() {
             },
           }, '*');
         }
+        if (pluginGuiState.pluginName && typeof loadPluginGuiRecall === 'function') {
+          void loadPluginGuiRecall(pluginGuiState.pluginName);
+        }
       }
     }
   }
@@ -18080,6 +18083,7 @@ function renderWebApp() {
     viewMode: 'gui',
     recallData: null,
     selectedRecallIdx: 0,
+    selectedRecallId: 0,
     bannerDismissed: false,
   };
 
@@ -18193,6 +18197,36 @@ function renderWebApp() {
     }
   }
 
+  function getRecallItemChars(item) {
+    if (!item || typeof item !== 'object') return 0;
+    const direct = Number(item.totalInjectedChars) || 0;
+    if (direct > 0) return direct;
+    const blocks = Array.isArray(item.injectedBlocks) ? item.injectedBlocks : [];
+    return blocks.reduce((acc, b) => acc + (Number(b && b.addedChars) || String((b && b.text) || '').length), 0);
+  }
+
+  function getRecallItemCount(item) {
+    if (!item || typeof item !== 'object') return 0;
+    const direct = Number(item.injectedCount) || 0;
+    if (direct > 0) return direct;
+    const blocks = Array.isArray(item.injectedBlocks) ? item.injectedBlocks : [];
+    return blocks.length;
+  }
+
+  function pickPreferredRecallIdx(history, rec) {
+    const list = Array.isArray(history) ? history : [];
+    if (!list.length) return 0;
+    const recIdx = rec && Number.isInteger(rec.recommendedIndex) ? rec.recommendedIndex : -1;
+    if (recIdx >= 0 && recIdx < list.length) return recIdx;
+    let idx = list.findIndex((h) => h && h.matchesCurrentChat && getRecallItemChars(h) > 0);
+    if (idx >= 0) return idx;
+    idx = list.findIndex((h) => h && h.matchesCurrentChat);
+    if (idx >= 0) return idx;
+    idx = list.findIndex((h) => getRecallItemChars(h) > 0);
+    if (idx >= 0) return idx;
+    return 0;
+  }
+
   function renderPluginGuiRecallUi() {
     const toggleBtn = document.getElementById('pluginGuiRecallToggleBtn');
     const barEl = document.getElementById('pluginGuiRecallBar');
@@ -18200,18 +18234,23 @@ function renderWebApp() {
     const paneEl = document.getElementById('pluginGuiRecallPane');
     const rec = pluginGuiState.recallData;
     const history = rec && Array.isArray(rec.history) ? rec.history : [];
-    const latest = history.length ? history[0] : null;
+    const idx = history.length ? Math.max(0, Math.min(history.length - 1, Number(pluginGuiState.selectedRecallIdx) || 0)) : 0;
+    pluginGuiState.selectedRecallIdx = idx;
+    const activeItem = history.length ? history[idx] : null;
+    const activeCount = getRecallItemCount(activeItem);
+    const activeChars = getRecallItemChars(activeItem);
+    const totalHookRuns = ((rec && rec.beforeRequestRuns) || 0) + ((rec && rec.bodyIntercepterRuns) || 0);
     const isRecallView = pluginGuiState.viewMode === 'recall';
 
     if (toggleBtn) {
       if (isRecallView) {
         toggleBtn.textContent = '🖥️ 플러그인 GUI로 돌아가기';
         toggleBtn.className = 'pill active';
-      } else if (latest && latest.totalInjectedChars > 0) {
-        toggleBtn.textContent = '🧠 이번 회상·주입 (' + latest.injectedCount + '블록 · ' + latest.totalInjectedChars.toLocaleString() + '자)';
+      } else if (activeItem && activeChars > 0) {
+        toggleBtn.textContent = '🧠 이번 회상·주입 (' + activeCount + '블록 · ' + activeChars.toLocaleString() + '자)';
         toggleBtn.className = 'pill active';
-      } else if (rec && rec.beforeRequestRuns > 0) {
-        toggleBtn.textContent = '🧠 백엔드 실행 기록 (' + rec.beforeRequestRuns + '회)';
+      } else if (totalHookRuns > 0 || history.length > 0) {
+        toggleBtn.textContent = '🧠 백엔드 실행 기록 (' + Math.max(totalHookRuns, history.length) + '회)';
         toggleBtn.className = 'pill';
       } else {
         toggleBtn.textContent = '🧠 백엔드 회상 기록 (0)';
@@ -18220,10 +18259,10 @@ function renderWebApp() {
     }
 
     if (barEl) {
-      if (!isRecallView && !pluginGuiState.bannerDismissed && rec && rec.beforeRequestRuns > 0) {
-        const summaryTxt = (latest && latest.totalInjectedChars > 0)
-          ? '<b>🧠 백엔드에서 최근 회상·주입 완료</b> (' + latest.injectedCount + '블록 · ' + latest.totalInjectedChars.toLocaleString() + '자)'
-          : '<b>🧠 백엔드 훅 ' + rec.beforeRequestRuns + '회 실행됨</b> (최근 주입 0자)';
+      if (!isRecallView && !pluginGuiState.bannerDismissed && (totalHookRuns > 0 || history.length > 0)) {
+        const summaryTxt = (activeItem && activeChars > 0)
+          ? '<b>🧠 백엔드에서 최근 회상·주입 완료</b> (' + activeCount + '블록 · ' + activeChars.toLocaleString() + '자)'
+          : '<b>🧠 백엔드 훅 ' + Math.max(totalHookRuns, history.length) + '회 실행됨</b> (최근 주입 0자)';
         barEl.innerHTML =
           '<div style="min-width:0; flex:1 1 260px;">' +
             summaryTxt +
@@ -18244,9 +18283,7 @@ function renderWebApp() {
     paneEl.style.display = isRecallView ? 'flex' : 'none';
     if (!isRecallView) return;
 
-    const idx = history.length ? Math.max(0, Math.min(history.length - 1, Number(pluginGuiState.selectedRecallIdx) || 0)) : 0;
-    pluginGuiState.selectedRecallIdx = idx;
-    const item = history.length ? history[idx] : null;
+    const item = activeItem;
     const blocks = item && Array.isArray(item.injectedBlocks) ? item.injectedBlocks : [];
 
     const noticeHtml =
@@ -18262,8 +18299,8 @@ function renderWebApp() {
       '<div class="plg-recall-stats">' +
         '<div class="plg-recall-stat">' +
           '<div class="plg-recall-stat-label">beforeRequest (회상·주입)</div>' +
-          '<div class="plg-recall-stat-val">' + ((rec && rec.beforeRequestRuns) || 0) + '회</div>' +
-          '<div class="plg-recall-stat-sub">최근: ' + formatRecallTime(rec && rec.lastBeforeRequestAt) + '</div>' +
+          '<div class="plg-recall-stat-val">' + Math.max((rec && rec.beforeRequestRuns) || 0, totalHookRuns) + '회</div>' +
+          '<div class="plg-recall-stat-sub">최근: ' + formatRecallTime(Math.max((rec && rec.lastBeforeRequestAt) || 0, (rec && rec.lastBodyIntercepterAt) || 0)) + '</div>' +
         '</div>' +
         '<div class="plg-recall-stat">' +
           '<div class="plg-recall-stat-label">afterRequest (후처리)</div>' +
@@ -18277,7 +18314,7 @@ function renderWebApp() {
         '</div>' +
         '<div class="plg-recall-stat">' +
           '<div class="plg-recall-stat-label">선택 턴 주입 요약</div>' +
-          '<div class="plg-recall-stat-val">' + (item ? (item.injectedCount + '블록 · ' + item.totalInjectedChars.toLocaleString() + '자') : '-') + '</div>' +
+          '<div class="plg-recall-stat-val">' + (item ? (activeCount + '블록 · ' + activeChars.toLocaleString() + '자') : '-') + '</div>' +
           '<div class="plg-recall-stat-sub">' + (item ? ('소요 ' + item.durationMs + 'ms · API ' + (item.fetchCount || 0) + '회 · LLM ' + (item.llmCount || 0) + '회') : '실행 기록 없음') + '</div>' +
         '</div>' +
       '</div>';
@@ -18295,7 +18332,9 @@ function renderWebApp() {
           history.map((h, i) => {
             const activeCls = i === idx ? 'pill active' : 'pill';
             const chatBadge = h.matchesCurrentChat ? '현재 채팅 · ' : '';
-            const label = chatBadge + formatRecallTime(h.at) + ' (' + h.injectedCount + '블록/' + h.totalInjectedChars.toLocaleString() + '자)';
+            const hCount = getRecallItemCount(h);
+            const hChars = getRecallItemChars(h);
+            const label = chatBadge + formatRecallTime(h.at) + ' (' + hCount + '블록/' + hChars.toLocaleString() + '자)';
             return '<button type="button" class="' + activeCls + '" data-plg-recall-turn="' + i + '">' + esc(label) + '</button>';
           }).join('') +
         '</div>';
@@ -18361,8 +18400,15 @@ function renderWebApp() {
       if (!pluginGuiState.open || pluginGuiState.pluginName !== pluginName) return;
       pluginGuiState.recallData = (res && res.recall) || null;
       const hist = (pluginGuiState.recallData && Array.isArray(pluginGuiState.recallData.history)) ? pluginGuiState.recallData.history : [];
-      const curIdx = hist.findIndex((h) => h && h.matchesCurrentChat);
-      pluginGuiState.selectedRecallIdx = curIdx >= 0 ? curIdx : 0;
+      const manualIdx = pluginGuiState.selectedRecallId
+        ? hist.findIndex((h) => h && h.id === pluginGuiState.selectedRecallId)
+        : -1;
+      if (manualIdx >= 0) {
+        pluginGuiState.selectedRecallIdx = manualIdx;
+      } else {
+        pluginGuiState.selectedRecallId = 0;
+        pluginGuiState.selectedRecallIdx = pickPreferredRecallIdx(hist, pluginGuiState.recallData);
+      }
       renderPluginGuiRecallUi();
     } catch (_) {}
   }
@@ -18374,6 +18420,7 @@ function renderWebApp() {
     pluginGuiState.viewMode = 'gui';
     pluginGuiState.recallData = null;
     pluginGuiState.selectedRecallIdx = 0;
+    pluginGuiState.selectedRecallId = 0;
     pluginGuiState.bannerDismissed = false;
     const modal = document.getElementById('pluginGuiModal');
     if (modal) {
@@ -18394,6 +18441,7 @@ function renderWebApp() {
     pluginGuiState.viewMode = 'gui';
     pluginGuiState.recallData = null;
     pluginGuiState.selectedRecallIdx = 0;
+    pluginGuiState.selectedRecallId = 0;
     pluginGuiState.bannerDismissed = false;
     pluginGuiState.lastNotifyKey = String((lastState && lastState.snapshotVersion) || 0) + ':' + ((lastState && (lastState.generating || lastState.directGenerating)) ? '1' : '0');
 
@@ -18516,6 +18564,7 @@ function renderWebApp() {
       if (e.target.closest('[data-plg-gui-open-recall]')) {
         pluginGuiState.viewMode = 'recall';
         renderPluginGuiRecallUi();
+        void loadPluginGuiRecall(pluginGuiState.pluginName);
         return;
       }
       if (e.target.closest('[data-plg-gui-dismiss-bar]')) {
@@ -18529,7 +18578,10 @@ function renderWebApp() {
       }
       const turnBtn = e.target.closest('[data-plg-recall-turn]');
       if (turnBtn) {
-        pluginGuiState.selectedRecallIdx = Number(turnBtn.getAttribute('data-plg-recall-turn')) || 0;
+        const nextIdx = Number(turnBtn.getAttribute('data-plg-recall-turn')) || 0;
+        const hist = (pluginGuiState.recallData && Array.isArray(pluginGuiState.recallData.history)) ? pluginGuiState.recallData.history : [];
+        pluginGuiState.selectedRecallIdx = nextIdx;
+        pluginGuiState.selectedRecallId = (hist[nextIdx] && hist[nextIdx].id) || 0;
         renderPluginGuiRecallUi();
         return;
       }
