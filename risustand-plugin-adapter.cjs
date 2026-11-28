@@ -171,7 +171,7 @@ function parsePluginHeader(sourceText, fallbackName = '') {
         } else if (directive === 'link' && !link) {
             link = rest;
         } else if (directive === 'allowed-ipc') {
-            for (const peer of rest.split(/\s+/)) {
+            for (const peer of rest.split(/[\s,]+/)) {
                 if (peer) allowedIPC.push(peer);
             }
         } else if (directive === 'arg' || directive === 'risu-arg') {
@@ -847,7 +847,15 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                     else self.attributes.delete('class');
                     if (changed) scheduleSurfaceMutationNotify(self);
                 },
-                contains: (c) => String(self.className || '').split(/\s+/).includes(String(c)),
+                contains: (c) => {
+                    const key = String(c);
+                    const list = String(self.className || '').split(/\s+/).filter(Boolean);
+                    if (list.includes(key)) return true;
+                    if (self._rsAllowRisuPrefixMatch && key.startsWith('x-risu-')) {
+                        return list.includes(key.slice(7));
+                    }
+                    return false;
+                },
                 toggle: (c, force) => {
                     const has = self.classList.contains(c);
                     const next = force === undefined ? !has : Boolean(force);
@@ -1195,7 +1203,14 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             const evName = String((evObj && evObj.type) || '');
             if (map) {
                 for (const rec of [...map.values()]) {
-                    if (rec.ev === evName) await rec.fn(evObj);
+                    if (rec.ev === evName) {
+                        try {
+                            await rec.fn(evObj);
+                        } catch (err) {
+                            console.error('[PluginDom] element listener error:', err && err.message ? err.message : String(err));
+                        }
+                        if (evObj && evObj.immediatePropagationStopped) break;
+                    }
                 }
             }
             return true;
@@ -1229,10 +1244,16 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
     documentElement.appendChild(head);
     documentElement.appendChild(body);
 
-    async function dispatchDocListeners(type, eventObj) {
+    async function dispatchDocListeners(type, eventObj, syncEventObj) {
         const list = [...listeners.values()].filter((v) => v.ev === type);
         for (const rec of list) {
-            await rec.fn(eventObj);
+            const evArg = rec.sync && syncEventObj ? syncEventObj : eventObj;
+            try {
+                await rec.fn(evArg);
+            } catch (err) {
+                console.error('[PluginDom] doc listener error:', err && err.message ? err.message : String(err));
+            }
+            if (evArg && evArg.immediatePropagationStopped) break;
         }
     }
 
@@ -1268,24 +1289,32 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
 
         const wrappedTarget = wrapSafeElement(rawTarget) || rawTarget;
         const wrappedDoc = wrapSafeElement(documentElement) || documentElement;
-        const makeEv = (type) => {
-            const ev = {
+        const makeEvPair = (type) => {
+            const evState = { defaultPrevented: false, propagationStopped: false, immediatePropagationStopped: false };
+            const makeView = (target, currentTarget) => ({
                 type,
+                bubbles: true,
+                cancelable: true,
+                composed: true,
                 clientX: clickX,
                 clientY: clickY,
                 pageX: clickX,
                 pageY: clickY,
                 button: 0,
                 buttons: type === 'mousedown' ? 1 : 0,
-                target: wrappedTarget,
-                currentTarget: wrappedDoc,
-                defaultPrevented: false,
-                propagationStopped: false,
-                preventDefault() { this.defaultPrevented = true; },
-                stopPropagation() { this.propagationStopped = true; },
-                stopImmediatePropagation() { this.propagationStopped = true; },
+                target,
+                currentTarget,
+                get defaultPrevented() { return evState.defaultPrevented; },
+                get propagationStopped() { return evState.propagationStopped; },
+                get immediatePropagationStopped() { return evState.immediatePropagationStopped; },
+                preventDefault() { evState.defaultPrevented = true; },
+                stopPropagation() { evState.propagationStopped = true; },
+                stopImmediatePropagation() { evState.propagationStopped = true; evState.immediatePropagationStopped = true; },
+            });
+            return {
+                asyncEv: makeView(wrappedTarget, wrappedDoc),
+                syncEv: makeView(rawTarget, documentElement),
             };
-            return ev;
         };
 
         const dispatchBubble = async (ev) => {
@@ -1302,10 +1331,10 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         hoverEl = rawTarget || null;
         focusedEl = rawTarget || null;
         try {
-            for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-                const ev = makeEv(type);
-                await dispatchDocListeners(type, ev);
-                await dispatchBubble(ev);
+            for (const type of ['mouseover', 'mouseenter', 'pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                const { asyncEv, syncEv } = makeEvPair(type);
+                await dispatchDocListeners(type, asyncEv, syncEv);
+                await dispatchBubble(asyncEv);
             }
             await new Promise((r) => setTimeout(r, 12));
             return true;
@@ -1335,16 +1364,27 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         const evName = eventType === 'change' ? 'change' : 'input';
         const wrappedTarget = wrapSafeElement(rawTarget) || rawTarget;
         const wrappedDoc = wrapSafeElement(documentElement) || documentElement;
-        const makeEv = (type) => ({
-            type,
-            target: wrappedTarget,
-            currentTarget: wrappedDoc,
-            defaultPrevented: false,
-            propagationStopped: false,
-            preventDefault() { this.defaultPrevented = true; },
-            stopPropagation() { this.propagationStopped = true; },
-            stopImmediatePropagation() { this.propagationStopped = true; },
-        });
+        const makeEvPair = (type) => {
+            const evState = { defaultPrevented: false, propagationStopped: false, immediatePropagationStopped: false };
+            const makeView = (target, currentTarget) => ({
+                type,
+                bubbles: true,
+                cancelable: true,
+                composed: true,
+                target,
+                currentTarget,
+                get defaultPrevented() { return evState.defaultPrevented; },
+                get propagationStopped() { return evState.propagationStopped; },
+                get immediatePropagationStopped() { return evState.immediatePropagationStopped; },
+                preventDefault() { evState.defaultPrevented = true; },
+                stopPropagation() { evState.propagationStopped = true; },
+                stopImmediatePropagation() { evState.propagationStopped = true; evState.immediatePropagationStopped = true; },
+            });
+            return {
+                asyncEv: makeView(wrappedTarget, wrappedDoc),
+                syncEv: makeView(rawTarget, documentElement),
+            };
+        };
         const dispatchBubble = async (ev) => {
             let cur = rawTarget;
             while (cur && cur.nodeType === 1 && !ev.propagationStopped) {
@@ -1354,13 +1394,13 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                 cur = cur.parentElement;
             }
         };
-        const ev1 = makeEv(evName);
-        await dispatchDocListeners(evName, ev1);
-        await dispatchBubble(ev1);
+        const pair1 = makeEvPair(evName);
+        await dispatchDocListeners(evName, pair1.asyncEv, pair1.syncEv);
+        await dispatchBubble(pair1.asyncEv);
         if (evName === 'change') {
-            const evIn = makeEv('input');
-            await dispatchDocListeners('input', evIn);
-            await dispatchBubble(evIn);
+            const pairIn = makeEvPair('input');
+            await dispatchDocListeners('input', pairIn.asyncEv, pairIn.syncEv);
+            await dispatchBubble(pairIn.asyncEv);
         }
         await new Promise((r) => setTimeout(r, 10));
         return true;
@@ -1616,6 +1656,16 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
                     row.appendChild(textEl);
                 }
                 textEl.innerHTML = bodySrc;
+                const markVirtualRisuPrefixes = (rootEl) => {
+                    const walk = (node) => {
+                        if (!node || node.nodeType !== 1) return;
+                        node._rsAllowRisuPrefixMatch = true;
+                        for (const ch of node.children || []) walk(ch);
+                    };
+                    for (const ch of rootEl.children || []) walk(ch);
+                };
+                markVirtualRisuPrefixes(textEl);
+                row._rsBodyMutated = false;
                 nextRows.push(row);
             }
             const curRows = chatScreen.children.filter((ch) => ch.classList && ch.classList.contains('risu-chat'));
@@ -1647,38 +1697,39 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         const footersByChatId = Object.create(null);
         const footersByIndex = Object.create(null);
         const bodyHtmlByChatId = Object.create(null);
+        const footerSel = '.x-risu-am-illustration-footer, .am-illustration-footer, [data-am-illustration-footer]';
         for (const row of chatScreen.children) {
             if (!row || !row.classList || !row.classList.contains('risu-chat')) continue;
             const cid = row.getAttribute('data-chat-id') || '';
             const mIdx = Number(row.getAttribute('data-chat-index') ?? -1);
             const textEl = row.querySelector('.chattext');
-            const footer = (textEl && textEl.querySelector('.x-risu-am-illustration-footer')) || row.querySelector('.x-risu-am-illustration-footer');
+            const footer = (textEl && textEl.querySelector(footerSel)) || row.querySelector(footerSel);
             if (footer) {
                 const fHtml = footer.outerHTML;
                 if (cid) footersByChatId[cid] = fHtml;
                 if (Number.isInteger(mIdx) && mIdx >= 0) footersByIndex[mIdx] = fHtml;
             }
+            const extraRowNodes = [];
+            for (const ch of row.childNodes || []) {
+                if (!ch || ch === textEl || ch === footer) continue;
+                if (ch.nodeType === 1) {
+                    if (ch.classList && (ch.classList.contains('x-risu-am-illustration-footer') || ch.classList.contains('am-illustration-footer'))) continue;
+                    if (typeof ch.getAttribute === 'function' && ch.getAttribute('data-am-illustration-footer') !== null) continue;
+                    extraRowNodes.push(ch);
+                }
+            }
             if (textEl && cid) {
-                const hasInjected = Boolean(
-                    row._rsBodyMutated
-                    || textEl.querySelector('.x-risu-am-illustration-slot')
-                    || textEl.querySelector('.am-illustration-projection')
-                    || textEl.querySelector('.x-risu-am-illustration-projection')
-                    || textEl.querySelector('.x-risu-am-image')
-                    || textEl.querySelector('.am-image')
-                    || textEl.querySelector('.x-risu-am-generated-image')
-                    || textEl.querySelector('.am-generated-image')
-                    || textEl.querySelector('.am-chat-regenerate-action')
-                    || textEl.querySelector('.am-chat-history-edge-controls')
-                    || textEl.querySelector('.x-risu-am-chat-history-edge-controls')
-                );
+                const hasInjected = Boolean(row._rsBodyMutated || extraRowNodes.length > 0);
                 if (hasInjected) {
                     const parts = [];
                     for (const ch of textEl.childNodes) {
                         if (!ch) continue;
-                        if (ch.nodeType === 1 && ch.classList && ch.classList.contains('x-risu-am-illustration-footer')) continue;
+                        if (ch.nodeType === 1 && ((ch.classList && (ch.classList.contains('x-risu-am-illustration-footer') || ch.classList.contains('am-illustration-footer'))) || (typeof ch.getAttribute === 'function' && ch.getAttribute('data-am-illustration-footer') !== null))) continue;
                         if (ch.nodeType === 1) parts.push(ch.outerHTML);
                         else if (ch.nodeType === 3) parts.push(escapeHtmlText(ch.textContent || ''));
+                    }
+                    for (const ex of extraRowNodes) {
+                        parts.push(ex.outerHTML);
                     }
                     bodyHtmlByChatId[cid] = parts.join('');
                 }
@@ -1700,6 +1751,15 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
             get className() { return rawEl.className; },
             get classList() { return rawEl.classList; },
             get dataset() { return rawEl.dataset; },
+            get parentElement() { return wrapSafeElement(rawEl.parentElement); },
+            get parentNode() { return wrapSafeElement(rawEl.parentNode); },
+            get style() { return rawEl.style; },
+            get textContent() { return rawEl.textContent; },
+            set textContent(v) { rawEl.textContent = v; },
+            get innerHTML() { return rawEl.innerHTML; },
+            set innerHTML(v) { rawEl.innerHTML = v; },
+            get outerHTML() { return rawEl.outerHTML; },
+            get ownerDocument() { return doc; },
             get value() { return rawEl.value; },
             set value(v) { rawEl.value = String(v ?? ''); },
             get checked() { return Boolean(rawEl.checked); },
@@ -1800,7 +1860,7 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         querySelectorAll: async (sel) => makeSafeNodeList(collectMatchingElements(documentElement, sel).map(wrapSafeElement).filter(Boolean)),
         addEventListener: async (ev, fn, opts) => {
             const id = `doc-ev-${++seq}`;
-            listeners.set(id, { ev: String(ev), fn, opts: opts || false });
+            listeners.set(id, { ev: String(ev), fn, opts: opts || false, sync: false });
             return id;
         },
         removeEventListener: async (ev, idOrFn) => {
@@ -1822,7 +1882,7 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         querySelectorAll: (sel) => collectMatchingElements(documentElement, sel),
         addEventListener: (ev, fn, opts) => {
             const id = `doc-ev-${++seq}`;
-            listeners.set(id, { ev: String(ev), fn, opts: opts || false });
+            listeners.set(id, { ev: String(ev), fn, opts: opts || false, sync: true });
             return id;
         },
         removeEventListener: (ev, idOrFn) => {
@@ -1850,6 +1910,189 @@ function createHeadlessMockDom({ onToastText = null, onChatSurfaceMutated = null
         createMutationObserver,
         getObserverCount: () => mutationObservers.size,
         getListenerCount: () => listeners.size,
+    };
+}
+
+function diffPluginPromptInjection(beforeMsgs, afterMsgs) {
+    const normalize = (arr) => (Array.isArray(arr) ? arr : []).map((m) => ({
+        role: String((m && m.role) || ''),
+        content: String((m && m.content) ?? ''),
+    }));
+    const before = normalize(beforeMsgs);
+    const after = normalize(afterMsgs);
+    const n = before.length;
+    const m = after.length;
+    const keyOf = (x) => `${x.role}\0${x.content}`;
+    const bKeys = before.map(keyOf);
+    const aKeys = after.map(keyOf);
+
+    const matchedPairs = [];
+    if (n > 0 && m > 0) {
+        if (n * m <= 160000) {
+            const cols = m + 1;
+            const dp = new Int32Array((n + 1) * cols);
+            for (let i = n - 1; i >= 0; i -= 1) {
+                const rowOff = i * cols;
+                const nextOff = (i + 1) * cols;
+                for (let j = m - 1; j >= 0; j -= 1) {
+                    if (bKeys[i] === aKeys[j]) {
+                        dp[rowOff + j] = 1 + dp[nextOff + j + 1];
+                    } else {
+                        const down = dp[nextOff + j];
+                        const right = dp[rowOff + j + 1];
+                        dp[rowOff + j] = down >= right ? down : right;
+                    }
+                }
+            }
+            let i = 0;
+            let j = 0;
+            while (i < n && j < m) {
+                if (bKeys[i] === aKeys[j]) {
+                    matchedPairs.push([i, j]);
+                    i += 1;
+                    j += 1;
+                } else if (dp[(i + 1) * cols + j] >= dp[i * cols + j + 1]) {
+                    i += 1;
+                } else {
+                    j += 1;
+                }
+            }
+        } else {
+            let startJ = 0;
+            for (let i = 0; i < n; i += 1) {
+                for (let j = startJ; j < m; j += 1) {
+                    if (bKeys[i] === aKeys[j]) {
+                        matchedPairs.push([i, j]);
+                        startJ = j + 1;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    const commonEdges = (a, b) => {
+        const minLen = Math.min(a.length, b.length);
+        let p = 0;
+        while (p < minLen && a.charCodeAt(p) === b.charCodeAt(p)) p += 1;
+        let s = 0;
+        while (p + s < minLen && a.charCodeAt(a.length - 1 - s) === b.charCodeAt(b.length - 1 - s)) s += 1;
+        return { p, s };
+    };
+
+    const MAX_BLOCK_CHARS = 48000;
+    const MAX_BLOCKS = 32;
+    const injectedBlocks = [];
+    const strippedBlocks = [];
+    let strippedCount = 0;
+    let totalRemovedChars = 0;
+    const anchors = [[-1, -1], ...matchedPairs, [n, m]];
+
+    for (let k = 0; k < anchors.length - 1; k += 1) {
+        if (injectedBlocks.length >= MAX_BLOCKS) break;
+        const [bi0, ai0] = anchors[k];
+        const [bi1, ai1] = anchors[k + 1];
+        const bGap = [];
+        for (let bi = bi0 + 1; bi < bi1; bi += 1) bGap.push(bi);
+        const aGap = [];
+        for (let ai = ai0 + 1; ai < ai1; ai += 1) aGap.push(ai);
+        if (!aGap.length) continue;
+
+        const pairForA = new Map();
+        const usedA = new Set();
+        const usedB = new Set();
+
+        for (const bi of bGap) {
+            let bestAi = -1;
+            let bestScore = -1;
+            for (const ai of aGap) {
+                if (usedA.has(ai)) continue;
+                if (before[bi].role !== after[ai].role) continue;
+                const { p, s } = commonEdges(before[bi].content, after[ai].content);
+                const score = p + s;
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestAi = ai;
+                }
+            }
+            if (bestAi >= 0) {
+                pairForA.set(bestAi, bi);
+                usedA.add(bestAi);
+                usedB.add(bi);
+            }
+        }
+
+        const remB = bGap.filter((bi) => !usedB.has(bi));
+        const remA = aGap.filter((ai) => !usedA.has(ai));
+        for (let r = 0; r < remB.length && r < remA.length; r += 1) {
+            const bi = remB[r];
+            const ai = remA[r];
+            const { p, s } = commonEdges(before[bi].content, after[ai].content);
+            if (p + s > 0 || before[bi].role === after[ai].role) {
+                pairForA.set(ai, bi);
+            }
+        }
+
+        for (const ai of aGap) {
+            if (injectedBlocks.length >= MAX_BLOCKS) break;
+            const afterMsg = after[ai];
+            const matchedBi = pairForA.get(ai);
+            if (matchedBi === undefined) {
+                const rawText = afterMsg.content;
+                if (!rawText || !rawText.trim()) continue;
+                injectedBlocks.push({
+                    kind: 'added',
+                    role: afterMsg.role,
+                    index: ai,
+                    addedChars: rawText.length,
+                    removedChars: 0,
+                    text: rawText.slice(0, MAX_BLOCK_CHARS),
+                    truncated: rawText.length > MAX_BLOCK_CHARS,
+                });
+            } else {
+                const prevText = before[matchedBi].content;
+                const nextText = afterMsg.content;
+                if (prevText === nextText) continue;
+                const { p, s } = commonEdges(prevText, nextText);
+                const inserted = nextText.slice(p, nextText.length - s);
+                const removed = prevText.slice(p, prevText.length - s);
+                if (!inserted && !removed) continue;
+                if (!inserted.trim()) {
+                    strippedCount += 1;
+                    totalRemovedChars += removed.length;
+                    if (strippedBlocks.length < MAX_BLOCKS) {
+                        strippedBlocks.push({
+                            role: afterMsg.role,
+                            index: ai,
+                            removedChars: removed.length,
+                        });
+                    }
+                    continue;
+                }
+                injectedBlocks.push({
+                    kind: 'modified',
+                    role: afterMsg.role,
+                    index: ai,
+                    addedChars: inserted.length,
+                    removedChars: removed.length,
+                    text: inserted.slice(0, MAX_BLOCK_CHARS),
+                    truncated: inserted.length > MAX_BLOCK_CHARS,
+                });
+            }
+        }
+    }
+
+    const totalInjectedChars = injectedBlocks.reduce((acc, b) => acc + (b.addedChars || 0), 0);
+    return {
+        beforeCount: n,
+        afterCount: m,
+        injectedBlocks,
+        injectedCount: injectedBlocks.length,
+        totalInjectedChars,
+        strippedCount,
+        totalRemovedChars,
+        strippedBlocks,
+        changed: injectedBlocks.length > 0 || strippedCount > 0,
     };
 }
 
@@ -1906,6 +2149,38 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
   const pluginCode = JSON.parse(document.getElementById('__rs_plugin_code').textContent || '""');
   let rpcSeq = 0;
   const pendingRpc = new Map();
+  const chatListeners = new Set();
+  const BATCHABLE_RPC_RX = /^(?:pluginStorage|safeLocalStorage|localPluginStorage)\\.|^db\\.|^getArg(?:ument)?$|^ipc\\.poll$/;
+  let rpcBatchQueue = [];
+  let rpcBatchTimer = null;
+
+  function flushRpcBatch() {
+    if (rpcBatchTimer) {
+      clearTimeout(rpcBatchTimer);
+      rpcBatchTimer = null;
+    }
+    if (!rpcBatchQueue.length) return;
+    const items = rpcBatchQueue.splice(0, 64);
+    if (rpcBatchQueue.length && !rpcBatchTimer) {
+      rpcBatchTimer = setTimeout(flushRpcBatch, 0);
+    }
+    if (items.length === 1) {
+      const one = items[0];
+      window.parent.postMessage({
+        __rsGuiRpc: 1,
+        reqId: one.reqId,
+        pluginName: meta.name,
+        method: one.method,
+        args: one.args,
+      }, '*');
+      return;
+    }
+    window.parent.postMessage({
+      __rsGuiRpcBatch: 1,
+      pluginName: meta.name,
+      calls: items,
+    }, '*');
+  }
 
   function rpcCall(method, args) {
     return new Promise((resolve, reject) => {
@@ -1915,12 +2190,22 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
         reject(new Error('GUI RPC timeout: ' + method));
       }, 45000);
       pendingRpc.set(reqId, { resolve, reject, timer });
+      const argList = Array.isArray(args) ? args : [];
+      if (BATCHABLE_RPC_RX.test(String(method || ''))) {
+        rpcBatchQueue.push({ reqId, method, args: argList });
+        if (rpcBatchQueue.length >= 48) {
+          flushRpcBatch();
+        } else if (!rpcBatchTimer) {
+          rpcBatchTimer = setTimeout(flushRpcBatch, 4);
+        }
+        return;
+      }
       window.parent.postMessage({
         __rsGuiRpc: 1,
         reqId,
         pluginName: meta.name,
         method,
-        args: Array.isArray(args) ? args : [],
+        args: argList,
       }, '*');
     });
   }
@@ -1928,6 +2213,17 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
   window.addEventListener('message', (ev) => {
     const d = ev && ev.data;
     if (!d || typeof d !== 'object') return;
+    if (d.__rsGuiRpcBatchRes === 1 && Array.isArray(d.results)) {
+      for (const r of d.results) {
+        if (!r || !r.reqId || !pendingRpc.has(r.reqId)) continue;
+        const p = pendingRpc.get(r.reqId);
+        pendingRpc.delete(r.reqId);
+        clearTimeout(p.timer);
+        if (r.ok) p.resolve(r.value);
+        else p.reject(new Error(r.error || 'RPC error'));
+      }
+      return;
+    }
     if (d.__rsGuiRpcRes === 1 && d.reqId && pendingRpc.has(d.reqId)) {
       const p = pendingRpc.get(d.reqId);
       pendingRpc.delete(d.reqId);
@@ -1940,10 +2236,22 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
       invokeEntry(d.entryId || '');
       return;
     }
+    if (d.__rsGuiChatChanged === 1) {
+      for (const fn of [...chatListeners]) {
+        if (typeof fn === 'function') {
+          try { fn(d.payload || { source: 'risustand' }); } catch (e) { console.error(e); }
+        }
+      }
+      return;
+    }
     if (d.__rsGuiChannelDeliver === 1 && d.channel) {
-      const fn = channelListeners.get(String(d.channel));
-      if (typeof fn === 'function') {
-        try { fn(d.message, { sender: String(d.sender || ''), channel: String(d.channel) }); } catch (e) { console.error(e); }
+      const set = channelListeners.get(String(d.channel));
+      if (set && set.size) {
+        for (const fn of [...set]) {
+          if (typeof fn === 'function') {
+            try { fn(d.message, { sender: String(d.sender || ''), channel: String(d.channel) }); } catch (e) { console.error(e); }
+          }
+        }
       }
     }
   });
@@ -2209,31 +2517,88 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
     runLLMModel: (req) => rpcCall('runLLMModel', [req || {}]),
 
     addPluginChannelListener: async (ch, fn) => {
-      channelListeners.set(String(ch), fn);
-      if (!window.__rsIpcPollTimer) {
-        let lastIpcSeq = 0;
-        window.__rsIpcPollTimer = setInterval(async () => {
-          if (channelListeners.size === 0) return;
+      if (typeof fn !== 'function') return false;
+      const chKey = String(ch);
+      let set = channelListeners.get(chKey);
+      if (!set) {
+        set = new Set();
+        channelListeners.set(chKey, set);
+      }
+      set.add(fn);
+      if (!window.__rsIpcCursorProm) {
+        window.__rsLastIpcSeq = 0;
+        window.__rsIpcCursorProm = rpcCall('ipc.poll', [0, true]).then((initRes) => {
+          if (initRes && typeof initRes.latestSeq === 'number') {
+            window.__rsLastIpcSeq = Math.max(window.__rsLastIpcSeq || 0, initRes.latestSeq);
+          }
+        }).catch(() => {});
+      }
+      await window.__rsIpcCursorProm;
+      if (!window.__rsPollIpcNow) {
+        let polling = false;
+        window.__rsPollIpcNow = async () => {
+          if (polling || channelListeners.size === 0) return;
+          polling = true;
           try {
-            const res = await rpcCall('ipc.poll', [lastIpcSeq]);
-            if (res && typeof res.latestSeq === 'number') lastIpcSeq = res.latestSeq;
+            const res = await rpcCall('ipc.poll', [window.__rsLastIpcSeq || 0]);
+            if (res && typeof res.latestSeq === 'number') {
+              window.__rsLastIpcSeq = Math.max(window.__rsLastIpcSeq || 0, res.latestSeq);
+            }
             const list = Array.isArray(res && res.events) ? res.events : [];
             for (const ev of list) {
-              const listener = channelListeners.get(String(ev.channel || ''));
-              if (typeof listener === 'function') {
-                try { listener(ev.message, { sender: String(ev.sender || ''), channel: String(ev.channel || '') }); } catch (e) { console.error(e); }
+              const targetSet = channelListeners.get(String(ev.channel || ''));
+              if (!targetSet || !targetSet.size) continue;
+              const metaObj = { sender: String(ev.sender || ''), channel: String(ev.channel || '') };
+              for (const listener of [...targetSet]) {
+                if (typeof listener === 'function') {
+                  try { listener(ev.message, metaObj); } catch (e) { console.error(e); }
+                }
               }
             }
-          } catch (_) {}
-        }, 1200);
+          } catch (_) {} finally {
+            polling = false;
+          }
+        };
+      }
+      if (!window.__rsIpcPollTimer) {
+        window.__rsIpcPollTimer = setInterval(window.__rsPollIpcNow, 120);
       }
       return true;
     },
-    removePluginChannelListener: async (ch) => {
-      channelListeners.delete(String(ch));
+    removePluginChannelListener: async (ch, fn) => {
+      const chKey = String(ch);
+      if (typeof fn === 'function') {
+        const set = channelListeners.get(chKey);
+        if (set) {
+          set.delete(fn);
+          if (!set.size) channelListeners.delete(chKey);
+        }
+      } else {
+        channelListeners.delete(chKey);
+      }
       return true;
     },
-    postPluginChannelMessage: (target, ch, msg) => rpcCall('ipc.post', [String(target || ''), String(ch || ''), msg]),
+    unregisterPluginChannelListener: async (ch, fn) => {
+      const chKey = String(ch);
+      if (typeof fn === 'function') {
+        const set = channelListeners.get(chKey);
+        if (set) {
+          set.delete(fn);
+          if (!set.size) channelListeners.delete(chKey);
+        }
+      } else {
+        channelListeners.delete(chKey);
+      }
+      return true;
+    },
+    postPluginChannelMessage: async (target, ch, msg) => {
+      const ok = await rpcCall('ipc.post', [String(target || ''), String(ch || ''), msg]);
+      if (typeof window.__rsPollIpcNow === 'function' && channelListeners.size > 0) {
+        setTimeout(() => { void window.__rsPollIpcNow(); }, 15);
+        setTimeout(() => { void window.__rsPollIpcNow(); }, 75);
+      }
+      return ok;
+    },
 
     getRuntimeInfo: async () => ({ apiVersion: '3.0', platform: 'risustand-remote-gui', saveMethod: 'local' }),
     requestPluginPermission: async () => true,
@@ -2247,8 +2612,8 @@ function buildPluginGuiSrcdoc({ plugin, entryId = '', theme = 'dark' }) {
     alertError: async (msg) => { window.alert(String(msg || 'Error')); },
     log: (...a) => console.log(...a),
     onUnload: async () => {},
-    addRisuChatListener: async () => {},
-    removeRisuChatListener: async () => {},
+    addRisuChatListener: async (fn) => { if (typeof fn === 'function') chatListeners.add(fn); },
+    removeRisuChatListener: async (fn) => { chatListeners.delete(fn); },
     addRisuReplacer: async () => {},
     removeRisuReplacer: async () => {},
     addRisuScriptHandler: async () => {},
@@ -2318,14 +2683,57 @@ function createPluginAdapter({
     const pcPlugins = new Map(); // name -> { name, displayName, version, script, header, pcRealArg, pcEnabled, updatedAt }
     const activeHosts = new Map(); // name -> { unload, api, record, context }
     const lastErrors = new Map(); // name -> string
-    const pluginChannels = new Map(); // `${pluginName}\0${channel}` -> { pluginName, callback }
+    const pluginChannels = new Map(); // `${pluginName}\0${channel}` -> Set<Function>
     const providers = new Map(); // providerName -> { pluginName, fn, options }
     const pluginDoms = new Map(); // pluginName -> mockDom
     const chatPanels = new Map(); // `${pluginName}::${panelId}` -> { id, pluginName, displayName, className, html }
     const guiIpcOutbox = []; // [{ seq, targetPlugin, channel, message, sender, at }]
     let guiIpcSeq = 0;
-    let activeHookFrame = null; // { stage, step, total, pluginName, explicit, handle }
+    const pluginRuntimeLedger = new Map(); // pluginName -> runtime hook & prompt-injection recall ledger
+    let runtimeRecallSeq = 0;
+    let activeHookFrame = null; // { stage, step, total, pluginName, explicit, handle, logs, fetchCount, llmCount }
     let activeActionTracker = null; // { dbMutated, surfaceMutated, openedContainerPlugin }
+
+    function ensureRuntimeLedger(pluginName) {
+        const key = String(pluginName || '');
+        let rec = pluginRuntimeLedger.get(key);
+        if (!rec) {
+            rec = {
+                pluginName: key,
+                beforeRequestRuns: 0,
+                afterRequestRuns: 0,
+                outputRuns: 0,
+                lastBeforeRequestAt: 0,
+                lastAfterRequestAt: 0,
+                lastOutputAt: 0,
+                lastAfterRequest: null,
+                lastOutput: null,
+                history: [],
+            };
+            pluginRuntimeLedger.set(key, rec);
+        }
+        return rec;
+    }
+
+    function appendHookStepLog(pluginName, text) {
+        const f = activeHookFrame;
+        if (!f || f.pluginName !== pluginName || !Array.isArray(f.logs)) return;
+        const clean = String(text ?? '').replace(/\s+/g, ' ').trim().slice(0, 300);
+        if (!clean) return;
+        if (f.logs.length && f.logs[f.logs.length - 1] === clean) return;
+        if (f.logs.length < 20) f.logs.push(clean);
+    }
+
+    function extractLastUserPreview(msgs) {
+        if (!Array.isArray(msgs)) return '';
+        for (let i = msgs.length - 1; i >= 0; i -= 1) {
+            const msg = msgs[i];
+            if (!msg || String(msg.role || '').toLowerCase() !== 'user') continue;
+            const clean = String(msg.content ?? '').replace(/\s+/g, ' ').trim();
+            if (clean) return clean.slice(0, 140);
+        }
+        return '';
+    }
 
     function getPluginDisplayName(pluginName) {
         const custom = customPlugins.find((p) => p && p.name === pluginName);
@@ -2384,6 +2792,7 @@ function createPluginAdapter({
         if (!f || f.pluginName !== pluginName) return;
         const clean = String(detail || '').replace(/\s+/g, ' ').trim().slice(0, 100);
         if (!clean) return;
+        appendHookStepLog(pluginName, clean);
         if (!explicit && f.explicit) return;
         if (explicit) f.explicit = true;
         if (f.handle && typeof f.handle.update === 'function') {
@@ -2415,6 +2824,9 @@ function createPluginAdapter({
             pluginName,
             explicit: false,
             handle,
+            logs: [],
+            fetchCount: 0,
+            llmCount: 0,
         };
         try {
             return await fn();
@@ -2454,6 +2866,71 @@ function createPluginAdapter({
     };
 
     const isRpcConnected = () => Boolean(hostRpc && typeof hostRpc.isConnected === 'function' && hostRpc.isConnected());
+
+    // Short-TTL + in-flight dedup cache for GUI / host RPC reads (never masks turnCache or mutations)
+    const READ_CACHE_TTL_MS = 800;
+    const READ_CACHE_MAX_ENTRIES = 512;
+    const rpcReadCache = new Map(); // cacheKey -> { at, val }
+    const rpcReadInFlight = new Map(); // cacheKey -> Promise<any>
+
+    function invalidateReadCache(prefix = '') {
+        if (!prefix) {
+            rpcReadCache.clear();
+            rpcReadInFlight.clear();
+            return;
+        }
+        for (const k of rpcReadCache.keys()) {
+            if (k.startsWith(prefix)) rpcReadCache.delete(k);
+        }
+        for (const k of rpcReadInFlight.keys()) {
+            if (k.startsWith(prefix)) rpcReadInFlight.delete(k);
+        }
+    }
+
+    function deleteReadCacheKey(key) {
+        rpcReadCache.delete(key);
+        rpcReadInFlight.delete(key);
+    }
+
+    function putReadCache(key, val) {
+        if (rpcReadCache.size >= READ_CACHE_MAX_ENTRIES) {
+            const oldest = rpcReadCache.keys().next().value;
+            if (oldest !== undefined) rpcReadCache.delete(oldest);
+        }
+        rpcReadCache.set(key, { at: Date.now(), val: val === undefined ? null : cloneJson(val) });
+    }
+
+    function getFreshReadCache(key) {
+        if (!rpcReadCache.has(key)) return undefined;
+        const hit = rpcReadCache.get(key);
+        if (!hit || (Date.now() - hit.at) >= READ_CACHE_TTL_MS) {
+            rpcReadCache.delete(key);
+            return undefined;
+        }
+        return hit.val;
+    }
+
+    async function cachedRpcRead(key, fetcher) {
+        const fresh = getFreshReadCache(key);
+        if (fresh !== undefined) return cloneJson(fresh);
+        if (rpcReadInFlight.has(key)) {
+            const shared = await rpcReadInFlight.get(key);
+            return shared === undefined ? null : cloneJson(shared);
+        }
+        const p = (async () => {
+            const v = await fetcher();
+            const normalized = v === undefined ? null : v;
+            if (rpcReadInFlight.get(key) === p) {
+                putReadCache(key, normalized);
+            }
+            return normalized;
+        })().finally(() => {
+            if (rpcReadInFlight.get(key) === p) rpcReadInFlight.delete(key);
+        });
+        rpcReadInFlight.set(key, p);
+        const res = await p;
+        return res === undefined ? null : cloneJson(res);
+    }
 
     function loadCustomPluginsFromDisk() {
         if (!pluginsPath || persistDisabled) return;
@@ -2553,7 +3030,7 @@ function createPluginAdapter({
             }
             let val;
             if (isRpcConnected()) {
-                val = await hostRpc.invoke('pluginStorage.getItem', [k]);
+                val = await cachedRpcRead(`store:pluginStorage:${k}`, () => hostRpc.invoke('pluginStorage.getItem', [k]));
             } else {
                 val = fallbackPluginStore.has(k) ? JSON.parse(fallbackPluginStore.get(k)) : null;
             }
@@ -2564,7 +3041,7 @@ function createPluginAdapter({
         }
         const op = `${storeKind}.getItem`;
         if (isRpcConnected()) {
-            const v = await hostRpc.invoke(op, [k]);
+            const v = await cachedRpcRead(`store:${storeKind}:${k}`, () => hostRpc.invoke(op, [k]));
             return v === undefined ? null : v;
         }
         const fb = storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin;
@@ -2573,6 +3050,8 @@ function createPluginAdapter({
 
     async function storeSet(storeKind, key, value) {
         const k = String(key);
+        deleteReadCacheKey(`store:${storeKind}:${k}`);
+        deleteReadCacheKey(`storeKeys:${storeKind}`);
         if (storeKind === 'pluginStorage') {
             const jsonStr = JSON.stringify(value) ?? 'null';
             const normalized = JSON.parse(jsonStr);
@@ -2598,6 +3077,8 @@ function createPluginAdapter({
 
     async function storeRemove(storeKind, key) {
         const k = String(key);
+        deleteReadCacheKey(`store:${storeKind}:${k}`);
+        deleteReadCacheKey(`storeKeys:${storeKind}`);
         if (storeKind === 'pluginStorage' && turnCache.active) {
             turnCache.pluginStoreCache.set(k, null);
         }
@@ -2611,6 +3092,8 @@ function createPluginAdapter({
     }
 
     async function storeClear(storeKind) {
+        invalidateReadCache(`store:${storeKind}:`);
+        deleteReadCacheKey(`storeKeys:${storeKind}`);
         if (storeKind === 'pluginStorage' && turnCache.active) {
             turnCache.pluginStoreCache.clear();
         }
@@ -2625,7 +3108,7 @@ function createPluginAdapter({
 
     async function storeKeys(storeKind) {
         if (isRpcConnected()) {
-            const ks = await hostRpc.invoke(`${storeKind}.keys`, []);
+            const ks = await cachedRpcRead(`storeKeys:${storeKind}`, () => hostRpc.invoke(`${storeKind}.keys`, []));
             return Array.isArray(ks) ? ks : [];
         }
         const fb = storeKind === 'pluginStorage' ? fallbackPluginStore : (storeKind === 'safeLocalStorage' ? fallbackSafeLocal : fallbackLocalPlugin);
@@ -2752,7 +3235,7 @@ function createPluginAdapter({
             return copy;
         }
         if (isRpcConnected()) {
-            const ch = await hostRpc.invoke('db.getCharacter', [cIdx]);
+            const ch = await cachedRpcRead(`dbChar:${cIdx}`, () => hostRpc.invoke('db.getCharacter', [cIdx]));
             if (ch && Array.isArray(ch.chats)) {
                 for (let ci = 0; ci < ch.chats.length; ci += 1) {
                     ensureStableChatAndMessageIds(ch, cIdx, ch.chats[ci], ci);
@@ -2768,6 +3251,9 @@ function createPluginAdapter({
     async function dbSetCharacterToIndex(idx, charObj) {
         const cIdx = Number(idx);
         if (Number.isNaN(cIdx) || cIdx < 0 || !charObj) return false;
+        invalidateReadCache('db:');
+        invalidateReadCache(`dbChar:${cIdx}`);
+        invalidateReadCache(`dbChat:${cIdx}:`);
         const copy = cloneJson(charObj);
         if (Array.isArray(copy.chats)) {
             for (let ci = 0; ci < copy.chats.length; ci += 1) {
@@ -2799,7 +3285,7 @@ function createPluginAdapter({
             return ensureStableChatAndMessageIds(turnCache.charObj, ci, cloneJson(turnCache.chatObj), chi);
         }
         if (isRpcConnected()) {
-            const chat = await hostRpc.invoke('db.getChat', [ci, chi]);
+            const chat = await cachedRpcRead(`dbChat:${ci}:${chi}`, () => hostRpc.invoke('db.getChat', [ci, chi]));
             return ensureStableChatAndMessageIds({ chaId: '' }, ci, chat, chi);
         }
         const fb = getOrSeedFallbackChar(ci);
@@ -2811,6 +3297,9 @@ function createPluginAdapter({
         const ci = Number(cIdx);
         const chi = Number(chIdx);
         if (Number.isNaN(ci) || ci < 0 || Number.isNaN(chi) || chi < 0 || !chatObj) return false;
+        invalidateReadCache('db:');
+        deleteReadCacheKey(`dbChar:${ci}`);
+        deleteReadCacheKey(`dbChat:${ci}:${chi}`);
         const copy = cloneJson(chatObj);
         const cachedChar = fallbackCharCache.get(ci) || turnCache.charObj || null;
         ensureStableChatAndMessageIds(cachedChar, ci, copy, chi);
@@ -2839,7 +3328,8 @@ function createPluginAdapter({
         let out = {};
         const includesPlugins = want === 'all' || (Array.isArray(want) && want.includes('plugins'));
         if (isRpcConnected()) {
-            out = (await hostRpc.invoke('db.getDatabase', [want], includesPlugins ? 60000 : 15000)) || {};
+            const dbKey = `db:${Array.isArray(want) ? want.slice().sort().join(',') : String(want)}`;
+            out = (await cachedRpcRead(dbKey, () => hostRpc.invoke('db.getDatabase', [want], includesPlugins ? 60000 : 15000))) || {};
         } else {
             const snap = getFallbackSnapshot();
             const fbChar = getOrSeedFallbackChar(snap && typeof snap.charIndex === 'number' ? snap.charIndex : 0) || buildSnapshotCharFallback(snap);
@@ -2880,6 +3370,7 @@ function createPluginAdapter({
     }
 
     async function dbSetDatabase(method, patch) {
+        invalidateReadCache('db');
         const safePatch = cloneJson(patch || {});
         if (turnCache.active && safePatch && Array.isArray(safePatch.characters) && safePatch.characters[turnCache.charIndex]) {
             turnCache.charObj = cloneJson(safePatch.characters[turnCache.charIndex]);
@@ -2932,11 +3423,15 @@ function createPluginAdapter({
     }
 
     async function assetReadImage(assetPath) {
-        const key = String(assetPath || '');
-        if (!key) return null;
+        const key = String(assetPath || '').trim();
+        if (!key || /^\[\[RS/i.test(key)) return null;
         if (isRpcConnected()) {
-            const res = await hostRpc.invoke('asset.readImage', [key]);
-            return (res && res.__b64) ? new Uint8Array(Buffer.from(res.__b64, 'base64')) : null;
+            try {
+                const res = await hostRpc.invoke('asset.readImage', [key]);
+                return (res && res.__b64) ? new Uint8Array(Buffer.from(res.__b64, 'base64')) : null;
+            } catch (_) {
+                return null;
+            }
         }
         const hit = fallbackAssetStore.get(key);
         return hit ? new Uint8Array(hit) : null;
@@ -2955,10 +3450,14 @@ function createPluginAdapter({
     }
 
     async function assetReadInlay(id) {
-        const key = String(id || '');
+        const key = String(id || '').trim();
         if (!key) return null;
         if (isRpcConnected()) {
-            return await hostRpc.invoke('asset.readInlay', [key]);
+            try {
+                return await hostRpc.invoke('asset.readInlay', [key]);
+            } catch (_) {
+                return null;
+            }
         }
         return cloneJson(fallbackInlayStore.get(key) || null);
     }
@@ -3020,6 +3519,7 @@ function createPluginAdapter({
         }
         const method = String(initOpts.method || (body !== undefined && body !== null ? 'POST' : 'GET')).toUpperCase();
         if (pluginName && activeHookFrame && activeHookFrame.pluginName === pluginName) {
+            activeHookFrame.fetchCount = (activeHookFrame.fetchCount || 0) + 1;
             updateHookTaskDetail(pluginName, inferFetchHookTask(parsed, activeHookFrame.stage), false);
         }
         const resp = await fetch(parsed.toString(), {
@@ -3050,31 +3550,54 @@ function createPluginAdapter({
 
     async function postIpcMessage(senderEntry, targetPluginName, channelName, message) {
         const targetEntry = getPluginEntry(targetPluginName);
-        if (!targetEntry) return false;
+        if (!targetEntry || !senderEntry) return false;
         const senderAllowed = (senderEntry && senderEntry.header && senderEntry.header.allowedIPC) || [];
         const targetAllowed = (targetEntry && targetEntry.header && targetEntry.header.allowedIPC) || [];
-        if (targetAllowed.length && !targetAllowed.includes(senderEntry.name)) return false;
-        if (senderAllowed.length && !senderAllowed.includes(targetEntry.name)) return false;
+        if (targetAllowed.length && !targetAllowed.includes('*') && !targetAllowed.includes(senderEntry.name)) return false;
+        if (senderAllowed.length && !senderAllowed.includes('*') && !senderAllowed.includes(targetEntry.name)) return false;
         const cloned = cloneJson(message);
-        const rec = pluginChannels.get(`${targetPluginName}\0${channelName}`);
-        if (rec && typeof rec.callback === 'function') {
-            await rec.callback(cloned, { sender: senderEntry.name, channel: String(channelName) });
+        const ch = String(channelName);
+        const meta = { sender: String(senderEntry.name || ''), channel: ch };
+        const set = pluginChannels.get(`${targetPluginName}\0${ch}`);
+        if (set && set.size) {
+            const listeners = [...set];
+            queueMicrotask(() => {
+                for (const cb of listeners) {
+                    if (typeof cb !== 'function') continue;
+                    try {
+                        const p = cb(cloneJson(cloned), { ...meta });
+                        if (p && typeof p.catch === 'function') {
+                            p.catch((err) => {
+                                console.warn(`[PluginIPC:${targetPluginName}/${ch}] listener error:`, err && err.message ? err.message : String(err));
+                            });
+                        }
+                    } catch (err) {
+                        console.warn(`[PluginIPC:${targetPluginName}/${ch}] listener error:`, err && err.message ? err.message : String(err));
+                    }
+                }
+            });
         }
         guiIpcOutbox.push({
             seq: ++guiIpcSeq,
             targetPlugin: String(targetPluginName),
-            channel: String(channelName),
+            channel: ch,
             message: cloned,
             sender: String(senderEntry.name || ''),
             at: Date.now(),
         });
-        if (guiIpcOutbox.length > 60) {
-            guiIpcOutbox.splice(0, guiIpcOutbox.length - 60);
+        if (guiIpcOutbox.length > 240) {
+            guiIpcOutbox.splice(0, guiIpcOutbox.length - 240);
         }
         return true;
     }
 
-    function pollGuiIpc(pluginName, afterSeq = 0) {
+    function pollGuiIpc(pluginName, afterSeq = 0, initCursor = false) {
+        if (initCursor) {
+            return {
+                latestSeq: guiIpcSeq,
+                events: [],
+            };
+        }
         const n = String(pluginName || '');
         const s = Number(afterSeq) || 0;
         const events = guiIpcOutbox.filter((ev) => ev.targetPlugin === n && ev.seq > s);
@@ -3303,13 +3826,48 @@ function createPluginAdapter({
             },
 
             addPluginChannelListener: async (channelName, cb) => {
-                if (typeof cb !== 'function') return;
-                const key = `${pluginName}\0${channelName}`;
-                pluginChannels.set(key, { pluginName, callback: cb });
-                addUnload(() => { pluginChannels.delete(key); });
+                if (typeof cb !== 'function') return false;
+                const key = `${pluginName}\0${String(channelName)}`;
+                let set = pluginChannels.get(key);
+                if (!set) {
+                    set = new Set();
+                    pluginChannels.set(key, set);
+                }
+                set.add(cb);
+                addUnload(() => {
+                    const s = pluginChannels.get(key);
+                    if (s) {
+                        s.delete(cb);
+                        if (!s.size) pluginChannels.delete(key);
+                    }
+                });
+                return true;
             },
-            removePluginChannelListener: async (channelName) => {
-                pluginChannels.delete(`${pluginName}\0${channelName}`);
+            removePluginChannelListener: async (channelName, cb) => {
+                const key = `${pluginName}\0${String(channelName)}`;
+                if (typeof cb === 'function') {
+                    const s = pluginChannels.get(key);
+                    if (s) {
+                        s.delete(cb);
+                        if (!s.size) pluginChannels.delete(key);
+                    }
+                } else {
+                    pluginChannels.delete(key);
+                }
+                return true;
+            },
+            unregisterPluginChannelListener: async (channelName, cb) => {
+                const key = `${pluginName}\0${String(channelName)}`;
+                if (typeof cb === 'function') {
+                    const s = pluginChannels.get(key);
+                    if (s) {
+                        s.delete(cb);
+                        if (!s.size) pluginChannels.delete(key);
+                    }
+                } else {
+                    pluginChannels.delete(key);
+                }
+                return true;
             },
             postPluginChannelMessage: (target, channel, msg) => postIpcMessage(getPluginEntry(pluginName) || entry, target, channel, msg),
 
@@ -3321,6 +3879,7 @@ function createPluginAdapter({
                     return { type: 'fail', result: 'No LLM runner available in backend adapter' };
                 }
                 if (activeHookFrame && activeHookFrame.pluginName === pluginName) {
+                    activeHookFrame.llmCount = (activeHookFrame.llmCount || 0) + 1;
                     const reqMode = String((req && req.mode) || 'model');
                     const taskTxt = reqMode === 'otherAx'
                         ? (activeHookFrame.stage === 'beforeRequest' ? '보조 모델(OtherAx) 분석 중' : '보조 모델(OtherAx) 후처리 중')
@@ -3469,6 +4028,245 @@ function createPluginAdapter({
         inst.timers.clear();
     }
 
+    function buildSandboxDomGlobals(sharedMockDom) {
+        const MockEl = sharedMockDom && sharedMockDom.MockElement ? sharedMockDom.MockElement : null;
+        const SVG_TAGS = new Set(['SVG', 'PATH', 'CIRCLE', 'RECT', 'LINE', 'POLYGON', 'POLYLINE', 'ELLIPSE', 'G', 'DEFS', 'USE', 'SYMBOL', 'TEXT', 'TSPAN', 'LINEARGRADIENT', 'RADIALGRADIENT', 'STOP', 'CLIPPATH', 'MASK']);
+
+        class EventTarget {
+            addEventListener() {}
+            removeEventListener() {}
+            dispatchEvent() { return true; }
+            static [Symbol.hasInstance](x) {
+                return Boolean(x && typeof x === 'object' && (typeof x.nodeType === 'number' || typeof x.addEventListener === 'function' || Object.prototype.isPrototypeOf.call(EventTarget.prototype, x)));
+            }
+        }
+        class Node extends EventTarget {
+            static [Symbol.hasInstance](x) {
+                return Boolean(x && typeof x === 'object' && (typeof x.nodeType === 'number' || Object.prototype.isPrototypeOf.call(Node.prototype, x)));
+            }
+        }
+        Node.ELEMENT_NODE = 1;
+        Node.ATTRIBUTE_NODE = 2;
+        Node.TEXT_NODE = 3;
+        Node.COMMENT_NODE = 8;
+        Node.DOCUMENT_NODE = 9;
+        Node.DOCUMENT_FRAGMENT_NODE = 11;
+
+        class Element extends Node {
+            static [Symbol.hasInstance](x) {
+                return Boolean(x && typeof x === 'object' && (x.nodeType === 1 || Object.prototype.isPrototypeOf.call(Element.prototype, x)));
+            }
+        }
+        class HTMLElement extends Element {
+            static [Symbol.hasInstance](x) {
+                return Boolean(x && typeof x === 'object' && (x.nodeType === 1 || Object.prototype.isPrototypeOf.call(HTMLElement.prototype, x)));
+            }
+        }
+        class SVGElement extends Element {
+            static [Symbol.hasInstance](x) {
+                if (!x || typeof x !== 'object') return false;
+                if (Object.prototype.isPrototypeOf.call(SVGElement.prototype, x)) return true;
+                return x.nodeType === 1 && SVG_TAGS.has(String(x.tagName || '').toUpperCase());
+            }
+        }
+        class Text extends Node {
+            static [Symbol.hasInstance](x) {
+                return Boolean(x && typeof x === 'object' && (x.nodeType === 3 || Object.prototype.isPrototypeOf.call(Text.prototype, x)));
+            }
+        }
+        class Document extends Node {
+            static [Symbol.hasInstance](x) {
+                return Boolean(x && typeof x === 'object' && (x.nodeType === 9 || Object.prototype.isPrototypeOf.call(Document.prototype, x)));
+            }
+        }
+        class DocumentFragment extends Node {
+            static [Symbol.hasInstance](x) {
+                return Boolean(x && typeof x === 'object' && (x.nodeType === 11 || Object.prototype.isPrototypeOf.call(DocumentFragment.prototype, x)));
+            }
+        }
+
+        const makeHtmlTagClass = (tags) => {
+            const tagSet = new Set(Array.isArray(tags) ? tags : [tags]);
+            return class HtmlTagElement extends HTMLElement {
+                static [Symbol.hasInstance](x) {
+                    if (!x || typeof x !== 'object') return false;
+                    if (Object.prototype.isPrototypeOf.call(HtmlTagElement.prototype, x)) return true;
+                    return x.nodeType === 1 && tagSet.has(String(x.tagName || '').toUpperCase());
+                }
+            };
+        };
+
+        class Event {
+            constructor(type, init = {}) {
+                this.type = String(type || '');
+                this.bubbles = Boolean(init && init.bubbles);
+                this.cancelable = Boolean(init && init.cancelable);
+                this.composed = Boolean(init && init.composed);
+                this.defaultPrevented = false;
+                this.target = null;
+                this.currentTarget = null;
+                this.timeStamp = Date.now();
+            }
+            preventDefault() { if (this.cancelable) this.defaultPrevented = true; }
+            stopPropagation() { this.propagationStopped = true; }
+            stopImmediatePropagation() { this.propagationStopped = true; this.immediatePropagationStopped = true; }
+            static [Symbol.hasInstance](x) {
+                return Boolean(x && typeof x === 'object' && (Object.prototype.isPrototypeOf.call(Event.prototype, x) || (typeof x.type === 'string' && typeof x.preventDefault === 'function')));
+            }
+        }
+        class CustomEvent extends Event {
+            constructor(type, init = {}) {
+                super(type, init);
+                this.detail = init && Object.prototype.hasOwnProperty.call(init, 'detail') ? init.detail : null;
+            }
+            static [Symbol.hasInstance](x) {
+                return Boolean(x && typeof x === 'object' && Object.prototype.isPrototypeOf.call(CustomEvent.prototype, x));
+            }
+        }
+        class UIEvent extends Event {
+            constructor(type, init = {}) {
+                super(type, init);
+                this.view = (init && init.view) || null;
+                this.detail = Number((init && init.detail) || 0);
+            }
+            static [Symbol.hasInstance](x) {
+                return Boolean(x && typeof x === 'object' && (Object.prototype.isPrototypeOf.call(UIEvent.prototype, x) || (typeof x.type === 'string' && typeof x.clientX === 'number' && typeof x.preventDefault === 'function')));
+            }
+        }
+        class MouseEvent extends UIEvent {
+            constructor(type, init = {}) {
+                super(type, init);
+                this.clientX = Number((init && init.clientX) || 0);
+                this.clientY = Number((init && init.clientY) || 0);
+                this.pageX = Number((init && init.pageX) || this.clientX);
+                this.pageY = Number((init && init.pageY) || this.clientY);
+                this.button = Number((init && init.button) || 0);
+                this.buttons = Number((init && init.buttons) || 0);
+            }
+            static [Symbol.hasInstance](x) {
+                return Boolean(x && typeof x === 'object' && (Object.prototype.isPrototypeOf.call(MouseEvent.prototype, x) || (typeof x.type === 'string' && typeof x.clientX === 'number' && typeof x.preventDefault === 'function')));
+            }
+        }
+        class PointerEvent extends MouseEvent {
+            constructor(type, init = {}) {
+                super(type, init);
+                this.pointerId = Number((init && init.pointerId) || 1);
+                this.pointerType = String((init && init.pointerType) || 'mouse');
+            }
+            static [Symbol.hasInstance](x) {
+                return Boolean(x && typeof x === 'object' && (Object.prototype.isPrototypeOf.call(PointerEvent.prototype, x) || (typeof x.type === 'string' && typeof x.clientX === 'number' && typeof x.preventDefault === 'function')));
+            }
+        }
+        class KeyboardEvent extends UIEvent {
+            constructor(type, init = {}) {
+                super(type, init);
+                this.key = String((init && init.key) || '');
+                this.code = String((init && init.code) || '');
+                this.ctrlKey = Boolean(init && init.ctrlKey);
+                this.shiftKey = Boolean(init && init.shiftKey);
+                this.altKey = Boolean(init && init.altKey);
+                this.metaKey = Boolean(init && init.metaKey);
+            }
+            static [Symbol.hasInstance](x) {
+                return Boolean(x && typeof x === 'object' && Object.prototype.isPrototypeOf.call(KeyboardEvent.prototype, x));
+            }
+        }
+        class InputEvent extends UIEvent {
+            constructor(type, init = {}) {
+                super(type, init);
+                this.data = (init && init.data !== undefined) ? init.data : null;
+                this.inputType = String((init && init.inputType) || '');
+            }
+            static [Symbol.hasInstance](x) {
+                return Boolean(x && typeof x === 'object' && (Object.prototype.isPrototypeOf.call(InputEvent.prototype, x) || ((x.type === 'input' || x.type === 'change') && typeof x.preventDefault === 'function')));
+            }
+        }
+        class DOMParser {
+            parseFromString(html) {
+                if (!MockEl) return { nodeType: 9, documentElement: null, head: null, body: null, querySelector: () => null, querySelectorAll: () => [], getElementById: () => null };
+                const htmlEl = new MockEl('html');
+                const headEl = new MockEl('head');
+                const bodyEl = new MockEl('body');
+                htmlEl.appendChild(headEl);
+                htmlEl.appendChild(bodyEl);
+                bodyEl.innerHTML = String(html ?? '');
+                return {
+                    nodeType: 9,
+                    nodeName: '#document',
+                    documentElement: htmlEl,
+                    head: headEl,
+                    body: bodyEl,
+                    querySelector: (sel) => htmlEl.querySelector(sel),
+                    querySelectorAll: (sel) => htmlEl.querySelectorAll(sel),
+                    getElementById: (id) => htmlEl.querySelector(`#${String(id || '').replace(/[^a-zA-Z0-9_-]/g, '')}`),
+                };
+            }
+        }
+        const NodeFilter = {
+            SHOW_ALL: 0xFFFFFFFF,
+            SHOW_ELEMENT: 1,
+            SHOW_TEXT: 4,
+            SHOW_COMMENT: 128,
+            FILTER_ACCEPT: 1,
+            FILTER_REJECT: 2,
+            FILTER_SKIP: 3,
+        };
+        const CSS = {
+            escape: (s) => String(s ?? '').replace(/([^\w-])/g, '\\$1'),
+            supports: () => true,
+        };
+        const noopObserver = class { observe() {} unobserve() {} disconnect() {} takeRecords() { return []; } };
+        return {
+            EventTarget,
+            Node,
+            Element,
+            HTMLElement,
+            SVGElement,
+            Text,
+            Document,
+            DocumentFragment,
+            HTMLInputElement: makeHtmlTagClass('INPUT'),
+            HTMLTextAreaElement: makeHtmlTagClass('TEXTAREA'),
+            HTMLButtonElement: makeHtmlTagClass('BUTTON'),
+            HTMLImageElement: makeHtmlTagClass('IMG'),
+            HTMLSelectElement: makeHtmlTagClass('SELECT'),
+            HTMLFormElement: makeHtmlTagClass('FORM'),
+            HTMLDivElement: makeHtmlTagClass('DIV'),
+            HTMLSpanElement: makeHtmlTagClass('SPAN'),
+            HTMLAnchorElement: makeHtmlTagClass('A'),
+            HTMLCanvasElement: makeHtmlTagClass('CANVAS'),
+            HTMLIFrameElement: makeHtmlTagClass('IFRAME'),
+            HTMLStyleElement: makeHtmlTagClass('STYLE'),
+            HTMLScriptElement: makeHtmlTagClass('SCRIPT'),
+            HTMLTemplateElement: makeHtmlTagClass('TEMPLATE'),
+            Event,
+            CustomEvent,
+            UIEvent,
+            MouseEvent,
+            PointerEvent,
+            KeyboardEvent,
+            InputEvent,
+            NodeFilter,
+            DOMParser,
+            CSS,
+            getComputedStyle: (el) => (el && el.style ? el.style : {}),
+            ResizeObserver: noopObserver,
+            IntersectionObserver: noopObserver,
+            navigator: {
+                userAgent: 'Mozilla/5.0 RisuStand/1.0',
+                language: 'ko-KR',
+                languages: ['ko-KR', 'ko', 'en-US'],
+                clipboard: {
+                    writeText: async () => {},
+                    readText: async () => '',
+                },
+            },
+            innerWidth: 1280,
+            innerHeight: 800,
+            devicePixelRatio: 1,
+        };
+    }
+
     async function loadPlugin(name) {
         const entry = getPluginEntry(name);
         if (!entry) return false;
@@ -3519,12 +4317,21 @@ function createPluginAdapter({
             replace: () => {},
         };
 
+        const logFromPlugin = (...a) => {
+            if (activeHookFrame && activeHookFrame.pluginName === name) {
+                const msg = a.map((v) => {
+                    if (typeof v === 'string') return v;
+                    try { return JSON.stringify(v); } catch (_) { return String(v); }
+                }).join(' ');
+                appendHookStepLog(name, msg);
+            }
+        };
         const sandbox = {
             console: {
-                log: (...a) => console.log(`[Plugin:${name}]`, ...a),
-                info: (...a) => console.log(`[Plugin:${name}]`, ...a),
-                warn: (...a) => console.warn(`[Plugin:${name}]`, ...a),
-                error: (...a) => console.error(`[Plugin:${name}]`, ...a),
+                log: (...a) => { logFromPlugin(...a); console.log(`[Plugin:${name}]`, ...a); },
+                info: (...a) => { logFromPlugin(...a); console.log(`[Plugin:${name}]`, ...a); },
+                warn: (...a) => { logFromPlugin(...a); console.warn(`[Plugin:${name}]`, ...a); },
+                error: (...a) => { logFromPlugin(...a); console.error(`[Plugin:${name}]`, ...a); },
                 debug: () => {},
             },
             setTimeout: (fn, ms, ...args) => {
@@ -3585,6 +4392,7 @@ function createPluginAdapter({
             matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
             requestAnimationFrame: (fn) => sandbox.setTimeout(fn, 16),
             cancelAnimationFrame: (id) => sandbox.clearTimeout(id),
+            ...buildSandboxDomGlobals(sharedMockDom),
             location: mockLocation,
         };
         syncDoc.location = mockLocation;
@@ -3866,6 +4674,7 @@ function createPluginAdapter({
 
     // ---- Direct Turn Pipeline Orchestration ----
     async function prepareTurn(charIndex, chatIndex, fallbackSnap) {
+        invalidateReadCache();
         turnCache = {
             active: true,
             charIndex: Number(charIndex),
@@ -3982,6 +4791,12 @@ function createPluginAdapter({
                 pluginName: h.pluginName,
                 initialTask,
             }, async () => {
+                const startedAt = Date.now();
+                const beforeSnap = msgs.map((m) => ({
+                    role: String((m && m.role) || ''),
+                    content: String((m && m.content) ?? ''),
+                }));
+                let stepErr = '';
                 if (kind === 'editprocess') {
                     try {
                         for (let i = 0; i < msgs.length; i += 1) {
@@ -3989,7 +4804,8 @@ function createPluginAdapter({
                             if (typeof res === 'string') msgs[i].content = res;
                         }
                     } catch (e) {
-                        console.warn(`[Plugin:${h.pluginName}] editprocess error:`, e.message);
+                        stepErr = e && e.message ? e.message : String(e);
+                        console.warn(`[Plugin:${h.pluginName}] editprocess error:`, stepErr);
                     }
                 } else {
                     try {
@@ -4001,7 +4817,42 @@ function createPluginAdapter({
                             msgs = res.content;
                         }
                     } catch (e) {
-                        console.warn(`[Plugin:${h.pluginName}] beforeRequest error:`, e.message);
+                        stepErr = e && e.message ? e.message : String(e);
+                        console.warn(`[Plugin:${h.pluginName}] beforeRequest error:`, stepErr);
+                    }
+                }
+                const diff = diffPluginPromptInjection(beforeSnap, msgs);
+                if (kind === 'beforeRequest' || diff.changed || stepErr) {
+                    const rec = ensureRuntimeLedger(h.pluginName);
+                    const now = Date.now();
+                    rec.beforeRequestRuns += 1;
+                    rec.lastBeforeRequestAt = now;
+                    rec.history.push({
+                        id: ++runtimeRecallSeq,
+                        at: now,
+                        durationMs: Math.max(0, now - startedAt),
+                        kind,
+                        mode: String(mode || 'model'),
+                        charIndex: turnCache.active ? turnCache.charIndex : lastActiveLocation.charIndex,
+                        chatIndex: turnCache.active ? turnCache.chatIndex : lastActiveLocation.chatIndex,
+                        chatUuid: String((turnCache.chatObj && turnCache.chatObj.id) || ''),
+                        charName: String((turnCache.charObj && turnCache.charObj.name) || ''),
+                        chatName: String((turnCache.chatObj && turnCache.chatObj.name) || ''),
+                        userPreview: extractLastUserPreview(beforeSnap),
+                        beforeCount: diff.beforeCount,
+                        afterCount: diff.afterCount,
+                        injectedCount: diff.injectedCount,
+                        totalInjectedChars: diff.totalInjectedChars,
+                        strippedCount: diff.strippedCount || 0,
+                        totalRemovedChars: diff.totalRemovedChars || 0,
+                        injectedBlocks: diff.injectedBlocks,
+                        fetchCount: (activeHookFrame && activeHookFrame.fetchCount) || 0,
+                        llmCount: (activeHookFrame && activeHookFrame.llmCount) || 0,
+                        stepLogs: (activeHookFrame && Array.isArray(activeHookFrame.logs)) ? [...activeHookFrame.logs] : [],
+                        error: stepErr,
+                    });
+                    if (rec.history.length > 12) {
+                        rec.history.splice(0, rec.history.length - 12);
                     }
                 }
             });
@@ -4041,20 +4892,43 @@ function createPluginAdapter({
                 pluginName: h.pluginName,
                 initialTask,
             }, async () => {
+                const startedAt = Date.now();
+                const beforeOut = out;
+                let stepErr = '';
                 if (kind === 'afterRequest') {
                     try {
                         const res = await h.fn(out, mode);
                         if (typeof res === 'string') out = res;
                     } catch (e) {
-                        console.warn(`[Plugin:${h.pluginName}] afterRequest error:`, e.message);
+                        stepErr = e && e.message ? e.message : String(e);
+                        console.warn(`[Plugin:${h.pluginName}] afterRequest error:`, stepErr);
                     }
                 } else {
                     try {
                         const res = await h.fn(out);
                         if (typeof res === 'string') out = res;
                     } catch (e) {
-                        console.warn(`[Plugin:${h.pluginName}] editoutput error:`, e.message);
+                        stepErr = e && e.message ? e.message : String(e);
+                        console.warn(`[Plugin:${h.pluginName}] editoutput error:`, stepErr);
                     }
+                }
+                if (kind === 'afterRequest' || out !== beforeOut || stepErr) {
+                    const rec = ensureRuntimeLedger(h.pluginName);
+                    const now = Date.now();
+                    rec.afterRequestRuns += 1;
+                    rec.lastAfterRequestAt = now;
+                    rec.lastAfterRequest = {
+                        at: now,
+                        durationMs: Math.max(0, now - startedAt),
+                        kind,
+                        mode: String(mode || 'model'),
+                        outputChanged: out !== beforeOut,
+                        deltaChars: out.length - beforeOut.length,
+                        fetchCount: (activeHookFrame && activeHookFrame.fetchCount) || 0,
+                        llmCount: (activeHookFrame && activeHookFrame.llmCount) || 0,
+                        stepLogs: (activeHookFrame && Array.isArray(activeHookFrame.logs)) ? [...activeHookFrame.logs] : [],
+                        error: stepErr,
+                    };
                 }
             });
         }
@@ -4115,14 +4989,28 @@ function createPluginAdapter({
 
     function collectMockDomStyles(mockDom) {
         const styles = [];
+        const seen = new Set();
         if (!mockDom) return styles;
+        const pushStyleEl = (st) => {
+            if (!st || st.tagName !== 'STYLE') return;
+            const txt = st.textContent || st.innerHTML || '';
+            if (txt && !seen.has(txt)) {
+                seen.add(txt);
+                styles.push(txt);
+            }
+        };
+        const docEl = mockDom.documentElement;
         const head = mockDom.head;
         const body = mockDom.body;
-        for (const st of [...(head ? head.children : []), ...(body ? body.children : [])]) {
-            if (st && st.tagName === 'STYLE') {
-                const txt = st.textContent || st.innerHTML || '';
-                if (txt) styles.push(txt);
+        if (docEl && typeof docEl.querySelectorAll === 'function') {
+            for (const st of docEl.querySelectorAll('style')) pushStyleEl(st);
+        }
+        for (const container of [docEl, head, body]) {
+            if (!container) continue;
+            if (typeof container.querySelectorAll === 'function') {
+                for (const st of container.querySelectorAll('style')) pushStyleEl(st);
             }
+            for (const st of container.children || []) pushStyleEl(st);
         }
         return styles;
     }
@@ -4141,6 +5029,8 @@ function createPluginAdapter({
         return Boolean(inner.trim() || (el.children && el.children.length));
     }
 
+    const knownModalsByPlugin = new Map();
+
     function isPersistentToastOrBadge(el) {
         if (!el || el.nodeType !== 1) return false;
         if (el.hasAttribute('data-am-toast-region') || el.hasAttribute('data-am-count-region')) return true;
@@ -4150,23 +5040,175 @@ function createPluginAdapter({
         return false;
     }
 
-    function extractOverlayBlocks(mockDom) {
+    function isExplicitModalElement(el) {
+        if (!el || el.nodeType !== 1) return false;
+        if (isNodeVisiblyHidden(el) || isPersistentToastOrBadge(el)) return false;
+        const tag = String(el.tagName || '').toUpperCase();
+        if (tag === 'DIALOG' && el.hasAttribute('open')) return true;
+        const role = String((el.attributes && el.attributes.get('role')) || '').toLowerCase();
+        if (role === 'dialog' || role === 'alertdialog') return true;
+        if (String((el.attributes && el.attributes.get('aria-modal')) || '').toLowerCase() === 'true') return true;
+        if (el.attributes) {
+            for (const aName of el.attributes.keys()) {
+                if (/^(?:data-am-(?:viewer|lightbox|modal|inspector|gallery|dialog|sheet|drawer|overlay)|data-plugin-modal|data-modal)/i.test(aName)) {
+                    return true;
+                }
+            }
+        }
+        const cls = String(el.className || '');
+        if (!/(?:^|[-_\s])(?:toast|count|toolbar|badge|fab|generation-count)(?:$|[-_\s])/i.test(cls)
+            && /(?:^|[-_\s])(?:modal|dialog|viewer|lightbox|inspector|gallery|sheet|drawer|popup)(?:$|[-_\s])/i.test(cls)) {
+            return true;
+        }
+        return false;
+    }
+
+    function describeOverlayElement(el) {
+        let key = '';
+        if (el && el.id) {
+            key = String(el.id).trim();
+        }
+        if (!key && el && el.attributes) {
+            for (const aName of el.attributes.keys()) {
+                if (/^(?:data-am-(?:viewer|lightbox|modal|inspector|gallery|dialog|sheet|drawer)|data-plugin-modal|data-modal)/i.test(aName)) {
+                    const aVal = String(el.attributes.get(aName) || '').trim();
+                    key = aVal && aVal !== 'true' && aVal !== '1' ? `${aName}:${aVal}` : aName;
+                    break;
+                }
+            }
+        }
+        if (!key && el && el.className) {
+            const clsTokens = String(el.className).split(/\s+/).filter(Boolean).map((c) => c.replace(/^x-risu-/, ''));
+            const modalCls = clsTokens.find((c) => /(?:modal|dialog|viewer|lightbox|inspector|gallery|sheet|drawer|popup)/i.test(c));
+            key = modalCls || clsTokens[0] || '';
+        }
+        if (!key) key = `overlay-${String((el && el.tagName) || 'div').toLowerCase()}`;
+
+        let label = '';
+        if (el && typeof el.querySelector === 'function') {
+            const heading = el.querySelector('h1, h2, h3, [role="heading"], [data-am-modal-title]');
+            if (heading) label = String(heading.textContent || '').replace(/\s+/g, ' ').trim();
+        }
+        if (!label && el && el.attributes) {
+            label = String(el.attributes.get('aria-label') || el.attributes.get('title') || '').replace(/\s+/g, ' ').trim();
+        }
+        if (!label) {
+            if (/inspector|viewer|gallery|lightbox/i.test(key)) label = '삽화 뷰어 · 관리 모달';
+            else if (/range|scene|setting/i.test(key)) label = '장면 · 설정 모달';
+            else if (/modal|dialog|popup|drawer|sheet/i.test(key)) label = `팝업 모달 (${key})`;
+            else label = `플러그인 오버레이 (${key})`;
+        }
+        return { key, label: label.slice(0, 64), autoPopup: true };
+    }
+
+    function extractTriggerKeyFromElement(el) {
+        if (!el || el.nodeType !== 1 || !el.attributes) return '';
+        const actionAttrs = [
+            'data-am-runtime-generation-count-action',
+            'data-am-viewer-action',
+            'data-am-image-action',
+            'data-am-illustration-action',
+            'data-am-gallery-action',
+            'data-am-action',
+            'data-am-runtime-toast-action',
+        ];
+        for (const aName of actionAttrs) {
+            const v = el.attributes.get(aName);
+            if (v !== undefined && v !== null && String(v).trim() !== '') {
+                return `trigger:${aName}=${String(v).trim()}`;
+            }
+        }
+        if (el.id) return `trigger:#${String(el.id).trim()}`;
+        const txt = String(el.attributes.get('aria-label') || el.attributes.get('title') || el.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!txt || txt === '-' || txt === '+' || txt === '−') return '';
+        return `trigger:label:${txt.toLowerCase().slice(0, 40)}`;
+    }
+
+    function recordPluginModalEntry(pluginName, item) {
+        if (!pluginName || !item || !item.key) return;
+        let map = knownModalsByPlugin.get(pluginName);
+        if (!map) {
+            map = new Map();
+            knownModalsByPlugin.set(pluginName, map);
+        }
+        const prev = map.get(item.key);
+        map.set(item.key, {
+            key: item.key,
+            label: item.label || (prev && prev.label) || item.key,
+            kind: item.kind || (prev && prev.kind) || 'modal',
+            autoPopup: item.autoPopup !== undefined ? item.autoPopup : (prev ? prev.autoPopup : true),
+        });
+    }
+
+    function getKnownModalsList(pluginName) {
+        const map = knownModalsByPlugin.get(pluginName);
+        if (!map) return [];
+        return Array.from(map.values());
+    }
+
+    function recordPluginModalCatalog(pluginName, mockDom) {
+        if (!pluginName || !mockDom) return;
+        const rootNode = mockDom.documentElement || mockDom.body;
+        if (rootNode && typeof rootNode.querySelector === 'function') {
+            const countRoot = rootNode.querySelector('[data-am-count-region], .x-risu-am-generation-count');
+            if (countRoot) {
+                recordPluginModalEntry(pluginName, {
+                    key: 'floating-bar',
+                    label: '플로팅 컨트롤 바 (펼침/접힘)',
+                    kind: 'inline',
+                    autoPopup: false,
+                });
+            }
+            const btns = typeof rootNode.querySelectorAll === 'function' ? rootNode.querySelectorAll('button, [role="button"], [data-am-runtime-generation-count-action]') : [];
+            let addedTriggers = 0;
+            for (const btn of btns) {
+                if (addedTriggers >= 12) break;
+                if (mockDom.chatScreen && mockDom.chatScreen.contains && mockDom.chatScreen.contains(btn)) continue;
+                const tKey = extractTriggerKeyFromElement(btn);
+                if (!tKey) continue;
+                const rawLbl = String((btn.attributes && (btn.attributes.get('title') || btn.attributes.get('aria-label'))) || btn.textContent || '').replace(/\s+/g, ' ').trim();
+                const cleanLbl = rawLbl && rawLbl.length <= 28 ? rawLbl : tKey.replace(/^trigger:(?:[^=]+=|label:)?/, '');
+                if (!cleanLbl || cleanLbl === '-' || cleanLbl === '+' || cleanLbl === '−') continue;
+                recordPluginModalEntry(pluginName, {
+                    key: tKey,
+                    label: `컨트롤: ${cleanLbl}`,
+                    kind: 'trigger',
+                    autoPopup: null,
+                });
+                addedTriggers += 1;
+            }
+        }
+    }
+
+    function extractOverlayEntries(mockDom) {
         const out = [];
         if (!mockDom || !mockDom.body) return out;
+        const collectModalDescendants = (node) => {
+            if (!node || node.nodeType !== 1 || isNodeVisiblyHidden(node)) return;
+            if (isExplicitModalElement(node)) {
+                if (hasVisibleContent(node)) {
+                    out.push({ ...describeOverlayElement(node), html: node.outerHTML });
+                }
+                return;
+            }
+            for (const sub of node.children || []) {
+                collectModalDescendants(sub);
+            }
+        };
         const collectFromNode = (el) => {
             if (!el || el === mockDom.chatScreen || el.tagName === 'STYLE' || el.tagName === 'SCRIPT') return;
             if (isNodeVisiblyHidden(el)) return;
             if (typeof el.hasAttribute === 'function' && el.hasAttribute('data-plugin-chat-panel')) return;
-            if (typeof el.hasAttribute === 'function' && (el.hasAttribute('data-am-floating-viewport') || el.hasAttribute('x-am-root-host'))) {
+            if (isPersistentToastOrBadge(el)) {
+                // Persistent floating bars/toasts stay inline; only explicit modal children inside them open overlays
                 for (const sub of el.children || []) {
-                    collectFromNode(sub);
+                    collectModalDescendants(sub);
                 }
                 return;
             }
-            if (isPersistentToastOrBadge(el)) {
-                // If an element wraps both count/toast regions and a modal, recurse; otherwise skip
+            if (typeof el.hasAttribute === 'function' && (el.hasAttribute('data-am-floating-viewport') || el.hasAttribute('x-am-root-host'))) {
                 for (const sub of el.children || []) {
-                    if (!isPersistentToastOrBadge(sub)) collectFromNode(sub);
+                    collectFromNode(sub);
                 }
                 return;
             }
@@ -4179,7 +5221,7 @@ function createPluginAdapter({
                 return;
             }
             if (!hasVisibleContent(el)) return;
-            out.push(el.outerHTML);
+            out.push({ ...describeOverlayElement(el), html: el.outerHTML });
         };
         for (const ch of mockDom.body.children || []) {
             collectFromNode(ch);
@@ -4193,16 +5235,28 @@ function createPluginAdapter({
         return out;
     }
 
+    function extractOverlayBlocks(mockDom) {
+        return extractOverlayEntries(mockDom).map((e) => e.html);
+    }
+
     function getPluginOverlaySnapshot(pluginName) {
         const mockDom = pluginDoms.get(pluginName);
         if (!mockDom || !activeHosts.has(pluginName)) return null;
-        const blocks = extractOverlayBlocks(mockDom);
-        if (!blocks.length) return null;
+        recordPluginModalCatalog(pluginName, mockDom);
+        const entries = extractOverlayEntries(mockDom);
+        if (!entries.length) return null;
+        for (const e of entries) {
+            recordPluginModalEntry(pluginName, { key: e.key, label: e.label, kind: 'modal', autoPopup: true });
+        }
+        const primary = entries[entries.length - 1];
         return {
             pluginName,
             displayName: getPluginDisplayName(pluginName),
             styles: collectMockDomStyles(mockDom),
-            html: blocks.join('\n'),
+            html: entries.map((e) => e.html).join('\n'),
+            modalKey: primary.key,
+            modalLabel: primary.label,
+            autoPopup: primary.autoPopup !== false,
         };
     }
 
@@ -4251,28 +5305,39 @@ function createPluginAdapter({
 
         try {
             const matchOpts = { msgIndex, chatId: resolvedCid, selector, actionHtml, dataset, textContent, ariaLabel, title, className, siblingIndex };
+            const pluginErrors = [];
             for (const [pName, mockDom] of pluginDoms.entries()) {
                 if (!activeHosts.has(pName)) continue;
-                if (syncedMsgs.length && typeof mockDom.syncChatMessages === 'function') {
-                    mockDom.syncChatMessages(syncedMsgs);
-                }
-                const liveEl = typeof mockDom.findChatSurfaceInteractiveElement === 'function'
-                    ? mockDom.findChatSurfaceInteractiveElement(matchOpts)
-                    : null;
-                if (liveEl) {
-                    matchedLive = true;
-                    await mockDom.dispatchSurfaceClick(liveEl, 24, 24);
-                    dispatchedCount += 1;
-                } else {
-                    const el = mockDom.mountSurfaceActionElement(actionHtml, dataset, { msgIndex, chatId: resolvedCid });
-                    try {
-                        await mockDom.dispatchSurfaceClick(el, 24, 24);
-                        dispatchedCount += 1;
-                    } finally {
-                        if (el && el._rsTempWrapper) el._rsTempWrapper.remove();
-                        else if (el) el.remove();
+                try {
+                    if (syncedMsgs.length && typeof mockDom.syncChatMessages === 'function') {
+                        mockDom.syncChatMessages(syncedMsgs);
                     }
+                    const liveEl = typeof mockDom.findChatSurfaceInteractiveElement === 'function'
+                        ? mockDom.findChatSurfaceInteractiveElement(matchOpts)
+                        : null;
+                    if (liveEl) {
+                        matchedLive = true;
+                        await mockDom.dispatchSurfaceClick(liveEl, 24, 24);
+                        dispatchedCount += 1;
+                    } else {
+                        const el = mockDom.mountSurfaceActionElement(actionHtml, dataset, { msgIndex, chatId: resolvedCid });
+                        try {
+                            await mockDom.dispatchSurfaceClick(el, 24, 24);
+                            dispatchedCount += 1;
+                        } finally {
+                            if (el && el._rsTempWrapper) el._rsTempWrapper.remove();
+                            else if (el) el.remove();
+                        }
+                    }
+                } catch (err) {
+                    const msg = err && err.message ? err.message : String(err);
+                    lastErrors.set(pName, msg);
+                    pluginErrors.push(`${pName}: ${msg}`);
+                    console.error(`[Plugin:${pName}] surface-action error:`, msg);
                 }
+            }
+            if (dispatchedCount === 0 && pluginErrors.length > 0) {
+                throw new Error(pluginErrors[0]);
             }
 
             if (dispatchedCount > 0) {
@@ -4293,7 +5358,7 @@ function createPluginAdapter({
                     return null;
                 };
                 openedOverlay = checkOverlays();
-                for (let step = 0; step < 4 && !openedOverlay && !tracker.openedContainerPlugin && !tracker.dbMutated && !tracker.surfaceMutated; step += 1) {
+                for (let step = 0; step < 10 && !openedOverlay && !tracker.openedContainerPlugin && !tracker.dbMutated && !tracker.surfaceMutated; step += 1) {
                     await new Promise((r) => setTimeout(r, 35));
                     openedOverlay = checkOverlays();
                 }
@@ -4326,7 +5391,7 @@ function createPluginAdapter({
     }
 
     async function syncAndProjectChatSurface(baseSnap) {
-        const empty = { footersByChatId: {}, footersByIndex: {}, bodyHtmlByChatId: {}, assetPathsByName: {} };
+        const empty = { footersByChatId: {}, footersByIndex: {}, bodyHtmlByChatId: {}, assetPathsByName: {}, styles: [] };
         if (!baseSnap || !Array.isArray(baseSnap.messages) || activeHosts.size === 0) {
             return empty;
         }
@@ -4360,14 +5425,22 @@ function createPluginAdapter({
             const footersByChatId = Object.create(null);
             const footersByIndex = Object.create(null);
             const bodyHtmlByChatId = Object.create(null);
+            const styles = [];
+            const seenStyles = new Set();
             for (const [pName, mockDom] of pluginDoms.entries()) {
                 if (!activeHosts.has(pName) || !mockDom || typeof mockDom.extractChatSurfaceProjections !== 'function') continue;
                 const proj = mockDom.extractChatSurfaceProjections();
                 Object.assign(footersByChatId, proj.footersByChatId);
                 Object.assign(footersByIndex, proj.footersByIndex);
                 Object.assign(bodyHtmlByChatId, proj.bodyHtmlByChatId);
+                for (const s of collectMockDomStyles(mockDom)) {
+                    if (s && !seenStyles.has(s)) {
+                        seenStyles.add(s);
+                        styles.push(s);
+                    }
+                }
             }
-            return { footersByChatId, footersByIndex, bodyHtmlByChatId };
+            return { footersByChatId, footersByIndex, bodyHtmlByChatId, styles };
         };
 
         let merged = collectAll();
@@ -4396,6 +5469,7 @@ function createPluginAdapter({
             footersByIndex: merged.footersByIndex,
             bodyHtmlByChatId: merged.bodyHtmlByChatId,
             assetPathsByName,
+            styles: merged.styles || [],
         };
     }
 
@@ -4430,6 +5504,7 @@ function createPluginAdapter({
         const prevTracker = activeActionTracker;
         const tracker = { dbMutated: false, surfaceMutated: false, openedContainerPlugin: '' };
         activeActionTracker = tracker;
+        const beforeOverlayHtml = extractOverlayBlocks(mockDom).join('\n');
         try {
             const matchOpts = { selector, countNode, actionHtml, dataset, textContent, ariaLabel, title, className, siblingIndex };
             const liveEl = typeof mockDom.findRootInteractiveElement === 'function'
@@ -4442,26 +5517,30 @@ function createPluginAdapter({
                     await mockDom.dispatchSurfaceClick(liveEl, Number(x) || 24, Number(y) || 24);
                 }
                 await new Promise((r) => setTimeout(r, 35));
+                const overlaySnap = getPluginOverlaySnapshot(pName);
                 return {
                     ok: true,
                     dispatchedCount: 1,
                     matchedLive: true,
                     dbMutated: tracker.dbMutated,
                     surfaceMutated: tracker.surfaceMutated,
-                    activeOverlay: getPluginOverlaySnapshot(pName),
+                    overlayChanged: Boolean(overlaySnap && overlaySnap.html !== beforeOverlayHtml),
+                    activeOverlay: overlaySnap,
                 };
             }
             const el = mockDom.mountSurfaceActionElement(actionHtml, dataset);
             try {
                 await mockDom.dispatchSurfaceClick(el, Number(x) || 24, Number(y) || 24);
                 await new Promise((r) => setTimeout(r, 25));
+                const overlaySnap = getPluginOverlaySnapshot(pName);
                 return {
                     ok: true,
                     dispatchedCount: 1,
                     matchedLive: false,
                     dbMutated: tracker.dbMutated,
                     surfaceMutated: tracker.surfaceMutated,
-                    activeOverlay: getPluginOverlaySnapshot(pName),
+                    overlayChanged: Boolean(overlaySnap && overlaySnap.html !== beforeOverlayHtml),
+                    activeOverlay: overlaySnap,
                 };
             } finally {
                 el.remove();
@@ -4472,31 +5551,40 @@ function createPluginAdapter({
         }
     }
 
-    async function prepareFloatingPopupWidgets({ charIndex = -1, chatIndex = -1 } = {}) {
-        for (const pName of activeHosts.keys()) {
-            const mockDom = pluginDoms.get(pName);
-            if (!mockDom || !mockDom.body) continue;
-            const sec = mockDom.body.querySelector('.x-risu-am-generation-count');
-            if (!sec) continue;
-            const xExp = sec.getAttribute('x-am-expanded');
-            const dExp = sec.getAttribute('data-am-expanded');
-            if (xExp !== 'true' && dExp !== 'true') {
-                const toggleBtn = sec.querySelector('[data-am-runtime-generation-count-action="toggle"]');
-                if (toggleBtn) {
-                    await dispatchRootWidgetClick({
-                        pluginName: pName,
-                        charIndex,
-                        chatIndex,
-                        selector: '[data-am-runtime-generation-count-action="toggle"]',
-                        countNode: toggleBtn.getAttribute('data-am-count-node') || '',
-                    });
+    async function prepareFloatingPopupWidgets({ charIndex = -1, chatIndex = -1, autoExpand = true } = {}) {
+        if (autoExpand) {
+            for (const pName of activeHosts.keys()) {
+                const mockDom = pluginDoms.get(pName);
+                if (!mockDom) continue;
+                const rootNode = mockDom.documentElement || mockDom.body;
+                const sec = rootNode && typeof rootNode.querySelector === 'function'
+                    ? rootNode.querySelector('.x-risu-am-generation-count')
+                    : null;
+                if (!sec) continue;
+                const xExp = sec.getAttribute('x-am-expanded');
+                const dExp = sec.getAttribute('data-am-expanded');
+                if (xExp !== 'true' && dExp !== 'true') {
+                    const toggleBtn = sec.querySelector('[data-am-runtime-generation-count-action="toggle"]');
+                    if (toggleBtn) {
+                        try {
+                            await dispatchRootWidgetClick({
+                                pluginName: pName,
+                                charIndex,
+                                chatIndex,
+                                selector: '[data-am-runtime-generation-count-action="toggle"]',
+                                countNode: toggleBtn.getAttribute('data-am-count-node') || '',
+                            });
+                        } catch (err) {
+                            console.warn(`[Plugin:${pName}] floating-open prepare error:`, err && err.message ? err.message : String(err));
+                        }
+                    }
                 }
             }
         }
-        return getFloatingUiState();
+        return getFloatingUiState({ includeIdleWidgets: true });
     }
 
-    function getFloatingUiState() {
+    function getFloatingUiState({ includeIdleWidgets = false } = {}) {
         const buttons = [];
         const rootWidgets = [];
         for (const entry of getAllKnownEntries()) {
@@ -4524,10 +5612,20 @@ function createPluginAdapter({
             }
 
             const mockDom = pluginDoms.get(entry.name);
-            if (mockDom && mockDom.body) {
+            if (mockDom && (mockDom.body || mockDom.documentElement)) {
                 const styles = collectMockDomStyles(mockDom);
                 const blocks = [];
+                const topNodes = [];
+                const seenNodes = new Set();
                 for (const ch of (mockDom.body ? mockDom.body.children : [])) {
+                    if (ch && !seenNodes.has(ch)) { seenNodes.add(ch); topNodes.push(ch); }
+                }
+                for (const ch of (mockDom.documentElement ? mockDom.documentElement.children : [])) {
+                    if (!ch || ch === mockDom.head || ch === mockDom.body || seenNodes.has(ch)) continue;
+                    seenNodes.add(ch);
+                    topNodes.push(ch);
+                }
+                for (const ch of topNodes) {
                     if (!ch || ch === mockDom.chatScreen || ch.tagName === 'STYLE' || ch.tagName === 'SCRIPT') continue;
                     if (isNodeVisiblyHidden(ch)) continue;
                     if (typeof ch.hasAttribute === 'function' && ch.hasAttribute('data-plugin-chat-panel')) continue;
@@ -4542,7 +5640,7 @@ function createPluginAdapter({
                         continue;
                     }
                     const countReg = typeof ch.querySelector === 'function' ? ch.querySelector('[data-am-count-region]') : null;
-                    if (countReg && countReg.getAttribute('x-am-count-visible') === 'false') {
+                    if (!includeIdleWidgets && countReg && countReg.getAttribute('x-am-count-visible') === 'false') {
                         const toastReg = typeof ch.querySelector === 'function' ? ch.querySelector('[data-am-toast-region]') : null;
                         if (!toastReg || !(toastReg.innerHTML || '').trim()) continue;
                     }
@@ -4550,21 +5648,28 @@ function createPluginAdapter({
                     blocks.push(ch.outerHTML);
                 }
                 if (blocks.length) {
+                    recordPluginModalCatalog(entry.name, mockDom);
                     rootWidgets.push({
                         pluginName: entry.name,
                         displayName: entry.displayName || entry.name,
                         styles,
                         html: blocks.join('\n'),
+                        modals: getKnownModalsList(entry.name),
                     });
                 }
             }
         }
+        const modalsByPlugin = Object.create(null);
+        for (const pName of activeHosts.keys()) {
+            const list = getKnownModalsList(pName);
+            if (list.length) modalsByPlugin[pName] = list;
+        }
         const sig = crypto
             .createHash('sha1')
-            .update(JSON.stringify({ buttons, rootWidgets }))
+            .update(JSON.stringify({ buttons, rootWidgets, modalsByPlugin }))
             .digest('hex')
             .slice(0, 12);
-        return { rev: sig, buttons, rootWidgets };
+        return { rev: sig, buttons, rootWidgets, modalsByPlugin };
     }
 
     async function dispatchChatOutput({ charIndex, chatIndex, messageIndex }) {
@@ -4573,6 +5678,8 @@ function createPluginAdapter({
         const charSnap = await dbGetCharacterFromIndex(charIndex);
         const chatSnap = await dbGetChatFromIndex(charIndex, chatIndex);
         const work = Promise.all(list.map(async (h) => {
+            const startedAt = Date.now();
+            let errMsg = '';
             try {
                 await h.fn({
                     char: cloneJson(charSnap),
@@ -4582,7 +5689,21 @@ function createPluginAdapter({
                     messageIndex: Number(messageIndex),
                 });
             } catch (e) {
-                console.warn(`[Plugin:${h.pluginName}] chatOutput error:`, e.message);
+                errMsg = e && e.message ? e.message : String(e);
+                console.warn(`[Plugin:${h.pluginName}] chatOutput error:`, errMsg);
+            } finally {
+                const rec = ensureRuntimeLedger(h.pluginName);
+                const now = Date.now();
+                rec.outputRuns += 1;
+                rec.lastOutputAt = now;
+                rec.lastOutput = {
+                    at: now,
+                    durationMs: Math.max(0, now - startedAt),
+                    charIndex: Number(charIndex),
+                    chatIndex: Number(chatIndex),
+                    messageIndex: Number(messageIndex),
+                    error: errMsg,
+                };
             }
         }));
         await Promise.race([work, new Promise((r) => setTimeout(r, 1500))]);
@@ -4682,10 +5803,150 @@ function createPluginAdapter({
             return await postIpcMessage(entry, a[0], a[1], a[2]);
         }
         if (method === 'ipc.poll') {
-            return pollGuiIpc(pluginName, Number(a[0]) || 0);
+            return pollGuiIpc(pluginName, Number(a[0]) || 0, Boolean(a[1]));
         }
 
         throw new Error(`Unsupported GUI RPC method: ${method}`);
+    }
+
+    function isMutatingGuiRpcMethod(method) {
+        return /(?:^|\.)(?:set|remove|clear|save|create|reload|post|update|write)/i.test(String(method || ''));
+    }
+
+    async function handleGuiRpcBatch({ pluginName, calls = [] }) {
+        if (!Array.isArray(calls) || !calls.length) return [];
+        const slice = calls.slice(0, 64);
+        const hasMutation = slice.some((c) => isMutatingGuiRpcMethod(c && c.method));
+        const results = new Array(slice.length);
+
+        if (!hasMutation && isRpcConnected()) {
+            // Coalesce >= 2 uncached *.getItem calls per store kind into one *.getMany host RPC.
+            const uncachedByKind = { pluginStorage: new Set(), localPluginStorage: new Set(), safeLocalStorage: new Set() };
+            for (const c of slice) {
+                const m = String((c && c.method) || '');
+                const match = m.match(/^(pluginStorage|localPluginStorage|safeLocalStorage)\.getItem$/);
+                if (!match) continue;
+                const kind = match[1];
+                const k = String((Array.isArray(c.args) ? c.args[0] : '') ?? '');
+                if (kind === 'pluginStorage' && turnCache.active && turnCache.pluginStoreCache.has(k)) continue;
+                if (getFreshReadCache(`store:${kind}:${k}`) !== undefined) continue;
+                uncachedByKind[kind].add(k);
+            }
+            await Promise.all(Object.entries(uncachedByKind).map(async ([kind, keySet]) => {
+                if (keySet.size < 2) return;
+                const keysArr = [...keySet];
+                try {
+                    const map = await hostRpc.invoke(`${kind}.getMany`, [keysArr], 15000);
+                    if (map && typeof map === 'object') {
+                        for (const k of keysArr) {
+                            const val = map[k] === undefined ? null : map[k];
+                            putReadCache(`store:${kind}:${k}`, val);
+                            if (turnCache.active && kind === 'pluginStorage') {
+                                turnCache.pluginStoreCache.set(k, val === null ? null : cloneJson(val));
+                            }
+                        }
+                    }
+                } catch (_) {
+                    // Older PC plugin without *.getMany falls back cleanly to per-key getItem calls below.
+                }
+            }));
+        }
+
+        const runOne = async (idx) => {
+            const c = slice[idx] || {};
+            try {
+                const value = await handleGuiRpc({
+                    pluginName: c.pluginName || pluginName,
+                    method: c.method,
+                    args: Array.isArray(c.args) ? c.args : [],
+                });
+                results[idx] = { reqId: c.reqId || '', ok: true, value };
+            } catch (err) {
+                results[idx] = { reqId: c.reqId || '', ok: false, error: err && err.message ? err.message : String(err) };
+            }
+        };
+
+        if (hasMutation || slice.length <= 1) {
+            for (let i = 0; i < slice.length; i += 1) {
+                await runOne(i);
+            }
+        } else {
+            const workerCount = Math.min(8, slice.length);
+            let nextIdx = 0;
+            await Promise.all(Array.from({ length: workerCount }, async () => {
+                while (true) {
+                    const i = nextIdx++;
+                    if (i >= slice.length) break;
+                    await runOne(i);
+                }
+            }));
+        }
+        return results;
+    }
+
+    function formatRuntimeLedgerEntry(rec, targetChatUuid = '') {
+        if (!rec) return null;
+        return {
+            pluginName: rec.pluginName,
+            displayName: getPluginDisplayName(rec.pluginName),
+            beforeRequestRuns: rec.beforeRequestRuns,
+            afterRequestRuns: rec.afterRequestRuns,
+            outputRuns: rec.outputRuns,
+            lastBeforeRequestAt: rec.lastBeforeRequestAt,
+            lastAfterRequestAt: rec.lastAfterRequestAt,
+            lastOutputAt: rec.lastOutputAt,
+            lastAfterRequest: rec.lastAfterRequest ? cloneJson(rec.lastAfterRequest) : null,
+            lastOutput: rec.lastOutput ? cloneJson(rec.lastOutput) : null,
+            history: [...rec.history].reverse().map((item) => ({
+                ...cloneJson(item),
+                matchesCurrentChat: Boolean(targetChatUuid && item.chatUuid && item.chatUuid === targetChatUuid),
+            })),
+        };
+    }
+
+    function getPluginRuntimeRecall(pluginName = '', { chatUuid = '' } = {}) {
+        const target = String(pluginName || '').trim();
+        const targetChatUuid = String(chatUuid || '').trim();
+        if (target) {
+            const rec = pluginRuntimeLedger.get(target) || {
+                pluginName: target,
+                beforeRequestRuns: 0,
+                afterRequestRuns: 0,
+                outputRuns: 0,
+                lastBeforeRequestAt: 0,
+                lastAfterRequestAt: 0,
+                lastOutputAt: 0,
+                lastAfterRequest: null,
+                lastOutput: null,
+                history: [],
+            };
+            return formatRuntimeLedgerEntry(rec, targetChatUuid);
+        }
+        const names = new Set();
+        for (const entry of getAllKnownEntries()) {
+            if (entry && entry.name && isPluginEnabled(entry.name)) names.add(entry.name);
+        }
+        for (const k of pluginRuntimeLedger.keys()) names.add(k);
+        const list = [];
+        for (const name of names) {
+            const rec = pluginRuntimeLedger.get(name);
+            const latest = rec && rec.history.length ? rec.history[rec.history.length - 1] : null;
+            list.push({
+                pluginName: name,
+                displayName: getPluginDisplayName(name),
+                beforeRequestRuns: rec ? rec.beforeRequestRuns : 0,
+                afterRequestRuns: rec ? rec.afterRequestRuns : 0,
+                outputRuns: rec ? rec.outputRuns : 0,
+                lastBeforeRequestAt: rec ? rec.lastBeforeRequestAt : 0,
+                lastAfterRequestAt: rec ? rec.lastAfterRequestAt : 0,
+                lastOutputAt: rec ? rec.lastOutputAt : 0,
+                latestInjectedCount: latest ? latest.injectedCount : 0,
+                latestInjectedChars: latest ? latest.totalInjectedChars : 0,
+                latestChatUuid: latest ? latest.chatUuid : '',
+                matchesCurrentChat: Boolean(targetChatUuid && latest && latest.chatUuid && latest.chatUuid === targetChatUuid),
+            });
+        }
+        return list;
     }
 
     function getGuiSrcdoc(pluginName, entryId = '', theme = 'dark') {
@@ -4709,6 +5970,7 @@ function createPluginAdapter({
         providers.clear();
         pluginDoms.clear();
         chatPanels.clear();
+        pluginRuntimeLedger.clear();
         guiIpcOutbox.length = 0;
         for (const k of Object.keys(hookState)) hookState[k].length = 0;
     }
@@ -4750,15 +6012,19 @@ function createPluginAdapter({
         commitTurnReply,
         dispatchChatOutput,
         handleGuiRpc,
+        handleGuiRpcBatch,
+        invalidateReadCache,
+        getPluginRuntimeRecall,
         getGuiSrcdoc,
         dispose,
-        _debug: { hookState, providers, pluginDoms, fallbackPluginStore, fallbackSafeLocal, fallbackLocalPlugin, fallbackAssetStore, fallbackInlayStore, getAllKnownEntries },
+        _debug: { hookState, providers, pluginDoms, pluginRuntimeLedger, fallbackPluginStore, fallbackSafeLocal, fallbackLocalPlugin, fallbackAssetStore, fallbackInlayStore, getAllKnownEntries },
     };
 }
 
 module.exports = {
     URL_BLACKLIST,
     parsePluginHeader,
+    diffPluginPromptInjection,
     buildPluginGuiSrcdoc,
     createPluginAdapter,
 };

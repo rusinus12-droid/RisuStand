@@ -1244,3 +1244,490 @@ test('Plugin Adapter: self-update via setDatabase({ plugins }) + location.reload
         fs.rmSync(tmpDir, { recursive: true, force: true });
     }
 });
+
+test('GUI RPC batching coalesces pluginStorage.getItem into getMany, caches db.getChat briefly, and compiles srcdoc script', async () => {
+    const rpcCalls = [];
+    let chatVersion = 1;
+    const storeData = new Map([
+        ['hayaku:k1', { packet: 1 }],
+        ['hayaku:k2', { packet: 2 }],
+        ['hayaku:k3', { packet: 3 }],
+    ]);
+    const mockRpc = {
+        isConnected: () => true,
+        invoke: async (op, args) => {
+            rpcCalls.push({ op, args });
+            if (op === 'pluginStorage.getMany') {
+                const out = {};
+                for (const k of (args[0] || [])) out[k] = storeData.has(k) ? storeData.get(k) : null;
+                return out;
+            }
+            if (op === 'pluginStorage.getItem') {
+                return storeData.has(args[0]) ? storeData.get(args[0]) : null;
+            }
+            if (op === 'db.getChat') {
+                return { id: 'c-1', name: 'Room', version: chatVersion, message: [{ role: 'char', data: 'hello' }] };
+            }
+            if (op === 'db.setChat') {
+                chatVersion = (args[2] && args[2].version) || (chatVersion + 1);
+                return true;
+            }
+            return null;
+        },
+    };
+
+    const adapter = adapterMod.createPluginAdapter({
+        persistDisabled: true,
+        getBackendConfig: () => ({ backendPlugins: {} }),
+        saveBackendConfig: () => {},
+        hostRpc: mockRpc,
+    });
+    const server = relay.createRelayServer({
+        token: 'batch-test-tok',
+        configOverride: { persistDisabled: true, backendPlugins: {} },
+    });
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    const headers = {
+        'Content-Type': 'application/json',
+        'X-RisuStand-Token': 'batch-test-tok',
+    };
+
+    try {
+        const hayakuScript = '//@name hayaku_mock\n//@display-name HAYAKU Mock\n//@api 3.0\nrisuai.registerSetting("Open", () => {});\n';
+        await adapter.addCustomPlugin({
+            filename: 'hayaku_mock.js',
+            script: hayakuScript,
+            enabled: true,
+        });
+
+        // 1) Batch coalesces >= 2 uncached pluginStorage.getItem calls into a single pluginStorage.getMany
+        const batchResults = await adapter.handleGuiRpcBatch({
+            pluginName: 'hayaku_mock',
+            calls: [
+                { reqId: 'r1', method: 'pluginStorage.getItem', args: ['hayaku:k1'] },
+                { reqId: 'r2', method: 'pluginStorage.getItem', args: ['hayaku:k2'] },
+                { reqId: 'r3', method: 'pluginStorage.getItem', args: ['hayaku:k3'] },
+            ],
+        });
+        assert.deepEqual(batchResults.map((r) => [r.reqId, r.ok, r.value]), [
+            ['r1', true, { packet: 1 }],
+            ['r2', true, { packet: 2 }],
+            ['r3', true, { packet: 3 }],
+        ]);
+        assert.equal(rpcCalls.filter((c) => c.op === 'pluginStorage.getMany').length, 1);
+        assert.equal(rpcCalls.filter((c) => c.op === 'pluginStorage.getItem').length, 0);
+
+        // 2) Short-TTL cache deduplicates back-to-back db.getChat reads, and db.setChat invalidates it
+        rpcCalls.length = 0;
+        const chatBatch = await adapter.handleGuiRpcBatch({
+            pluginName: 'hayaku_mock',
+            calls: [
+                { reqId: 'c1', method: 'db.getChat', args: [0, 0] },
+                { reqId: 'c2', method: 'db.getChat', args: [0, 0] },
+            ],
+        });
+        assert.equal(chatBatch[0].value.version, 1);
+        assert.equal(chatBatch[1].value.version, 1);
+        assert.equal(rpcCalls.filter((c) => c.op === 'db.getChat').length, 1);
+
+        await adapter.handleGuiRpc({
+            pluginName: 'hayaku_mock',
+            method: 'db.setChat',
+            args: [0, 0, { id: 'c-1', name: 'Room', version: 2, message: [{ role: 'char', data: 'updated' }] }],
+        });
+        const afterSetVal = await adapter.handleGuiRpc({ pluginName: 'hayaku_mock', method: 'db.getChat', args: [0, 0] });
+        assert.equal(afterSetVal.version, 2);
+
+        // 3) Upload plugin onto relay server and verify /api/plugins/gui-rpc-batch + /api/plugins/gui-srcdoc
+        const upRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/plugins/upload',
+            headers,
+            body: JSON.stringify({ filename: 'hayaku_mock.js', script: hayakuScript, enabled: true }),
+        });
+        assert.equal(upRes.status, 200);
+
+        const httpBatchRes = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/plugins/gui-rpc-batch',
+            headers,
+            body: JSON.stringify({
+                pluginName: 'hayaku_mock',
+                calls: [
+                    { reqId: 'w1', method: 'pluginStorage.setItem', args: ['hayaku:w1', { ok: true }] },
+                    { reqId: 'g1', method: 'pluginStorage.getItem', args: ['hayaku:w1'] },
+                ],
+            }),
+        });
+        assert.equal(httpBatchRes.status, 200);
+        const httpBatchBody = JSON.parse(httpBatchRes.body);
+        assert.equal(httpBatchBody.ok, true);
+        assert.deepEqual(httpBatchBody.results.map((r) => [r.reqId, r.ok, r.value]), [
+            ['w1', true, true],
+            ['g1', true, { ok: true }],
+        ]);
+
+        const srcdocRes = await requestHttp(port, {
+            path: '/api/plugins/gui-srcdoc?name=hayaku_mock&theme=dark',
+            headers: { 'X-RisuStand-Token': 'batch-test-tok' },
+        });
+        assert.equal(srcdocRes.status, 200);
+        const srcdocHtml = JSON.parse(srcdocRes.body).srcdoc;
+        assert.ok(srcdocHtml.includes('__rsGuiRpcBatch'));
+        assert.ok(srcdocHtml.includes('__rsGuiChatChanged'));
+        assert.ok(srcdocHtml.includes('setInterval(window.__rsPollIpcNow, 120)'));
+        const scriptMatches = [...srcdocHtml.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+        assert.ok(scriptMatches.length >= 1);
+        for (const m of scriptMatches) {
+            new vm.Script(m[1]);
+        }
+    } finally {
+        await new Promise((resolve) => server.close(resolve));
+        await adapter.dispose();
+    }
+});
+
+test('sandbox DOM globals support Element/HTMLElement/HTMLButtonElement instanceof, DOMParser, sync document listener, and error isolation across plugins', async () => {
+    const store = makeMapStore();
+    const adapter = adapterMod.createPluginAdapter({
+        persistDisabled: true,
+        getBackendConfig: () => ({ backendPlugins: {} }),
+        saveBackendConfig: () => {},
+        getFallbackSnapshot: () => ({
+            charIndex: 0,
+            chatIndex: 0,
+            chatId: 'chat-dom-1',
+            messages: [
+                { index: 0, role: 'char', chatId: 'msg-dom-0', data: 'hello <button data-act="go">Go</button>', html: '<button data-act="go">Go</button>' },
+            ],
+        }),
+        hostRpc: {
+            isConnected: () => true,
+            invoke: async (op, args) => {
+                if (op === 'pluginStorage.setItem') { store.map.set(args[0], args[1]); return true; }
+                if (op === 'pluginStorage.getItem') return store.map.has(args[0]) ? store.map.get(args[0]) : null;
+                return null;
+            },
+        },
+    });
+
+    try {
+        await adapter.addCustomPlugin({
+            filename: 'sync_dom_plugin.js',
+            enabled: true,
+            script: `
+//@name sync_dom_plugin
+//@display-name Sync DOM Plugin
+//@api 3.0
+(() => {
+  const parsed = new DOMParser().parseFromString('<div class="wrap"><span id="hi">ok</span></div>', 'text/html');
+  const ce = new CustomEvent('ping', { detail: { ok: true } });
+  document.addEventListener('click', (e) => {
+    const t = e.target;
+    const btn = t && typeof t.closest === 'function' ? t.closest('button') : null;
+    const checks = {
+      isEl: t instanceof Element,
+      isHtmlEl: t instanceof HTMLElement,
+      isNode: t instanceof Node,
+      isBtn: t instanceof HTMLButtonElement,
+      isNotImg: !(t instanceof HTMLImageElement),
+      isEv: e instanceof Event,
+      isMouse: e instanceof MouseEvent,
+      hasBtn: Boolean(btn && btn.getAttribute('data-act') === 'go'),
+      parsedOk: Boolean(parsed.getElementById('hi') && parsed.getElementById('hi').textContent === 'ok'),
+      ceOk: (ce instanceof CustomEvent) && (ce instanceof Event) && ce.detail && ce.detail.ok === true,
+    };
+    void risuai.pluginStorage.setItem('sync_dom_checks', checks);
+  });
+})();
+`,
+        });
+
+        await adapter.addCustomPlugin({
+            filename: 'async_dom_plugin.js',
+            enabled: true,
+            script: `
+//@name async_dom_plugin
+//@display-name Async DOM Plugin
+//@api 3.0
+(async () => {
+  const doc = await risuai.getRootDocument();
+  await doc.addEventListener('click', async (ev) => {
+    const t = ev.target;
+    const btn = t && typeof t.closest === 'function' ? await t.closest('button') : null;
+    await risuai.pluginStorage.setItem('async_dom_checks', {
+      isEl: t instanceof Element,
+      isHtmlEl: t instanceof HTMLElement,
+      isNode: t instanceof Node,
+      isBtn: t instanceof HTMLButtonElement,
+      hasBtn: Boolean(btn && (await btn.getAttribute('data-act')) === 'go'),
+    });
+  });
+})();
+`,
+        });
+
+        await adapter.addCustomPlugin({
+            filename: 'throwing_plugin.js',
+            enabled: true,
+            script: `
+//@name throwing_plugin
+//@display-name Throwing Plugin
+//@api 3.0
+(() => {
+  document.addEventListener('click', () => {
+    throw new Error('simulated listener boom');
+  });
+})();
+`,
+        });
+
+        const res = await adapter.dispatchSurfaceAction({
+            charIndex: 0,
+            chatIndex: 0,
+            msgIndex: 0,
+            chatId: 'msg-dom-0',
+            actionHtml: '<button data-act="go">Go</button>',
+            dataset: { act: 'go' },
+        });
+        assert.equal(res.ok, true);
+        assert.equal(res.dispatchedCount, 3);
+
+        await waitUntil(() => store.map.has('sync_dom_checks') && store.map.has('async_dom_checks'));
+        assert.deepEqual(store.map.get('sync_dom_checks'), {
+            isEl: true,
+            isHtmlEl: true,
+            isNode: true,
+            isBtn: true,
+            isNotImg: true,
+            isEv: true,
+            isMouse: true,
+            hasBtn: true,
+            parsedOk: true,
+            ceOk: true,
+        });
+        assert.deepEqual(store.map.get('async_dom_checks'), {
+            isEl: true,
+            isHtmlEl: true,
+            isNode: true,
+            isBtn: true,
+            hasBtn: true,
+        });
+    } finally {
+        await adapter.dispose();
+    }
+});
+
+test('prepareFloatingPopupWidgets includes idle x-am-count-visible=false widgets and survives toggle errors', async () => {
+    const adapter = adapterMod.createPluginAdapter({
+        persistDisabled: true,
+        getBackendConfig: () => ({ backendPlugins: {} }),
+        saveBackendConfig: () => {},
+        getFallbackSnapshot: () => ({ charIndex: 0, chatIndex: 0, messages: [] }),
+    });
+
+    try {
+        await adapter.addCustomPlugin({
+            filename: 'idle_am_plugin.js',
+            enabled: true,
+            script: `
+//@name idle_am_plugin
+//@display-name Asset Maid Idle
+//@api 3.0
+(async () => {
+  const doc = await risuai.getRootDocument();
+  const host = await doc.createElement('div');
+  await host.setAttribute('x-am-root-host', 'am-idle');
+  await host.setInnerHTML(
+    '<div data-am-count-region x-am-count-visible="false">' +
+      '<div class="x-risu-am-generation-count" data-am-expanded="false">' +
+        '<button type="button" data-am-runtime-generation-count-action="toggle" data-am-count-node="root-1">0</button>' +
+      '</div>' +
+    '</div>'
+  );
+  await doc.body.appendChild(host);
+  await doc.addEventListener('click', () => {
+    throw new Error('simulated toggle error');
+  });
+})();
+`,
+        });
+
+        // Default poll state omits idle x-am-count-visible="false" widgets
+        const idleState = adapter.getFloatingUiState();
+        assert.equal(idleState.rootWidgets.length, 0);
+
+        // prepareFloatingPopupWidgets returns the idle widget anyway and survives click errors
+        const openState = await adapter.prepareFloatingPopupWidgets({ charIndex: 0, chatIndex: 0 });
+        assert.equal(openState.rootWidgets.length, 1);
+        assert.equal(openState.rootWidgets[0].pluginName, 'idle_am_plugin');
+        assert.ok(openState.rootWidgets[0].html.includes('x-risu-am-generation-count'));
+    } finally {
+        await adapter.dispose();
+    }
+});
+
+test('syncAndProjectChatSurface adds x-risu- class prefixes and collects projected surface styles', async () => {
+    const adapter = adapterMod.createPluginAdapter({
+        persistDisabled: true,
+        getBackendConfig: () => ({ backendPlugins: {} }),
+        saveBackendConfig: () => {},
+        getFallbackSnapshot: () => ({ charIndex: 0, chatIndex: 0, messages: [] }),
+    });
+
+    try {
+        await adapter.addCustomPlugin({
+            filename: 'surface_prefix_style_plugin.js',
+            enabled: true,
+            script: `
+//@name surface_prefix_style_plugin
+//@display-name Surface Prefix & Style
+//@api 3.0
+(async () => {
+  const doc = await risuai.getRootDocument();
+  const st = await doc.createElement('style');
+  await st.setInnerHTML('.x-risu-am-image { position: relative; } .am-hover-ctrl { display: flex; }');
+  await doc.head.appendChild(st);
+
+  const root = await doc.getRoot ? await doc.getRoot() : doc.body;
+  const obs = await risuai.createMutationObserver(async () => {
+    const imgs = await doc.querySelectorAll('.x-risu-am-image');
+    for (const imgEl of imgs) {
+      const hasCtrl = await imgEl.querySelector('.am-hover-ctrl');
+      if (!hasCtrl) {
+        const ctrl = await doc.createElement('button');
+        await ctrl.setAttribute('class', 'am-hover-ctrl');
+        await ctrl.setAttribute('data-am-image-action', 'prev');
+        await ctrl.setInnerHTML('<');
+        await imgEl.appendChild(ctrl);
+      }
+    }
+  });
+  await obs.observe(doc.body, { childList: true, subtree: true });
+})();
+`,
+        });
+
+        const snap = {
+            charIndex: 0,
+            chatIndex: 0,
+            charName: 'Char',
+            chatName: 'Chat',
+            assetMap: {},
+            messages: [
+                {
+                    index: 0,
+                    role: 'char',
+                    chatId: 'm-0',
+                    text: 'img',
+                    html: '<div class="am-image"><img class="am-image__media" src="a.png"></div>',
+                },
+            ],
+        };
+        const proj = await adapter.syncAndProjectChatSurface(snap);
+        assert.ok(Array.isArray(proj.styles) && proj.styles.some((s) => s.includes('.x-risu-am-image')));
+        assert.ok(proj.bodyHtmlByChatId['m-0'], 'prefixed .x-risu-am-image target must receive injected controls');
+        assert.ok(proj.bodyHtmlByChatId['m-0'].includes('class="am-image"'));
+        assert.ok(proj.bodyHtmlByChatId['m-0'].includes('data-am-image-action="prev"'));
+    } finally {
+        await adapter.dispose();
+    }
+});
+
+test('inline floating toolbar toggle does not trigger activeOverlay while explicit modal does and registers modal catalog', async () => {
+    const adapter = adapterMod.createPluginAdapter({
+        persistDisabled: true,
+        getBackendConfig: () => ({ backendPlugins: {} }),
+        saveBackendConfig: () => {},
+        getFallbackSnapshot: () => ({ charIndex: 0, chatIndex: 0, messages: [] }),
+    });
+
+    try {
+        await adapter.addCustomPlugin({
+            filename: 'am_overlay_policy_test.js',
+            enabled: true,
+            script: `
+//@name am_overlay_policy_test
+//@display-name Asset Maid Overlay Policy Test
+//@api 3.0
+(async () => {
+  const doc = await risuai.getRootDocument();
+  const host = await doc.createElement('div');
+  await host.setAttribute('x-am-root-host', 'am-host');
+  await host.setInnerHTML(
+    '<div data-am-count-region x-am-count-visible="true">' +
+      '<div class="x-risu-am-generation-count" data-am-expanded="false">' +
+        '<div class="x-risu-am-generation-count__panel-anchor">' +
+          '<div class="x-risu-am-generation-count__panel">' +
+            '<button type="button" data-am-action="open-gallery">삽화</button>' +
+          '</div>' +
+        '</div>' +
+        '<button type="button" data-am-runtime-generation-count-action="toggle" data-am-count-node="cnt-1">1-3</button>' +
+      '</div>' +
+    '</div>'
+  );
+  await doc.body.appendChild(host);
+
+  await doc.addEventListener('click', async (ev) => {
+    const t = ev && ev.target;
+    if (!t || typeof t.getAttribute !== 'function') return;
+    const toggleAct = await t.getAttribute('data-am-runtime-generation-count-action');
+    if (toggleAct === 'toggle') {
+      const cnt = await doc.querySelector('.x-risu-am-generation-count');
+      if (cnt) {
+        const cur = await cnt.getAttribute('data-am-expanded');
+        await cnt.setAttribute('data-am-expanded', cur === 'true' ? 'false' : 'true');
+      }
+      return;
+    }
+    const amAct = await t.getAttribute('data-am-action');
+    if (amAct === 'open-gallery') {
+      let vp = await doc.querySelector('[data-am-floating-viewport]');
+      if (!vp) {
+        vp = await doc.createElement('div');
+        await vp.setAttribute('data-am-floating-viewport', 'true');
+        await doc.body.appendChild(vp);
+      }
+      await vp.setInnerHTML('<div class="am-inspector-modal" role="dialog"><h3>전체 삽화 관리</h3><button type="button">닫기</button></div>');
+    }
+  });
+})();
+`,
+        });
+
+        // 1) Toggling 1-3 expands inline bar ONLY -> activeOverlay must remain null
+        const toggleRes = await adapter.dispatchRootWidgetClick({
+            pluginName: 'am_overlay_policy_test',
+            charIndex: 0,
+            chatIndex: 0,
+            selector: '[data-am-runtime-generation-count-action="toggle"]',
+            countNode: 'cnt-1',
+        });
+        assert.equal(toggleRes.ok, true);
+        assert.equal(toggleRes.activeOverlay, null, 'expanding inline toolbar must NOT produce fullscreen activeOverlay');
+
+        // 2) Opening explicit modal DOES produce activeOverlay with metadata + registers modals in floatingUiState
+        const openRes = await adapter.dispatchRootWidgetClick({
+            pluginName: 'am_overlay_policy_test',
+            charIndex: 0,
+            chatIndex: 0,
+            dataset: { 'data-am-action': 'open-gallery' },
+        });
+        assert.equal(openRes.ok, true);
+        assert.equal(openRes.overlayChanged, true);
+        assert.ok(openRes.activeOverlay && openRes.activeOverlay.html.includes('am-inspector-modal'));
+        assert.equal(openRes.activeOverlay.modalKey, 'am-inspector-modal');
+        assert.equal(openRes.activeOverlay.modalLabel, '전체 삽화 관리');
+        assert.equal(openRes.activeOverlay.autoPopup, true);
+
+        const uiState = adapter.getFloatingUiState({ includeIdleWidgets: true });
+        assert.ok(uiState.rootWidgets.length >= 1);
+        const modals = uiState.rootWidgets[0].modals || [];
+        assert.ok(modals.some((m) => m.key === 'floating-bar' && m.autoPopup === false));
+        assert.ok(modals.some((m) => m.key === 'am-inspector-modal' && m.autoPopup === true));
+    } finally {
+        await adapter.dispose();
+    }
+});

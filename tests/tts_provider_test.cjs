@@ -3,23 +3,35 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const {
     TTS_ENDPOINT_PRESETS,
     TTS_VOICE_GROUPS,
     TTS_BUILTIN_VOICE_REFERENCES,
     TTS_TONE_TAG_PRESETS,
+    TTS_SPEECH_MODEL_SPECS,
     normalizeVoiceGroup,
     normalizeVoiceProfiles,
     inferTtsVoiceGroup,
     normalizeTtsEndpointUrl,
+    resolveTtsSpeechModelSpec,
+    sanitizeModelToneTag,
+    buildTtsBotKey,
     buildTtsChatKey,
+    buildTtsScriptKey,
+    createTtsScriptStore,
     getEffectiveTtsCharacters,
+    mergeCharacterSpeechProfiles,
     defaultTtsConfig,
     normalizeTtsConfig,
     sanitizeTtsForClient,
     cleanTextForTts,
     parseSegmentsRuleBased,
+    buildScriptDirectorMessages,
+    parseScriptDirectorResult,
     parseScriptDirectorResponse,
     analyzeTtsSegments,
     resolveSegmentVoice,
@@ -133,6 +145,7 @@ test('parseSegmentsRuleBased splits long text chunks along sentence boundaries',
 
 test('analyzeTtsSegments handles llm, hybrid fallback, and voice resolution', async () => {
     const cfg = normalizeTtsConfig({
+        characterVoicesEnabled: true,
         parseMode: 'hybrid',
         narration: { voiceId: 'v-nar', toneTag: 'calm', speed: 0.95 },
         defaultVoices: {
@@ -303,6 +316,7 @@ test('relay server TTS routes, config persistence, and web UI integration', asyn
                 apiKey: 'secret-fish-key-9999',
                 parseMode: 'hybrid',
                 llmSource: 'active',
+                characterVoicesEnabled: true,
                 characters: [{ name: '이리스', gender: 'female', voiceId: 'ref-iris' }],
             },
         },
@@ -340,7 +354,12 @@ test('relay server TTS routes, config persistence, and web UI integration', asyn
         assert.ok(html.includes('id="ttsTestAudio"'));
         assert.ok(!html.includes('id="ttsCastQuickBtn"'), 'per-chat quick button must be removed from topbar');
         assert.ok(!html.includes('id="ttsCastModal"'), 'per-chat modal must be removed');
-        assert.ok(html.includes('id="ttsGlobalCastBox"'));
+        assert.ok(html.includes('id="ttsGlobalCastBox"') && !html.includes('id="ttsGlobalCastBox" hidden'), 'per-bot cast box must be visible on screen');
+        assert.ok(html.includes('id="ttsCastBotSel"'));
+        assert.ok(html.includes('id="ttsCharVoicesEnabledChk"'));
+        assert.ok(html.includes('id="ttsAutoLearnProfilesChk"'));
+        assert.ok(html.includes('id="ttsModelTagSpecBadge"'));
+        assert.ok(html.includes('id="ttscAnalyzeBotBtn"'));
         assert.ok(html.includes('id="ttsGlobalCastList"'));
         assert.ok(html.includes('id="ttsGlobalCastEditor"'));
         assert.ok(html.includes('ttscVoiceGroupSel'));
@@ -492,6 +511,22 @@ test('relay server TTS routes, config persistence, and web UI integration', asyn
         });
         assert.equal(synthRoomB.status, 200);
         assert.equal(synthRoomB.headers.get('x-tts-voice'), 'ref-iris-global-v3');
+        assert.equal(normalizeTtsConfig({ characterVoicesEnabled: false }).characterVoicesEnabled, false);
+        assert.equal(defaultTtsConfig().characterVoicesEnabled, true);
+        assert.equal(defaultTtsConfig().autoLearnBotProfiles, true);
+        const disabledCharsCfg = normalizeTtsConfig({
+            characterVoicesEnabled: false,
+            defaultVoices: { female: { voiceId: 'def-female-voice' } },
+            characters: [{ name: '이리스', gender: 'female', voiceId: 'ref-iris' }],
+        });
+        assert.equal(disabledCharsCfg.characterVoicesEnabled, false);
+        assert.deepEqual(getEffectiveTtsCharacters(disabledCharsCfg), []);
+        const resolvedDefaultVoice = resolveSegmentVoice(
+            { kind: 'dialogue', speaker: '이리스', gender: 'female', text: '테스트' },
+            disabledCharsCfg
+        );
+        assert.equal(resolvedDefaultVoice.voiceId, 'def-female-voice');
+        assert.equal(resolvedDefaultVoice.matchedCharacter, '');
     } finally {
         await closeServer(relay);
         await closeServer(mockTts);
@@ -561,6 +596,7 @@ test('character voice cast applies globally across all chats and migrates legacy
     assert.equal(key1, 'bot-uuid-1:r2');
 
     const cfg = normalizeTtsConfig({
+        characterVoicesEnabled: true,
         parseMode: 'rule',
         characters: [
             { name: '아리아', gender: 'female', voiceId: 'v-aria-global' },
@@ -599,29 +635,38 @@ test('character voice cast applies globally across all chats and migrates legacy
 });
 
 test('voice profile catalogs, 2-tier group inference, tone tag presets, and /api/tts/voice-profiles routes', async () => {
-    assert.deepEqual(TTS_VOICE_GROUPS.map((g) => g.id), ['fish', 'openai_qwen']);
-    assert.ok(TTS_BUILTIN_VOICE_REFERENCES.openai_qwen.some((v) => v.id === 'nova'));
-    assert.ok(TTS_BUILTIN_VOICE_REFERENCES.openai_qwen.some((v) => v.id === 'Sohee'));
+    assert.deepEqual(TTS_VOICE_GROUPS.map((g) => g.id), ['fish', 'openai', 'qwen']);
+    assert.ok(TTS_BUILTIN_VOICE_REFERENCES.openai.some((v) => v.id === 'nova'));
+    assert.ok(!TTS_BUILTIN_VOICE_REFERENCES.openai.some((v) => v.id === 'Sohee'));
+    assert.ok(TTS_BUILTIN_VOICE_REFERENCES.qwen.some((v) => v.id === 'Sohee'));
+    assert.ok(!TTS_BUILTIN_VOICE_REFERENCES.qwen.some((v) => v.id === 'nova'));
     assert.ok(TTS_TONE_TAG_PRESETS.some((t) => t.value === 'whispering' && t.category === 'delivery'));
     assert.ok(TTS_TONE_TAG_PRESETS.some((t) => t.value === 'calm' && t.category === 'emotion'));
 
     assert.equal(normalizeVoiceGroup('fish_local'), 'fish');
-    assert.equal(normalizeVoiceGroup('openai_compat_local'), 'openai_qwen');
+    assert.equal(normalizeVoiceGroup('openai_compat_cloud'), 'openai');
+    assert.equal(normalizeVoiceGroup('openai_compat_local'), 'qwen');
 
     const profiles = normalizeVoiceProfiles({
         fish: [
             { id: 'ref-sieun-1', label: '시은', gender: '여성' },
             { id: 'ref-sieun-1', label: '중복제거', gender: 'female' },
         ],
-        openai_qwen: ['Sohee', { id: 'custom-qwen-1', label: '카일', gender: 'male' }],
+        openai_qwen: ['Sohee', 'coral', { id: 'custom-qwen-1', label: '카일', gender: 'male' }],
     });
     assert.equal(profiles.fish.length, 1);
     assert.equal(profiles.fish[0].gender, 'female');
-    assert.equal(profiles.openai_qwen.length, 2);
+    assert.equal(profiles.openai.length, 1);
+    assert.equal(profiles.openai[0].id, 'coral');
+    assert.equal(profiles.qwen.length, 2);
+    assert.deepEqual(profiles.qwen.map((v) => v.id), ['Sohee', 'custom-qwen-1']);
 
     assert.equal(inferTtsVoiceGroup('ref-sieun-1', 'openai_compat_cloud', profiles), 'fish');
-    assert.equal(inferTtsVoiceGroup('Sohee', 'fish_local', profiles), 'openai_qwen');
+    assert.equal(inferTtsVoiceGroup('Sohee', 'fish_local', profiles), 'qwen');
+    assert.equal(inferTtsVoiceGroup('verse', 'fish_local', profiles), 'openai');
     assert.equal(inferTtsVoiceGroup('unknown-id', 'fish_local', profiles), 'fish');
+    assert.equal(inferTtsVoiceGroup('unknown-id', 'openai_compat_cloud', profiles), 'openai');
+    assert.equal(inferTtsVoiceGroup('unknown-id', 'openai_compat_local', profiles), 'qwen');
 
     const cfgWithGroup = normalizeTtsConfig({
         voiceProfiles: profiles,
@@ -629,6 +674,8 @@ test('voice profile catalogs, 2-tier group inference, tone tag presets, and /api
     });
     assert.equal(cfgWithGroup.characters[0].voiceGroup, 'fish');
     assert.equal(cfgWithGroup.voiceProfiles.fish[0].id, 'ref-sieun-1');
+    assert.equal(cfgWithGroup.voiceProfiles.openai[0].id, 'coral');
+    assert.equal(cfgWithGroup.voiceProfiles.qwen.length, 2);
 
     // HTTP route tests for /api/tts/voice-profiles and /api/tts/models with group separation
     const mockTtsSrv = http.createServer((req, res) => {
@@ -682,16 +729,23 @@ test('voice profile catalogs, 2-tier group inference, tone tag presets, and /api
         assert.equal(upFish.tts.voiceProfiles.fish.length, 1);
         assert.equal(upFish.tts.voiceProfiles.fish[0].label, '시은 Fish');
 
-        const upOa = await fetch(`${relayUrl}/api/tts/voice-profiles`, {
+        const upQwen = await fetch(`${relayUrl}/api/tts/voice-profiles`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
-            body: JSON.stringify({ action: 'upsert', group: 'openai_qwen', item: { id: 'Sohee', label: '소희 Qwen', gender: 'female' } }),
+            body: JSON.stringify({ action: 'upsert', group: 'qwen', item: { id: 'Sohee', label: '소희 Qwen', gender: 'female' } }),
         }).then((r) => r.json());
-        assert.equal(upOa.tts.voiceProfiles.fish.length, 1);
-        assert.equal(upOa.tts.voiceProfiles.openai_qwen.length, 1);
+        assert.equal(upQwen.tts.voiceProfiles.fish.length, 1);
+        assert.equal(upQwen.tts.voiceProfiles.qwen.length, 1);
+
+        const upOpenAi = await fetch(`${relayUrl}/api/tts/voice-profiles`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+            body: JSON.stringify({ action: 'upsert', group: 'openai', item: { id: 'verse', label: 'Verse OpenAI', gender: 'male' } }),
+        }).then((r) => r.json());
+        assert.equal(upOpenAi.tts.voiceProfiles.openai.length, 1);
 
         // Saving global TTS config without voiceProfiles preserves existing voiceProfiles
-        const partialTts = { ...upOa.tts };
+        const partialTts = { ...upOpenAi.tts };
         delete partialTts.voiceProfiles;
         const afterRouterSave = await fetch(`${relayUrl}/api/router/config`, {
             method: 'POST',
@@ -699,9 +753,15 @@ test('voice profile catalogs, 2-tier group inference, tone tag presets, and /api
             body: JSON.stringify({ tts: partialTts }),
         }).then((r) => r.json());
         assert.equal(afterRouterSave.tts.voiceProfiles.fish[0].id, 'fish-ref-a');
-        assert.equal(afterRouterSave.tts.voiceProfiles.openai_qwen[0].id, 'Sohee');
+        assert.equal(afterRouterSave.tts.voiceProfiles.openai[0].id, 'verse');
+        assert.equal(afterRouterSave.tts.voiceProfiles.qwen[0].id, 'Sohee');
 
-        // Query /api/tts/models with group='fish' vs group='openai_qwen'
+        // Verify UI serves separated OpenAI and Qwen3-TTS tabs
+        const uiHtml = await fetch(`${relayUrl}/`).then((r) => r.text());
+        assert.ok(uiHtml.includes('data-vp-tab="openai"'));
+        assert.ok(uiHtml.includes('data-vp-tab="qwen"'));
+
+        // Query /api/tts/models with group='fish' vs group='qwen' vs group='openai'
         const fishModelsRes = await fetch(`${relayUrl}/api/tts/models`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
@@ -711,13 +771,21 @@ test('voice profile catalogs, 2-tier group inference, tone tag presets, and /api
         assert.deepEqual(fishModelsRes.voices, ['fish-ref-a', 'fish-ref-b']);
         assert.equal(fishModelsRes.voiceProfiles.fish[0].id, 'fish-ref-a');
 
-        const oaModelsRes = await fetch(`${relayUrl}/api/tts/models`, {
+        const qwenModelsRes = await fetch(`${relayUrl}/api/tts/models`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
-            body: JSON.stringify({ group: 'openai_qwen', apiUrl: mockUrl }),
+            body: JSON.stringify({ group: 'qwen', apiUrl: mockUrl }),
         }).then((r) => r.json());
-        assert.equal(oaModelsRes.voiceGroup, 'openai_qwen');
-        assert.deepEqual(oaModelsRes.voices, ['Sohee', 'Ryan']);
+        assert.equal(qwenModelsRes.voiceGroup, 'qwen');
+        assert.deepEqual(qwenModelsRes.voices, ['Sohee', 'Ryan']);
+
+        const openaiModelsRes = await fetch(`${relayUrl}/api/tts/models`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+            body: JSON.stringify({ group: 'openai', apiUrl: mockUrl }),
+        }).then((r) => r.json());
+        assert.equal(openaiModelsRes.voiceGroup, 'openai');
+        assert.ok(openaiModelsRes.voices.includes('alloy'));
 
         // Delete profile from fish group
         const delFish = await fetch(`${relayUrl}/api/tts/voice-profiles`, {
@@ -726,9 +794,474 @@ test('voice profile catalogs, 2-tier group inference, tone tag presets, and /api
             body: JSON.stringify({ action: 'delete', group: 'fish', id: 'fish-ref-a' }),
         }).then((r) => r.json());
         assert.equal(delFish.tts.voiceProfiles.fish.length, 0);
-        assert.equal(delFish.tts.voiceProfiles.openai_qwen.length, 1);
+        assert.equal(delFish.tts.voiceProfiles.openai.length, 1);
+        assert.equal(delFish.tts.voiceProfiles.qwen.length, 1);
     } finally {
         await closeServer(relay);
         await closeServer(mockTtsSrv);
+    }
+});
+
+test('model-aware speech tag injection, synthesis instruction/tag mapping, and per-bot character speech profile learning', async () => {
+    // 1) Model spec resolution & prompt injection per speech model
+    const specFishS2 = resolveTtsSpeechModelSpec({ provider: 'fish_local', model: 's2-pro', fishTagStyle: 'brackets' });
+    assert.equal(specFishS2.id, 'fish_s2');
+    assert.equal(specFishS2.deliveryMode, 'inline_tag');
+
+    const specFishS1 = resolveTtsSpeechModelSpec({ provider: 'fish_local', model: 's1', fishTagStyle: 'parens' });
+    assert.equal(specFishS1.id, 'fish_s1');
+    assert.equal(sanitizeModelToneTag('[happy]', specFishS1), 'joyful');
+
+    const specOpenAi = resolveTtsSpeechModelSpec({ provider: 'openai_compat_cloud', model: 'gpt-4o-mini-tts' });
+    assert.equal(specOpenAi.id, 'openai_tts');
+    assert.equal(specOpenAi.deliveryMode, 'instruction');
+
+    const specQwen = resolveTtsSpeechModelSpec({ provider: 'openai_compat_local', model: 'qwen3-tts' });
+    assert.equal(specQwen.id, 'qwen3_tts');
+    assert.equal(specQwen.deliveryMode, 'instruction');
+
+    const msgsOpenAi = buildScriptDirectorMessages('"안녕?"', { ttsConfig: { provider: 'openai_compat_cloud', model: 'gpt-4o-mini-tts' } });
+    assert.ok(msgsOpenAi[0].content.includes('OpenAI TTS (gpt-4o-mini-tts)'));
+    assert.ok(msgsOpenAi[0].content.includes('instructions'));
+    assert.ok(msgsOpenAi[0].content.includes('characterProfiles'));
+
+    const msgsQwen = buildScriptDirectorMessages('"반가워."', { ttsConfig: { provider: 'openai_compat_local', model: 'qwen3-tts' } });
+    assert.ok(msgsQwen[0].content.includes('Qwen3-TTS'));
+
+    // Stripping accidental inline [tags] from text when target model uses `instruction` mode
+    const parsedOpenAiResult = parseScriptDirectorResult(JSON.stringify({
+        characterProfiles: [{
+            name: '하연',
+            gender: 'female',
+            personality: '장난기 많고 밝은 성격',
+            speechStyle: '생기 있고 경쾌한 말투',
+            dialogueTag: 'playful',
+            dialogueInstruction: '밝고 장난스러운 한국어 여성 어조',
+        }],
+        segments: [{
+            kind: 'dialogue',
+            speaker: '하연',
+            gender: 'female',
+            tone: 'playful',
+            instruction: '미소 띤 목소리로 가볍게',
+            text: '[playful] 먼저 갈 거면 나도 따라갈래.',
+        }],
+    }), '하연', 260, specOpenAi);
+    assert.equal(parsedOpenAiResult.segments[0].text, '먼저 갈 거면 나도 따라갈래.');
+    assert.equal(parsedOpenAiResult.characterProfiles.length, 1);
+    assert.equal(parsedOpenAiResult.characterProfiles[0].speechTagsByModel.openai_tts.dialogueInstruction, '밝고 장난스러운 한국어 여성 어조');
+
+    // Verify resolveSegmentVoice produces combined model-specific instruction & Qwen3 HTTP body carries `instructions`
+    const upstreamCalls = [];
+    const mockTtsSrv = http.createServer(async (req, res) => {
+        if (req.url === '/v1/audio/speech' && req.method === 'POST') {
+            const chunks = [];
+            for await (const c of req) chunks.push(c);
+            upstreamCalls.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+            res.writeHead(200, { 'Content-Type': 'audio/mpeg' });
+            res.end(FAKE_MP3);
+            return;
+        }
+        res.writeHead(404);
+        res.end();
+    });
+    const mockTtsUrl = await listenServer(mockTtsSrv);
+
+    let llmMode = 'script';
+    const seenLlmPrompts = [];
+    const mockLlmSrv = http.createServer(async (req, res) => {
+        const chunks = [];
+        for await (const c of req) chunks.push(c);
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        seenLlmPrompts.push(body.messages);
+        let contentJson;
+        if (llmMode === 'bot_cast') {
+            contentJson = {
+                characters: [
+                    {
+                        name: '소연',
+                        aliases: ['Soyeon'],
+                        gender: 'female',
+                        personality: '차분하고 내성적이지만 다정한 성격',
+                        speechStyle: '조용하고 나긋한 속삭임 같은 말투',
+                        voiceId: 'Sohee',
+                        dialogueTag: 'gentle',
+                        thoughtTag: 'whispering',
+                        dialogueInstruction: '차분하고 부드러운 한국어 여성 목소리, 조곤조곤한 어조',
+                        thoughtInstruction: '속으로 조용히 되뇌는 속삭이는 어조',
+                    },
+                    {
+                        name: '허구보이스',
+                        gender: 'male',
+                        personality: '거친 성격',
+                        speechStyle: '굵고 낮은 목소리',
+                        voiceId: 'nonexistent-hallucinated-id',
+                        dialogueInstruction: '낮고 거친 남성 목소리',
+                    },
+                ],
+            };
+        } else {
+            contentJson = {
+                characterProfiles: [{
+                    name: '하연',
+                    aliases: ['Hayeon'],
+                    gender: 'female',
+                    personality: '장난기 많고 호기심이 왕성한 성격',
+                    speechStyle: '빠르고 톡톡 튀는 경쾌한 어조',
+                    dialogueTag: 'playful',
+                    thoughtTag: 'shy',
+                    dialogueInstruction: '장난기 있고 밝은 한국어 여성 목소리',
+                    thoughtInstruction: '조금 수줍어하며 작게 중얼거리는 톤',
+                }],
+                segments: [
+                    {
+                        kind: 'dialogue',
+                        speaker: '하연',
+                        gender: 'female',
+                        tone: 'playful',
+                        instruction: '웃음을 참으며 장난스럽게 말하기',
+                        text: '[playful] 벌써 들어가게요?',
+                    },
+                ],
+            };
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(contentJson) } }] }));
+    });
+    const mockLlmUrl = await listenServer(mockLlmSrv);
+
+    const token = 'test-adv-tts-token';
+    const relay = createRelayServer({
+        token,
+        configOverride: {
+            activeProfileId: 'llm1',
+            profiles: [{
+                id: 'llm1',
+                name: 'MockLLM',
+                providerType: 'openai_compat',
+                baseUrl: `${mockLlmUrl}/v1/chat/completions`,
+                apiKey: 'k',
+                model: 'mock-gpt',
+            }],
+            tts: {
+                provider: 'openai_compat_local',
+                apiUrl: `${mockTtsUrl}/v1/audio/speech`,
+                model: 'qwen3-tts',
+                parseMode: 'llm',
+                llmSource: 'active',
+                characterVoicesEnabled: true,
+                autoLearnBotProfiles: true,
+                defaultVoices: { female: { voiceId: 'Vivian' }, male: { voiceId: 'Ryan' } },
+            },
+        },
+    });
+    const relayUrl = await listenServer(relay);
+
+    try {
+        // 2) First /api/tts/analyze on bot-A learns Hayeon's profile under bot-A & applies immediately
+        const resAnalyze1 = await fetch(`${relayUrl}/api/tts/analyze`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+            body: JSON.stringify({
+                botKey: 'bot-A',
+                botName: '클로젬 동아리',
+                text: '"벌써 들어가게요?"',
+                charName: '하연',
+            }),
+        }).then((r) => r.json());
+
+        assert.equal(resAnalyze1.ok, true);
+        assert.equal(resAnalyze1.botKey, 'bot-A');
+        assert.equal(resAnalyze1.botProfilesUpdated, true);
+        assert.equal(resAnalyze1.modelSpec.id, 'qwen3_tts');
+        assert.equal(resAnalyze1.segments[0].text, '벌써 들어가게요?');
+        assert.ok(resAnalyze1.segments[0].instruction.includes('장난기 있고 밝은 한국어 여성 목소리'));
+        assert.ok(resAnalyze1.segments[0].instruction.includes('웃음을 참으며 장난스럽게 말하기'));
+
+        // Verify persisted only under bot-A (not leaked into global or bot-B)
+        const cfgAfterLearn = await fetch(`${relayUrl}/api/router/config`, {
+            headers: { 'X-RisuStand-Token': token },
+        }).then((r) => r.json());
+        assert.equal(cfgAfterLearn.tts.botCharacters['bot-A'].characters.length, 1);
+        assert.equal(cfgAfterLearn.tts.botCharacters['bot-A'].characters[0].name, '하연');
+        assert.equal(cfgAfterLearn.tts.botCharacters['bot-A'].characters[0].personality, '장난기 많고 호기심이 왕성한 성격');
+        assert.equal(cfgAfterLearn.tts.botCharacters['bot-B'], undefined);
+        assert.equal(cfgAfterLearn.tts.characters.length, 0);
+
+        // 3) Second /api/tts/analyze for bot-A injects saved personality & speechStyle back into prompt
+        await fetch(`${relayUrl}/api/tts/analyze`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+            body: JSON.stringify({
+                botKey: 'bot-A',
+                text: '"다음에도 또 봐요."',
+                charName: '하연',
+            }),
+        }).then((r) => r.json());
+        assert.ok(seenLlmPrompts[1][1].content.includes('장난기 많고 호기심이 왕성한 성격'));
+        assert.ok(seenLlmPrompts[1][1].content.includes('빠르고 톡톡 튀는 경쾌한 어조'));
+
+        // 4) /api/tts/synthesize forwards clean text & model-matched `instructions` to Qwen3-TTS server
+        const synthRes = await fetch(`${relayUrl}/api/tts/synthesize`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+            body: JSON.stringify({ botKey: 'bot-A', segment: resAnalyze1.segments[0] }),
+        });
+        assert.equal(synthRes.status, 200);
+        assert.equal(upstreamCalls[0].input, '벌써 들어가게요?');
+        assert.ok(upstreamCalls[0].instructions.includes('장난기 있고 밝은 한국어 여성 목소리'));
+
+        // 5) /api/tts/analyze-bot-cast builds full bot cast, validates voiceId, and isolates per bot
+        llmMode = 'bot_cast';
+        const castRes = await fetch(`${relayUrl}/api/tts/analyze-bot-cast`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+            body: JSON.stringify({
+                botKey: 'bot-B',
+                botName: '서점 봇',
+                desc: '조용한 서점에서 일하는 차분한 소연과 거친 성격의 점주 허구보이스.',
+            }),
+        }).then((r) => r.json());
+        assert.equal(castRes.ok, true);
+        assert.equal(castRes.botKey, 'bot-B');
+        assert.equal(castRes.addedCount, 2);
+        const soyeon = castRes.characters.find((c) => c.name === '소연');
+        const hallucinated = castRes.characters.find((c) => c.name === '허구보이스');
+        assert.equal(soyeon.voiceId, 'Sohee'); // Valid builtin Qwen voice preserved
+        assert.equal(soyeon.voiceGroup, 'qwen');
+        assert.equal(hallucinated.voiceId, ''); // Hallucinated voiceId rejected safely
+        assert.equal(castRes.config.tts.botCharacters['bot-A'].characters.length, 1); // bot-A untouched!
+        assert.equal(castRes.config.tts.botCharacters['bot-B'].characters.length, 2);
+
+        // Verify resolveSegmentVoice uses bot-B's saved Sohee profile while bot-A stays independent
+        const segSoyeon = resolveSegmentVoice({ kind: 'dialogue', speaker: '소연', text: '어서 오세요.' }, castRes.config.tts, '소연', 'bot-B');
+        assert.equal(segSoyeon.voiceId, 'Sohee');
+        assert.ok(segSoyeon.instruction.includes('차분하고 부드러운 한국어 여성 목소리'));
+        const segSoyeonInBotA = resolveSegmentVoice({ kind: 'dialogue', speaker: '소연', gender: 'female', text: '어서 오세요.' }, castRes.config.tts, '소연', 'bot-A');
+        assert.equal(segSoyeonInBotA.matchedCharacter, '');
+        assert.equal(segSoyeonInBotA.voiceId, 'Vivian');
+
+        // 6) Explicit mergeCharacterSpeechProfiles honors overwriteVoices=false
+        const mergedKeep = mergeCharacterSpeechProfiles(castRes.characters, [
+            { name: '소연', gender: 'female', voiceId: 'Ryan', dialogueInstruction: '새 지시문' },
+        ], { modelSpecId: 'qwen3_tts', overwriteTags: false, overwriteVoices: false });
+        assert.equal(mergedKeep.characters[0].voiceId, 'Sohee');
+        assert.equal(buildTtsBotKey({ charIndex: 2, charContext: { charId: 'bot-z:r4' } }), 'bot-z');
+    } finally {
+        await closeServer(relay);
+        await closeServer(mockTtsSrv);
+        await closeServer(mockLlmSrv);
+    }
+});
+
+test('persistent TTS script store reuses saved scripts without LLM re-run and supports manual editing popup & disk reload', async () => {
+    // 1) Disk persistence check on temporary file
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rs-tts-scripts-'));
+    const scriptFilePath = path.join(tmpDir, 'scripts.json');
+    try {
+        const sKey = buildTtsScriptKey({ botKey: 'bot-disk', role: 'char', text: '"안녕!"' });
+        assert.ok(sKey && sKey.length >= 16);
+        const store1 = createTtsScriptStore({ filePath: scriptFilePath });
+        store1.set(sKey, {
+            botKey: 'bot-disk',
+            botName: '디스크 봇',
+            manuallyEdited: true,
+            segments: [{ kind: 'dialogue', speaker: '시은', gender: 'female', voiceId: 'Sohee', toneTags: ['soft'], instruction: '부드럽게', text: '안녕!' }],
+        });
+        const store2 = createTtsScriptStore({ filePath: scriptFilePath });
+        const reloaded = store2.get(sKey);
+        assert.ok(reloaded);
+        assert.equal(reloaded.manuallyEdited, true);
+        assert.equal(reloaded.segments[0].voiceId, 'Sohee');
+        assert.equal(reloaded.segments[0].text, '안녕!');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+
+    // 2) Full HTTP script persistence, manual edit, WYSIWYG synthesis, and UI checks
+    const upstreamPayloads = [];
+    const mockTtsSrv = http.createServer(async (req, res) => {
+        if (req.url === '/v1/tts' && req.method === 'POST') {
+            const chunks = [];
+            for await (const c of req) chunks.push(c);
+            upstreamPayloads.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+            res.writeHead(200, { 'Content-Type': 'audio/mpeg' });
+            res.end(FAKE_MP3);
+            return;
+        }
+        res.writeHead(404);
+        res.end();
+    });
+    const mockTtsUrl = await listenServer(mockTtsSrv);
+
+    let llmCalls = 0;
+    const mockLlmSrv = http.createServer(async (req, res) => {
+        llmCalls += 1;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            choices: [{
+                message: {
+                    content: JSON.stringify({
+                        segments: [
+                            { kind: 'narration', speaker: 'Narrator', gender: 'neutral', tone: 'calm', text: '문이 열렸다.' },
+                            { kind: 'dialogue', speaker: '이리스', gender: 'female', tone: 'gentle', text: `들어오세요 (${llmCalls}차).` },
+                        ],
+                    }),
+                },
+            }],
+        }));
+    });
+    const mockLlmUrl = await listenServer(mockLlmSrv);
+
+    const token = 'test-script-store-tok';
+    const relay = createRelayServer({
+        token,
+        configOverride: {
+            activeProfileId: 'llm1',
+            profiles: [{
+                id: 'llm1',
+                name: 'MockLLM',
+                providerType: 'openai_compat',
+                baseUrl: `${mockLlmUrl}/v1/chat/completions`,
+                apiKey: 'k',
+                model: 'mock-gpt',
+            }],
+            tts: {
+                provider: 'fish_local',
+                apiUrl: `${mockTtsUrl}/v1/tts`,
+                model: 's2-pro',
+                fishTagStyle: 'brackets',
+                parseMode: 'llm',
+                llmSource: 'active',
+                defaultVoices: { female: { voiceId: 'default-fem' }, neutral: { voiceId: 'default-nar' } },
+            },
+        },
+    });
+    const relayUrl = await listenServer(relay);
+
+    try {
+        const sampleMsg = '문이 열렸다. "들어오세요."';
+
+        // UI HTML contains popup editor modal, player bar edit button, turn edit icon, and compiles cleanly
+        const html = await fetch(`${relayUrl}/`).then((r) => r.text());
+        assert.ok(html.includes('id="ttsScriptModal"'));
+        assert.ok(html.includes('id="ttsEditScriptBtn"'));
+        assert.ok(html.includes('data-tts-script-msg'));
+        assert.ok(html.includes('function openTtsScriptEditorModal('));
+        const scriptMatch = html.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
+        assert.doesNotThrow(() => new Function(scriptMatch[1]));
+
+        // First /api/tts/analyze invokes LLM once and persists the generated script
+        const firstAnalyze = await fetch(`${relayUrl}/api/tts/analyze`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+            body: JSON.stringify({ botKey: 'bot-s1', botName: '테스트 봇', text: sampleMsg, charName: '이리스', msgIndex: 3 }),
+        }).then((r) => r.json());
+        assert.equal(firstAnalyze.ok, true);
+        assert.equal(firstAnalyze.scriptSaved, true);
+        assert.equal(firstAnalyze.scriptHit, false);
+        assert.equal(llmCalls, 1);
+        assert.ok(firstAnalyze.scriptKey);
+
+        // Second /api/tts/analyze reuses saved script WITHOUT calling LLM again
+        const secondAnalyze = await fetch(`${relayUrl}/api/tts/analyze`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+            body: JSON.stringify({ botKey: 'bot-s1', text: sampleMsg, charName: '이리스', msgIndex: 3 }),
+        }).then((r) => r.json());
+        assert.equal(secondAnalyze.ok, true);
+        assert.equal(secondAnalyze.scriptHit, true);
+        assert.equal(llmCalls, 1);
+
+        // /api/tts/script/get and /api/tts/scripts expose saved script
+        const gotSaved = await fetch(`${relayUrl}/api/tts/script/get`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+            body: JSON.stringify({ botKey: 'bot-s1', text: sampleMsg, charName: '이리스' }),
+        }).then((r) => r.json());
+        assert.equal(gotSaved.exists, true);
+        assert.equal(gotSaved.script.segments.length, 2);
+
+        const listRes = await fetch(`${relayUrl}/api/tts/scripts?botKey=bot-s1`, {
+            headers: { 'X-RisuStand-Token': token },
+        }).then((r) => r.json());
+        assert.equal(listRes.total, 1);
+        assert.equal(listRes.scripts[0].scriptKey, firstAnalyze.scriptKey);
+
+        // Manual edit via /api/tts/script/save overrides speaker, voiceId, toneTags, speed, text
+        const manualSave = await fetch(`${relayUrl}/api/tts/script/save`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+            body: JSON.stringify({
+                scriptKey: firstAnalyze.scriptKey,
+                botKey: 'bot-s1',
+                text: sampleMsg,
+                charName: '이리스',
+                segments: [
+                    {
+                        kind: 'dialogue',
+                        speaker: '이리스',
+                        gender: 'female',
+                        voiceId: 'manual-iris-voice',
+                        toneTags: ['playful', 'whispering'],
+                        speed: 1.15,
+                        text: '수동으로 다듬은 대사입니다.',
+                    },
+                ],
+            }),
+        }).then((r) => r.json());
+        assert.equal(manualSave.ok, true);
+        assert.equal(manualSave.script.manuallyEdited, true);
+
+        // /api/tts/analyze now serves the manually edited script directly without LLM call
+        const thirdAnalyze = await fetch(`${relayUrl}/api/tts/analyze`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+            body: JSON.stringify({ botKey: 'bot-s1', text: sampleMsg, charName: '이리스' }),
+        }).then((r) => r.json());
+        assert.equal(thirdAnalyze.scriptHit, true);
+        assert.equal(thirdAnalyze.manuallyEdited, true);
+        assert.equal(thirdAnalyze.segments[0].voiceId, 'manual-iris-voice');
+        assert.deepEqual(thirdAnalyze.segments[0].toneTags, ['playful', 'whispering']);
+        assert.equal(thirdAnalyze.segments[0].text, '수동으로 다듬은 대사입니다.');
+        assert.equal(llmCalls, 1);
+
+        // Synthesizing that manual segment sends exact manual voice & [tag] formatting upstream
+        const synthManual = await fetch(`${relayUrl}/api/tts/synthesize`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+            body: JSON.stringify({ botKey: 'bot-s1', segment: thirdAnalyze.segments[0] }),
+        });
+        assert.equal(synthManual.status, 200);
+        assert.equal(upstreamPayloads[0].reference_id, 'manual-iris-voice');
+        assert.equal(upstreamPayloads[0].text, '[playful][whispering] 수동으로 다듬은 대사입니다.');
+
+        // forceReanalyze: true bypasses saved script and re-runs LLM
+        const forceRes = await fetch(`${relayUrl}/api/tts/analyze`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+            body: JSON.stringify({ botKey: 'bot-s1', text: sampleMsg, charName: '이리스', forceReanalyze: true }),
+        }).then((r) => r.json());
+        assert.equal(forceRes.scriptHit, false);
+        assert.equal(llmCalls, 2);
+
+        // /api/tts/script/delete removes the saved script
+        const delRes = await fetch(`${relayUrl}/api/tts/script/delete`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+            body: JSON.stringify({ scriptKey: firstAnalyze.scriptKey }),
+        }).then((r) => r.json());
+        assert.equal(delRes.deleted, true);
+
+        const afterDel = await fetch(`${relayUrl}/api/tts/script/get`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+            body: JSON.stringify({ scriptKey: firstAnalyze.scriptKey }),
+        }).then((r) => r.json());
+        assert.equal(afterDel.exists, false);
+    } finally {
+        await closeServer(relay);
+        await closeServer(mockTtsSrv);
+        await closeServer(mockLlmSrv);
     }
 });

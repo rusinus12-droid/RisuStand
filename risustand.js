@@ -3927,6 +3927,7 @@
         let cfg = { ...DEFAULT_CFG };
         let pollTimer = null;
         let isPolling = false;
+        let pendingForcePoll = false;
         let isGenerating = false;
         let lastStatus = '대기 중';
         let lastSyncTime = '';
@@ -3944,6 +3945,7 @@
         let viewCharIndex = -1;
         let viewChatIndex = -1;
         const assetDataCache = new Map();
+        const charIdByIndex = new Map(); // charIndex -> chaId
         let swipeHistory = Object.create(null);
 
         function makeSwipeKey(charObj, cIdx, chatObj, chIdx, msgIdx) {
@@ -4222,6 +4224,46 @@
             }
             if (!tokens.length) return false;
 
+            const evalWhenCmp = (leftRaw, op, rightRaw) => {
+                const lStr = String(leftRaw ?? '');
+                const rStr = String(rightRaw ?? '');
+                if (op === 'is' || op === '==' || op === '=') return lStr === rStr;
+                if (op === 'isnot' || op === '!=') return lStr !== rStr;
+                if (op === '>' || op === 'greater') return Number(lStr) > Number(rStr);
+                if (op === '<' || op === 'less') return Number(lStr) < Number(rStr);
+                if (op === '>=' || op === 'greater_equal' || op === 'greaterequal') return Number(lStr) >= Number(rStr);
+                if (op === '<=' || op === 'less_equal' || op === 'lessequal') return Number(lStr) <= Number(rStr);
+                if (op === 'includes' || op === 'contains') {
+                    if (lStr.trim().startsWith('[')) {
+                        try {
+                            const arr = JSON.parse(lStr);
+                            if (Array.isArray(arr)) return arr.some((x) => String(x) === rStr);
+                        } catch (_) {}
+                    }
+                    return lStr.includes(rStr);
+                }
+                if (op === 'in' || op === 'notin') {
+                    let found = false;
+                    if (rStr.trim().startsWith('[')) {
+                        try {
+                            const arr = JSON.parse(rStr);
+                            if (Array.isArray(arr)) found = arr.some((x) => String(x) === lStr);
+                        } catch (_) {}
+                    } else {
+                        found = rStr.split(',').map((s) => s.trim()).includes(lStr);
+                    }
+                    return op === 'in' ? found : !found;
+                }
+                return false;
+            };
+
+            const CMP_OPS = new Set([
+                'is', 'isnot', 'vis', 'visnot', 'tis', 'tisnot',
+                '==', '=', '!=', '>', 'greater', '<', 'less',
+                '>=', 'greater_equal', 'greaterequal', '<=', 'less_equal', 'lessequal',
+                'in', 'notin', 'includes', 'contains',
+            ]);
+
             const evalAtom = (arr) => {
                 if (!arr.length) return false;
                 let neg = false;
@@ -4232,7 +4274,11 @@
                 }
                 const rem = arr.slice(idx);
                 let result = false;
-                if (rem.length >= 3 && (rem[1] === 'is' || rem[1] === 'isnot' || rem[1] === 'vis' || rem[1] === 'visnot' || rem[1] === 'tis' || rem[1] === 'tisnot' || rem[1] === '>' || rem[1] === 'greater' || rem[1] === '<' || rem[1] === 'less' || rem[1] === '>=' || rem[1] === 'greater_equal' || rem[1] === 'greaterequal' || rem[1] === '<=' || rem[1] === 'less_equal' || rem[1] === 'lessequal')) {
+                if (rem.length === 1 && (rem[0] === 'is_first_msg' || rem[0] === 'isfirstmsg')) {
+                    result = ctx.chatIndex === -1 || ctx.chatIndex === 0;
+                } else if (rem.length === 1 && (rem[0] === 'is_last_msg' || rem[0] === 'islastmsg')) {
+                    result = ctx.chatIndex === ctx.lastMessageId;
+                } else if (rem.length >= 3 && CMP_OPS.has(rem[1])) {
                     const op = rem[1];
                     const right = evalCBS(rem.slice(2).join('::'), ctx, depth + 1).trim();
                     if (op === 'vis' || op === 'visnot') {
@@ -4247,28 +4293,21 @@
                         result = op === 'tis' ? (val === right) : (val !== right);
                     } else {
                         const left = evalCBS(rem[0], ctx, depth + 1).trim();
-                        if (op === 'is') result = left === right;
-                        else if (op === 'isnot') result = left !== right;
-                        else if (op === '>' || op === 'greater') result = Number(left) > Number(right);
-                        else if (op === '<' || op === 'less') result = Number(left) < Number(right);
-                        else if (op === '>=' || op === 'greater_equal' || op === 'greaterequal') result = Number(left) >= Number(right);
-                        else if (op === '<=' || op === 'less_equal' || op === 'lessequal') result = Number(left) <= Number(right);
+                        result = evalWhenCmp(left, op, right);
                     }
-                } else if (rem.length >= 2 && rem[0] === 'var') {
+                } else if (rem.length >= 2 && (rem[0] === 'var' || rem[0] === 'toggle')) {
                     const k = evalCBS(rem[1], ctx, depth + 1).trim();
-                    const val = Object.prototype.hasOwnProperty.call(ctx.vars, k) ? ctx.vars[k] : 'null';
-                    if (rem.length >= 4 && (rem[2] === 'is' || rem[2] === 'isnot')) {
-                        const r = evalCBS(rem[3], ctx, depth + 1).trim();
-                        result = rem[2] === 'is' ? String(val) === r : String(val) !== r;
+                    const rawVal = rem[0] === 'var'
+                        ? (Object.prototype.hasOwnProperty.call(ctx.vars, k) ? ctx.vars[k] : 'null')
+                        : (Object.prototype.hasOwnProperty.call(ctx.globalVars, k)
+                            ? ctx.globalVars[k]
+                            : ctx.globalVars['toggle_' + k]);
+                    if (rem.length >= 4 && CMP_OPS.has(rem[2])) {
+                        const r = evalCBS(rem.slice(3).join('::'), ctx, depth + 1).trim();
+                        result = evalWhenCmp(String(rawVal ?? ''), rem[2], r);
                     } else {
-                        result = isCbsTruthy(val);
+                        result = isCbsTruthy(rawVal);
                     }
-                } else if (rem.length >= 2 && rem[0] === 'toggle') {
-                    const k = evalCBS(rem[1], ctx, depth + 1).trim();
-                    const val = Object.prototype.hasOwnProperty.call(ctx.globalVars, k)
-                        ? ctx.globalVars[k]
-                        : ctx.globalVars['toggle_' + k];
-                    result = isCbsTruthy(val);
                 } else {
                     const val = evalCBS(rem.join('::'), ctx, depth + 1).trim();
                     result = isCbsTruthy(val);
@@ -4445,6 +4484,26 @@
                 const rawInner = str.slice(openAt + 2, closeAt);
                 const trimmed = rawInner.trim();
 
+                // Raw escape block: {{#escape}}...{{/escape}}
+                if (/^#escape(?:[\s:]|$)/i.test(trimmed)) {
+                    const parsed = findBlockBranches(str, closeAt + 2, true);
+                    if (parsed) {
+                        out += parsed.branches.length ? parsed.branches[0].body : '';
+                        pos = parsed.endPos;
+                        continue;
+                    }
+                }
+
+                // Pure display block: {{#pure_display}}...{{/pure_display}} / {{#pure}}...{{/pure}}
+                if (/^#pure(?:_?display)?(?:[\s:]|$)/i.test(trimmed)) {
+                    const parsed = findBlockBranches(str, closeAt + 2, true);
+                    if (parsed) {
+                        out += evalCBS(parsed.branches.length ? parsed.branches[0].body : '', ctx, depth + 1);
+                        pos = parsed.endPos;
+                        continue;
+                    }
+                }
+
                 // Block conditionals: {{#when...}}, {{#if...}}, {{#if_pure...}}
                 const blockMatch = trimmed.match(/^#(when|if_pure|if)(?:::|\s+)([\s\S]*)$/i);
                 if (blockMatch) {
@@ -4530,7 +4589,7 @@
                 }
 
                 // Preserve asset/inlay macros for inline resolution (resolve nested CBS inside arguments)
-                const assetMacro = rawInner.match(/^\s*(img|raw|asset|image|emotion|inlay|inlayed)::([\s\S]+)$/i);
+                const assetMacro = rawInner.match(/^\s*(img|raw|path|asset|image|emotion|inlay|inlayed)::([\s\S]+)$/i);
                 if (assetMacro) {
                     const resolvedArg = evalCBS(assetMacro[2], ctx, depth + 1).trim();
                     out += `{{${assetMacro[1].toLowerCase()}::${resolvedArg}}}`;
@@ -4559,18 +4618,73 @@
                     out += ctx.userName || 'User';
                 } else if (cmd === 'char') {
                     out += ctx.charName || 'Character';
+                } else if (cmd === 'persona') {
+                    out += ctx.personaPrompt || '';
+                } else if (cmd === 'description' || cmd === 'char_desc') {
+                    out += ctx.charDesc || '';
+                } else if (cmd === 'personality') {
+                    out += ctx.personality || '';
+                } else if (cmd === 'scenario') {
+                    out += ctx.scenario || '';
+                } else if (cmd === 'authorsnote' || cmd === 'authornote') {
+                    out += ctx.note || '';
+                } else if (cmd === 'globalnote') {
+                    out += ctx.globalNote || '';
+                } else if (cmd === 'mainprompt') {
+                    out += ctx.mainPrompt || '';
+                } else if (cmd === 'jailbreak') {
+                    out += ctx.jailbreak || '';
+                } else if (cmd === 'source') {
+                    const target = evalCBS(effectiveParts[1] || '', ctx, depth + 1).trim().toLowerCase();
+                    const rawSrc = target === 'user' ? String(ctx.userIcon || '') : (target === 'char' ? String(ctx.charImage || '') : '');
+                    if (rawSrc) {
+                        out += /^(?:https?:\/\/|data:image\/|\/)/i.test(rawSrc) ? rawSrc : `{{raw::${rawSrc}}}`;
+                    }
+                } else if (cmd === 'lastmessage') {
+                    const list = Array.isArray(ctx.chatList) ? ctx.chatList : [];
+                    if (list.length) out += String((list[list.length - 1] && list[list.length - 1].content) ?? '');
+                } else if (cmd === 'lastcharmessage') {
+                    const list = Array.isArray(ctx.chatList) ? ctx.chatList : [];
+                    for (let li = list.length - 1; li >= 0; li -= 1) {
+                        if (list[li] && list[li].role !== 'user') { out += String(list[li].content ?? ''); break; }
+                    }
+                } else if (cmd === 'lastusermessage') {
+                    const list = Array.isArray(ctx.chatList) ? ctx.chatList : [];
+                    for (let li = list.length - 1; li >= 0; li -= 1) {
+                        if (list[li] && list[li].role === 'user') { out += String(list[li].content ?? ''); break; }
+                    }
+                } else if (cmd === 'firstmessage') {
+                    out += String(ctx.firstMessage || '');
+                } else if (cmd === 'idle_duration' || cmd === 'idleduration') {
+                    out += String(ctx.idleDuration || '0s');
+                } else if (cmd === 'role') {
+                    out += ctx.msgRole || 'char';
                 } else if (cmd === 'br' || cmd === 'newline') {
                     out += '\n';
                 } else if (cmd === 'blank' || cmd === 'comment' || cmd === 'hidden_key' || cmd === 'hiddenkey' || cmd.startsWith('//')) {
                     // hidden / non-prose
-                } else if (cmd === 'chat_index') {
+                } else if (cmd === 'chat_index' || cmd === 'chatindex' || cmd === 'chat_id') {
                     out += String(ctx.chatIndex ?? 0);
-                } else if (cmd === 'lastmessageid') {
+                } else if (cmd === 'lastmessageid' || cmd === 'last_message_id') {
                     out += String(ctx.lastMessageId ?? 0);
+                } else if (cmd === 'message_count' || cmd === 'msgcount') {
+                    out += String(Array.isArray(ctx.chatList) ? ctx.chatList.length : Math.max(0, (ctx.lastMessageId ?? -1) + 1));
+                } else if (cmd === 'is_first_msg' || cmd === 'isfirstmsg') {
+                    out += (ctx.chatIndex === -1 || ctx.chatIndex === 0) ? '1' : '0';
+                } else if (cmd === 'is_last_msg' || cmd === 'islastmsg') {
+                    out += (ctx.chatIndex === ctx.lastMessageId) ? '1' : '0';
                 } else if (cmd === 'previous_chat_log' || cmd === 'previouschatlog') {
                     const idx = Number(evalCBS(effectiveParts[1] || '', ctx, depth + 1).trim());
                     if (Array.isArray(ctx.chatList) && Number.isInteger(idx) && idx >= 0 && idx < ctx.chatList.length) {
                         out += String((ctx.chatList[idx] && ctx.chatList[idx].content) ?? '');
+                    }
+                } else if (cmd === 'history' || cmd === 'raw_history') {
+                    const sub = evalCBS(effectiveParts[1] || '', ctx, depth + 1).trim().toLowerCase();
+                    const list = Array.isArray(ctx.chatList) ? ctx.chatList : [];
+                    if (sub === 'role') {
+                        out += JSON.stringify(list.map((m) => `${m && m.role === 'user' ? 'user' : 'char'}: ${String((m && m.content) ?? '')}`));
+                    } else {
+                        out += JSON.stringify(list.map((m) => String((m && m.content) ?? '')));
                     }
                 } else if (cmd === 'array' || cmd === 'makearray' || cmd === 'a') {
                     out += JSON.stringify(effectiveParts.slice(1).map((p) => evalCBS(p, ctx, depth + 1)));
@@ -4621,12 +4735,21 @@
                 } else if (cmd === 'u' || cmd === 'unicode') {
                     const cp = parseInt(evalCBS(effectiveParts[1] || '', ctx, depth + 1).trim(), 16);
                     if (Number.isFinite(cp) && cp >= 0 && cp <= 0x10FFFF) out += String.fromCodePoint(cp);
-                } else if (cmd === 'time') {
+                } else if (cmd === 'time' || cmd === 'date' || cmd === 'isodate' || cmd === 'isotime' || cmd === 'unixtime') {
                     const d = new Date();
-                    const pad = (n) => String(n).padStart(2, '0');
-                    const fmt = evalCBS(effectiveParts[1] || 'HH:mm:ss', ctx, depth + 1).trim() || 'HH:mm:ss';
-                    const tMap = { YYYY: String(d.getFullYear()), YY: String(d.getFullYear()).slice(-2), MM: pad(d.getMonth() + 1), DD: pad(d.getDate()), HH: pad(d.getHours()), mm: pad(d.getMinutes()), ss: pad(d.getSeconds()) };
-                    out += fmt.replace(/YYYY|YY|MM|DD|HH|mm|ss/g, (tk) => tMap[tk] ?? tk);
+                    if (cmd === 'unixtime') {
+                        out += String(Math.floor(d.getTime() / 1000));
+                    } else if (cmd === 'isodate') {
+                        out += d.toISOString().slice(0, 10);
+                    } else if (cmd === 'isotime') {
+                        out += d.toISOString().slice(11, 19);
+                    } else {
+                        const pad = (n) => String(n).padStart(2, '0');
+                        const defFmt = cmd === 'date' ? 'YYYY-MM-DD' : 'HH:mm:ss';
+                        const fmt = evalCBS(effectiveParts[1] || defFmt, ctx, depth + 1).trim() || defFmt;
+                        const tMap = { YYYY: String(d.getFullYear()), YY: String(d.getFullYear()).slice(-2), MM: pad(d.getMonth() + 1), DD: pad(d.getDate()), HH: pad(d.getHours()), mm: pad(d.getMinutes()), ss: pad(d.getSeconds()) };
+                        out += fmt.replace(/YYYY|YY|MM|DD|HH|mm|ss/g, (tk) => tMap[tk] ?? tk);
+                    }
                 } else if (cmd === 'slot') {
                     const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
                     const slots = ctx.slots || {};
@@ -4639,13 +4762,19 @@
                 } else if (cmd === 'module_assetlist' || cmd === 'moduleassetlist') {
                     const ns = evalCBS(parts.slice(1).join('::'), ctx, depth + 1);
                     out += getModuleAssetListJson(ns, ctx);
+                } else if (cmd === 'assetlist' || cmd === 'char_assetlist') {
+                    const list = Array.isArray(ctx && ctx.charAssetNames) ? ctx.charAssetNames : [];
+                    out += JSON.stringify(list);
+                } else if (cmd === 'emotionlist') {
+                    const list = Array.isArray(ctx && ctx.emotionNames) ? ctx.emotionNames : [];
+                    out += JSON.stringify(list);
                 } else if (cmd === 'button') {
                     const lbl = evalCBS(parts[1] || '', ctx, depth + 1).trim();
                     const trig = evalCBS(parts[2] || '', ctx, depth + 1).trim();
                     if (trig) {
                         out += `<button type="button" class="risu-cbs-btn" risu-trigger="${escapeHtml(trig)}">${escapeHtml(lbl || trig)}</button>`;
                     }
-                } else if (cmd === 'getvar' || cmd === 'getchatvar') {
+                } else if (cmd === 'getvar' || cmd === 'getchatvar' || cmd === 'var') {
                     const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
                     out += Object.prototype.hasOwnProperty.call(ctx.vars, k) ? String(ctx.vars[k]) : 'null';
                 } else if (cmd === 'setvar') {
@@ -4658,46 +4787,61 @@
                     if (k && (!Object.prototype.hasOwnProperty.call(ctx.vars, k) || ctx.vars[k] === 'null' || ctx.vars[k] === '')) {
                         ctx.vars[k] = v;
                     }
-                } else if (cmd === 'addvar') {
+                } else if (cmd === 'addvar' || cmd === 'subvar' || cmd === 'mulvar' || cmd === 'divvar') {
                     const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
-                    const delta = Number(evalCBS(parts[2] || '0', ctx, depth + 1)) || 0;
-                    if (k) ctx.vars[k] = String((Number(ctx.vars[k]) || 0) + delta);
-                } else if (cmd === 'gettempvar') {
+                    const operand = Number(evalCBS(parts[2] || '0', ctx, depth + 1)) || 0;
+                    const curNum = Number(ctx.vars[k]) || 0;
+                    if (k) {
+                        if (cmd === 'addvar') ctx.vars[k] = String(curNum + operand);
+                        else if (cmd === 'subvar') ctx.vars[k] = String(curNum - operand);
+                        else if (cmd === 'mulvar') ctx.vars[k] = String(curNum * operand);
+                        else ctx.vars[k] = operand === 0 ? '0' : String(curNum / operand);
+                    }
+                } else if (cmd === 'gettempvar' || cmd === 'tempvar') {
                     const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
                     out += Object.prototype.hasOwnProperty.call(ctx.tempVars, k) ? String(ctx.tempVars[k]) : '';
                 } else if (cmd === 'settempvar') {
                     const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
                     const v = evalCBS(parts.slice(2).join('::'), ctx, depth + 1);
                     if (k) ctx.tempVars[k] = v;
-                } else if (cmd === 'getglobalvar') {
+                } else if (cmd === 'getglobalvar' || cmd === 'globalvar' || cmd === 'toggle') {
                     const k = evalCBS(parts[1] || '', ctx, depth + 1).trim();
                     if (Object.prototype.hasOwnProperty.call(ctx.globalVars, k)) out += String(ctx.globalVars[k]);
                     else if (Object.prototype.hasOwnProperty.call(ctx.globalVars, 'toggle_' + k)) out += String(ctx.globalVars['toggle_' + k]);
                     else out += 'null';
-                } else if (cmd === 'equal') {
+                } else if (cmd === 'equal' || cmd === 'eq' || cmd === '==') {
                     const a = evalCBS(parts[1] || '', ctx, depth + 1).trim();
                     const b = evalCBS(parts[2] || '', ctx, depth + 1).trim();
-                    out += a === b ? '1' : '0';
-                } else if (cmd === 'not_equal' || cmd === 'notequal') {
+                    const na = Number(a);
+                    const nb = Number(b);
+                    out += (a === b || (cmd !== 'equal' && a !== '' && b !== '' && Number.isFinite(na) && Number.isFinite(nb) && na === nb)) ? '1' : '0';
+                } else if (cmd === 'not_equal' || cmd === 'notequal' || cmd === 'neq' || cmd === '!=') {
                     const a = evalCBS(parts[1] || '', ctx, depth + 1).trim();
                     const b = evalCBS(parts[2] || '', ctx, depth + 1).trim();
-                    out += a !== b ? '1' : '0';
-                } else if (cmd === 'greater') {
+                    const na = Number(a);
+                    const nb = Number(b);
+                    out += (a !== b && !(cmd !== 'not_equal' && cmd !== 'notequal' && a !== '' && b !== '' && Number.isFinite(na) && Number.isFinite(nb) && na === nb)) ? '1' : '0';
+                } else if (cmd === 'greater' || cmd === 'gt' || cmd === 'greaterthan' || cmd === 'greater_than' || cmd === '>') {
                     const a = Number(evalCBS(parts[1] || '', ctx, depth + 1).trim());
                     const b = Number(evalCBS(parts[2] || '', ctx, depth + 1).trim());
                     out += a > b ? '1' : '0';
-                } else if (cmd === 'less') {
+                } else if (cmd === 'less' || cmd === 'lt' || cmd === 'lessthan' || cmd === 'less_than' || cmd === '<') {
                     const a = Number(evalCBS(parts[1] || '', ctx, depth + 1).trim());
                     const b = Number(evalCBS(parts[2] || '', ctx, depth + 1).trim());
                     out += a < b ? '1' : '0';
-                } else if (cmd === 'greater_equal') {
+                } else if (cmd === 'greater_equal' || cmd === 'greaterequal' || cmd === 'gte' || cmd === 'greaterthanequal' || cmd === 'greater_than_equal' || cmd === '>=') {
                     const a = Number(evalCBS(parts[1] || '', ctx, depth + 1).trim());
                     const b = Number(evalCBS(parts[2] || '', ctx, depth + 1).trim());
                     out += a >= b ? '1' : '0';
-                } else if (cmd === 'less_equal') {
+                } else if (cmd === 'less_equal' || cmd === 'lessequal' || cmd === 'lte' || cmd === 'lessthanequal' || cmd === 'less_than_equal' || cmd === '<=') {
                     const a = Number(evalCBS(parts[1] || '', ctx, depth + 1).trim());
                     const b = Number(evalCBS(parts[2] || '', ctx, depth + 1).trim());
                     out += a <= b ? '1' : '0';
+                } else if (cmd === 'tonumber') {
+                    const n = Number(evalCBS(parts[1] || '', ctx, depth + 1).trim());
+                    out += Number.isFinite(n) ? String(n) : '0';
+                } else if (cmd === 'return') {
+                    out += evalCBS(parts[1] || '', ctx, depth + 1);
                 } else if (cmd === 'and' || cmd === 'all') {
                     const vals = parts.slice(1).map((p) => evalCBS(p, ctx, depth + 1));
                     out += vals.length && vals.every((v) => isCbsTruthy(v)) ? '1' : '0';
@@ -4719,10 +4863,205 @@
                     out += evalSimpleExpr(evalCBS(parts.slice(1).join('::'), ctx, depth + 1));
                 } else if (cmd === 'trim') {
                     out += evalCBS(parts.slice(1).join('::'), ctx, depth + 1).trim();
-                } else if (cmd === 'lower') {
+                } else if (cmd === 'lower' || cmd === 'lowercase') {
                     out += evalCBS(parts.slice(1).join('::'), ctx, depth + 1).toLowerCase();
-                } else if (cmd === 'upper') {
+                } else if (cmd === 'upper' || cmd === 'uppercase') {
                     out += evalCBS(parts.slice(1).join('::'), ctx, depth + 1).toUpperCase();
+                } else if (cmd === 'includes') {
+                    const hay = evalCBS(parts[1] ?? '', ctx, depth + 1);
+                    const needle = evalCBS(parts.slice(2).join('::'), ctx, depth + 1);
+                    let found = hay.includes(needle);
+                    if (!found && hay.trim().startsWith('[')) {
+                        try {
+                            const arr = JSON.parse(hay);
+                            if (Array.isArray(arr)) found = arr.some((item) => String(item) === needle);
+                        } catch {}
+                    }
+                    out += found ? '1' : '0';
+                } else if (cmd === 'startswith') {
+                    const hay = evalCBS(parts[1] ?? '', ctx, depth + 1);
+                    const prefix = evalCBS(parts.slice(2).join('::'), ctx, depth + 1);
+                    out += hay.startsWith(prefix) ? '1' : '0';
+                } else if (cmd === 'endswith') {
+                    const hay = evalCBS(parts[1] ?? '', ctx, depth + 1);
+                    const suffix = evalCBS(parts.slice(2).join('::'), ctx, depth + 1);
+                    out += hay.endsWith(suffix) ? '1' : '0';
+                } else if (cmd === 'index_of' || cmd === 'indexof') {
+                    const hay = evalCBS(parts[1] ?? '', ctx, depth + 1);
+                    const needle = evalCBS(parts.slice(2).join('::'), ctx, depth + 1);
+                    let idx = -1;
+                    if (hay.trim().startsWith('[')) {
+                        try {
+                            const arr = JSON.parse(hay);
+                            if (Array.isArray(arr)) idx = arr.findIndex((item) => String(item) === needle);
+                        } catch {}
+                    }
+                    if (idx < 0 && !hay.trim().startsWith('[')) idx = hay.indexOf(needle);
+                    out += String(idx);
+                } else if (cmd === 'split') {
+                    const src = evalCBS(parts[1] ?? '', ctx, depth + 1);
+                    const sep = parts.length > 2 ? evalCBS(parts.slice(2).join('::'), ctx, depth + 1) : ',';
+                    out += JSON.stringify(src.split(sep));
+                } else if (cmd === 'join') {
+                    const rawArr = evalCBS(parts[1] ?? '', ctx, depth + 1).trim();
+                    const sep = parts.length > 2 ? evalCBS(parts.slice(2).join('::'), ctx, depth + 1) : ',';
+                    let items = [];
+                    if (rawArr.startsWith('[')) {
+                        try {
+                            const parsed = JSON.parse(rawArr);
+                            if (Array.isArray(parsed)) items = parsed.map((v) => String(v ?? ''));
+                        } catch {}
+                    } else if (rawArr) {
+                        items = rawArr.split('§');
+                    }
+                    out += items.join(sep);
+                } else if (cmd === 'array_element' || cmd === 'arrayelement') {
+                    const rawArr = evalCBS(parts[1] ?? '', ctx, depth + 1).trim();
+                    const idx = Math.trunc(Number(evalCBS(parts[2] ?? '0', ctx, depth + 1)));
+                    let items = null;
+                    if (rawArr.startsWith('[')) {
+                        try {
+                            const parsed = JSON.parse(rawArr);
+                            if (Array.isArray(parsed)) items = parsed;
+                        } catch {}
+                    }
+                    if (items && Number.isInteger(idx)) {
+                        const resolvedIdx = idx < 0 ? items.length + idx : idx;
+                        if (resolvedIdx >= 0 && resolvedIdx < items.length) {
+                            const v = items[resolvedIdx];
+                            out += typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v ?? '');
+                        }
+                    }
+                } else if (cmd === 'array_length' || cmd === 'arraylength') {
+                    const rawArr = evalCBS(parts[1] ?? '', ctx, depth + 1).trim();
+                    let len = 0;
+                    if (rawArr.startsWith('[')) {
+                        try {
+                            const parsed = JSON.parse(rawArr);
+                            if (Array.isArray(parsed)) len = parsed.length;
+                        } catch {}
+                    }
+                    out += String(len);
+                } else if (cmd === 'round' || cmd === 'floor' || cmd === 'ceil') {
+                    const n = Number(evalCBS(parts[1] ?? '0', ctx, depth + 1).trim()) || 0;
+                    out += String(cmd === 'round' ? Math.round(n) : (cmd === 'floor' ? Math.floor(n) : Math.ceil(n)));
+                } else if (cmd === 'min' || cmd === 'max') {
+                    const nums = parts.slice(1).map((p) => Number(evalCBS(p, ctx, depth + 1).trim())).filter((n) => Number.isFinite(n));
+                    out += nums.length ? String(cmd === 'min' ? Math.min(...nums) : Math.max(...nums)) : '0';
+                } else if (cmd === 'rem' || cmd === 'mod') {
+                    const a = Number(evalCBS(parts[1] ?? '0', ctx, depth + 1).trim()) || 0;
+                    const b = Number(evalCBS(parts[2] ?? '1', ctx, depth + 1).trim()) || 0;
+                    out += b === 0 ? '0' : String(a % b);
+                } else if (cmd === 'fixnum' || cmd === 'tofixed') {
+                    const n = Number(evalCBS(parts[1] ?? '0', ctx, depth + 1).trim()) || 0;
+                    const dec = Math.max(0, Math.min(20, Math.trunc(Number(evalCBS(parts[2] ?? '0', ctx, depth + 1).trim()) || 0)));
+                    out += n.toFixed(dec);
+                } else if (cmd === 'substr' || cmd === 'substring' || cmd === 'slice') {
+                    const s = evalCBS(parts[1] ?? '', ctx, depth + 1);
+                    const start = Math.trunc(Number(evalCBS(parts[2] ?? '0', ctx, depth + 1).trim()) || 0);
+                    if (parts.length > 3) {
+                        const end = Math.trunc(Number(evalCBS(parts[3] ?? '0', ctx, depth + 1).trim()) || 0);
+                        out += cmd === 'slice' ? s.slice(start, end) : s.substring(start, end);
+                    } else {
+                        out += cmd === 'slice' ? s.slice(start) : s.substring(start);
+                    }
+                } else if (cmd === 'capitalize') {
+                    const s = evalCBS(parts.slice(1).join('::'), ctx, depth + 1);
+                    out += s ? (s.charAt(0).toUpperCase() + s.slice(1)) : '';
+                } else if (cmd === 'ltrim') {
+                    out += evalCBS(parts.slice(1).join('::'), ctx, depth + 1).trimStart();
+                } else if (cmd === 'rtrim') {
+                    out += evalCBS(parts.slice(1).join('::'), ctx, depth + 1).trimEnd();
+                } else if (cmd === 'padstart' || cmd === 'padend') {
+                    const s = evalCBS(parts[1] ?? '', ctx, depth + 1);
+                    const len = Math.max(0, Math.trunc(Number(evalCBS(parts[2] ?? '0', ctx, depth + 1).trim()) || 0));
+                    const fill = parts.length > 3 ? evalCBS(parts[3] ?? ' ', ctx, depth + 1) : ' ';
+                    out += cmd === 'padstart' ? s.padStart(len, fill) : s.padEnd(len, fill);
+                } else if (cmd === 'repeat') {
+                    const s = evalCBS(parts[1] ?? '', ctx, depth + 1);
+                    const cnt = Math.max(0, Math.min(1000, Math.trunc(Number(evalCBS(parts[2] ?? '0', ctx, depth + 1).trim()) || 0)));
+                    out += s.repeat(cnt);
+                } else if (cmd === 'reverse') {
+                    const s = evalCBS(parts.slice(1).join('::'), ctx, depth + 1);
+                    if (s.trim().startsWith('[')) {
+                        try {
+                            const arr = JSON.parse(s);
+                            if (Array.isArray(arr)) { out += JSON.stringify([...arr].reverse()); pos = closeAt + 2; continue; }
+                        } catch {}
+                    }
+                    out += Array.from(s).reverse().join('');
+                } else if (cmd === 'escape') {
+                    out += escapeHtml(evalCBS(parts.slice(1).join('::'), ctx, depth + 1));
+                } else if (cmd === 'unescape') {
+                    out += evalCBS(parts.slice(1).join('::'), ctx, depth + 1)
+                        .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+                } else if (cmd === 'dictelement' || cmd === 'dict_element' || cmd === 'object_element') {
+                    const rawObj = evalCBS(parts[1] ?? '', ctx, depth + 1).trim();
+                    const key = evalCBS(parts[2] ?? '', ctx, depth + 1);
+                    try {
+                        const obj = JSON.parse(rawObj);
+                        if (obj && typeof obj === 'object' && Object.prototype.hasOwnProperty.call(obj, key)) {
+                            const v = obj[key];
+                            out += typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v ?? '');
+                        }
+                    } catch {}
+                } else if (cmd === 'object_keys' || cmd === 'object_values') {
+                    const rawObj = evalCBS(parts[1] ?? '', ctx, depth + 1).trim();
+                    try {
+                        const obj = JSON.parse(rawObj);
+                        if (obj && typeof obj === 'object') {
+                            out += JSON.stringify(cmd === 'object_keys' ? Object.keys(obj) : Object.values(obj));
+                        } else out += '[]';
+                    } catch { out += '[]'; }
+                } else if (cmd === 'makedict' || cmd === 'dict') {
+                    const dict = {};
+                    for (const pair of parts.slice(1)) {
+                        const ev = evalCBS(pair, ctx, depth + 1);
+                        const eqIdx = ev.indexOf('=');
+                        if (eqIdx > 0) dict[ev.slice(0, eqIdx).trim()] = ev.slice(eqIdx + 1);
+                    }
+                    out += JSON.stringify(dict);
+                } else if (cmd === 'array_push') {
+                    const rawArr = evalCBS(parts[1] ?? '', ctx, depth + 1).trim();
+                    let arr = [];
+                    try { const p = JSON.parse(rawArr); if (Array.isArray(p)) arr = p; } catch {}
+                    for (const extra of parts.slice(2)) arr.push(evalCBS(extra, ctx, depth + 1));
+                    out += JSON.stringify(arr);
+                } else if (cmd === 'array_slice') {
+                    const rawArr = evalCBS(parts[1] ?? '', ctx, depth + 1).trim();
+                    const start = Math.trunc(Number(evalCBS(parts[2] ?? '0', ctx, depth + 1).trim()) || 0);
+                    let arr = [];
+                    try { const p = JSON.parse(rawArr); if (Array.isArray(p)) arr = p; } catch {}
+                    if (parts.length > 3) {
+                        const end = Math.trunc(Number(evalCBS(parts[3] ?? '0', ctx, depth + 1).trim()) || 0);
+                        out += JSON.stringify(arr.slice(start, end));
+                    } else {
+                        out += JSON.stringify(arr.slice(start));
+                    }
+                } else if (cmd === 'array_includes') {
+                    const rawArr = evalCBS(parts[1] ?? '', ctx, depth + 1).trim();
+                    const needle = evalCBS(parts[2] ?? '', ctx, depth + 1);
+                    let ok = false;
+                    try { const p = JSON.parse(rawArr); if (Array.isArray(p)) ok = p.some((x) => String(x) === needle); } catch {}
+                    out += ok ? '1' : '0';
+                } else if (cmd === 'range') {
+                    const a = Math.trunc(Number(evalCBS(parts[1] ?? '0', ctx, depth + 1).trim()) || 0);
+                    const b = parts.length > 2 ? Math.trunc(Number(evalCBS(parts[2] ?? '0', ctx, depth + 1).trim()) || 0) : a;
+                    const s = parts.length > 2 ? a : 0;
+                    const e = parts.length > 2 ? b : a;
+                    const step = parts.length > 3 ? (Math.trunc(Number(evalCBS(parts[3] ?? '1', ctx, depth + 1).trim()) || 1) || 1) : (s <= e ? 1 : -1);
+                    const res = [];
+                    for (let v = s; step > 0 ? v < e : v > e; v += step) {
+                        if (res.length >= 2000) break;
+                        res.push(v);
+                    }
+                    out += JSON.stringify(res);
+                } else if (cmd === 'spread') {
+                    const rawArr = evalCBS(parts[1] ?? '', ctx, depth + 1).trim();
+                    try {
+                        const p = JSON.parse(rawArr);
+                        if (Array.isArray(p)) out += p.join('::');
+                    } catch {}
                 } else if (cmd === 'call') {
                     if ((ctx.callStack || 0) <= 20) {
                         const argData = parts.slice(1).map((p) => evalCBS(p, ctx, depth + 1));
@@ -4785,7 +5124,7 @@
             return { defaults, options };
         }
 
-        function buildRenderContext(charObj, chatObj, db, personaName, enabledModules, msgIndex, totalMsgs) {
+        function buildRenderContext(charObj, chatObj, db, personaName, enabledModules, msgIndex, totalMsgs, allMsgs = [], personaPrompt = '', extra = {}) {
             const vars = Object.create(null);
             for (const m of enabledModules || []) {
                 if (m && m.defaultVariables) parseDefaultVariables(m.defaultVariables, vars);
@@ -4812,18 +5151,58 @@
                 Object.assign(globalVars, chatObj.GLGlobalVariables);
             }
 
+            const sortDisplayScripts = (scripts) => {
+                if (!Array.isArray(scripts) || scripts.length <= 1) return scripts;
+                const getMeta = (sc) => {
+                    const flag = (sc && sc.flag) ? String(sc.flag) : '';
+                    let bucket = 1;
+                    if (flag.includes('<move_top>')) bucket = 0;
+                    else if (flag.includes('<move_bottom>')) bucket = 2;
+                    const ordMatch = flag.match(/<order\s+(-?\d+)>/i);
+                    const order = ordMatch ? Number(ordMatch[1]) : 0;
+                    return { bucket, order };
+                };
+                return scripts
+                    .map((sc, idx) => ({ sc, idx, meta: getMeta(sc) }))
+                    .sort((a, b) => {
+                        if (a.meta.bucket !== b.meta.bucket) return a.meta.bucket - b.meta.bucket;
+                        if (a.meta.order !== b.meta.order) return b.meta.order - a.meta.order;
+                        return a.idx - b.idx;
+                    })
+                    .map((x) => x.sc);
+            };
+
             const displayScripts = [];
             if (db && Array.isArray(db.customscript)) {
                 for (const sc of db.customscript) if (sc && sc.type === 'editdisplay') displayScripts.push(sc);
             }
             for (const m of enabledModules || []) {
-                if (m && Array.isArray(m.regex)) {
-                    for (const sc of m.regex) if (sc && sc.type === 'editdisplay') displayScripts.push(sc);
+                const modRegex = m && (Array.isArray(m.regex) ? m.regex : (Array.isArray(m.customScripts) ? m.customScripts : null));
+                if (modRegex) {
+                    for (const sc of modRegex) if (sc && sc.type === 'editdisplay') displayScripts.push(sc);
                 }
             }
-            if (charObj && Array.isArray(charObj.customscript)) {
-                for (const sc of charObj.customscript) if (sc && sc.type === 'editdisplay') displayScripts.push(sc);
+            const charScripts = charObj && (Array.isArray(charObj.customscript) ? charObj.customscript : (Array.isArray(charObj.customScripts) ? charObj.customScripts : null));
+            if (charScripts) {
+                for (const sc of charScripts) if (sc && sc.type === 'editdisplay') displayScripts.push(sc);
             }
+
+            const collectCharAssetNames = (arr) => {
+                const out = [];
+                const seen = new Set();
+                for (const item of arr || []) {
+                    if (!Array.isArray(item) || !item[0]) continue;
+                    const name = String(item[0]);
+                    if (!seen.has(name)) {
+                        seen.add(name);
+                        out.push(name);
+                    }
+                }
+                return out;
+            };
+            const emotionNames = collectCharAssetNames(charObj && charObj.emotionImages);
+            const additionalAssetNames = collectCharAssetNames(charObj && charObj.additionalAssets);
+            const charAssetNames = additionalAssetNames.length ? additionalAssetNames : emotionNames;
 
             return {
                 vars,
@@ -4834,23 +5213,53 @@
                 callArgs: null,
                 callStack: 0,
                 enabledModules: Array.isArray(enabledModules) ? enabledModules : [],
-                displayScripts,
+                charAssetNames,
+                emotionNames,
+                displayScripts: sortDisplayScripts(displayScripts),
                 charName: (charObj && charObj.name) || 'Character',
+                charDesc: String((charObj && charObj.desc) || ''),
+                personality: String((charObj && charObj.personality) || ''),
+                scenario: String((charObj && charObj.scenario) || ''),
+                note: String((chatObj && chatObj.note) || ''),
+                globalNote: String((charObj && charObj.replaceGlobalNote) || ''),
+                mainPrompt: String((charObj && charObj.systemPrompt) || ''),
+                jailbreak: '',
+                firstMessage: String((charObj && charObj.firstMessage) || ''),
                 userName: personaName || 'User',
+                personaPrompt: String(personaPrompt || ''),
+                userIcon: String((extra && extra.personaIcon) || ''),
+                charImage: String((extra && extra.charImage) || ''),
+                msgRole: 'char',
+                chatList: Array.isArray(allMsgs)
+                    ? allMsgs.map((m) => ({ role: m && m.role === 'user' ? 'user' : 'assistant', content: String((m && m.data) || '') }))
+                    : [],
                 chatIndex: msgIndex,
                 lastMessageId: Number(totalMsgs || 0) - 1,
             };
         }
 
         function applyDisplayRegexScripts(text, ctx) {
-            let out = String(text || '');
+            let out = String(text || '').replace(/\r\n/g, '\n');
             for (const sc of ctx.displayScripts || []) {
                 if (!sc || !sc.in) continue;
-                const rawOut = String(sc.out || '');
-                const rawIn = String(sc.in);
                 const rawFlag = sc.ableFlag && sc.flag ? String(sc.flag) : '';
                 const hasCbsFlag = rawFlag.includes('<cbs>');
-                const jsFlags = rawFlag.replace(/<[^>]+>/g, '').replace(/[^gimsu]/g, '') || 'g';
+                const noEndNl = rawFlag.includes('<no_end_nl>');
+                let rawOut = String(sc.out || '');
+                if (rawOut.includes('\\n')) rawOut = rawOut.replace(/\\n/g, '\n');
+                if (noEndNl && rawOut.endsWith('\n')) rawOut = rawOut.slice(0, -1);
+                let jsFlags = 'g';
+                if (sc.ableFlag) {
+                    const metaAdded = (rawFlag.includes('<ignore_case>') ? 'i' : '')
+                        + (rawFlag.includes('<multiline>') ? 'm' : '')
+                        + (rawFlag.includes('<dotall>') ? 's' : '')
+                        + (rawFlag.includes('<global>') ? 'g' : '');
+                    const rawJs = rawFlag.replace(/<[^>]+>/g, '').replace(/[^dgimsuvy]/g, '');
+                    jsFlags = Array.from(new Set((rawJs + metaAdded).split(''))).join('');
+                    if (!jsFlags && !rawFlag.includes('<no_g>')) jsFlags = 'g';
+                    else if (!jsFlags.includes('g') && !rawFlag.includes('<no_g>')) jsFlags += 'g';
+                }
+                const rawIn = String(sc.in);
                 const patternStr = hasCbsFlag ? evalCBS(rawIn, ctx) : rawIn;
                 if (!patternStr) continue;
 
@@ -4858,11 +5267,18 @@
                     const rx = new RegExp(patternStr, jsFlags);
                     out = out.replace(rx, (...args) => {
                         const fullMatch = args[0];
-                        const caps = args.slice(1, -2);
-                        const substituted = rawOut.replace(/\$(\$|&|\d{1,2})/g, (_, tok) => {
-                            if (tok === '$') return '$';
-                            if (tok === '&') return fullMatch;
-                            const n = parseInt(tok, 10);
+                        const hasGroups = args.length >= 4 && typeof args[args.length - 1] === 'object' && args[args.length - 1] !== null && typeof args[args.length - 2] === 'string';
+                        const groups = hasGroups ? args[args.length - 1] : null;
+                        const inputStr = hasGroups ? args[args.length - 2] : args[args.length - 1];
+                        const offset = hasGroups ? args[args.length - 3] : args[args.length - 2];
+                        const caps = hasGroups ? args.slice(1, -3) : args.slice(1, -2);
+                        const substituted = rawOut.replace(/\$(?:\$|&|`|'|<([^>]+)>|(\d{1,2}))/g, (tok, groupName, numStr) => {
+                            if (tok === '$$') return '$';
+                            if (tok === '$&') return fullMatch;
+                            if (tok === '$`') return typeof inputStr === 'string' && typeof offset === 'number' ? inputStr.slice(0, offset) : '';
+                            if (tok === "$'") return typeof inputStr === 'string' && typeof offset === 'number' ? inputStr.slice(offset + fullMatch.length) : '';
+                            if (groupName !== undefined) return groups && groups[groupName] !== undefined ? String(groups[groupName]) : '';
+                            const n = parseInt(numStr, 10);
                             if (n === 0) return fullMatch;
                             if (n >= 1 && n <= caps.length) return caps[n - 1] ?? '';
                             return '';
@@ -4947,7 +5363,8 @@
                     : raw instanceof ArrayBuffer
                     ? new Uint8Array(raw)
                     : new Uint8Array(Object.values(raw));
-                if (!bytes.length || bytes.length > 2.5 * 1024 * 1024) return null;
+                if (!bytes.length) return null;
+                if (bytes.length > 2.5 * 1024 * 1024) return '__RS_TOO_LARGE__';
                 const url = `data:${detectImageMime(bytes, assetPath)};base64,${uint8ToBase64(bytes)}`;
                 if (url.length <= 2_000_000) {
                     cacheSetBounded(assetDataCache, assetPath, url, 48);
@@ -4964,7 +5381,8 @@
             if (assetDataCache.has(cacheKey)) return assetDataCache.get(cacheKey);
             try {
                 const res = await risuai.readInlay(inlayId);
-                if (res && res.data && String(res.data).startsWith('data:') && String(res.data).length <= 3.5 * 1024 * 1024) {
+                if (res && res.data && String(res.data).startsWith('data:')) {
+                    if (String(res.data).length > 3.5 * 1024 * 1024) return '__RS_TOO_LARGE__';
                     if (String(res.data).length <= 2_000_000) {
                         cacheSetBounded(assetDataCache, cacheKey, res.data, 24);
                     }
@@ -4985,26 +5403,31 @@
                     list.push({ n: `${name}.${String(ext).trim()}`.toLowerCase(), p: pathStr });
                 }
             };
-            if (charObj && Array.isArray(charObj.additionalAssets)) {
-                for (const a of charObj.additionalAssets) {
-                    if (Array.isArray(a)) pushEntry(a[0], a[1], a[2]);
+            const pushRawItem = (entry) => {
+                if (Array.isArray(entry)) {
+                    pushEntry(entry[0], entry[1], entry[2]);
+                } else if (entry && typeof entry === 'object') {
+                    pushEntry(entry.name || entry.key || '', entry.path || entry.key || '', entry.ext || '');
                 }
+            };
+            if (charObj && Array.isArray(charObj.additionalAssets)) {
+                for (const a of charObj.additionalAssets) pushRawItem(a);
             }
             if (charObj && Array.isArray(charObj.emotionImages)) {
-                for (const e of charObj.emotionImages) {
-                    if (Array.isArray(e)) pushEntry(e[0], e[1], e[2]);
-                }
+                for (const e of charObj.emotionImages) pushRawItem(e);
             }
             for (const m of enabledModules || []) {
                 if (m && Array.isArray(m.assets)) {
-                    for (const a of m.assets) {
-                        if (Array.isArray(a)) pushEntry(a[0], a[1], a[2]);
-                    }
+                    for (const a of m.assets) pushRawItem(a);
                 }
             }
             const norm = (s) => String(s || '').replace(/\.[a-z0-9]{2,5}$/i, '').replace(/[\s_\-]+/g, '').toLowerCase();
             const findSingle = (rawName) => {
-                const rawLower = String(rawName || '').trim().toLowerCase();
+                let decoded = String(rawName || '').trim();
+                if (decoded.includes('%')) {
+                    try { decoded = decodeURIComponent(decoded); } catch (_) {}
+                }
+                const rawLower = decoded.toLowerCase();
                 if (!rawLower) return null;
                 for (const item of list) {
                     if (item.n === rawLower) return item.p;
@@ -5016,7 +5439,11 @@
                 }
                 for (const item of list) {
                     const nk = norm(item.n);
-                    if (nk && (nk.includes(k) || k.includes(nk))) return item.p;
+                    if (nk && nk.includes(k)) return item.p;
+                }
+                for (const item of list) {
+                    const nk = norm(item.n);
+                    if (nk && nk.length >= 2 && k.includes(nk)) return item.p;
                 }
                 return null;
             };
@@ -5032,17 +5459,19 @@
         function createAssetCollector(findPath, allowImages, seasonSuffix = '') {
             const assetMap = Object.create(null);
             const urlToId = new Map();
+            const pathToId = new Map();
             let seq = 0;
             let totalBytes = 0;
-            const MAX_ASSETS = 64;
+            const MAX_ASSETS = 512;
             const MAX_TOTAL_BYTES = 12 * 1024 * 1024;
 
-            const addDataUrl = (url) => {
+            const addRef = (url) => {
                 if (!url) return null;
                 if (urlToId.has(url)) return urlToId.get(url);
                 if (seq >= MAX_ASSETS) return null;
-                const size = String(url).length;
-                if (totalBytes + size > MAX_TOTAL_BYTES) return null;
+                const isInline = url.startsWith('data:');
+                const size = isInline ? String(url).length : 0;
+                if (isInline && totalBytes + size > MAX_TOTAL_BYTES) return null;
                 const id = `a${seq++}`;
                 totalBytes += size;
                 urlToId.set(url, id);
@@ -5050,23 +5479,74 @@
                 return id;
             };
 
-            const resolveUrl = async (name, kind = 'asset') => {
+            const register = async (name, kind = 'asset', { inlineOnly = false, lazyOnly = false } = {}) => {
                 if (!allowImages || !cfg.includeImages || !name) return null;
-                if (kind === 'inlay') return await readInlayDataUrl(name);
-                if (/^(?:data:image\/|https?:\/\/)/i.test(name)) return name;
-                if (/^assets\/[^/\\]+$/i.test(name)) return await readAssetDataUrl(name);
-                const p = findPath(name, seasonSuffix);
-                return p ? await readAssetDataUrl(p) : null;
+                if (kind === 'inlay') {
+                    const inlayId = String(name).trim();
+                    if (!inlayId) return null;
+                    const cacheKey = `inlay:${inlayId}`;
+                    if (pathToId.has(cacheKey)) {
+                        const id = pathToId.get(cacheKey);
+                        return { id, url: assetMap[id], token: `[[RSASSET:${id}]]` };
+                    }
+                    let id = null;
+                    if (!lazyOnly && totalBytes < MAX_TOTAL_BYTES) {
+                        const dataUrl = await readInlayDataUrl(inlayId);
+                        if (dataUrl === '__RS_TOO_LARGE__') {
+                            if (!inlineOnly) id = addRef(`pcinlay:${inlayId}`);
+                        } else if (dataUrl) {
+                            id = addRef(dataUrl);
+                            if (!id && !inlineOnly) id = addRef(`pcinlay:${inlayId}`);
+                        } else {
+                            return null;
+                        }
+                    } else if (!inlineOnly) {
+                        id = addRef(`pcinlay:${inlayId}`);
+                    }
+                    if (!id) return null;
+                    pathToId.set(cacheKey, id);
+                    return { id, url: assetMap[id], token: `[[RSASSET:${id}]]` };
+                }
+                const cleanName = String(name).trim();
+                if (!cleanName) return null;
+                if (/^(?:data:image\/|https?:\/\/|\/api\/asset\/)/i.test(cleanName)) {
+                    const id = addRef(cleanName);
+                    if (!id) return null;
+                    return { id, url: assetMap[id], token: `[[RSASSET:${id}]]` };
+                }
+                const assetPath = (/^assets\/[^\s"'<>]+$/i.test(cleanName) && !cleanName.includes('..'))
+                    ? cleanName
+                    : findPath(cleanName, seasonSuffix);
+                if (!assetPath) return null;
+                if (pathToId.has(assetPath)) {
+                    const id = pathToId.get(assetPath);
+                    return { id, url: assetMap[id], token: `[[RSASSET:${id}]]` };
+                }
+                let id = null;
+                if (!lazyOnly && totalBytes < MAX_TOTAL_BYTES) {
+                    const dataUrl = await readAssetDataUrl(assetPath);
+                    if (dataUrl === '__RS_TOO_LARGE__') {
+                        if (!inlineOnly) id = addRef(`pcpath:${assetPath}`);
+                    } else if (dataUrl) {
+                        id = addRef(dataUrl);
+                        if (!id && !inlineOnly) id = addRef(`pcpath:${assetPath}`);
+                    } else {
+                        return null;
+                    }
+                } else if (!inlineOnly) {
+                    id = addRef(`pcpath:${assetPath}`);
+                }
+                if (!id) return null;
+                pathToId.set(assetPath, id);
+                return { id, url: assetMap[id], token: `[[RSASSET:${id}]]` };
             };
 
             return {
                 assetMap,
-                async register(name, kind = 'asset') {
-                    const url = await resolveUrl(name, kind);
-                    if (!url) return null;
-                    const id = addDataUrl(url);
-                    if (!id) return null;
-                    return { id, url, token: `[[RSASSET:${id}]]` };
+                register,
+                lazyView: {
+                    assetMap,
+                    register: (name, kind = 'asset') => register(name, kind, { lazyOnly: true }),
                 },
             };
         }
@@ -5087,14 +5567,14 @@
                 if (url && !msgImgs.includes(url)) msgImgs.push(url);
             };
             const isInsideAttrOrCssUrl = (index) => {
-                const before = src.slice(Math.max(0, index - 80), index);
+                const before = src.slice(Math.max(0, index - 400), index);
                 if (/(?:src|href|background|poster)\s*=\s*["']?[^"'>]*$/i.test(before)) return true;
                 if (/url\(\s*["']?[^"')]*$/i.test(before)) return true;
                 return false;
             };
 
-            // Pass 1: Resolve {{raw/img/asset/image/emotion/inlay/inlayed::...}} and <img=...>
-            const macroRe = /<img\s*=\s*["']?([^"'\s>]+)["']?\s*\/?>|\{\{(?:(inlay|inlayed)|(img|raw|asset|image|emotion))::([^}]+)\}\}/gi;
+            // Pass 1: Resolve {{raw/path/img/asset/image/emotion/inlay/inlayed::...}} and <img=...>
+            const macroRe = /<img\s*=\s*["']?([^"'\s>]+)["']?\s*\/?>|\{\{(?:(inlay|inlayed)|(img|raw|path|asset|image|emotion))::([^}]+)\}\}/gi;
             const macroMatches = [];
             let m;
             while ((m = macroRe.exec(src)) !== null) {
@@ -5104,7 +5584,9 @@
                 } else if (m[2]) {
                     macroMatches.push({ start: m.index, end: macroRe.lastIndex, kind: 'inlay', name: m[4].trim(), asImgTag: !isAttrTag });
                 } else {
-                    macroMatches.push({ start: m.index, end: macroRe.lastIndex, kind: 'asset', name: m[4].trim(), asImgTag: !isAttrTag });
+                    const macroName = (m[3] || '').toLowerCase();
+                    const isRawUrlMacro = macroName === 'raw' || macroName === 'path';
+                    macroMatches.push({ start: m.index, end: macroRe.lastIndex, kind: 'asset', name: m[4].trim(), asImgTag: isRawUrlMacro ? false : !isAttrTag });
                 }
             }
             let html = '';
@@ -5120,7 +5602,7 @@
             }
             html += src.slice(cursor);
 
-            // Pass 2: Resolve bare <img src=foo> where src is not http(s), data:, or already [[RSASSET:...]]
+            // Pass 2: Resolve bare <img src=foo> where src is not http(s), data:, /api/asset/, or already [[RSASSET:...]]
             const imgTagRe = /<img\b([^>]*?)\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))([^>]*)>/gi;
             const imgMatches = [];
             while ((m = imgTagRe.exec(html)) !== null) {
@@ -5131,7 +5613,7 @@
                     if (collector.assetMap[assetId]) pushMsgImg(srcVal);
                     continue;
                 }
-                if (/^(?:https?:\/\/|data:image\/)/i.test(srcVal)) {
+                if (/^(?:https?:\/\/|data:image\/|\/api\/asset\/)/i.test(srcVal)) {
                     pushMsgImg(srcVal);
                     continue;
                 }
@@ -5157,6 +5639,70 @@
                 }
                 nextHtml += html.slice(c2);
                 html = nextHtml;
+            }
+            if (html.includes('url(')) {
+                const resolveCssUrlBlock = async (cssText, innerQuote) => {
+                    const urlRe = /url\(\s*(?:"([^"]+)"|'([^']+)'|([^)'"\s][^)'"]*?))\s*\)/gi;
+                    let c3 = 0;
+                    let built = '';
+                    let um;
+                    while ((um = urlRe.exec(cssText)) !== null) {
+                        built += cssText.slice(c3, um.index);
+                        c3 = um.index + um[0].length;
+                        const rawRef = String(um[1] ?? um[2] ?? um[3] ?? '').trim();
+                        if (!rawRef || /^(?:data:|https?:|blob:|pcpath:|pcinlay:|\/|#|a\d+$|__rs_)/i.test(rawRef)) {
+                            built += um[0];
+                            continue;
+                        }
+                        let cleanRef = rawRef;
+                        try { cleanRef = decodeURIComponent(rawRef); } catch {}
+                        const entry = await collector.register(cleanRef, 'asset') || (cleanRef !== rawRef ? await collector.register(rawRef, 'asset') : null);
+                        if (entry) {
+                            pushMsgImg(entry.token);
+                            built += `url(${innerQuote}${entry.token}${innerQuote})`;
+                        } else {
+                            built += um[0];
+                        }
+                    }
+                    built += cssText.slice(c3);
+                    return built;
+                };
+                const styleAttrRe = /(\bstyle\s*=\s*)(?:"([^"]*)"|'([^']*)')/gi;
+                let sCursor = 0;
+                let sNext = '';
+                let sm;
+                while ((sm = styleAttrRe.exec(html)) !== null) {
+                    sNext += html.slice(sCursor, sm.index);
+                    sCursor = sm.index + sm[0].length;
+                    const quote = sm[2] !== undefined ? '"' : "'";
+                    const val = sm[2] !== undefined ? sm[2] : sm[3];
+                    if (val && val.toLowerCase().includes('url(')) {
+                        const resolvedVal = await resolveCssUrlBlock(val, quote === '"' ? "'" : '"');
+                        sNext += `${sm[1]}${quote}${resolvedVal}${quote}`;
+                    } else {
+                        sNext += sm[0];
+                    }
+                }
+                sNext += html.slice(sCursor);
+                html = sNext;
+                if (/<style\b/i.test(html)) {
+                    const styleTagRe = /(<style\b[^>]*>)([\s\S]*?)(<\/style>)/gi;
+                    let tCursor = 0;
+                    let tNext = '';
+                    let tm;
+                    while ((tm = styleTagRe.exec(html)) !== null) {
+                        tNext += html.slice(tCursor, tm.index);
+                        tCursor = tm.index + tm[0].length;
+                        if (tm[2] && tm[2].toLowerCase().includes('url(')) {
+                            const resolvedCss = await resolveCssUrlBlock(tm[2], "'");
+                            tNext += `${tm[1]}${resolvedCss}${tm[3]}`;
+                        } else {
+                            tNext += tm[0];
+                        }
+                    }
+                    tNext += html.slice(tCursor);
+                    html = tNext;
+                }
             }
             return { html: html.replace(/(?:[ \t]*\r?\n){3,}/g, '\n\n').trim(), images: msgImgs };
         }
@@ -5471,6 +6017,7 @@
                 }
             }
             if (!charObj || isTrashedEntry(charObj)) return null;
+            if (charObj.chaId) charIdByIndex.set(viewCharIndex, String(charObj.chaId));
     
             const chats = Array.isArray(charObj.chats) ? charObj.chats : [];
             if (viewChatIndex < 0 || viewChatIndex >= chats.length || isTrashedEntry(chats[viewChatIndex])) {
@@ -5519,6 +6066,7 @@
                         'enabledModules',
                         'personas',
                         'selectedPersona',
+                        'userIcon',
                         'customscript',
                         'globalChatVariables',
                     ]);
@@ -5559,8 +6107,13 @@
                 return sw && Array.isArray(sw.swipes) ? `${sw.index}/${sw.swipes.length}` : '0/1';
             }).join(',');
             const toggleSig = `${useLocalToggles}:${Object.keys(localVars).length}:${JSON.stringify(localVars)}:${JSON.stringify(globalToggleValues)}:${toggleBlocks.length}:${enabledModIds}`;
-            const loreSig = `${Array.isArray(charObj.globalLore) ? charObj.globalLore.length : 0}:${Array.isArray(chatObj.localLore) ? chatObj.localLore.length : 0}:${hashLoreUid(charObj.replaceGlobalNote || '')}:${hashLoreUid(chatObj.note || '')}:${hashLoreUid(charObj.desc || '')}`;
-            const stateSig = `${fmIdx}:${firstMessageCount}:${JSON.stringify(scriptState)}:${swipeDigest}:${loreSig}`;
+            const loreSig = `${Array.isArray(charObj.globalLore) ? charObj.globalLore.length : 0}:${Array.isArray(chatObj.localLore) ? chatObj.localLore.length : 0}:${hashLoreUid(charObj.replaceGlobalNote || '')}:${hashLoreUid(chatObj.note || '')}:${hashLoreUid(charObj.desc || '')}:${hashLoreUid(charObj.backgroundHTML || '')}`;
+            const activePersonaObj = db && Array.isArray(db.personas) ? db.personas[db.selectedPersona || 0] : null;
+            const personaIconVal = String((activePersonaObj && activePersonaObj.icon) || (db && db.userIcon) || '').trim();
+            const personaSig = db && Array.isArray(db.personas)
+                ? `${db.selectedPersona || 0}:${(activePersonaObj && activePersonaObj.name) || ''}:${personaIconVal}`
+                : `0::${personaIconVal}`;
+            const stateSig = `${fmIdx}:${firstMessageCount}:${JSON.stringify(scriptState)}:${swipeDigest}:${loreSig}:${personaSig}`;
             const sig = `${viewCharIndex}:${viewChatIndex}:${isPcActive}:${allMsgs.length}:${recentDigest}:${chatObj.name || ''}:${toggleSig}:${stateSig}:${Boolean(cfg.includeImages)}`;
             if (!forceFull && sig === lastSnapSig) {
                 return { snapshot: null, sig };
@@ -5568,16 +6121,15 @@
 
             let personaName = 'User';
             let personaPrompt = '';
-            if (db && Array.isArray(db.personas)) {
-                const p = db.personas[db.selectedPersona || 0];
-                if (p) {
-                    personaName = p.name || 'User';
-                    personaPrompt = p.personaPrompt || '';
-                }
+            const personaIcon = personaIconVal;
+            const charImage = String((charObj && charObj.image) || '').trim();
+            if (activePersonaObj) {
+                personaName = activePersonaObj.name || 'User';
+                personaPrompt = activePersonaObj.personaPrompt || '';
             }
 
             const findPath = buildLookup(charObj, enabledModules);
-            const renderCtx = buildRenderContext(charObj, chatObj, db, personaName, enabledModules, -1, allMsgs.length);
+            const renderCtx = buildRenderContext(charObj, chatObj, db, personaName, enabledModules, -1, allMsgs.length, allMsgs, personaPrompt, { personaIcon, charImage });
             const collector = createAssetCollector(findPath, Boolean(cfg.includeImages), renderCtx.vars.current_season_suffix || '');
             const outMsgs = [];
 
@@ -5585,6 +6137,9 @@
             let greetingControls = [];
             let inferredDefaults = {};
             let botWidgetHtml = '';
+            const firstMessageStyles = [];
+            let pendingFirstMsg = null;
+            let pendingWidgetHtml = '';
             if (charObj.firstMessage && startOffset === 0) {
                 const firstRaw = fmIdx >= 0 && altGreetings[fmIdx] ? altGreetings[fmIdx] : charObj.firstMessage;
                 if (firstRaw) {
@@ -5597,10 +6152,14 @@
                         tempVars: Object.create(null),
                         slots: Object.create(null),
                         chatIndex: -1,
+                        msgRole: 'char',
                     };
                     let renderedFirst = renderRemoteMessage(firstStr, firstCtx);
-                    let parsedFirst = await renderMessageHtmlAndText(renderedFirst, collector);
-                    if (!parsedFirst.text && !parsedFirst.images.length && /\{\{#(?:when|if|if_pure)/i.test(firstStr)) {
+                    const hasFirstContent = (s) => Boolean(
+                        cleanProse(stripDangerousNonHtml(s)) ||
+                        /<img\b|\{\{(?:img|raw|path|asset|image|emotion|inlay|inlayed)::/i.test(String(s || ''))
+                    );
+                    if (!hasFirstContent(renderedFirst) && /\{\{#(?:when|if|if_pure)/i.test(firstStr)) {
                         let filled = false;
                         for (const [k, v] of Object.entries(greetingMeta.defaults)) {
                             if (!Object.prototype.hasOwnProperty.call(firstCtx.vars, k)) {
@@ -5611,7 +6170,6 @@
                         }
                         if (filled) {
                             renderedFirst = renderRemoteMessage(firstStr, firstCtx);
-                            parsedFirst = await renderMessageHtmlAndText(renderedFirst, collector);
                         }
                     }
                     greetingControls = Object.entries(greetingMeta.options)
@@ -5623,16 +6181,7 @@
                                 : String(greetingMeta.defaults[key] ?? opts[0] ?? ''),
                             options: opts,
                         }));
-                    outMsgs.push({
-                        index: -1,
-                        role: 'char',
-                        text: parsedFirst.text,
-                        html: parsedFirst.html,
-                        raw: firstStr,
-                        images: parsedFirst.images,
-                        isFirstMessage: true,
-                        turnIndex: 0,
-                    });
+                    pendingFirstMsg = { renderedFirst, firstStr };
                 }
             } else if (charObj.firstMessage) {
                 const firstRaw = fmIdx >= 0 && altGreetings[fmIdx] ? altGreetings[fmIdx] : charObj.firstMessage;
@@ -5655,9 +6204,11 @@
                         tempVars: Object.create(null),
                         slots: Object.create(null),
                         chatIndex: -1,
+                        msgRole: 'char',
                     };
                     let renderedFirst = renderRemoteMessage(firstStr, firstCtx);
-                    if (!/position\s*:\s*fixed/i.test(renderedFirst) && !/(?:buttons-container|side-panel|floating)/i.test(renderedFirst) && /\{\{#(?:when|if|if_pure)/i.test(firstStr)) {
+                    const looksInteractiveWidget = (h) => /position\s*:\s*fixed/i.test(h) || /(?:buttons-container|side-panel|floating|risu-trigger|risu-btn)/i.test(h) || /<input\b[^>]*\btype\s*=\s*["']?(?:checkbox|radio)/i.test(h);
+                    if (!looksInteractiveWidget(renderedFirst) && /\{\{#(?:when|if|if_pure)/i.test(firstStr)) {
                         let filled = false;
                         for (const [k, v] of Object.entries(greetingMeta.defaults)) {
                             if (!Object.prototype.hasOwnProperty.call(firstCtx.vars, k)) {
@@ -5667,33 +6218,31 @@
                         }
                         if (filled) renderedFirst = renderRemoteMessage(firstStr, firstCtx);
                     }
-                    if (renderedFirst && (/position\s*:\s*fixed/i.test(renderedFirst) || /(?:buttons-container|side-panel|floating)/i.test(renderedFirst))) {
-                        const parsedWidget = await renderMessageHtmlAndText(renderedFirst, collector);
-                        botWidgetHtml = parsedWidget.html || '';
+                    if (renderedFirst && /<style\b/i.test(renderedFirst)) {
+                        const styleMatches = renderedFirst.match(/<style\b[^>]*>[\s\S]*?<\/style>/gi);
+                        if (styleMatches) {
+                            for (const sm of styleMatches) firstMessageStyles.push(sm);
+                        }
+                    }
+                    if (renderedFirst && looksInteractiveWidget(renderedFirst)) {
+                        pendingWidgetHtml = renderedFirst;
                     }
                 }
             }
 
-            const recentAssetStart = Math.max(0, recent.length - 8);
-            const fallbackCollector = createAssetCollector(findPath, false, renderCtx.vars.current_season_suffix || '');
+            // Evaluate CBS chronologically so var side effects stay exact
+            const renderedRecent = [];
             for (let i = 0; i < recent.length; i++) {
                 const msg = recent[i];
-                const isRecent = i >= recentAssetStart;
-                const msgCtx = { ...renderCtx, tempVars: Object.create(null), slots: Object.create(null), chatIndex: startOffset + i };
+                const msgCtx = { ...renderCtx, tempVars: Object.create(null), slots: Object.create(null), chatIndex: startOffset + i, msgRole: msg.role || 'char' };
                 const renderedMsg = renderRemoteMessage(msg.data, msgCtx);
-                const parsed = await renderMessageHtmlAndText(renderedMsg, isRecent ? collector : fallbackCollector);
                 const swEntry = swipeHistory[makeSwipeKey(charObj, viewCharIndex, chatObj, viewChatIndex, startOffset + i)];
-                outMsgs.push({
-                    index: startOffset + i,
-                    role: msg.role,
-                    chatId: String(msg.chatId || ''),
-                    text: parsed.text,
-                    html: parsed.html,
-                    raw: String(msg.data || ''),
-                    images: parsed.images,
+                renderedRecent.push({
+                    idx: startOffset + i,
+                    msg,
+                    renderedMsg,
+                    swEntry,
                     turnIndex: uaStats.turnByIndex[startOffset + i] || 0,
-                    swipeCount: swEntry && Array.isArray(swEntry.swipes) ? swEntry.swipes.length : 1,
-                    swipeIndex: swEntry && typeof swEntry.index === 'number' ? swEntry.index : 0,
                 });
             }
 
@@ -5702,10 +6251,63 @@
             for (const m of enabledModules) {
                 if (m && m.backgroundEmbedding) bgParts.push(String(m.backgroundEmbedding));
             }
-            let backgroundHtml = '';
-            if (bgParts.length) {
-                const evaluatedBg = evalCBS(bgParts.join('\n'), { ...renderCtx, tempVars: Object.create(null), slots: Object.create(null) });
-                backgroundHtml = (await resolveHtmlAssetRefs(evaluatedBg, collector)).html;
+            for (const fms of firstMessageStyles) bgParts.push(fms);
+            const evaluatedBg = bgParts.length
+                ? evalCBS(bgParts.join('\n'), { ...renderCtx, tempVars: Object.create(null), slots: Object.create(null) })
+                : '';
+
+            // Resolve assets newest-first so latest status card, side drawer, and backgroundHtml get inline priority
+            const recentAssetStart = Math.max(0, renderedRecent.length - 8);
+            const parsedRecent = new Array(renderedRecent.length);
+            if (renderedRecent.length > 0) {
+                const lastIdx = renderedRecent.length - 1;
+                parsedRecent[lastIdx] = await renderMessageHtmlAndText(renderedRecent[lastIdx].renderedMsg, collector);
+            }
+            const backgroundHtml = evaluatedBg
+                ? (await resolveHtmlAssetRefs(evaluatedBg, collector)).html
+                : '';
+            if (pendingWidgetHtml) {
+                const parsedWidget = await renderMessageHtmlAndText(pendingWidgetHtml, collector);
+                botWidgetHtml = parsedWidget.html || '';
+            }
+            for (let i = renderedRecent.length - 2; i >= recentAssetStart; i--) {
+                parsedRecent[i] = await renderMessageHtmlAndText(renderedRecent[i].renderedMsg, collector);
+            }
+            let parsedFirst = null;
+            if (pendingFirstMsg) {
+                parsedFirst = await renderMessageHtmlAndText(pendingFirstMsg.renderedFirst, collector);
+            }
+            for (let i = recentAssetStart - 1; i >= 0; i--) {
+                parsedRecent[i] = await renderMessageHtmlAndText(renderedRecent[i].renderedMsg, collector.lazyView);
+            }
+
+            if (pendingFirstMsg && parsedFirst) {
+                outMsgs.push({
+                    index: -1,
+                    role: 'char',
+                    text: parsedFirst.text,
+                    html: parsedFirst.html,
+                    raw: pendingFirstMsg.firstStr,
+                    images: parsedFirst.images,
+                    isFirstMessage: true,
+                    turnIndex: 0,
+                });
+            }
+            for (let i = 0; i < renderedRecent.length; i++) {
+                const item = renderedRecent[i];
+                const parsed = parsedRecent[i] || { text: '', html: '', images: [] };
+                outMsgs.push({
+                    index: item.idx,
+                    role: item.msg.role,
+                    chatId: String(item.msg.chatId || ''),
+                    text: parsed.text,
+                    html: parsed.html,
+                    raw: String(item.msg.data || ''),
+                    images: parsed.images,
+                    turnIndex: item.turnIndex,
+                    swipeCount: item.swEntry && Array.isArray(item.swEntry.swipes) ? item.swEntry.swipes.length : 1,
+                    swipeIndex: item.swEntry && typeof item.swEntry.index === 'number' ? item.swEntry.index : 0,
+                });
             }
 
             const chatVariables = {};
@@ -5773,6 +6375,11 @@
                         note: String(chatObj.note || '').slice(0, 4000),
                         personaName,
                         personaPrompt: String(personaPrompt || '').slice(0, 4000),
+                        personaIcon,
+                        charImage,
+                        charAssetNames: renderCtx.charAssetNames,
+                        emotionNames: renderCtx.emotionNames,
+                        firstMessage: String(charObj.firstMessage || ''),
                     },
                 },
             };
@@ -6733,18 +7340,51 @@
                 }
             });
 
+            const utf8Lib = new LuaTable();
+            utf8Lib.set('len', (s) => Array.from(luaToStr(s)).length);
+            utf8Lib.set('sub', (s, i, j) => {
+                const chars = Array.from(luaToStr(s));
+                const start = Math.max(1, Number(i) || 1);
+                const end = j === undefined || j === null ? chars.length : (Number(j) < 0 ? chars.length + Number(j) + 1 : Number(j));
+                return chars.slice(start - 1, Math.max(0, end)).join('');
+            });
+            utf8Lib.set('codes', (s) => {
+                const chars = Array.from(luaToStr(s));
+                let idx = 0;
+                const iter = () => {
+                    if (idx >= chars.length) return null;
+                    const ch = chars[idx];
+                    const bytePos = idx + 1;
+                    idx += 1;
+                    return new LuaMultiRet([bytePos, ch.codePointAt(0) || 0]);
+                };
+                return new LuaMultiRet([iter, null, null]);
+            });
+            const osLib = new LuaTable();
+            osLib.set('time', () => Math.floor(Date.now() / 1000));
+            osLib.set('clock', () => Number((Date.now() / 1000).toFixed(3)));
+            osLib.set('date', (fmt) => {
+                const d = new Date();
+                if (!fmt || fmt === '*t') {
+                    return toLuaValue({ year: d.getFullYear(), month: d.getMonth() + 1, day: d.getDate(), hour: d.getHours(), min: d.getMinutes(), sec: d.getSeconds() });
+                }
+                return d.toISOString();
+            });
+
             rootEnv.vars.string = strLib;
             rootEnv.vars.table = tblLib;
             rootEnv.vars.math = mathLib;
             rootEnv.vars.json = jsonLib;
+            rootEnv.vars.utf8 = utf8Lib;
+            rootEnv.vars.os = osLib;
             rootEnv.vars.require = (modName) => {
                 const name = String(modName || '').trim().toLowerCase();
                 if (name === 'json' || name === 'dkjson' || name === 'cjson' || name === 'rxi.json') return jsonLib;
                 if (name === 'math') return mathLib;
                 if (name === 'string') return strLib;
                 if (name === 'table') return tblLib;
-                if (name === 'utf8') return rootEnv.vars.utf8 || new LuaTable();
-                if (name === 'os') return rootEnv.vars.os || new LuaTable();
+                if (name === 'utf8') return utf8Lib;
+                if (name === 'os') return osLib;
                 return new LuaTable();
             };
             rootEnv.vars.tostring = (v) => luaToStr(v);
@@ -7490,6 +8130,29 @@
             return { kind: 'ok' };
         }
     
+        function applyTargetSelection(nextChar, nextChat) {
+            if (!Number.isInteger(nextChar) || nextChar < 0) return false;
+            viewCharIndex = nextChar;
+            viewChatIndex = Number.isInteger(nextChat) && nextChat >= 0 ? nextChat : 0;
+            lastSnapSig = '';
+            lastCatalogSig = '';
+            pendingForcePoll = true;
+            setTimeout(() => pollOnce(true), 40);
+            void (async () => {
+                try {
+                    const pcCharIdx = await risuai.getCurrentCharacterIndex();
+                    if (viewCharIndex === pcCharIdx) {
+                        const charObj = await risuai.getCharacterFromIndex(viewCharIndex);
+                        if (charObj && Array.isArray(charObj.chats) && viewChatIndex < charObj.chats.length && charObj.chatPage !== viewChatIndex) {
+                            charObj.chatPage = viewChatIndex;
+                            await risuai.setCharacterToIndex(viewCharIndex, charObj);
+                        }
+                    }
+                } catch (_) {}
+            })();
+            return true;
+        }
+
         async function handleCommand(cmd) {
             const type = cmd.type;
             const p = cmd.payload || {};
@@ -7497,30 +8160,13 @@
             if (type === 'sync_chat' || type === 'sync_all') {
                 lastSnapSig = '';
                 lastCatalogSig = '';
+                pendingForcePoll = true;
                 setTimeout(() => pollOnce(true), 80);
                 return;
             }
     
             if (type === 'select_target') {
-                const nextChar = Number(p.charIndex);
-                const nextChat = Number(p.chatIndex);
-                if (!Number.isNaN(nextChar) && nextChar >= 0) {
-                    viewCharIndex = nextChar;
-                    viewChatIndex = !Number.isNaN(nextChat) && nextChat >= 0 ? nextChat : 0;
-                    const pcCharIdx = await risuai.getCurrentCharacterIndex();
-                    if (viewCharIndex === pcCharIdx) {
-                        try {
-                            const charObj = await risuai.getCharacterFromIndex(viewCharIndex);
-                            if (charObj && Array.isArray(charObj.chats) && viewChatIndex < charObj.chats.length) {
-                                charObj.chatPage = viewChatIndex;
-                                await risuai.setCharacterToIndex(viewCharIndex, charObj);
-                            }
-                        } catch (_) {}
-                    }
-                    lastSnapSig = '';
-                    lastCatalogSig = '';
-                    setTimeout(() => pollOnce(true), 120);
-                }
+                applyTargetSelection(Number(p.charIndex), Number(p.chatIndex));
                 return;
             }
     
@@ -8139,9 +8785,14 @@
             }
             if (kindOp === 'pluginStorage.getMany') {
                 const out = {};
-                const ks = Array.isArray(a[0]) ? a[0] : [];
+                const ks = Array.isArray(a[0]) ? [...new Set(a[0].map((k) => String(k ?? '')))] : [];
                 if (risuai.pluginStorage && risuai.pluginStorage.getItem) {
-                    for (const k of ks) out[String(k)] = await risuai.pluginStorage.getItem(String(k));
+                    const CHUNK = 16;
+                    for (let i = 0; i < ks.length; i += CHUNK) {
+                        const slice = ks.slice(i, i + CHUNK);
+                        const vals = await Promise.all(slice.map((k) => risuai.pluginStorage.getItem(k).catch(() => null)));
+                        for (let j = 0; j < slice.length; j++) out[slice[j]] = vals[j];
+                    }
                 }
                 return out;
             }
@@ -8177,6 +8828,20 @@
             }
 
             // 2) Shared safeLocalStorage
+            if (kindOp === 'safeLocalStorage.getMany') {
+                const out = {};
+                const ks = Array.isArray(a[0]) ? [...new Set(a[0].map((k) => String(k ?? '')))] : [];
+                const sl = risuai.safeLocalStorage;
+                if (sl && typeof sl.getItem === 'function') {
+                    const CHUNK = 16;
+                    for (let i = 0; i < ks.length; i += CHUNK) {
+                        const slice = ks.slice(i, i + CHUNK);
+                        const vals = await Promise.all(slice.map((k) => Promise.resolve(sl.getItem(k)).catch(() => null)));
+                        for (let j = 0; j < slice.length; j++) out[slice[j]] = vals[j] === undefined ? null : vals[j];
+                    }
+                }
+                return out;
+            }
             if (kindOp.startsWith('safeLocalStorage.')) {
                 const m = kindOp.slice(17);
                 const sl = risuai.safeLocalStorage;
@@ -8189,6 +8854,20 @@
             }
 
             // 3) Shared getLocalPluginStorage()
+            if (kindOp === 'localPluginStorage.getMany') {
+                const out = {};
+                const ks = Array.isArray(a[0]) ? [...new Set(a[0].map((k) => String(k ?? '')))] : [];
+                const lps = await getSharedLocalPluginStore();
+                if (lps && typeof lps.getItem === 'function') {
+                    const CHUNK = 16;
+                    for (let i = 0; i < ks.length; i += CHUNK) {
+                        const slice = ks.slice(i, i + CHUNK);
+                        const vals = await Promise.all(slice.map((k) => Promise.resolve(lps.getItem(k)).catch(() => null)));
+                        for (let j = 0; j < slice.length; j++) out[slice[j]] = vals[j] === undefined ? null : vals[j];
+                    }
+                }
+                return out;
+            }
             if (kindOp.startsWith('localPluginStorage.')) {
                 const m = kindOp.slice(19);
                 const lps = await getSharedLocalPluginStore();
@@ -8202,6 +8881,93 @@
             }
 
             // 4) Direct RisuAI DB Read / Write (dbWrite permission)
+            if (kindOp === 'bridge.selectTarget') {
+                const nextChar = Number(a[0]);
+                const nextChat = Number(a[1]);
+                if (!applyTargetSelection(nextChar, nextChat)) {
+                    throw new Error('Invalid target character/chat index');
+                }
+                return { ok: true, charIndex: viewCharIndex, chatIndex: viewChatIndex };
+            }
+            const buildSlimCharacterMeta = (ch, cIdx) => {
+                if (!ch || typeof ch !== 'object') return null;
+                return {
+                    name: ch.name || '',
+                    chaId: ch.chaId ? String(ch.chaId) : String(cIdx),
+                    lowLevelAccess: Boolean(ch.lowLevelAccess),
+                    triggerscript: Array.isArray(ch.triggerscript) ? ch.triggerscript : [],
+                    customscript: Array.isArray(ch.customscript) ? ch.customscript : [],
+                    customScripts: Array.isArray(ch.customScripts) ? ch.customScripts : [],
+                    additionalAssets: Array.isArray(ch.additionalAssets) ? ch.additionalAssets : [],
+                    emotionImages: Array.isArray(ch.emotionImages) ? ch.emotionImages : [],
+                    customModuleToggle: String(ch.customModuleToggle || ''),
+                };
+            };
+            const collectActiveModulesFromDb = (db, chatObj, { includeHeavy = true } = {}) => {
+                const enSet = new Set([
+                    ...(db && Array.isArray(db.enabledModules) ? db.enabledModules.map(String) : []),
+                    ...(chatObj && Array.isArray(chatObj.modules) ? chatObj.modules.map(String) : []),
+                ]);
+                const rawMods = (db && Array.isArray(db.modules)) ? db.modules : [];
+                const modules = [];
+                const seenIds = new Set();
+                for (const m of rawMods) {
+                    if (!m || !enSet.has(String(m.id))) continue;
+                    const mid = String(m.id);
+                    if (seenIds.has(mid)) continue;
+                    seenIds.add(mid);
+                    const modOut = {
+                        id: mid,
+                        name: String(m.name || mid),
+                        namespace: String(m.namespace || ''),
+                        lowLevelAccess: Boolean(m.lowLevelAccess),
+                        trigger: Array.isArray(m.trigger) ? m.trigger : [],
+                        regex: Array.isArray(m.regex) ? m.regex : [],
+                        assets: Array.isArray(m.assets) ? m.assets : [],
+                        customModuleToggle: String(m.customModuleToggle || ''),
+                    };
+                    if (includeHeavy) {
+                        modOut.lorebook = Array.isArray(m.lorebook) ? m.lorebook : [];
+                        modOut.backgroundEmbedding = String(m.backgroundEmbedding || '');
+                    }
+                    modules.push(modOut);
+                }
+                return modules;
+            };
+            if (kindOp === 'db.getCharacterDisplayMeta') {
+                const cIdx = Number(a[0]);
+                const ch = await risuai.getCharacterFromIndex(cIdx);
+                if (!ch || typeof ch !== 'object') return null;
+                if (ch.chaId) charIdByIndex.set(cIdx, String(ch.chaId));
+                return buildSlimCharacterMeta(ch, cIdx);
+            }
+            if (kindOp === 'db.getDisplayLuaBundle') {
+                const cIdx = Number(a[0]);
+                const chIdx = Number(a[1]);
+                const ch = cIdx >= 0 ? await risuai.getCharacterFromIndex(cIdx) : null;
+                if (ch && ch.chaId) charIdByIndex.set(cIdx, String(ch.chaId));
+                let rawChat = (ch && Array.isArray(ch.chats) && chIdx >= 0 && chIdx < ch.chats.length)
+                    ? ch.chats[chIdx]
+                    : null;
+                if (!rawChat && cIdx >= 0 && chIdx >= 0) {
+                    rawChat = await risuai.getChatFromIndex(cIdx, chIdx).catch(() => null);
+                }
+                const chatObj = ensureStableChatAndMessageIds(ch, cIdx, rawChat, chIdx);
+                const db = await risuai.getDatabase([
+                    'modules',
+                    'enabledModules',
+                    'globalChatVariables',
+                    'templateDefaultVariables',
+                ]);
+                return {
+                    charObj: buildSlimCharacterMeta(ch, cIdx),
+                    chatObj,
+                    modules: collectActiveModulesFromDb(db, chatObj, { includeHeavy: false }),
+                    globalChatVariables: (db && db.globalChatVariables && typeof db.globalChatVariables === 'object') ? db.globalChatVariables : {},
+                    templateDefaultVariables: String((db && db.templateDefaultVariables) || ''),
+                    charLowLevelAccess: Boolean(ch && ch.lowLevelAccess),
+                };
+            }
             if (kindOp === 'db.getCurrentIndices') {
                 const charIndex = await risuai.getCurrentCharacterIndex();
                 const chatIndex = charIndex >= 0 ? await risuai.getCurrentChatIndex() : -1;
@@ -8210,6 +8976,7 @@
             if (kindOp === 'db.getCharacter') {
                 const cIdx = Number(a[0]);
                 const ch = await risuai.getCharacterFromIndex(cIdx);
+                if (ch && ch.chaId) charIdByIndex.set(cIdx, String(ch.chaId));
                 if (ch && Array.isArray(ch.chats)) {
                     for (let ci = 0; ci < ch.chats.length; ci++) {
                         ensureStableChatAndMessageIds(ch, cIdx, ch.chats[ci], ci);
@@ -8228,11 +8995,16 @@
             if (kindOp === 'db.getChat') {
                 const cIdx = Number(a[0]);
                 const chIdx = Number(a[1]);
-                const [ch, chat] = await Promise.all([
-                    risuai.getCharacterFromIndex(cIdx).catch(() => null),
-                    risuai.getChatFromIndex(cIdx, chIdx),
-                ]);
-                return ensureStableChatAndMessageIds(ch, cIdx, chat, chIdx);
+                const chat = await risuai.getChatFromIndex(cIdx, chIdx);
+                let chaId = charIdByIndex.get(cIdx) || '';
+                if (!chaId && (!chat || !chat.id)) {
+                    const ch = await risuai.getCharacterFromIndex(cIdx).catch(() => null);
+                    if (ch && ch.chaId) {
+                        chaId = String(ch.chaId);
+                        charIdByIndex.set(cIdx, chaId);
+                    }
+                }
+                return ensureStableChatAndMessageIds(chaId ? { chaId } : null, cIdx, chat, chIdx);
             }
             if (kindOp === 'db.setChat') {
                 await risuai.setChatToIndex(Number(a[0]), Number(a[1]), a[2]);
@@ -8323,30 +9095,7 @@
                     'globalChatVariables',
                     'templateDefaultVariables',
                 ]);
-                const enSet = new Set([
-                    ...(db && Array.isArray(db.enabledModules) ? db.enabledModules.map(String) : []),
-                    ...(chatObj && Array.isArray(chatObj.modules) ? chatObj.modules.map(String) : []),
-                ]);
-                const rawMods = (db && Array.isArray(db.modules)) ? db.modules : [];
-                const modules = [];
-                const seenIds = new Set();
-                for (const m of rawMods) {
-                    if (!m || !enSet.has(String(m.id))) continue;
-                    const mid = String(m.id);
-                    if (seenIds.has(mid)) continue;
-                    seenIds.add(mid);
-                    modules.push({
-                        id: mid,
-                        name: String(m.name || mid),
-                        namespace: String(m.namespace || ''),
-                        lowLevelAccess: Boolean(m.lowLevelAccess),
-                        trigger: Array.isArray(m.trigger) ? m.trigger : [],
-                        regex: Array.isArray(m.regex) ? m.regex : [],
-                        lorebook: Array.isArray(m.lorebook) ? m.lorebook : [],
-                        customModuleToggle: String(m.customModuleToggle || ''),
-                        backgroundEmbedding: String(m.backgroundEmbedding || ''),
-                    });
-                }
+                const modules = collectActiveModulesFromDb(db, chatObj, { includeHeavy: true });
                 return {
                     modules,
                     globalChatVariables: (db && db.globalChatVariables && typeof db.globalChatVariables === 'object') ? db.globalChatVariables : {},
@@ -8426,9 +9175,14 @@
                 };
             }
             if (kindOp === 'asset.readImage') {
-                const targetPath = String(a[0] || '');
-                if (!targetPath || typeof risuai.readImage !== 'function') return null;
-                const raw = await risuai.readImage(targetPath);
+                const targetPath = String(a[0] || '').trim();
+                if (!targetPath || /^\[\[RS/i.test(targetPath) || typeof risuai.readImage !== 'function') return null;
+                let raw = null;
+                try {
+                    raw = await risuai.readImage(targetPath);
+                } catch (_) {
+                    return null;
+                }
                 if (!raw) return null;
                 const bytes = raw instanceof Uint8Array
                     ? raw
@@ -8449,9 +9203,13 @@
                 return String(savedPath || '');
             }
             if (kindOp === 'asset.readInlay') {
-                const inlayId = String(a[0] || '');
+                const inlayId = String(a[0] || '').trim();
                 if (!inlayId || typeof risuai.readInlay !== 'function') return null;
-                return (await risuai.readInlay(inlayId)) || null;
+                try {
+                    return (await risuai.readInlay(inlayId)) || null;
+                } catch (_) {
+                    return null;
+                }
             }
             if (kindOp === 'asset.createInlay') {
                 const payload = (a[0] && typeof a[0] === 'object') ? a[0] : {};
@@ -8482,16 +9240,38 @@
             return new Uint8Array(Buffer.from(clean, 'base64'));
         }
 
+        function isMutatingHostRpcOp(op) {
+            const s = String(op || '');
+            return /(?:^|\.)(?:set|remove|clear|save|create|reload|post|delete|update|write)/i.test(s);
+        }
+
         async function runHostRpcBatch(calls) {
             if (!Array.isArray(calls) || !calls.length || !cfg.enabled || !cfg.relayUrl || !cfg.token) return;
-            const results = [];
-            for (const c of calls) {
+            const results = new Array(calls.length);
+            const hasMutation = calls.some((c) => isMutatingHostRpcOp(c && c.op));
+            const runOne = async (idx) => {
+                const c = calls[idx];
                 try {
                     const value = await executeHostRpcCall(c.op, c.args);
-                    results.push({ id: c.id, ok: true, value });
+                    results[idx] = { id: c.id, ok: true, value };
                 } catch (err) {
-                    results.push({ id: c.id, ok: false, error: err && err.message ? err.message : String(err) });
+                    results[idx] = { id: c.id, ok: false, error: err && err.message ? err.message : String(err) };
                 }
+            };
+            if (hasMutation || calls.length <= 1) {
+                for (let i = 0; i < calls.length; i++) {
+                    await runOne(i);
+                }
+            } else {
+                const workerCount = Math.min(12, calls.length);
+                let nextIdx = 0;
+                await Promise.all(Array.from({ length: workerCount }, async () => {
+                    while (true) {
+                        const i = nextIdx++;
+                        if (i >= calls.length) break;
+                        await runOne(i);
+                    }
+                }));
             }
             const resEndpoint = cfg.relayUrl.replace(/\/+$/, '') + '/api/pc/rpc-result';
             try {
@@ -8529,9 +9309,14 @@
             if (rpcLoopRunning || !cfg.enabled || !cfg.relayUrl || !cfg.token || !hostRpcSupported) return;
             rpcLoopRunning = true;
             const myNonce = ++rpcLoopNonce;
+            const activeRpcBatches = new Set();
             void (async () => {
                 try {
                     while (rpcLoopNonce === myNonce && cfg.enabled && cfg.relayUrl && cfg.token && hostRpcSupported) {
+                        if (activeRpcBatches.size >= 4) {
+                            await Promise.race(activeRpcBatches).catch(() => {});
+                            continue;
+                        }
                         try {
                             const waitEndpoint = cfg.relayUrl.replace(/\/+$/, '') + '/api/pc/rpc-wait';
                             const resp = await risuai.nativeFetch(waitEndpoint, {
@@ -8549,7 +9334,12 @@
                             }
                             const payload = await resp.json();
                             if (Array.isArray(payload && payload.calls) && payload.calls.length) {
-                                await runHostRpcBatch(payload.calls);
+                                const hasMutation = payload.calls.some((c) => isMutatingHostRpcOp(c && c.op));
+                                const batchPromise = runHostRpcBatch(payload.calls).finally(() => {
+                                    activeRpcBatches.delete(batchPromise);
+                                });
+                                activeRpcBatches.add(batchPromise);
+                                if (hasMutation) await batchPromise;
                             }
                         } catch (_) {
                             if (rpcLoopNonce !== myNonce || !cfg.enabled) break;
@@ -8557,13 +9347,18 @@
                         }
                     }
                 } finally {
+                    await Promise.allSettled([...activeRpcBatches]);
                     if (rpcLoopNonce === myNonce) rpcLoopRunning = false;
                 }
             })();
         }
 
         async function pollOnce(forceFull = false) {
-            if (!cfg.enabled || !cfg.relayUrl || !cfg.token || isPolling) return;
+            if (!cfg.enabled || !cfg.relayUrl || !cfg.token) return;
+            if (isPolling) {
+                if (forceFull) pendingForcePoll = true;
+                return;
+            }
             isPolling = true;
             try {
                 const endpoint = cfg.relayUrl.replace(/\/+$/, '') + '/api/pc/poll';
@@ -8630,6 +9425,10 @@
                 lastStatus = `🔴 연결 실패 (${err && err.message ? err.message : '네트워크 오류'})`;
             } finally {
                 isPolling = false;
+                if (pendingForcePoll) {
+                    pendingForcePoll = false;
+                    setTimeout(() => pollOnce(true), 60);
+                }
             }
         }
     

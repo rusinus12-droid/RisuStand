@@ -489,6 +489,12 @@ test('pc poll needFullSync signal & risustand.js trash filtering / post-ACK sign
         assert.ok(html.body.includes('openBookImgPreview'));
         assert.ok(html.body.includes('closeBookImgPreview'));
         assert.ok(html.body.includes('bookImgPreview'));
+        assert.ok(html.body.includes('findExpandableBotAsset'));
+        assert.ok(html.body.includes('extractCssBgImageUrl'));
+        assert.ok(html.body.includes('data-rs-bg-img'));
+        assert.ok(html.body.includes('scrollImgPreview'));
+        assert.ok(html.body.includes('chatImgLightbox'));
+        assert.ok(html.body.includes('openChatImgLightbox'));
         assert.ok(html.body.includes('bookColOffsets'));
         assert.ok(html.body.includes('getBookSpreadScrollLeft'));
         assert.ok(html.body.includes('setBookViewportScrollLeft'));
@@ -508,8 +514,18 @@ test('pc poll needFullSync signal & risustand.js trash filtering / post-ACK sign
         assert.ok(scriptMatch);
         new vm.Script(scriptMatch[1], { filename: 'webapp-bots-sync-inline.js' });
 
-        // Verify scopeBotCss behavior directly
-        const fnMatch = scriptMatch[1].match(/function splitCssSelectors[\s\S]*?function sanitizeBotNode/);
+        // Verify extractCssBgImageUrl behavior in VM
+        const bgFnMatch = scriptMatch[1].match(/function extractCssBgImageUrl[\s\S]*?function ensureBotAssetRatio/);
+        assert.ok(bgFnMatch);
+        const bgCtx = {};
+        vm.runInNewContext(bgFnMatch[0].replace(/function ensureBotAssetRatio$/, ''), bgCtx);
+        assert.equal(bgCtx.extractCssBgImageUrl('url("/api/asset/abc")'), '/api/asset/abc');
+        assert.equal(bgCtx.extractCssBgImageUrl("url('https://example.com/a.png')"), 'https://example.com/a.png');
+        assert.equal(bgCtx.extractCssBgImageUrl('linear-gradient(135deg, #fff, #000)'), '');
+        assert.equal(bgCtx.extractCssBgImageUrl('none'), '');
+
+        // Verify sanitizeBotCss, scopeBotCss, and stripBotFixedMenuNodes behavior directly
+        const fnMatch = scriptMatch[1].match(/function sanitizeBotCss[\s\S]*?function sanitizeBotNode/);
         assert.ok(fnMatch);
         const scopeCtx = {};
         vm.runInNewContext(fnMatch[0].replace(/function sanitizeBotNode$/, ''), scopeCtx);
@@ -531,6 +547,93 @@ test('pc poll needFullSync signal & risustand.js trash filtering / post-ACK sign
         assert.ok(scopedDescendant.includes('.rs-bot-html .card') && scopedDescendant.includes('position: relative'));
         const scopedIs = scopeCtx.scopeBotCss(':is(.a, .b) { color: red; }');
         assert.ok(scopedIs.includes('.rs-bot-html :is(.a, .b)'));
+
+        // .x-risu- prefix alias expansion (class & attribute selectors)
+        const scopedRisuCls = scopeCtx.scopeBotCss('.x-risu-cg-card .x-risu-cg-item { display: flex; }');
+        assert.ok(scopedRisuCls.includes('.rs-bot-html .x-risu-cg-card .x-risu-cg-item'));
+        assert.ok(scopedRisuCls.includes('.rs-bot-html .cg-card .cg-item'));
+        const scopedRisuAttr = scopeCtx.scopeBotCss('[class^="x-risu-cg-"] { color: #111; }');
+        assert.ok(scopedRisuAttr.includes('.rs-bot-html [class^="x-risu-cg-"]'));
+        assert.ok(scopedRisuAttr.includes('.rs-bot-html [class^="cg-"]'));
+
+        // Unquoted Google Fonts @import with semicolons inside url(...) must not break downstream rules
+        const gfontCss = '@import url(https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;700&display=swap); .cg-card { display: flex; }';
+        const scopedGfont = scopeCtx.scopeBotCss(gfontCss);
+        assert.ok(scopedGfont.includes('@import url(https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;700&display=swap);'));
+        assert.ok(scopedGfont.includes('.rs-bot-html .cg-card{ display: flex; }') || scopedGfont.includes('.rs-bot-html .cg-card { display: flex; }') || scopedGfont.includes('.rs-bot-html .cg-card{'));
+
+        // sanitizeBotCss allows quoted https @import and cleanly strips unsafe http @import
+        const sanAllowed = scopeCtx.sanitizeBotCss('@import "https://fonts.googleapis.com/css2?family=Inter:wght@400;700"; .ok { color: green; }');
+        assert.ok(sanAllowed.includes('@import "https://fonts.googleapis.com/css2?family=Inter:wght@400;700";'));
+        const sanBlocked = scopeCtx.sanitizeBotCss('@import url(http://evil.example/x.css); .ok { color: green; }');
+        assert.ok(!sanBlocked.includes('evil.example') && sanBlocked.includes('.ok { color: green; }'));
+
+        // Custom properties on html/body propagate to .rs-bot-html as well as #botBgHost
+        const scopedBodyVars = scopeCtx.scopeBotCss('body { --cg-accent: #ff0; background: #fff; position: fixed; }');
+        assert.ok(scopedBodyVars.includes('#botBgHost{') && scopedBodyVars.includes('background: #fff') && !/position\s*:/i.test(scopedBodyVars));
+        assert.ok(scopedBodyVars.includes('.rs-bot-html{--cg-accent: #ff0}'));
+
+        // stripBotFixedMenuNodes preserves <style>, status card checkboxes, and .cg-bg-overlay while stripping real fixed menus
+        const fixedMatch = scriptMatch[1].match(/const BOT_FIXED_CLASS_SEL[\s\S]*?function syncBotBackground/);
+        assert.ok(fixedMatch);
+        const fixedCtx = {};
+        vm.runInNewContext(fixedMatch[0].replace(/function syncBotBackground$/, ''), fixedCtx);
+        const makeEl = (tag, { cls = '', style = '', type = '', text = '' } = {}) => ({
+            nodeType: 1,
+            tagName: tag.toUpperCase(),
+            className: cls,
+            type,
+            textContent: text,
+            children: [],
+            parentElement: null,
+            getAttribute(k) { return k === 'style' ? style : (k === 'class' ? cls : null); },
+            appendChild(c) { c.parentElement = this; this.children.push(c); return c; },
+            remove() {
+                if (this.parentElement) {
+                    this.parentElement.children = this.parentElement.children.filter((x) => x !== this);
+                    this.parentElement = null;
+                }
+            },
+            querySelectorAll(sel) {
+                const out = [];
+                const parts = sel.split(',').map((s) => s.trim());
+                const matchesOne = (node, s) => {
+                    if (s === 'style') return node.tagName === 'STYLE';
+                    if (s === '.floating') return node.className.split(/\s+/).includes('floating');
+                    const attrMatch = s.match(/^\[class\*="([^"]+)"/i);
+                    if (attrMatch) return node.className.toLowerCase().includes(attrMatch[1].toLowerCase());
+                    const tagStyleMatch = s.match(/^([a-z]+)\[style\]$/i);
+                    if (tagStyleMatch) return node.tagName === tagStyleMatch[1].toUpperCase() && Boolean(node.getAttribute('style'));
+                    return false;
+                };
+                const walk = (node) => {
+                    for (const c of node.children) {
+                        if (parts.some((p) => matchesOne(c, p))) out.push(c);
+                        walk(c);
+                    }
+                };
+                walk(this);
+                return out;
+            },
+            querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
+        });
+        const cardContainer = makeEl('div');
+        const cardStyle = cardContainer.appendChild(makeEl('style', { text: '.cg-modal{position:fixed;} .cg-card{display:flex;}' }));
+        const cardChk = cardContainer.appendChild(makeEl('input', { type: 'checkbox' }));
+        const cardOverlay = cardContainer.appendChild(makeEl('div', { cls: 'cg-bg-overlay' }));
+        assert.equal(fixedCtx.containerHasBotFixedMenu(cardContainer), false);
+        fixedCtx.stripBotFixedMenuNodes(cardContainer);
+        assert.deepEqual(cardContainer.children, [cardStyle, cardChk, cardOverlay]);
+
+        const menuContainer = makeEl('div');
+        const menuStyle = menuContainer.appendChild(makeEl('style', { text: '.buttons-container{position:fixed;}' }));
+        menuContainer.appendChild(makeEl('input', { type: 'checkbox' }));
+        menuContainer.appendChild(makeEl('div', { cls: 'buttons-container' }));
+        menuContainer.appendChild(makeEl('div', { cls: 'side-panel' }));
+        menuContainer.appendChild(makeEl('div', { cls: 'menu-overlay' }));
+        assert.equal(fixedCtx.containerHasBotFixedMenu(menuContainer), true);
+        fixedCtx.stripBotFixedMenuNodes(menuContainer);
+        assert.deepEqual(menuContainer.children, [menuStyle]);
     } finally {
         await new Promise((r) => server.close(r));
     }
@@ -654,6 +757,126 @@ test('OOM optimizations: /api/asset binary cache, cookie auth, and /api/state re
         assert.ok(scriptMatch);
         new vm.Script(scriptMatch[1], { filename: 'webapp-oom-inline.js' });
     } finally {
+        await new Promise((r) => server.close(r));
+    }
+});
+
+test('On-demand PC asset proxy resolves pcpath: and pcinlay: via hostRpc and caches into assetStore', async () => {
+    const server = relay.createRelayServer({ token: 'pc-asset-token' });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    const baseUrl = `http://127.0.0.1:${port}`;
+    const hdrs = { 'X-RisuStand-Token': 'pc-asset-token', 'Content-Type': 'application/json' };
+    const bigPng = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x11, 0x22, 0x33, 0x44]);
+    const inlayPng = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x55, 0x66, 0x77, 0x88]);
+    let stopRpc = false;
+    let rpcLoopPromise = null;
+    const rpcAbort = new AbortController();
+
+    try {
+        await requestHttp(port, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({
+                catalog: { characters: [{ index: 0, name: 'Bot', chats: [{ index: 0, id: 'c0', name: 'Chat 1', msgCount: 1 }] }] },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: 'Bot',
+                    chatName: 'Chat 1',
+                    assetMap: {
+                        a0: 'pcpath:assets/big_portrait.png',
+                        a1: 'pcinlay:inlay-9',
+                    },
+                    messages: [{
+                        index: 0,
+                        role: 'char',
+                        text: 'hi',
+                        html: '<img src="[[RSASSET:a0]]"><img src="[[RSASSET:a1]]">',
+                        images: ['[[RSASSET:a0]]', '[[RSASSET:a1]]'],
+                    }],
+                },
+            }),
+        });
+
+        const stRes = await requestHttp(port, { path: '/api/state', headers: { 'X-RisuStand-Token': 'pc-asset-token' } });
+        assert.equal(stRes.status, 200);
+        const setCookie = [].concat(stRes.headers['set-cookie'] || []).join('; ');
+        const cookiePair = setCookie.match(/rs_asset_sid=[a-f0-9]{32}/)[0];
+        const stJson = JSON.parse(stRes.body);
+        const a0Url = stJson.snapshot.assetMap.a0;
+        const a1Url = stJson.snapshot.assetMap.a1;
+        assert.match(a0Url, /^\/api\/asset\/[a-f0-9]{32}$/);
+        assert.match(a1Url, /^\/api\/asset\/[a-f0-9]{32}$/);
+
+        // Disconnected PC RPC -> 503 with Cache-Control: no-store
+        const disRes = await fetch(`${baseUrl}${a0Url}`, { headers: { Cookie: cookiePair } });
+        assert.equal(disRes.status, 503);
+        assert.equal(disRes.headers.get('cache-control'), 'no-store');
+
+        // Start mock PC Host RPC loop
+        let readImageCalls = 0;
+        let readInlayCalls = 0;
+        rpcLoopPromise = (async () => {
+            while (!stopRpc) {
+                try {
+                    const wResp = await fetch(`${baseUrl}/api/pc/rpc-wait`, {
+                        method: 'POST',
+                        headers: hdrs,
+                        body: JSON.stringify({ timeoutMs: 2000 }),
+                        signal: rpcAbort.signal,
+                    });
+                    if (!wResp.ok) break;
+                    const data = await wResp.json();
+                    if (Array.isArray(data.calls) && data.calls.length) {
+                        const results = data.calls.map((c) => {
+                            if (c.op === 'asset.readImage' && c.args[0] === 'assets/big_portrait.png') {
+                                readImageCalls += 1;
+                                return { id: c.id, ok: true, value: { __b64: bigPng.toString('base64'), mime: 'image/png' } };
+                            }
+                            if (c.op === 'asset.readInlay' && c.args[0] === 'inlay-9') {
+                                readInlayCalls += 1;
+                                return { id: c.id, ok: true, value: { data: 'data:image/png;base64,' + inlayPng.toString('base64') } };
+                            }
+                            return { id: c.id, ok: false, error: 'unexpected op' };
+                        });
+                        await fetch(`${baseUrl}/api/pc/rpc-result`, {
+                            method: 'POST',
+                            headers: hdrs,
+                            body: JSON.stringify({ results }),
+                            signal: rpcAbort.signal,
+                        });
+                    }
+                } catch (_) {
+                    if (stopRpc) break;
+                }
+            }
+        })();
+        // Wait briefly for rpc-wait to mark rpcClientActive = true
+        await new Promise((r) => setTimeout(r, 40));
+
+        const resA0 = await fetch(`${baseUrl}${a0Url}`, { headers: { Cookie: cookiePair } });
+        assert.equal(resA0.status, 200);
+        assert.equal(resA0.headers.get('content-type'), 'image/png');
+        assert.deepEqual(Buffer.from(await resA0.arrayBuffer()), bigPng);
+        assert.equal(readImageCalls, 1);
+
+        // Second request served from assetStore cache without another RPC
+        const resA0Cached = await fetch(`${baseUrl}${a0Url}`, { headers: { Cookie: cookiePair } });
+        assert.equal(resA0Cached.status, 200);
+        assert.deepEqual(Buffer.from(await resA0Cached.arrayBuffer()), bigPng);
+        assert.equal(readImageCalls, 1);
+
+        const resA1 = await fetch(`${baseUrl}${a1Url}`, { headers: { Cookie: cookiePair } });
+        assert.equal(resA1.status, 200);
+        assert.equal(resA1.headers.get('content-type'), 'image/png');
+        assert.deepEqual(Buffer.from(await resA1.arrayBuffer()), inlayPng);
+        assert.equal(readInlayCalls, 1);
+    } finally {
+        stopRpc = true;
+        rpcAbort.abort();
+        if (rpcLoopPromise) await rpcLoopPromise.catch(() => {});
         await new Promise((r) => server.close(r));
     }
 });
@@ -1875,6 +2098,13 @@ test('Zen minibar visibility on all tabs, horizontal touch-scroll CSS, bot menu 
         assert.ok(html.includes('BOT_FIXED_CLASS_SEL'));
         assert.ok(html.includes('function isBotFixedMenuElement('));
         assert.ok(html.includes('__rsGuiReloadPlugin'));
+        assert.ok(html.includes('#tab-chat { gap:18px; z-index:auto; isolation:auto; }'));
+        assert.ok(!html.includes('.book-frame {\n    flex:1; display:flex; flex-direction:column;\n    background:var(--book-bg); border:1px solid var(--border); border-radius:12px;\n    box-shadow: var(--shadow); overflow:hidden; position:relative;\n    perspective:1800px;'));
+        assert.ok(html.includes('@keyframes rsFlipNext { 0% { opacity:0.95; transform:perspective(1800px) rotateY(0deg); }'));
+        assert.ok(html.includes('html body #bookBotOverlay {\n    position:fixed !important; inset:0 !important; z-index:42 !important;'));
+        assert.ok(html.includes('#botMenuFab {\n    position:fixed; right:12px; top:62px; z-index:44;'));
+        assert.ok(html.includes('!/(?:side-panel|drawer|modal)/i.test(fallbackBar.className'));
+        assert.ok(html.includes("el.querySelector('button, a, input, select, textarea, label, [risu-trigger], [risu-btn]')"));
 
         const setThemeMatch = html.match(/function setTheme\(key\)\s*\{[\s\S]*?\n  \}/);
         assert.ok(setThemeMatch && setThemeMatch[0].includes("lastChatRenderSig = ''"), 'setTheme must reset lastChatRenderSig before re-rendering');
@@ -2911,7 +3141,245 @@ test('home tab UI and bot thumbnail endpoints (custom upload, default reset, aut
             body: JSON.stringify({ chaId: 'c1', charIndex: 0, source: 'asset', assetIndex: 0 }),
         });
         assert.equal(uncachedAsset.status, 400);
+
+        // Regression checks for /favicon.ico, mobile-web-app-capable meta, postMessage null guard, and idle count CSS
+        const favRes = await requestHttp(port, { path: '/favicon.ico' });
+        assert.equal(favRes.status, 204);
+        assert.ok(htmlRes.body.includes('name="mobile-web-app-capable"'));
+        assert.ok(htmlRes.body.includes("document.getElementById('pluginGuiFrame') === frame && frame.contentWindow"));
+        assert.ok(htmlRes.body.includes('.rs-pfm-stage [data-am-count-region][x-am-count-visible="false"]'));
+        assert.ok(htmlRes.body.includes('id="chatPinnedPluginCtrl"'));
+        assert.ok(htmlRes.body.includes('data-pfm-opt-show'));
+        assert.ok(htmlRes.body.includes('data-pfm-opt-place'));
+        assert.ok(htmlRes.body.includes('data-pfm-opt-align'));
+        assert.ok(htmlRes.body.includes('data-pfm-opt-nudge'));
+        assert.ok(htmlRes.body.includes('renderChatFloatingControls'));
+        assert.ok(htmlRes.body.includes('id="pluginSurfaceStyleHost"'));
+        assert.ok(htmlRes.body.includes('function syncPluginSurfaceStyles('));
+        assert.ok(htmlRes.body.includes('#pluginFloatingModal.is-action-overlay .plg-float-dialog'));
+        assert.ok(htmlRes.body.includes("'data-am-viewer-action'"));
+        assert.ok(htmlRes.body.includes('pluginSurfaceStyles'));
+        assert.ok(htmlRes.body.includes('extractFixedMenuSelectorsFromStyles'));
+        assert.ok(htmlRes.body.includes('appendMdProseSegment'));
+        assert.ok(htmlRes.body.includes('pluginModalRules'));
+        assert.ok(htmlRes.body.includes('shouldOpenPluginOverlay'));
+        assert.ok(htmlRes.body.includes('data-pfm-modal-rule'));
+        assert.ok(htmlRes.body.includes('data-pfm-suppress-modal'));
+        assert.ok(!htmlRes.body.includes('id="pluginFloatingDock"'));
+        assert.ok(!htmlRes.body.includes('id="pluginRootFloatingHost"'));
+        assert.ok(!htmlRes.body.includes('data-pfm-open-gui'));
+        const uiScript = htmlRes.body.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(uiScript);
+        new vm.Script(uiScript[1], { filename: 'webapp-floating-ui-regression.js' });
+
+        // CSS-scoped RisuAI chat container selectors and style-declared fixed bot menu detection
+        const cssScopeMatch = uiScript[1].match(/function sanitizeBotCss[\s\S]*?function sanitizeBotNode/);
+        assert.ok(cssScopeMatch);
+        const cssScopeCtx = {};
+        vm.runInNewContext(cssScopeMatch[0].replace(/function sanitizeBotNode$/, ''), cssScopeCtx);
+        const scopedChat = cssScopeCtx.scopeBotCss('.chattext p { color: #123; } .risu-chat em { font-style: italic; }');
+        assert.ok(scopedChat.includes('.rs-bot-html p') && scopedChat.includes('color: #123;'));
+        assert.ok(scopedChat.includes('.rs-bot-html em') && scopedChat.includes('font-style: italic;'));
+
+        const fixedFnMatch = uiScript[1].match(/const BOT_FIXED_CLASS_SEL[\s\S]*?function syncBotBackground/);
+        assert.ok(fixedFnMatch);
+        const fixedMenuCtx = {};
+        vm.runInNewContext(fixedFnMatch[0].replace(/function syncBotBackground$/, ''), fixedMenuCtx);
+        const mkNode = (tag, { cls = '', style = '', text = '' } = {}) => ({
+            nodeType: 1,
+            tagName: tag.toUpperCase(),
+            className: cls,
+            textContent: text,
+            children: [],
+            parentElement: null,
+            getAttribute(k) { return k === 'style' ? style : (k === 'class' ? cls : null); },
+            appendChild(c) { c.parentElement = this; this.children.push(c); return c; },
+            remove() {
+                if (this.parentElement) {
+                    this.parentElement.children = this.parentElement.children.filter((x) => x !== this);
+                    this.parentElement = null;
+                }
+            },
+            querySelectorAll(sel) {
+                const out = [];
+                const parts = sel.split(',').map((s) => s.trim());
+                const matchesOne = (node, s) => {
+                    if (s === 'style') return node.tagName === 'STYLE';
+                    if (s.startsWith('.')) return node.className.split(/\s+/).includes(s.slice(1));
+                    const attrMatch = s.match(/^\[class\*="([^"]+)"/i);
+                    if (attrMatch) return node.className.toLowerCase().includes(attrMatch[1].toLowerCase());
+                    return false;
+                };
+                const walk = (n) => { for (const c of n.children) { if (parts.some((p) => matchesOne(c, p))) out.push(c); walk(c); } };
+                walk(this);
+                return out;
+            },
+            querySelector(sel) { return this.querySelectorAll(sel)[0] || null; },
+        });
+        const badgeContainer = mkNode('div');
+        badgeContainer.appendChild(mkNode('style', { text: '.slogm-badge { position: fixed; top: 14px; right: 14px; }' }));
+        badgeContainer.appendChild(mkNode('label', { cls: 'slogm-badge', text: '플래그 0' }));
+        assert.equal(fixedMenuCtx.containerHasBotFixedMenu(badgeContainer), true, 'CSS-declared fixed label badge must be detected');
+
+        // Cross-container detection: backgroundHTML <style> declaring .hy-float { position: fixed; } + msg .hy-ui wrapper
+        const bgStyleHost = mkNode('div');
+        bgStyleHost.appendChild(mkNode('style', { text: '.hy-float { position: fixed; right: 18px; top: 88px; } .hy-panel { position: fixed; right: 0; }' }));
+        const hyMsgContainer = mkNode('div');
+        const hyUi = hyMsgContainer.appendChild(mkNode('div', { cls: 'hy-ui' }));
+        hyUi.appendChild(mkNode('button', { cls: 'hy-float', text: '유혜연' }));
+        hyUi.appendChild(mkNode('div', { cls: 'hy-panel', text: '패널' }));
+        assert.equal(fixedMenuCtx.containerHasBotFixedMenu(hyMsgContainer, bgStyleHost), true, 'backgroundHTML style fixed rule must detect .hy-ui/.hy-float in message');
+        assert.ok(fixedMenuCtx.isSelfContainedFixedUiWrapper(hyUi, fixedMenuCtx.extractFixedMenuSelectorsFromStyles(hyMsgContainer, bgStyleHost)));
+        fixedMenuCtx.stripBotFixedMenuNodes(hyMsgContainer, bgStyleHost);
+        assert.equal(hyMsgContainer.children.length, 0, 'stripped self-contained .hy-ui wrapper leaves no duplicate in bubble');
     } finally {
+        await new Promise((r) => server.close(r));
+    }
+});
+
+test('select_target prioritizes ahead of sync_all, supports fast Host RPC switch & fallback, and web selectTarget script compiles', async () => {
+    const tok = 'select-target-priority-tok';
+    const server = relay.createRelayServer({ token: tok, configOverride: {} });
+    await new Promise((r) => server.listen(0, '127.0.0.1', r));
+    const { port } = server.address();
+    const hdrs = { 'X-RisuStand-Token': tok, 'Content-Type': 'application/json' };
+    try {
+        // Verify client selectTarget / clearPendingTargetSwitch script compiles cleanly
+        const htmlRes = await requestHttp(port, { path: '/' });
+        assert.equal(htmlRes.status, 200);
+        const uiScript = htmlRes.body.match(/<script>([\s\S]*?)<\/script>/);
+        assert.ok(uiScript);
+        new vm.Script(uiScript[1], { filename: 'webapp-select-target.js' });
+        assert.ok(uiScript[1].includes('clearPendingTargetSwitch'));
+        assert.ok(uiScript[1].includes('fastSwitch') || uiScript[1].includes('res.snapshot'));
+        assert.ok(htmlRes.body.includes('id="afCompact"') && htmlRes.body.includes('id="afOriginal"'));
+        assert.ok(uiScript[1].includes('setAssetFit') && uiScript[1].includes('applyCompactBotAssetFit'));
+        assert.ok(htmlRes.body.includes('asset-fit-compact'));
+
+        // Drain any leftover module-level state.commandQueue entries from earlier tests
+        for (let d = 0; d < 6; d += 1) {
+            const drainRes = JSON.parse((await requestHttp(port, {
+                method: 'POST',
+                path: '/api/pc/poll',
+                headers: hdrs,
+                body: JSON.stringify({ supportsBatchCommands: true }),
+            })).body);
+            if (!Array.isArray(drainRes.commands) || drainRes.commands.length === 0) break;
+        }
+
+        // Queue sync_all first, then select_target; verify sync_all is dropped and select_target is delivered first
+        const sRes = await requestHttp(port, { method: 'POST', path: '/api/command', headers: hdrs, body: JSON.stringify({ type: 'sync_all' }) });
+        assert.equal(sRes.status, 200);
+        const tRes = await requestHttp(port, { method: 'POST', path: '/api/command', headers: hdrs, body: JSON.stringify({ type: 'select_target', payload: { charIndex: 2, chatIndex: 3 } }) });
+        assert.equal(tRes.status, 200);
+
+        const pollRes1 = await requestHttp(port, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({
+                supportsBatchCommands: true,
+                snapshot: { charIndex: 0, chatIndex: 0, charName: 'Bot0', chatName: 'C0', isPcActive: true, totalMessages: 1, messages: [{ index: 0, role: 'char', raw: 'hi', html: 'hi', text: 'hi' }] },
+            }),
+        });
+        assert.equal(pollRes1.status, 200);
+        const pollBody1 = JSON.parse(pollRes1.body);
+        assert.equal(pollBody1.commands.length, 1);
+        assert.equal(pollBody1.commands[0].type, 'select_target');
+        assert.deepEqual(pollBody1.commands[0].payload, { charIndex: 2, chatIndex: 3 });
+
+        // Helper that pumps /api/pc/rpc-wait, replying [] to background db.listPluginsMeta
+        // until the target RPC op arrives and is answered cleanly.
+        const pumpRpcUntil = async (targetOp, respondFn) => {
+            for (let attempt = 0; attempt < 6; attempt += 1) {
+                const waitRes = JSON.parse((await requestHttp(port, {
+                    method: 'POST',
+                    path: '/api/pc/rpc-wait',
+                    headers: hdrs,
+                    body: JSON.stringify({ timeoutMs: 1500 }),
+                })).body);
+                const calls = Array.isArray(waitRes.calls) ? waitRes.calls : [];
+                if (!calls.length) continue;
+                let matchedCall = null;
+                const results = [];
+                for (const c of calls) {
+                    if (c.op === targetOp && !matchedCall) {
+                        matchedCall = c;
+                        results.push(respondFn(c));
+                    } else if (c.op === 'db.listPluginsMeta') {
+                        results.push({ id: c.id, ok: true, value: [] });
+                    } else {
+                        results.push({ id: c.id, ok: true, value: null });
+                    }
+                }
+                await requestHttp(port, {
+                    method: 'POST',
+                    path: '/api/pc/rpc-result',
+                    headers: hdrs,
+                    body: JSON.stringify({ results }),
+                });
+                if (matchedCall) return matchedCall;
+            }
+            return null;
+        };
+
+        // 1) Fast switch via bridge.selectTarget
+        const pumpPromise1 = pumpRpcUntil('bridge.selectTarget', (c) => ({
+            id: c.id,
+            ok: true,
+            value: { ok: true, charIndex: c.args[0], chatIndex: c.args[1] },
+        }));
+        await new Promise((r) => setTimeout(r, 40));
+        const fastCmdPromise = requestHttp(port, {
+            method: 'POST',
+            path: '/api/command',
+            headers: hdrs,
+            body: JSON.stringify({ type: 'select_target', payload: { charIndex: 1, chatIndex: 2 } }),
+        });
+        const rpcCall1 = await pumpPromise1;
+        assert.ok(rpcCall1, 'select_target must invoke bridge.selectTarget when Host RPC is active');
+        assert.deepEqual(rpcCall1.args, [1, 2]);
+        await requestHttp(port, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({
+                snapshot: { charIndex: 1, chatIndex: 2, charName: 'Bot1', chatName: 'Room 2', isPcActive: false, totalMessages: 1, messages: [{ index: 0, role: 'char', raw: 'ok', html: 'ok', text: 'ok' }] },
+            }),
+        });
+        const fastResBody = JSON.parse((await fastCmdPromise).body);
+        assert.equal(fastResBody.ok, true);
+        assert.equal(fastResBody.fastSwitch, true);
+        assert.equal(fastResBody.snapshot.charIndex, 1);
+        assert.equal(fastResBody.snapshot.chatIndex, 2);
+
+        // 2) Legacy plugin returning Unsupported host RPC op falls back to queued select_target
+        const pumpPromise2 = pumpRpcUntil('bridge.selectTarget', (c) => ({
+            id: c.id,
+            ok: false,
+            error: 'Unsupported host RPC op: bridge.selectTarget',
+        }));
+        await new Promise((r) => setTimeout(r, 40));
+        const fallbackCmdPromise = requestHttp(port, {
+            method: 'POST',
+            path: '/api/command',
+            headers: hdrs,
+            body: JSON.stringify({ type: 'select_target', payload: { charIndex: 0, chatIndex: 1 } }),
+        });
+        const rpcCall2 = await pumpPromise2;
+        assert.ok(rpcCall2);
+        const fbBody = JSON.parse((await fallbackCmdPromise).body);
+        assert.equal(fbBody.ok, true);
+        const pollFb = JSON.parse((await requestHttp(port, {
+            method: 'POST',
+            path: '/api/pc/poll',
+            headers: hdrs,
+            body: JSON.stringify({ supportsBatchCommands: true }),
+        })).body);
+        assert.equal(pollFb.commands[0].type, 'select_target');
+        assert.deepEqual(pollFb.commands[0].payload, { charIndex: 0, chatIndex: 1 });
+    } finally {
+        if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
         await new Promise((r) => server.close(r));
     }
 });

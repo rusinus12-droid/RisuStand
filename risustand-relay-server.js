@@ -26,13 +26,24 @@ const {
     TTS_VOICE_GROUPS,
     TTS_BUILTIN_VOICE_REFERENCES,
     TTS_TONE_TAG_PRESETS,
+    TTS_SPEECH_MODEL_SPECS,
     normalizeVoiceGroup,
     normalizeVoiceProfiles,
     inferTtsVoiceGroup,
     normalizeTtsEndpointUrl,
+    resolveTtsSpeechModelSpec,
+    buildTtsBotKey,
+    buildTtsChatKey,
+    buildTtsScriptKey,
+    normalizeTtsScriptSegment,
+    hydrateSavedScriptSegments,
+    createTtsScriptStore,
+    mergeCharacterSpeechProfiles,
+    analyzeBotCharacterProfiles,
     defaultTtsConfig,
     normalizeTtsConfig,
     sanitizeTtsForClient,
+    cleanTextForTts,
     analyzeTtsSegments,
     resolveSegmentVoice,
     listTtsModels,
@@ -50,6 +61,7 @@ const ROOT_DIR = __dirname;
 const TOKEN_PATH = path.join(ROOT_DIR, '.risustand-token');
 const CONFIG_PATH = path.join(ROOT_DIR, '.risustand-config.json');
 const PRESETS_PATH = path.join(ROOT_DIR, '.risustand-presets.json');
+const TTS_SCRIPTS_PATH = path.join(ROOT_DIR, '.risustand-tts-scripts.json');
 const PLUGINS_PATH = path.join(ROOT_DIR, '.risustand-plugins.json');
 const THUMBS_DIR = process.env.RISUSTAND_THUMBS_DIR || path.join(ROOT_DIR, '.risustand-thumbs');
 let configPersistDisabled = false;
@@ -153,6 +165,8 @@ function defaultConfig() {
         translator: {
             enabled: false,
             useActiveProfile: true,
+            profileId: '',
+            profileModelOverride: '',
             autoTranslateOutput: false,
             autoTranslateInput: false,
             targetLang: 'Korean',
@@ -1067,24 +1081,21 @@ const state = {
 const translationCache = new Map();
 
 const ASSET_HMAC_KEY = crypto.randomBytes(32);
-const ASSET_STORE_MAX_ITEMS = 160;
-const ASSET_STORE_MAX_BYTES = 48 * 1024 * 1024;
+const ASSET_STORE_MAX_ITEMS = 400;
+const ASSET_STORE_MAX_BYTES = 128 * 1024 * 1024;
+const PC_ASSET_MAX_SINGLE_BYTES = 16 * 1024 * 1024;
+const PC_ASSET_REF_MAX_ITEMS = 1024;
 const assetStore = new Map(); // id (32 hex) -> { buf: Buffer, mime: string }
+const pcAssetRefMap = new Map(); // id (32 hex) -> { type: 'pcpath', path } | { type: 'pcinlay', inlayId }
 let assetStoreBytes = 0;
 
-function storeDataUriAsset(dataUri) {
-    if (typeof dataUri !== 'string' || !dataUri.startsWith('data:image/')) return dataUri;
-    const m = dataUri.match(/^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i);
-    if (!m) return dataUri;
-    const mime = m[1].toLowerCase();
-    const buf = Buffer.from(m[2].replace(/\s+/g, ''), 'base64');
-    if (!buf.length) return dataUri;
-    const id = crypto.createHmac('sha256', ASSET_HMAC_KEY).update(mime + ':').update(buf).digest('hex').slice(0, 32);
+function putAssetStoreEntry(id, buf, mime) {
+    if (!id || !buf || !buf.length || !mime) return;
     if (assetStore.has(id)) {
         const existing = assetStore.get(id);
         assetStore.delete(id);
         assetStore.set(id, existing);
-        return `/api/asset/${id}`;
+        return;
     }
     if (buf.length <= ASSET_STORE_MAX_BYTES) {
         while (
@@ -1100,6 +1111,45 @@ function storeDataUriAsset(dataUri) {
         assetStore.set(id, { buf, mime });
         assetStoreBytes += buf.length;
     }
+}
+
+function registerPcAssetRef(refStr) {
+    if (typeof refStr !== 'string') return '';
+    let idInput = '';
+    let entry = null;
+    if (refStr.startsWith('pcpath:')) {
+        const assetPath = refStr.slice(7).trim();
+        if (!assetPath) return '';
+        idInput = 'pcpath:' + assetPath;
+        entry = { type: 'pcpath', path: assetPath };
+    } else if (refStr.startsWith('pcinlay:')) {
+        const inlayId = refStr.slice(8).trim();
+        if (!inlayId) return '';
+        idInput = 'pcinlay:' + inlayId;
+        entry = { type: 'pcinlay', inlayId };
+    } else {
+        return refStr;
+    }
+    const id = crypto.createHmac('sha256', ASSET_HMAC_KEY).update(idInput).digest('hex').slice(0, 32);
+    if (pcAssetRefMap.has(id)) {
+        pcAssetRefMap.delete(id);
+    } else if (pcAssetRefMap.size >= PC_ASSET_REF_MAX_ITEMS) {
+        const oldestKey = pcAssetRefMap.keys().next().value;
+        if (oldestKey) pcAssetRefMap.delete(oldestKey);
+    }
+    pcAssetRefMap.set(id, entry);
+    return `/api/asset/${id}`;
+}
+
+function storeDataUriAsset(dataUri) {
+    if (typeof dataUri !== 'string' || !dataUri.startsWith('data:image/')) return dataUri;
+    const m = dataUri.match(/^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i);
+    if (!m) return dataUri;
+    const mime = m[1].toLowerCase();
+    const buf = Buffer.from(m[2].replace(/\s+/g, ''), 'base64');
+    if (!buf.length) return dataUri;
+    const id = crypto.createHmac('sha256', ASSET_HMAC_KEY).update(mime + ':').update(buf).digest('hex').slice(0, 32);
+    putAssetStoreEntry(id, buf, mime);
     return `/api/asset/${id}`;
 }
 
@@ -1108,7 +1158,9 @@ function externalizeSnapshotAssets(snap) {
     const nextMap = {};
     if (snap.assetMap && typeof snap.assetMap === 'object') {
         for (const [k, v] of Object.entries(snap.assetMap)) {
-            nextMap[k] = (typeof v === 'string' && v.startsWith('data:image/')) ? storeDataUriAsset(v) : v;
+            if (typeof v === 'string' && v.startsWith('data:image/')) nextMap[k] = storeDataUriAsset(v);
+            else if (typeof v === 'string' && (v.startsWith('pcpath:') || v.startsWith('pcinlay:'))) nextMap[k] = registerPcAssetRef(v);
+            else nextMap[k] = v;
         }
     }
     const nextMsgs = Array.isArray(snap.messages)
@@ -1121,6 +1173,7 @@ function externalizeSnapshotAssets(snap) {
                     return nextMap[key] || s;
                 }
                 if (s.startsWith('data:image/')) return storeDataUriAsset(s);
+                if (s.startsWith('pcpath:') || s.startsWith('pcinlay:')) return registerPcAssetRef(s);
                 return s;
             });
             return { ...msg, images: nextImages };
@@ -1150,17 +1203,45 @@ async function replaceAsync(str, regex, asyncFn) {
     return out;
 }
 
+let displayRebuildChain = Promise.resolve();
+
+function resolveActivePersonaName(snapObj, catObj) {
+    const fromCtx = String((snapObj && snapObj.charContext && snapObj.charContext.personaName) || (snapObj && snapObj.personaName) || '').trim();
+    const catPersonas = (catObj && Array.isArray(catObj.personas)) ? catObj.personas : [];
+    const selIdx = Number(catObj && catObj.selectedPersona);
+    const catMatch = Number.isFinite(selIdx)
+        ? (catPersonas.find((p) => p && Number(p.index) === selIdx) || catPersonas[selIdx] || null)
+        : null;
+    const fromCat = String((catMatch && catMatch.name) || '').trim();
+    if (fromCtx && fromCtx !== 'User') return fromCtx;
+    if (fromCat) return fromCat;
+    return fromCtx || 'User';
+}
+
+function resolveSourceMediaUrl(rawPath) {
+    const p = String(rawPath || '').trim();
+    if (!p) return '';
+    if (/^(?:https?:\/\/|data:image\/|\/api\/asset\/|\/)/i.test(p)) return p;
+    return registerPcAssetRef(`pcpath:${p}`);
+}
+
 async function rebuildDisplayedSnapshot(baseSnap = state.baseSnapshot, adapter = activePluginAdapter) {
     if (!baseSnap || typeof baseSnap !== 'object') {
         state.snapshot = baseSnap;
         return baseSnap;
     }
-    const hasEditDisplay = Boolean(adapter && typeof adapter.hasEditDisplayHandlers === 'function' && adapter.hasEditDisplayHandlers());
-    const hasSurface = Boolean(adapter && ((typeof adapter.hasActiveSurfacePlugins === 'function' && adapter.hasActiveSurfacePlugins()) || (typeof adapter.hasEnabledPlugins === 'function' && adapter.hasEnabledPlugins())));
-    if ((!hasEditDisplay && !hasSurface) || !Array.isArray(baseSnap.messages) || !baseSnap.messages.length) {
-        state.snapshot = baseSnap;
-        return baseSnap;
-    }
+    const entrySnap = baseSnap;
+    const runRebuild = async () => {
+        if (state.baseSnapshot !== entrySnap) {
+            return state.snapshot;
+        }
+        const hasModDisplay = Boolean(activeModuleAdapter && typeof activeModuleAdapter.runDisplayLuaForSnapshot === 'function');
+        const hasEditDisplay = Boolean(adapter && typeof adapter.hasEditDisplayHandlers === 'function' && adapter.hasEditDisplayHandlers());
+        const hasSurface = Boolean(adapter && ((typeof adapter.hasActiveSurfacePlugins === 'function' && adapter.hasActiveSurfacePlugins()) || (typeof adapter.hasEnabledPlugins === 'function' && adapter.hasEnabledPlugins())));
+        if ((!hasEditDisplay && !hasSurface && !hasModDisplay) || !Array.isArray(baseSnap.messages) || !baseSnap.messages.length) {
+            if (state.baseSnapshot === entrySnap) state.snapshot = baseSnap;
+            return state.snapshot;
+        }
     const charIdPart = String((baseSnap.charContext && baseSnap.charContext.charId) || baseSnap.charName || baseSnap.charIndex || 0).replace(/[^a-zA-Z0-9_-]/g, '_');
     const ensuredChatUuid = String(baseSnap.chatUuid || baseSnap.chatId || `rs-chat-${charIdPart}-${Math.max(0, Number(baseSnap.chatIndex) || 0)}`);
     const preparedMessages = baseSnap.messages.map((m) => {
@@ -1168,26 +1249,80 @@ async function rebuildDisplayedSnapshot(baseSnap = state.baseSnapshot, adapter =
         if (m.chatId && String(m.chatId).trim()) return m;
         return { ...m, chatId: `rs-msg-${ensuredChatUuid}-${m.index}` };
     });
-    const surfaceProj = (hasSurface && typeof adapter.syncAndProjectChatSurface === 'function')
-        ? await adapter.syncAndProjectChatSurface({ ...baseSnap, chatUuid: ensuredChatUuid, messages: preparedMessages })
+    const displayPersonaName = resolveActivePersonaName(baseSnap, state.catalog);
+    const displayCharName = String(baseSnap.charName || (baseSnap.charContext && baseSnap.charContext.name) || 'Character');
+    const luaDisplayRes = hasModDisplay
+        ? await activeModuleAdapter.runDisplayLuaForSnapshot(baseSnap, preparedMessages, { personaName: displayPersonaName }).catch((err) => {
+            console.warn('[Relay] runDisplayLuaForSnapshot error:', err && err.message ? err.message : err);
+            return null;
+        })
         : null;
+    const messagesForSurface = preparedMessages.map((m) => {
+        if (!m || typeof m !== 'object') return m;
+        const lHtml = (luaDisplayRes && luaDisplayRes.htmlByIndex && Object.prototype.hasOwnProperty.call(luaDisplayRes.htmlByIndex, m.index))
+            ? String(luaDisplayRes.htmlByIndex[m.index] ?? '')
+            : '';
+        return lHtml ? { ...m, html: lHtml } : m;
+    });
+    const surfaceProj = (hasSurface && typeof adapter.syncAndProjectChatSurface === 'function')
+        ? await adapter.syncAndProjectChatSurface({ ...baseSnap, chatUuid: ensuredChatUuid, messages: messagesForSurface }).catch((err) => {
+            console.warn('[Relay] syncAndProjectChatSurface error:', err && err.message ? err.message : err);
+            return null;
+        })
+        : null;
+
+    const mergedAssetPaths = Object.create(null);
+    const mergeAssetMap = (src) => {
+        if (!src || typeof src !== 'object') return;
+        for (const [k, v] of Object.entries(src)) {
+            if (k && v && !mergedAssetPaths[k]) mergedAssetPaths[k] = v;
+        }
+    };
+    mergeAssetMap(luaDisplayRes && luaDisplayRes.assetPathsByName);
+    mergeAssetMap(surfaceProj && surfaceProj.assetPathsByName);
+
+    const resolveRsPlaceholder = (tok) => {
+        const rsAssetMatch = /^\[\[RSASSET:([^\]]+)\]\]$/i.exec(tok);
+        if (rsAssetMatch) {
+            const mapKey = rsAssetMatch[1];
+            return (baseSnap && baseSnap.assetMap && typeof baseSnap.assetMap[mapKey] === 'string')
+                ? baseSnap.assetMap[mapKey]
+                : '';
+        }
+        return /^\[\[RS/i.test(tok) ? '' : null;
+    };
 
     const resolveAdapterAssetUrl = async (rawToken, nextImages) => {
         const tok = String(rawToken || '').trim();
         if (!tok) return '';
-        const mappedPath = (surfaceProj && surfaceProj.assetPathsByName && surfaceProj.assetPathsByName[tok]) || '';
+        const rsVal = resolveRsPlaceholder(tok);
+        if (rsVal !== null) return rsVal;
+        const lower = tok.toLowerCase();
+        const noExt = lower.replace(/\.[a-z0-9]{2,5}$/i, '');
+        const mappedPath = mergedAssetPaths[tok] || mergedAssetPaths[lower] || mergedAssetPaths[noExt] || '';
+        const luaAssetPaths = luaDisplayRes && luaDisplayRes.assetPathsByName;
+        const fromLua = Boolean(luaAssetPaths && (luaAssetPaths[tok] || luaAssetPaths[lower] || luaAssetPaths[noExt]));
         const tryPaths = /^assets\//i.test(tok)
             ? [tok]
             : (mappedPath ? [mappedPath, tok] : [tok]);
+        if (fromLua && mappedPath) {
+            const pcUrl = registerPcAssetRef(`pcpath:${mappedPath}`);
+            if (pcUrl) {
+                if (!nextImages.includes(pcUrl)) nextImages.push(pcUrl);
+                return pcUrl;
+            }
+        }
         if (typeof adapter.readImage === 'function') {
             for (const p of tryPaths) {
-                const bytes = await adapter.readImage(p);
-                if (bytes && bytes.length) {
-                    const dataUri = `data:image/png;base64,${Buffer.from(bytes).toString('base64')}`;
-                    const url = storeDataUriAsset(dataUri);
-                    if (url && !nextImages.includes(url)) nextImages.push(url);
-                    return url;
-                }
+                try {
+                    const bytes = await adapter.readImage(p);
+                    if (bytes && bytes.length) {
+                        const dataUri = `data:image/png;base64,${Buffer.from(bytes).toString('base64')}`;
+                        const url = storeDataUriAsset(dataUri);
+                        if (url && !nextImages.includes(url)) nextImages.push(url);
+                        return url;
+                    }
+                } catch (_) {}
             }
         }
         if (baseSnap.assetMap && typeof baseSnap.assetMap[tok] === 'string') {
@@ -1195,6 +1330,23 @@ async function rebuildDisplayedSnapshot(baseSnap = state.baseSnapshot, adapter =
         }
         return '';
     };
+
+    const displayChatVars = (baseSnap.chatVariables && typeof baseSnap.chatVariables === 'object') ? baseSnap.chatVariables : {};
+    const displayGlobalVars = {
+        ...((baseSnap.globalToggleValues && typeof baseSnap.globalToggleValues === 'object') ? baseSnap.globalToggleValues : {}),
+        ...(baseSnap.useLocallySetGlobalVariables && baseSnap.localToggleValues && typeof baseSnap.localToggleValues === 'object' ? baseSnap.localToggleValues : {}),
+    };
+    const displayUserIconUrl = resolveSourceMediaUrl((baseSnap.charContext && baseSnap.charContext.personaIcon) || '');
+    const displayCharImageUrl = resolveSourceMediaUrl((baseSnap.charContext && baseSnap.charContext.charImage) || '');
+    const displayCharAssetNames = Array.isArray(baseSnap.charContext && baseSnap.charContext.charAssetNames) ? baseSnap.charContext.charAssetNames : [];
+    const displayEmotionNames = Array.isArray(baseSnap.charContext && baseSnap.charContext.emotionNames) ? baseSnap.charContext.emotionNames : [];
+    const displayFirstMessage = String((baseSnap.charContext && baseSnap.charContext.firstMessage) || '');
+    const displayChatList = preparedMessages
+        .filter((pm) => pm && !pm.isFirstMessage && Number(pm.index) >= 0)
+        .map((pm) => ({
+            role: pm.role === 'user' ? 'user' : 'assistant',
+            content: String(pm.raw || pm.text || pm.html || ''),
+        }));
 
     const nextMessages = [];
     for (const m of preparedMessages) {
@@ -1205,39 +1357,72 @@ async function rebuildDisplayedSnapshot(baseSnap = state.baseSnapshot, adapter =
         const mCid = String(m.chatId || '').trim();
         const surfaceBodyHtml = (surfaceProj && surfaceProj.bodyHtmlByChatId && mCid && surfaceProj.bodyHtmlByChatId[mCid]) || '';
         const rawFooter = (surfaceProj && ((mCid && surfaceProj.footersByChatId[mCid]) || (surfaceProj.footersByIndex && surfaceProj.footersByIndex[m.index]))) || '';
-        const pluginFooterHtml = rawFooter ? rawFooter.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '') : '';
+        const pluginFooterHtml = rawFooter ? await resolvePluginHtmlAssets(rawFooter, adapter, baseSnap) : '';
 
-        const baseHtml = surfaceBodyHtml || String(m.html || m.raw || '');
+        const luaHtml = (luaDisplayRes && luaDisplayRes.htmlByIndex && Object.prototype.hasOwnProperty.call(luaDisplayRes.htmlByIndex, m.index))
+            ? String(luaDisplayRes.htmlByIndex[m.index] ?? '')
+            : '';
+        const luaChanged = Boolean(luaHtml && luaHtml !== String(m.html || m.raw || ''));
+        const baseHtml = surfaceBodyHtml || luaHtml || String(m.html || m.raw || '');
         let nextHtml = hasEditDisplay ? await adapter.runEditDisplay(baseHtml) : baseHtml;
         if (typeof nextHtml !== 'string') nextHtml = baseHtml;
-        const hasTokens = /\{\{(?:inlay|inlayed|raw|img|asset|image)::/i.test(nextHtml) || /data:image\//i.test(nextHtml);
-        if (nextHtml === String(m.html || '') && !hasTokens && !surfaceBodyHtml) {
+        const hasAssetOrUrl = /\{\{(?:inlay|inlayed|raw|path|img|asset|image|emotion)::/i.test(nextHtml) || /data:image\//i.test(nextHtml) || /(?:src\s*=\s*["']?(?!\/|data:|https?:|blob:|\[\[RS)[^\s"'>]+|url\()/i.test(nextHtml);
+        const hasAnyCbs = nextHtml.includes('{{') && nextHtml.includes('}}');
+        if (nextHtml === String(m.html || '') && !hasAnyCbs && !hasAssetOrUrl && !surfaceBodyHtml && !luaChanged) {
             nextMessages.push(pluginFooterHtml ? { ...m, pluginFooterHtml } : m);
             continue;
         }
         nextHtml = nextHtml.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '');
+        if (hasAnyCbs) {
+            nextHtml = evalPresetCbs(nextHtml, {
+                charName: displayCharName,
+                personaName: displayPersonaName,
+                personaPrompt: String((baseSnap.charContext && baseSnap.charContext.personaPrompt) || ''),
+                desc: String((baseSnap.charContext && baseSnap.charContext.desc) || ''),
+                note: String((baseSnap.charContext && baseSnap.charContext.note) || ''),
+                globalNote: String((baseSnap.charContext && baseSnap.charContext.replaceGlobalNote) || ''),
+                firstMessage: displayFirstMessage,
+                userIconUrl: displayUserIconUrl,
+                charImageUrl: displayCharImageUrl,
+                charAssetNames: displayCharAssetNames,
+                emotionNames: displayEmotionNames,
+                chatVars: { ...displayChatVars },
+                globalVars: displayGlobalVars,
+                chatList: displayChatList,
+                chatIndex: Number(m.index ?? 0),
+                lastMessageId: Math.max(0, Number(baseSnap.totalMessages || displayChatList.length) - 1),
+                msgRole: m.role === 'user' ? 'user' : 'char',
+            });
+        }
+        const postCbsHasAssets = /\{\{(?:inlay|inlayed|raw|path|img|asset|image|emotion)::/i.test(nextHtml) || /data:image\//i.test(nextHtml) || /(?:src\s*=\s*["']?(?!\/|data:|https?:|blob:|\[\[RS)[^\s"'>]+|url\()/i.test(nextHtml);
+        if (nextHtml === String(m.html || '') && !postCbsHasAssets && !surfaceBodyHtml && !luaChanged) {
+            nextMessages.push(pluginFooterHtml ? { ...m, pluginFooterHtml } : m);
+            continue;
+        }
         const nextImages = Array.isArray(m.images) ? m.images.slice() : [];
         if (typeof adapter.readInlay === 'function') {
             nextHtml = await replaceAsync(nextHtml, /\{\{(?:inlay|inlayed)::([^}]+)\}\}/gi, async (_, rawId) => {
-                const inlay = await adapter.readInlay(String(rawId || '').trim());
-                if (inlay && inlay.data && String(inlay.data).startsWith('data:image/')) {
-                    const url = storeDataUriAsset(inlay.data);
-                    if (url && !nextImages.includes(url)) nextImages.push(url);
-                    return `<img class="msg-img" src="${url}" />`;
-                }
+                try {
+                    const inlay = await adapter.readInlay(String(rawId || '').trim());
+                    if (inlay && inlay.data && String(inlay.data).startsWith('data:image/')) {
+                        const url = storeDataUriAsset(inlay.data);
+                        if (url && !nextImages.includes(url)) nextImages.push(url);
+                        return `<img class="msg-img" src="${url}" />`;
+                    }
+                } catch (_) {}
                 return '';
             });
         }
         nextHtml = await replaceAsync(
             nextHtml,
-            /(\bsrc\s*=\s*)(?:"\{\{(?:raw|img|asset|image)::([^}]+)\}\}"|'\{\{(?:raw|img|asset|image)::([^}]+)\}\}'|\{\{(?:raw|img|asset|image)::([^}]+)\}\})/gi,
+            /(\bsrc\s*=\s*)(?:"\{\{(?:raw|path|img|asset|image|emotion)::([^}]+)\}\}"|'\{\{(?:raw|path|img|asset|image|emotion)::([^}]+)\}\}'|\{\{(?:raw|path|img|asset|image|emotion)::([^}]+)\}\})/gi,
             async (_, prefix, d1, d2, d3) => {
                 const url = await resolveAdapterAssetUrl(d1 || d2 || d3, nextImages);
                 return url ? `${prefix}"${url}"` : `${prefix}""`;
             }
         );
-        nextHtml = await replaceAsync(nextHtml, /\{\{raw::([^}]+)\}\}/gi, async (_, rawTok) => await resolveAdapterAssetUrl(rawTok, nextImages));
-        nextHtml = await replaceAsync(nextHtml, /\{\{(?:img|asset|image)::([^}]+)\}\}/gi, async (_, rawTok) => {
+        nextHtml = await replaceAsync(nextHtml, /\{\{(?:raw|path)::([^}]+)\}\}/gi, async (_, rawTok) => await resolveAdapterAssetUrl(rawTok, nextImages));
+        nextHtml = await replaceAsync(nextHtml, /\{\{(?:img|asset|image|emotion)::([^}]+)\}\}/gi, async (_, rawTok) => {
             const url = await resolveAdapterAssetUrl(rawTok, nextImages);
             return url ? `<img class="msg-img" src="${url}" />` : '';
         });
@@ -1247,6 +1432,9 @@ async function rebuildDisplayedSnapshot(baseSnap = state.baseSnapshot, adapter =
             if (url && !nextImages.includes(url)) nextImages.push(url);
             return `<img${bAttr} src="${url}"${aAttr}>`;
         });
+        if (/(?:src\s*=\s*["']?(?!\/|data:|https?:|blob:|\[\[RS)[^\s"'>]+|url\()/i.test(nextHtml)) {
+            nextHtml = await resolvePluginHtmlAssets(nextHtml, adapter, baseSnap);
+        }
         const strippedText = nextHtml
             .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, '')
             .replace(/<[^>]+>/g, '')
@@ -1260,18 +1448,45 @@ async function rebuildDisplayedSnapshot(baseSnap = state.baseSnapshot, adapter =
             pluginFooterHtml,
         });
     }
-    state.snapshot = {
+    const pluginSurfaceStyles = (surfaceProj && Array.isArray(surfaceProj.styles))
+        ? surfaceProj.styles.filter((s) => typeof s === 'string' && s.trim())
+        : [];
+    const nextSnapshot = {
         ...baseSnap,
         chatUuid: ensuredChatUuid,
         messages: nextMessages,
+        pluginSurfaceStyles,
     };
-    return state.snapshot;
+        if (state.baseSnapshot === entrySnap) {
+            state.snapshot = nextSnapshot;
+        }
+        return state.snapshot;
+    };
+    const nextRun = displayRebuildChain.catch(() => {}).then(runRebuild);
+    displayRebuildChain = nextRun.catch(() => {});
+    return nextRun;
 }
 
 async function resolvePluginHtmlAssets(rawHtml, adapter = activePluginAdapter, baseSnap = state.baseSnapshot) {
     let nextHtml = String(rawHtml || '');
     if (!nextHtml) return '';
     nextHtml = nextHtml.replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, '');
+    if (nextHtml.includes('{{') && nextHtml.includes('}}')) {
+        const snapObj = baseSnap && typeof baseSnap === 'object' ? baseSnap : {};
+        nextHtml = evalPresetCbs(nextHtml, {
+            charName: String(snapObj.charName || (snapObj.charContext && snapObj.charContext.name) || 'Character'),
+            personaName: resolveActivePersonaName(snapObj, state.catalog),
+            personaPrompt: String((snapObj.charContext && snapObj.charContext.personaPrompt) || ''),
+            desc: String((snapObj.charContext && snapObj.charContext.desc) || ''),
+            userIconUrl: resolveSourceMediaUrl((snapObj.charContext && snapObj.charContext.personaIcon) || ''),
+            charImageUrl: resolveSourceMediaUrl((snapObj.charContext && snapObj.charContext.charImage) || ''),
+            chatVars: { ...((snapObj.chatVariables && typeof snapObj.chatVariables === 'object') ? snapObj.chatVariables : {}) },
+            globalVars: {
+                ...((snapObj.globalToggleValues && typeof snapObj.globalToggleValues === 'object') ? snapObj.globalToggleValues : {}),
+                ...(snapObj.useLocallySetGlobalVariables && snapObj.localToggleValues && typeof snapObj.localToggleValues === 'object' ? snapObj.localToggleValues : {}),
+            },
+        });
+    }
     const assetPathsByName = {};
     try {
         if (adapter && typeof adapter.getTurnContext === 'function') {
@@ -1287,15 +1502,25 @@ async function resolvePluginHtmlAssets(rawHtml, adapter = activePluginAdapter, b
     const resolveTokenUrl = async (rawToken) => {
         const tok = String(rawToken || '').trim();
         if (!tok) return '';
+        const rsAssetMatch = /^\[\[RSASSET:([^\]]+)\]\]$/i.exec(tok);
+        if (rsAssetMatch) {
+            const mapKey = rsAssetMatch[1];
+            return (baseSnap && baseSnap.assetMap && typeof baseSnap.assetMap[mapKey] === 'string')
+                ? baseSnap.assetMap[mapKey]
+                : '';
+        }
+        if (/^\[\[RS/i.test(tok) || /^(?:none$|var\()/i.test(tok)) return '';
         const mappedPath = assetPathsByName[tok] || '';
         const tryPaths = /^assets\//i.test(tok) ? [tok] : (mappedPath ? [mappedPath, tok] : [tok]);
         if (adapter && typeof adapter.readImage === 'function') {
             for (const p of tryPaths) {
-                const bytes = await adapter.readImage(p);
-                if (bytes && bytes.length) {
-                    const dataUri = `data:image/png;base64,${Buffer.from(bytes).toString('base64')}`;
-                    return storeDataUriAsset(dataUri);
-                }
+                try {
+                    const bytes = await adapter.readImage(p);
+                    if (bytes && bytes.length) {
+                        const dataUri = `data:image/png;base64,${Buffer.from(bytes).toString('base64')}`;
+                        return storeDataUriAsset(dataUri);
+                    }
+                } catch (_) {}
             }
         }
         if (baseSnap && baseSnap.assetMap && typeof baseSnap.assetMap[tok] === 'string') {
@@ -1306,10 +1531,12 @@ async function resolvePluginHtmlAssets(rawHtml, adapter = activePluginAdapter, b
 
     const resolveInlayUrl = async (rawId) => {
         if (!adapter || typeof adapter.readInlay !== 'function') return '';
-        const inlay = await adapter.readInlay(String(rawId || '').trim());
-        if (inlay && inlay.data && String(inlay.data).startsWith('data:image/')) {
-            return storeDataUriAsset(inlay.data);
-        }
+        try {
+            const inlay = await adapter.readInlay(String(rawId || '').trim());
+            if (inlay && inlay.data && String(inlay.data).startsWith('data:image/')) {
+                return storeDataUriAsset(inlay.data);
+            }
+        } catch (_) {}
         return '';
     };
 
@@ -1345,6 +1572,40 @@ async function resolvePluginHtmlAssets(rawHtml, adapter = activePluginAdapter, b
         const url = storeDataUriAsset(rawUri);
         return `<img${bAttr} src="${url}"${aAttr}>`;
     });
+    nextHtml = await replaceAsync(
+        nextHtml,
+        /<img\b([^>]*?)\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s>]+))([^>]*)>/gi,
+        async (full, bAttr, s1, s2, s3, aAttr) => {
+            const rawSrc = String(s1 ?? s2 ?? s3 ?? '').trim();
+            if (!rawSrc || /^(?:data:|https?:|blob:|\/|\[\[RS)/i.test(rawSrc)) return full;
+            const url = await resolveTokenUrl(rawSrc);
+            return url ? `<img${bAttr} src="${url}"${aAttr}>` : full;
+        }
+    );
+    if (/url\(/i.test(nextHtml)) {
+        const rewriteCssUrl = async (cssText, innerQ) => replaceAsync(
+            cssText,
+            /url\(\s*(?:"([^"]+)"|'([^']+)'|([^)'"\s][^)'"]*?))\s*\)/gi,
+            async (full, u1, u2, u3) => {
+                const rawRef = String(u1 ?? u2 ?? u3 ?? '').trim();
+                if (!rawRef || /^(?:data:|https?:|blob:|\/|#|\[\[RS|none$|var\()/i.test(rawRef)) return full;
+                const url = await resolveTokenUrl(rawRef);
+                return url ? `url(${innerQ}${url}${innerQ})` : full;
+            }
+        );
+        nextHtml = await replaceAsync(nextHtml, /(\bstyle\s*=\s*)(?:"([^"]*)"|'([^']*)')/gi, async (full, prefix, v1, v2) => {
+            const q = v1 !== undefined ? '"' : "'";
+            const val = v1 !== undefined ? v1 : v2;
+            if (!val || !/url\(/i.test(val)) return full;
+            return `${prefix}${q}${await rewriteCssUrl(val, q === '"' ? "'" : '"')}${q}`;
+        });
+        if (/<style\b/i.test(nextHtml)) {
+            nextHtml = await replaceAsync(nextHtml, /(<style\b[^>]*>)([\s\S]*?)(<\/style>)/gi, async (full, openT, css, closeT) => {
+                if (!css || !/url\(/i.test(css)) return full;
+                return `${openT}${await rewriteCssUrl(css, "'")}${closeT}`;
+            });
+        }
+    }
     return nextHtml;
 }
 
@@ -1414,17 +1675,20 @@ function pruneCommandQueue(now = Date.now()) {
     }
 }
 
-function queueCommand(type, payload) {
+function queueCommand(type, payload, { front = false } = {}) {
     const now = Date.now();
     pruneCommandQueue(now);
-    state.commandQueue.push({
+    const cmdObj = {
         id: crypto.randomBytes(6).toString('hex'),
         type,
         payload: payload || {},
         createdAt: now,
-    });
+    };
+    if (front) state.commandQueue.unshift(cmdObj);
+    else state.commandQueue.push(cmdObj);
     if (state.commandQueue.length > CMD_MAX_LEN) {
-        state.commandQueue.shift();
+        if (front) state.commandQueue.pop();
+        else state.commandQueue.shift();
     }
 }
 
@@ -3071,12 +3335,97 @@ function summarizeRequestLog(entry) {
     };
 }
 
+let activeGenerationTracker = null;
+
+function estimateOutputTokens(text) {
+    const src = String(text || '');
+    if (!src) return 0;
+    let cjkCount = 0;
+    for (let i = 0; i < src.length; i += 1) {
+        const code = src.charCodeAt(i);
+        if ((code >= 0x3000 && code <= 0x9FFF) || (code >= 0xAC00 && code <= 0xD7AF) || (code >= 0xF900 && code <= 0xFAFF)) {
+            cjkCount += 1;
+        }
+    }
+    const otherCount = src.length - cjkCount;
+    return Math.max(1, Math.round(cjkCount * 1.15 + otherCount / 3.8));
+}
+
+function formatProviderLabel(profile) {
+    if (!profile || typeof profile !== 'object') return 'LLM';
+    const pt = String(profile.providerType || '').toLowerCase();
+    if (pt === 'anthropic') return 'Anthropic';
+    if (pt === 'gemini') return 'Gemini';
+    const rawUrl = String(profile.baseUrl || '').trim();
+    if (rawUrl) {
+        try {
+            const u = new URL(rawUrl.includes('://') ? rawUrl : `http://${rawUrl}`);
+            const h = u.hostname.toLowerCase();
+            if (h.includes('openrouter.ai')) return 'OpenRouter';
+            if (h === 'api.openai.com') return 'OpenAI';
+            if (h.includes('deepseek.com')) return 'DeepSeek';
+            if (h.includes('anthropic.com')) return 'Anthropic';
+            if (h.includes('generativelanguage.googleapis.com')) return 'Gemini';
+            if (h.includes('ollama.com') || u.port === '11434') return 'Ollama';
+            if (h === 'api.x.ai') return 'xAI';
+            if (h === 'api.groq.com') return 'Groq';
+            if (h.includes('together.xyz')) return 'Together';
+            if (h.includes('mistral.ai')) return 'Mistral';
+            if (h === '127.0.0.1' || h === 'localhost' || h === '::1') return String(profile.name || u.hostname);
+            return u.hostname;
+        } catch (_) {}
+    }
+    return String(profile.name || 'OpenAI-Compat');
+}
+
+function extractCompletionTokens(usageObj) {
+    if (!usageObj || typeof usageObj !== 'object') return null;
+    if (usageObj.completion_tokens !== undefined) return Number(usageObj.completion_tokens) || 0;
+    if (usageObj.output_tokens !== undefined) return Number(usageObj.output_tokens) || 0;
+    if (usageObj.candidatesTokenCount !== undefined) return Number(usageObj.candidatesTokenCount) || 0;
+    return null;
+}
+
+function shouldTrackLiveGeneration(source) {
+    return source !== 'translate' && source !== 'tts' && source !== 'tts_parse';
+}
+
+async function readSseStream(resp, onEvent) {
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let sseBuf = '';
+    const flushLine = (rawLine) => {
+        const line = rawLine.trim();
+        if (!line.startsWith('data:')) return;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') return;
+        try {
+            onEvent(JSON.parse(payload));
+        } catch (_) {}
+    };
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        sseBuf += decoder.decode(value, { stream: true });
+        let nl = sseBuf.indexOf('\n');
+        while (nl !== -1) {
+            flushLine(sseBuf.slice(0, nl));
+            sseBuf = sseBuf.slice(nl + 1);
+            nl = sseBuf.indexOf('\n');
+        }
+    }
+    sseBuf += decoder.decode();
+    if (sseBuf) flushLine(sseBuf);
+}
+
 async function callLLMNonStream(profile, messages, extraOpts = {}) {
     if (!profile) throw new Error('활성화된 모델 프로필이 없습니다. [모델/번역] 탭에서 프로필을 선택하세요.');
 
     const startedAt = Date.now();
     const source = extraOpts.source || 'llm';
     const wantStreamFlag = Boolean(extraOpts.stream);
+    const allowStreamProgress = Boolean(extraOpts.streamProgress);
+    let didStream = wantStreamFlag;
     const remotePromptFlag = Boolean(extraOpts.remotePrompt);
     const presetIdVal = String(extraOpts.presetId || '');
     const presetNameVal = String(extraOpts.presetName || '');
@@ -3095,6 +3444,15 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
     let logStatus = 0;
     let logRespData = null;
     let logModel = profile.model || '';
+    const genHandle = (activeGenerationTracker && shouldTrackLiveGeneration(source))
+        ? activeGenerationTracker.begin({
+            source,
+            provider: formatProviderLabel(profile),
+            profileName: profile.name || '',
+            providerType: profile.providerType || 'openai_compat',
+            model: logModel,
+        })
+        : null;
 
     const tempVal = extraOpts.forceTemperature !== undefined
         ? extraOpts.forceTemperature
@@ -3150,6 +3508,7 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
                 max_tokens: maxTokVal || 4096,
                 messages: anthropicMessages,
             };
+            if (allowStreamProgress) body.stream = true;
             if (anthropicSystem !== undefined) body.system = anthropicSystem;
             if (tempVal !== undefined) body.temperature = tempVal;
             if (typeof extraOpts.interceptBody === 'function') {
@@ -3171,11 +3530,34 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
                 signal,
             });
             logStatus = resp.status;
-            const data = await resp.json().catch(() => ({}));
-            logRespData = data;
-            if (!resp.ok) throw new Error(data.error?.message || `Anthropic HTTP ${resp.status}`);
-            const out = Array.isArray(data.content) ? data.content.map((b) => b.text || '').join('') : '';
-            logModel = data.model || profile.model || '';
+            const ctype = String(resp.headers.get('content-type') || '').toLowerCase();
+            let out = '';
+            let usageObj = null;
+            let data = {};
+            if (resp.ok && ctype.includes('text/event-stream') && resp.body) {
+                didStream = true;
+                await readSseStream(resp, (ev) => {
+                    if (ev.type === 'message_start' && ev.message) {
+                        if (ev.message.model) logModel = ev.message.model;
+                        if (ev.message.usage) usageObj = mergeStreamUsage(usageObj, ev.message.usage);
+                    } else if (ev.type === 'content_block_delta' && ev.delta && typeof ev.delta.text === 'string') {
+                        out += ev.delta.text;
+                        if (genHandle) genHandle.progress({ text: out, model: logModel, usage: usageObj });
+                    } else if (ev.type === 'message_delta' && ev.usage) {
+                        usageObj = mergeStreamUsage(usageObj, ev.usage);
+                        if (genHandle) genHandle.progress({ text: out, model: logModel, usage: usageObj });
+                    }
+                });
+                logRespData = { model: logModel, usage: usageObj, content: [{ type: 'text', text: out }] };
+            } else {
+                data = await resp.json().catch(() => ({}));
+                logRespData = data;
+                if (!resp.ok) throw new Error(data.error?.message || `Anthropic HTTP ${resp.status}`);
+                out = Array.isArray(data.content) ? data.content.map((b) => b.text || '').join('') : '';
+                logModel = data.model || profile.model || '';
+                usageObj = data.usage || null;
+            }
+            if (genHandle) genHandle.end({ ok: true, text: out, model: logModel, usage: usageObj });
             recordRequestLog({
                 source,
                 ...logMetaFields,
@@ -3183,27 +3565,30 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
                 providerType: profile.providerType,
                 model: logModel,
                 endpoint: logEndpoint,
-                stream: wantStreamFlag,
+                stream: didStream,
                 status: resp.status,
                 ok: true,
                 durationMs: Date.now() - startedAt,
                 msgCount: Array.isArray(messages) ? messages.length : 0,
-                usage: mapUsageToOpenAI(data.usage || null),
+                usage: mapUsageToOpenAI(usageObj),
                 headers: sanitizeLogHeaders(logHeaders),
                 messages: sanitizeLogMessages(messages),
                 rawBodyObj: body,
-                rawUsageObj: data.usage || null,
+                rawUsageObj: usageObj,
                 requestJson: safeJsonForLog(body, REQUEST_LOG_BODY_CHAR_LIMIT),
                 responseText: truncateLogText(out, REQUEST_LOG_RESP_CHAR_LIMIT),
-                responseJson: safeJsonForLog(data, REQUEST_LOG_RESP_CHAR_LIMIT),
+                responseJson: safeJsonForLog(logRespData, REQUEST_LOG_RESP_CHAR_LIMIT),
                 error: '',
             });
-            return { text: out, model: logModel, usage: data.usage || null };
+            return { text: out, model: logModel, usage: usageObj };
         }
 
         if (profile.providerType === 'gemini') {
             const base = (profile.baseUrl || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '');
-            const endpoint = `${base}/models/${encodeURIComponent(profile.model)}:generateContent`;
+            const useGeminiSse = allowStreamProgress && /generativelanguage\.googleapis\.com/i.test(base);
+            const endpoint = useGeminiSse
+                ? `${base}/models/${encodeURIComponent(profile.model)}:streamGenerateContent?alt=sse`
+                : `${base}/models/${encodeURIComponent(profile.model)}:generateContent`;
             const { sysParts, turns } = normalizeTurnMessages(messages, { assistantRole: 'model', ensureUserFirst: false });
             const contents = turns.map((t) => ({ role: t.role, parts: [{ text: t.text }] }));
             let body = { contents };
@@ -3230,34 +3615,56 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
                 signal,
             });
             logStatus = resp.status;
-            const data = await resp.json().catch(() => ({}));
-            logRespData = data;
-            if (!resp.ok) throw new Error(data.error?.message || `Gemini HTTP ${resp.status}`);
-            const parts = data.candidates?.[0]?.content?.parts || [];
-            const out = parts.map((p) => p.text || '').join('');
+            const ctype = String(resp.headers.get('content-type') || '').toLowerCase();
+            let out = '';
+            let usageObj = null;
+            let data = {};
+            if (resp.ok && ctype.includes('text/event-stream') && resp.body) {
+                didStream = true;
+                await readSseStream(resp, (ev) => {
+                    const cParts = ev.candidates?.[0]?.content?.parts;
+                    if (Array.isArray(cParts)) {
+                        for (const p of cParts) {
+                            if (p && typeof p.text === 'string') out += p.text;
+                        }
+                    }
+                    if (ev.usageMetadata) usageObj = mergeStreamUsage(usageObj, ev.usageMetadata);
+                    if (ev.modelVersion) logModel = ev.modelVersion;
+                    if (genHandle) genHandle.progress({ text: out, model: logModel, usage: usageObj });
+                });
+                logRespData = { modelVersion: logModel, usageMetadata: usageObj, text: out };
+            } else {
+                data = await resp.json().catch(() => ({}));
+                logRespData = data;
+                if (!resp.ok) throw new Error(data.error?.message || `Gemini HTTP ${resp.status}`);
+                const parts = data.candidates?.[0]?.content?.parts || [];
+                out = parts.map((p) => p.text || '').join('');
+                usageObj = data.usageMetadata || null;
+            }
+            if (genHandle) genHandle.end({ ok: true, text: out, model: logModel || profile.model, usage: usageObj });
             recordRequestLog({
                 source,
                 ...logMetaFields,
                 profileName: profile.name || '',
                 providerType: profile.providerType,
-                model: profile.model || '',
+                model: logModel || profile.model || '',
                 endpoint,
-                stream: wantStreamFlag,
+                stream: didStream,
                 status: resp.status,
                 ok: true,
                 durationMs: Date.now() - startedAt,
                 msgCount: Array.isArray(messages) ? messages.length : 0,
-                usage: mapUsageToOpenAI(data.usageMetadata || null),
+                usage: mapUsageToOpenAI(usageObj),
                 headers: sanitizeLogHeaders(logHeaders),
                 messages: sanitizeLogMessages(messages),
                 rawBodyObj: body,
-                rawUsageObj: data.usageMetadata || null,
+                rawUsageObj: usageObj,
                 requestJson: safeJsonForLog(body, REQUEST_LOG_BODY_CHAR_LIMIT),
                 responseText: truncateLogText(out, REQUEST_LOG_RESP_CHAR_LIMIT),
-                responseJson: safeJsonForLog(data, REQUEST_LOG_RESP_CHAR_LIMIT),
+                responseJson: safeJsonForLog(logRespData, REQUEST_LOG_RESP_CHAR_LIMIT),
                 error: '',
             });
-            return { text: out, model: profile.model, usage: data.usageMetadata || null };
+            return { text: out, model: logModel || profile.model, usage: usageObj };
         }
 
         // Default: OpenAI-Compatible
@@ -3272,7 +3679,7 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
         let body = {
             model: profile.model,
             messages: (Array.isArray(messages) ? messages : []).map(({ memo: _omitMemo, data: _omitData, _cachePoint: _omitCP, ...rest }) => rest),
-            stream: false,
+            stream: allowStreamProgress,
         };
         if (tempVal !== undefined) body.temperature = tempVal;
         if (maxTokVal !== undefined) body.max_tokens = maxTokVal;
@@ -3291,11 +3698,31 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
             signal,
         });
         logStatus = resp.status;
-        const data = await resp.json().catch(() => ({}));
-        logRespData = data;
-        if (!resp.ok) throw new Error(data.error?.message || `Upstream HTTP ${resp.status}`);
-        const out = data.choices?.[0]?.message?.content || '';
-        logModel = data.model || profile.model || '';
+        const ctype = String(resp.headers.get('content-type') || '').toLowerCase();
+        let out = '';
+        let usageObj = null;
+        let data = {};
+        if (resp.ok && ctype.includes('text/event-stream') && resp.body) {
+            didStream = true;
+            await readSseStream(resp, (ev) => {
+                if (ev.model) logModel = ev.model;
+                const uObj = ev.usage || ev.usageMetadata || (ev.message && ev.message.usage) || null;
+                if (uObj) usageObj = mergeStreamUsage(usageObj, uObj);
+                const delta = ev.choices?.[0]?.delta;
+                const piece = delta ? (delta.content || delta.reasoning_content || '') : '';
+                if (piece) out += piece;
+                if ((piece || uObj) && genHandle) genHandle.progress({ text: out, model: logModel, usage: usageObj });
+            });
+            logRespData = { model: logModel, usage: usageObj, text: out };
+        } else {
+            data = await resp.json().catch(() => ({}));
+            logRespData = data;
+            if (!resp.ok) throw new Error(data.error?.message || `Upstream HTTP ${resp.status}`);
+            out = data.choices?.[0]?.message?.content || '';
+            logModel = data.model || profile.model || '';
+            usageObj = data.usage || null;
+        }
+        if (genHandle) genHandle.end({ ok: true, text: out, model: logModel, usage: usageObj });
         recordRequestLog({
             source,
             ...logMetaFields,
@@ -3303,23 +3730,24 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
             providerType: profile.providerType || 'openai_compat',
             model: logModel,
             endpoint,
-            stream: wantStreamFlag,
+            stream: didStream,
             status: resp.status,
             ok: true,
             durationMs: Date.now() - startedAt,
             msgCount: Array.isArray(messages) ? messages.length : 0,
-            usage: mapUsageToOpenAI(data.usage || null),
+            usage: mapUsageToOpenAI(usageObj),
             headers: sanitizeLogHeaders(headers),
             messages: sanitizeLogMessages(messages),
             rawBodyObj: body,
-            rawUsageObj: data.usage || null,
+            rawUsageObj: usageObj,
             requestJson: safeJsonForLog(body, REQUEST_LOG_BODY_CHAR_LIMIT),
             responseText: truncateLogText(out, REQUEST_LOG_RESP_CHAR_LIMIT),
-            responseJson: safeJsonForLog(data, REQUEST_LOG_RESP_CHAR_LIMIT),
+            responseJson: safeJsonForLog(logRespData, REQUEST_LOG_RESP_CHAR_LIMIT),
             error: '',
         });
-        return { text: out, model: logModel, usage: data.usage || null };
+        return { text: out, model: logModel, usage: usageObj };
     } catch (err) {
+        if (genHandle) genHandle.end({ ok: false, model: logModel, error: err && err.message ? err.message : String(err) });
         recordRequestLog({
             source,
             ...logMetaFields,
@@ -3327,7 +3755,7 @@ async function callLLMNonStream(profile, messages, extraOpts = {}) {
             providerType: profile.providerType || 'openai_compat',
             model: logModel,
             endpoint: logEndpoint,
-            stream: wantStreamFlag,
+            stream: didStream,
             status: logStatus,
             ok: false,
             durationMs: Date.now() - startedAt,
@@ -3404,9 +3832,19 @@ async function handleOpenAIProxy(req, res) {
             let streamTruncated = false;
             let streamUsage = null;
             let streamModel = profile.model || '';
+            let streamAccumText = '';
             let sseBuf = '';
             let aborted = false;
             let streamErr = '';
+            const proxyGenHandle = activeGenerationTracker
+                ? activeGenerationTracker.begin({
+                    source: 'proxy',
+                    provider: formatProviderLabel(profile),
+                    profileName: profile.name || '',
+                    providerType: profile.providerType || 'openai_compat',
+                    model: streamModel,
+                })
+                : null;
             try {
                 const upRes = await fetch(endpoint, {
                     method: 'POST',
@@ -3469,6 +3907,7 @@ async function handleOpenAIProxy(req, res) {
                         const delta = choice && choice.delta ? choice.delta : null;
                         const piece = delta ? (delta.content || delta.reasoning_content || '') : '';
                         if (piece) {
+                            streamAccumText += piece;
                             if (streamText.length < REQUEST_LOG_RESP_CHAR_LIMIT) {
                                 const remain = REQUEST_LOG_RESP_CHAR_LIMIT - streamText.length;
                                 streamText += piece.length > remain ? piece.slice(0, remain) : piece;
@@ -3476,6 +3915,9 @@ async function handleOpenAIProxy(req, res) {
                             } else {
                                 streamTruncated = true;
                             }
+                        }
+                        if ((piece || uObj) && proxyGenHandle) {
+                            proxyGenHandle.progress({ text: streamAccumText, model: streamModel, usage: streamUsage });
                         }
                     } catch (_) {}
                 };
@@ -3507,6 +3949,15 @@ async function handleOpenAIProxy(req, res) {
                 throw err;
             } finally {
                 cleanup();
+                if (proxyGenHandle) {
+                    proxyGenHandle.end({
+                        ok: !streamErr && !aborted && upStatus >= 200 && upStatus < 300,
+                        text: streamAccumText,
+                        model: streamModel,
+                        usage: streamUsage,
+                        error: streamErr || (aborted ? 'Client disconnected' : ''),
+                    });
+                }
                 if (!logged) {
                     logged = true;
                     const respFull = streamTruncated
@@ -3608,31 +4059,53 @@ async function handleOpenAIProxy(req, res) {
 }
 
 // ================= Translator Core =================
+function resolveTranslatorProfile() {
+    const tr = config.translator || {};
+    const pid = typeof tr.profileId === 'string' ? tr.profileId.trim() : '';
+    const overrideModel = typeof tr.profileModelOverride === 'string' ? tr.profileModelOverride.trim() : '';
+
+    if (pid && pid !== 'active' && pid !== 'custom') {
+        const found = (config.profiles || []).find((p) => p && p.id === pid);
+        if (found) {
+            return {
+                ...found,
+                name: `${found.name || 'Profile'} (Translator)`,
+                model: overrideModel || found.model,
+            };
+        }
+    }
+    if (pid === 'active' || (!pid && tr.useActiveProfile)) {
+        const active = getActiveProfile();
+        if (active) {
+            return overrideModel
+                ? { ...active, name: `${active.name || 'Active'} (Translator)`, model: overrideModel }
+                : active;
+        }
+    }
+    return {
+        name: 'Translator',
+        provider: tr.provider || '',
+        providerType: tr.providerType || 'gemini',
+        baseUrl: tr.baseUrl || '',
+        apiKey: tr.apiKey || '',
+        model: tr.model || 'gemini-2.5-flash',
+        temperature: 0.2,
+        maxTokens: 2048,
+    };
+}
+
 async function translateText(text, direction = 'to_target') {
     const clean = String(text || '').trim();
     if (!clean) return '';
-    const cacheKey = `${direction}:${crypto.createHash('sha1').update(clean).digest('hex')}`;
-    if (translationCache.has(cacheKey)) return translationCache.get(cacheKey);
 
     const tr = config.translator || {};
-    let profile = null;
-    if (tr.useActiveProfile) {
-        profile = getActiveProfile();
-    } else {
-        profile = {
-            name: 'Translator',
-            providerType: tr.providerType || 'gemini',
-            baseUrl: tr.baseUrl || '',
-            apiKey: tr.apiKey || '',
-            model: tr.model || 'gemini-2.5-flash',
-            temperature: 0.2,
-            maxTokens: 2048,
-        };
-    }
-
+    const profile = resolveTranslatorProfile();
     if (!profile) {
         throw new Error('번역에 사용할 모델이 설정되지 않았습니다. [모델/번역] 탭에서 모델 프로필 또는 번역기 키를 설정하세요.');
     }
+
+    const cacheKey = `${direction}:${profile.providerType || ''}:${profile.model || ''}:${crypto.createHash('sha1').update(clean).digest('hex')}`;
+    if (translationCache.has(cacheKey)) return translationCache.get(cacheKey);
 
     const sysPrompt = direction === 'to_en'
         ? (tr.inputPrompt || 'Translate the following Korean text naturally into English. Output ONLY the translation.')
@@ -4100,6 +4573,15 @@ function formatCbsDateTime(fmt = '', dateObj = new Date()) {
     return template.replace(/YYYY|YY|MM|DD|HH|mm|ss|ddd/g, (tok) => map[tok] ?? tok);
 }
 
+function escapeCbsHtml(s) {
+    return String(s ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
 function evalPresetCbs(input, ctx = {}, depth = 0) {
     const str = String(input ?? '');
     if (!str.includes('{{') || depth > 200) return str;
@@ -4143,6 +4625,16 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
             out += str.slice(closeIdx + 2, bounds.endStart);
             pos = bounds.endClose + 2;
             continue;
+        }
+
+        const pureMatch = trimmed.match(/^#pure(?:_?display)?(?:[\s:]|$)/i);
+        if (pureMatch) {
+            const bounds = findMatchingCbsBlockEnd(str, closeIdx + 2);
+            if (bounds) {
+                out += evalPresetCbs(str.slice(closeIdx + 2, bounds.endStart), ctx, depth + 1);
+                pos = bounds.endClose + 2;
+                continue;
+            }
         }
 
         const funcMatch = trimmed.match(/^#func(?:(?:\s+|::)([\s\S]*))?$/i);
@@ -4258,6 +4750,14 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
             continue;
         }
 
+        const assetMacro = inner.match(/^\s*(img|raw|path|asset|image|emotion|inlay|inlayed)::([\s\S]+)$/i);
+        if (assetMacro) {
+            const resolvedArg = evalPresetCbs(assetMacro[2], ctx, depth + 1).trim();
+            out += `{{${assetMacro[1].toLowerCase()}::${resolvedArg}}}`;
+            pos = closeIdx + 2;
+            continue;
+        }
+
         const parts = splitCbsTopLevelArgs(inner);
         const rawCmd = parts[0] || '';
         const evalRawCmd = rawCmd.includes('{{') ? evalPresetCbs(rawCmd, ctx, depth + 1) : rawCmd;
@@ -4273,7 +4773,7 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
         const cVars = (ctx && ctx.chatVars) || {};
 
         let replaced = null;
-        if (cmd === 'getglobalvar') {
+        if (cmd === 'getglobalvar' || cmd === 'globalvar' || cmd === 'toggle') {
             const k = (args[0] || '').trim();
             if (Object.prototype.hasOwnProperty.call(gVars, k)) replaced = String(gVars[k] ?? '');
             else if (k && !k.startsWith('toggle_') && Object.prototype.hasOwnProperty.call(gVars, `toggle_${k}`)) {
@@ -4281,11 +4781,11 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
             } else {
                 replaced = 'null';
             }
-        } else if (cmd === 'getvar' || cmd === 'getchatvar') {
+        } else if (cmd === 'getvar' || cmd === 'getchatvar' || cmd === 'var') {
             const k = (args[0] || '').trim();
             if (Object.prototype.hasOwnProperty.call(cVars, k)) replaced = String(cVars[k] ?? '');
             else if (Object.prototype.hasOwnProperty.call(gVars, k)) replaced = String(gVars[k] ?? '');
-            else replaced = '';
+            else replaced = 'null';
         } else if (cmd === 'setvar') {
             const k = (args[0] || '').trim();
             if (k && ctx && ctx.chatVars) ctx.chatVars[k] = String(args.slice(1).join('::'));
@@ -4296,10 +4796,15 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
                 ctx.chatVars[k] = String(args.slice(1).join('::'));
             }
             replaced = '';
-        } else if (cmd === 'addvar') {
+        } else if (cmd === 'addvar' || cmd === 'subvar' || cmd === 'mulvar' || cmd === 'divvar') {
             const k = (args[0] || '').trim();
+            const operand = Number(args[1]) || 0;
+            const curNum = Number(ctx && ctx.chatVars && ctx.chatVars[k]) || 0;
             if (k && ctx && ctx.chatVars) {
-                ctx.chatVars[k] = String((Number(ctx.chatVars[k]) || 0) + (Number(args[1]) || 0));
+                if (cmd === 'addvar') ctx.chatVars[k] = String(curNum + operand);
+                else if (cmd === 'subvar') ctx.chatVars[k] = String(curNum - operand);
+                else if (cmd === 'mulvar') ctx.chatVars[k] = String(curNum * operand);
+                else ctx.chatVars[k] = operand === 0 ? '0' : String(curNum / operand);
             }
             replaced = '';
         } else if (cmd === 'tempvar' || cmd === 'gettempvar') {
@@ -4329,17 +4834,70 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
                 } catch (_) {}
             }
             if (replaced === null) replaced = String(valStr.length);
-        } else if (cmd === 'chat_index' || cmd === 'chatindex') {
+        } else if (cmd === 'chat_index' || cmd === 'chatindex' || cmd === 'chat_id') {
             const fallbackIdx = Array.isArray(ctx.chatList) ? Math.max(0, ctx.chatList.length - 1) : 0;
             replaced = String(ctx.chatIndex !== undefined ? ctx.chatIndex : (ctx.lastMessageId !== undefined ? ctx.lastMessageId : fallbackIdx));
-        } else if (cmd === 'lastmessageid') {
+        } else if (cmd === 'lastmessageid' || cmd === 'last_message_id') {
             const fallbackLast = Array.isArray(ctx.chatList) ? Math.max(0, ctx.chatList.length - 1) : 0;
             replaced = String(ctx.lastMessageId !== undefined ? ctx.lastMessageId : fallbackLast);
+        } else if (cmd === 'message_count' || cmd === 'msgcount') {
+            replaced = String(Array.isArray(ctx.chatList) ? ctx.chatList.length : Math.max(0, (Number(ctx.lastMessageId) || -1) + 1));
+        } else if (cmd === 'is_first_msg' || cmd === 'isfirstmsg') {
+            replaced = (ctx.chatIndex === -1 || ctx.chatIndex === 0) ? '1' : '0';
+        } else if (cmd === 'is_last_msg' || cmd === 'islastmsg') {
+            const fallbackLast = Array.isArray(ctx.chatList) ? Math.max(0, ctx.chatList.length - 1) : 0;
+            const lastId = ctx.lastMessageId !== undefined ? ctx.lastMessageId : fallbackLast;
+            replaced = (ctx.chatIndex === lastId) ? '1' : '0';
+        } else if (cmd === 'role') {
+            replaced = String(ctx.msgRole || 'char');
+        } else if (cmd === 'lastmessage') {
+            const list = Array.isArray(ctx.chatList) ? ctx.chatList : [];
+            replaced = list.length ? String((list[list.length - 1] && list[list.length - 1].content) ?? '') : '';
+        } else if (cmd === 'lastcharmessage') {
+            const list = Array.isArray(ctx.chatList) ? ctx.chatList : [];
+            let found = '';
+            for (let li = list.length - 1; li >= 0; li -= 1) {
+                if (list[li] && list[li].role !== 'user') { found = String(list[li].content ?? ''); break; }
+            }
+            replaced = found;
+        } else if (cmd === 'lastusermessage') {
+            const list = Array.isArray(ctx.chatList) ? ctx.chatList : [];
+            let found = '';
+            for (let li = list.length - 1; li >= 0; li -= 1) {
+                if (list[li] && list[li].role === 'user') { found = String(list[li].content ?? ''); break; }
+            }
+            replaced = found;
+        } else if (cmd === 'firstmessage') {
+            replaced = String(ctx.firstMessage || '');
+        } else if (cmd === 'source') {
+            const target = String(args[0] || '').trim().toLowerCase();
+            replaced = target === 'user' ? String(ctx.userIconUrl || '') : (target === 'char' ? String(ctx.charImageUrl || '') : '');
+        } else if (cmd === 'button') {
+            const lbl = String(args[0] || '').trim();
+            const trig = String(args[1] || '').trim();
+            replaced = trig ? `<button type="button" class="risu-cbs-btn" risu-trigger="${escapeCbsHtml(trig)}">${escapeCbsHtml(lbl || trig)}</button>` : '';
+        } else if (cmd === 'assetlist' || cmd === 'char_assetlist') {
+            replaced = JSON.stringify(Array.isArray(ctx.charAssetNames) ? ctx.charAssetNames : []);
+        } else if (cmd === 'emotionlist') {
+            replaced = JSON.stringify(Array.isArray(ctx.emotionNames) ? ctx.emotionNames : []);
+        } else if (cmd === 'module_assetlist' || cmd === 'moduleassetlist') {
+            const ns = String(args.join('::') || '').trim();
+            const mMap = (ctx && ctx.moduleAssetMap && typeof ctx.moduleAssetMap === 'object') ? ctx.moduleAssetMap : {};
+            const list = Array.isArray(mMap[ns]) ? mMap[ns] : (Array.isArray(mMap[ns.toLowerCase()]) ? mMap[ns.toLowerCase()] : []);
+            replaced = JSON.stringify(list);
         } else if (cmd === 'previous_chat_log' || cmd === 'previouschatlog') {
             const idx = Number((args[0] || '').trim());
             replaced = (Array.isArray(ctx.chatList) && Number.isInteger(idx) && idx >= 0 && idx < ctx.chatList.length)
                 ? String((ctx.chatList[idx] && ctx.chatList[idx].content) ?? '')
                 : '';
+        } else if (cmd === 'history' || cmd === 'raw_history') {
+            const sub = String(args[0] || '').trim().toLowerCase();
+            const list = Array.isArray(ctx.chatList) ? ctx.chatList : [];
+            if (sub === 'role') {
+                replaced = JSON.stringify(list.map((m) => `${m && m.role === 'user' ? 'user' : 'char'}: ${String((m && m.content) ?? '')}`));
+            } else {
+                replaced = JSON.stringify(list.map((m) => String((m && m.content) ?? '')));
+            }
         } else if (cmd === 'position') {
             const posKey = String(args[0] || '').trim();
             const ptMap = (ctx && ctx.ptPositions && typeof ctx.ptPositions === 'object') ? ctx.ptPositions : {};
@@ -4370,6 +4928,12 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
             replaced = formatCbsDateTime(args[0] || 'HH:mm:ss', new Date());
         } else if (cmd === 'date') {
             replaced = formatCbsDateTime(args[0] || 'YYYY-MM-DD', new Date());
+        } else if (cmd === 'isodate') {
+            replaced = new Date().toISOString().slice(0, 10);
+        } else if (cmd === 'isotime') {
+            replaced = new Date().toISOString().slice(11, 19);
+        } else if (cmd === 'unixtime') {
+            replaced = String(Math.floor(Date.now() / 1000));
         } else if (cmd === 'idle_duration' || cmd === 'idleduration') {
             if (Number.isFinite(ctx.lastUserMessageTime) && ctx.lastUserMessageTime > 0) {
                 const secs = Math.max(0, Math.floor((Date.now() - ctx.lastUserMessageTime) / 1000));
@@ -4441,9 +5005,9 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
             replaced = Number(args[0]) <= Number(args[1]) ? '1' : '0';
         } else if (cmd === 'trim') {
             replaced = String(args.join('::')).trim();
-        } else if (cmd === 'lower') {
+        } else if (cmd === 'lower' || cmd === 'lowercase') {
             replaced = String(args.join('::')).toLowerCase();
-        } else if (cmd === 'upper') {
+        } else if (cmd === 'upper' || cmd === 'uppercase') {
             replaced = String(args.join('::')).toUpperCase();
         } else if (cmd === 'abs') {
             replaced = String(Math.abs(Number(args[0]) || 0));
@@ -4453,6 +5017,23 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
             replaced = String(Math.floor(Number(args[0]) || 0));
         } else if (cmd === 'ceil') {
             replaced = String(Math.ceil(Number(args[0]) || 0));
+        } else if (cmd === 'rem' || cmd === 'mod') {
+            const a = Number(args[0]) || 0;
+            const b = Number(args[1]) || 0;
+            replaced = b === 0 ? '0' : String(a % b);
+        } else if (cmd === 'fixnum' || cmd === 'tofixed') {
+            const n = Number(args[0]) || 0;
+            const dec = Math.max(0, Math.min(20, Math.trunc(Number(args[1]) || 0)));
+            replaced = n.toFixed(dec);
+        } else if (cmd === 'substr' || cmd === 'substring' || cmd === 'slice') {
+            const s = String(args[0] ?? '');
+            const start = Math.trunc(Number(args[1]) || 0);
+            if (args.length > 2) {
+                const end = Math.trunc(Number(args[2]) || 0);
+                replaced = cmd === 'slice' ? s.slice(start, end) : s.substring(start, end);
+            } else {
+                replaced = cmd === 'slice' ? s.slice(start) : s.substring(start);
+            }
         } else if (cmd === 'tonumber') {
             const n = Number(String(args[0] || '').trim());
             replaced = Number.isFinite(n) ? String(n) : '0';
@@ -4466,14 +5047,153 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
             let sum = 0;
             for (const x of args) sum += Number(x) || 0;
             replaced = String(sum);
-        } else if (cmd === 'contains') {
-            replaced = String(args[0] ?? '').includes(String(args[1] ?? '')) ? '1' : '0';
+        } else if (cmd === 'contains' || cmd === 'includes') {
+            const hay = String(args[0] ?? '');
+            const needle = String(args[1] ?? '');
+            let found = hay.includes(needle);
+            if (!found && cmd === 'includes' && hay.trim().startsWith('[')) {
+                try { const arr = JSON.parse(hay); if (Array.isArray(arr)) found = arr.some((x) => String(x) === needle); } catch (_) {}
+            }
+            replaced = found ? '1' : '0';
+        } else if (cmd === 'index_of' || cmd === 'indexof') {
+            const hay = String(args[0] ?? '');
+            const needle = String(args[1] ?? '');
+            let idx = -1;
+            if (hay.trim().startsWith('[')) {
+                try { const arr = JSON.parse(hay); if (Array.isArray(arr)) idx = arr.findIndex((x) => String(x) === needle); } catch (_) {}
+            } else {
+                idx = hay.indexOf(needle);
+            }
+            replaced = String(idx);
+        } else if (cmd === 'split') {
+            replaced = JSON.stringify(String(args[0] ?? '').split(args.length > 1 ? String(args[1] ?? '') : ','));
+        } else if (cmd === 'join') {
+            const rawArr = String(args[0] ?? '').trim();
+            const sep = args.length > 1 ? String(args[1] ?? '') : ',';
+            let items = [];
+            if (rawArr.startsWith('[')) {
+                try { const p = JSON.parse(rawArr); if (Array.isArray(p)) items = p.map((v) => String(v ?? '')); } catch (_) {}
+            } else if (rawArr) {
+                items = rawArr.split('§');
+            }
+            replaced = items.join(sep);
+        } else if (cmd === 'array_element' || cmd === 'arrayelement') {
+            const rawArr = String(args[0] ?? '').trim();
+            const idx = Math.trunc(Number(args[1] ?? '0'));
+            let items = null;
+            if (rawArr.startsWith('[')) {
+                try { const p = JSON.parse(rawArr); if (Array.isArray(p)) items = p; } catch (_) {}
+            }
+            if (items && Number.isInteger(idx)) {
+                const ri = idx < 0 ? items.length + idx : idx;
+                replaced = (ri >= 0 && ri < items.length) ? (typeof items[ri] === 'object' && items[ri] !== null ? JSON.stringify(items[ri]) : String(items[ri] ?? '')) : '';
+            } else replaced = '';
+        } else if (cmd === 'array_length' || cmd === 'arraylength') {
+            const rawArr = String(args[0] ?? '').trim();
+            let len = 0;
+            if (rawArr.startsWith('[')) {
+                try { const p = JSON.parse(rawArr); if (Array.isArray(p)) len = p.length; } catch (_) {}
+            }
+            replaced = String(len);
+        } else if (cmd === 'dictelement' || cmd === 'dict_element' || cmd === 'object_element') {
+            const rawObj = String(args[0] ?? '').trim();
+            const key = String(args[1] ?? '');
+            replaced = '';
+            try {
+                const obj = JSON.parse(rawObj);
+                if (obj && typeof obj === 'object' && Object.prototype.hasOwnProperty.call(obj, key)) {
+                    const v = obj[key];
+                    replaced = typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v ?? '');
+                }
+            } catch (_) {}
         } else if (cmd === 'startswith') {
             replaced = String(args[0] ?? '').startsWith(String(args[1] ?? '')) ? '1' : '0';
         } else if (cmd === 'endswith') {
             replaced = String(args[0] ?? '').endsWith(String(args[1] ?? '')) ? '1' : '0';
         } else if (cmd === 'replace') {
             replaced = String(args[0] ?? '').split(String(args[1] ?? '')).join(String(args[2] ?? ''));
+        } else if (cmd === 'capitalize') {
+            const s = String(args.join('::') ?? '');
+            replaced = s ? (s.charAt(0).toUpperCase() + s.slice(1)) : '';
+        } else if (cmd === 'ltrim') {
+            replaced = String(args.join('::') ?? '').trimStart();
+        } else if (cmd === 'rtrim') {
+            replaced = String(args.join('::') ?? '').trimEnd();
+        } else if (cmd === 'padstart' || cmd === 'padend') {
+            const s = String(args[0] ?? '');
+            const len = Math.max(0, Math.trunc(Number(args[1] ?? '0') || 0));
+            const fill = args.length > 2 ? String(args[2] ?? ' ') : ' ';
+            replaced = cmd === 'padstart' ? s.padStart(len, fill) : s.padEnd(len, fill);
+        } else if (cmd === 'repeat') {
+            const s = String(args[0] ?? '');
+            const cnt = Math.max(0, Math.min(1000, Math.trunc(Number(args[1] ?? '0') || 0)));
+            replaced = s.repeat(cnt);
+        } else if (cmd === 'reverse') {
+            const s = String(args.join('::') ?? '');
+            if (s.trim().startsWith('[')) {
+                try {
+                    const arr = JSON.parse(s);
+                    if (Array.isArray(arr)) replaced = JSON.stringify([...arr].reverse());
+                } catch (_) {}
+            }
+            if (replaced === null) replaced = Array.from(s).reverse().join('');
+        } else if (cmd === 'escape') {
+            replaced = escapeCbsHtml(args.join('::'));
+        } else if (cmd === 'unescape') {
+            replaced = String(args.join('::') ?? '')
+                .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+        } else if (cmd === 'object_keys' || cmd === 'object_values') {
+            const rawObj = String(args[0] ?? '').trim();
+            replaced = '[]';
+            try {
+                const obj = JSON.parse(rawObj);
+                if (obj && typeof obj === 'object') {
+                    replaced = JSON.stringify(cmd === 'object_keys' ? Object.keys(obj) : Object.values(obj));
+                }
+            } catch (_) {}
+        } else if (cmd === 'makedict' || cmd === 'dict') {
+            const dict = {};
+            for (const pair of args) {
+                const ev = String(pair ?? '');
+                const eqIdx = ev.indexOf('=');
+                if (eqIdx > 0) dict[ev.slice(0, eqIdx).trim()] = ev.slice(eqIdx + 1);
+            }
+            replaced = JSON.stringify(dict);
+        } else if (cmd === 'array_push') {
+            let arr = [];
+            try { const p = JSON.parse(String(args[0] ?? '').trim()); if (Array.isArray(p)) arr = p; } catch (_) {}
+            for (const extra of args.slice(1)) arr.push(String(extra ?? ''));
+            replaced = JSON.stringify(arr);
+        } else if (cmd === 'array_slice') {
+            let arr = [];
+            try { const p = JSON.parse(String(args[0] ?? '').trim()); if (Array.isArray(p)) arr = p; } catch (_) {}
+            const start = Math.trunc(Number(args[1] ?? '0') || 0);
+            replaced = args.length > 2 ? JSON.stringify(arr.slice(start, Math.trunc(Number(args[2] ?? '0') || 0))) : JSON.stringify(arr.slice(start));
+        } else if (cmd === 'array_includes') {
+            let ok = false;
+            try {
+                const p = JSON.parse(String(args[0] ?? '').trim());
+                if (Array.isArray(p)) ok = p.some((x) => String(x) === String(args[1] ?? ''));
+            } catch (_) {}
+            replaced = ok ? '1' : '0';
+        } else if (cmd === 'range') {
+            const a = Math.trunc(Number(args[0] ?? '0') || 0);
+            const b = args.length > 1 ? Math.trunc(Number(args[1] ?? '0') || 0) : a;
+            const s = args.length > 1 ? a : 0;
+            const e = args.length > 1 ? b : a;
+            const step = args.length > 2 ? (Math.trunc(Number(args[2] ?? '1') || 1) || 1) : (s <= e ? 1 : -1);
+            const res = [];
+            for (let v = s; step > 0 ? v < e : v > e; v += step) {
+                if (res.length >= 2000) break;
+                res.push(v);
+            }
+            replaced = JSON.stringify(res);
+        } else if (cmd === 'spread') {
+            replaced = '';
+            try {
+                const p = JSON.parse(String(args[0] ?? '').trim());
+                if (Array.isArray(p)) replaced = p.join('::');
+            } catch (_) {}
         } else if (cmd === 'blank' || cmd === 'comment' || cmd === 'hiddenkey' || cmd === 'hidden_key') {
             replaced = '';
         } else if (cmd === 'char') {
@@ -4482,7 +5202,7 @@ function evalPresetCbs(input, ctx = {}, depth = 0) {
             replaced = String(ctx.personaName || 'User');
         } else if (cmd === 'persona') {
             replaced = String(ctx.personaPrompt || '');
-        } else if (cmd === 'description') {
+        } else if (cmd === 'description' || cmd === 'char_desc') {
             replaced = String(ctx.desc || '');
         } else if (cmd === 'personality') {
             replaced = String(ctx.personality || '');
@@ -4956,6 +5676,13 @@ function reconcileLeaveHayakuFooterContract(messages) {
     return changed ? out : list;
 }
 
+function stripReasoningTagsFromHistory(text) {
+    return String(text || '')
+        .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
+        .replace(/<Thoughts>[\s\S]*?<\/Thoughts>/gi, '')
+        .replace(/^\s+/, '');
+}
+
 function stripAuxBlocksFromProse(text) {
     return String(text || '')
         .replace(/<thinking>[\s\S]*?<\/thinking>/gi, '')
@@ -5163,6 +5890,8 @@ function buildTwoPassDraftMessages({ builtMessages, historyMessages, terminalTai
             ? '- RP AGENCY LOCK: {{user}} performs ONLY what their latest input explicitly states. Never invent unstated {{user}} dialogue, actions, feelings, or third-person proxying ("그가/그녀가" / "he/she" / "彼/彼女").'
             : '- NOVEL MODE: Advance the full cast naturally while honoring author reservations.',
         '- TERMINAL-FIRST CONTINUITY: Continue seamlessly from the immediately preceding scene tail without replaying earlier turns or adding sudden contrived interruptions.',
+        '- CHARACTER VOICE FIDELITY: Match each speaker\'s character sheet / Voice Guard cadence, sentence endings, warmth, teasing, and quirks—never flatten distinct NPCs into stiff, clipped, robotic statements even in tense beats.',
+        '- NATURAL PHYSICAL TRANSITIONS: When a character moves into a physical context that implies attire or posture changes (e.g., entering a bath or shower to wash), show the natural undressing/transition on-screen rather than keeping them awkwardly clothed.',
         '- PROSE ONLY: Output ONLY the raw in-world prose draft. Omit <thinking>, <statusdata>, character-card status lines, and trailing memory packets (Pass 2 will polish and append footers).',
         compactSys.length ? compactSys.join('\n\n').slice(0, 14000) : '',
     ].filter(Boolean).join('\n\n');
@@ -5197,6 +5926,7 @@ function appendTwoPassPolishDirective(finalMsgs, { draftText = '', terminalTail 
     const directive = [
         '[TWO-PASS EDITORIAL POLISH — PASS 2 FINISHING]',
         'Below is a Pass 1 candidate draft produced against the Terminal-First lock. Treat it as your raw material: preserve forward plot progress while fixing every listed guard issue, sharpening character voices, cutting crutch intensifier adverbs (e.g., "아주 천천히", "very slowly", "とてもゆっくり" max 1), balancing sentence rhythm, and appending all required closing blocks in exact order (Prose -> <statusdata> -> Card Status Line -> External Memory Packet).',
+        'Protect each speaker\'s living voice (character sheet / Voice Guard cadence, endings like "~", humor, warmth, and distinct rhythm) — NEVER over-trim lively dialogue into dry, robotic fragments. Show commonsense physical transitions naturally on-screen (e.g., undressing when entering a bath/shower to wash).',
         terminalTail ? `\n<terminal_scene_tail_anchor>\n${terminalTail.slice(-1200)}\n</terminal_scene_tail_anchor>` : '',
         `\n<deterministic_guard_audit>\n${auditBlock}\n</deterministic_guard_audit>`,
         `\n<pass1_candidate_draft>\n${String(draftText || '').slice(0, 9000)}\n</pass1_candidate_draft>`,
@@ -5267,11 +5997,16 @@ function buildDirectPromptMessages({
         }
     }
 
-    const chatList = (Array.isArray(historyMessages) ? historyMessages : []).map((m) => ({
-        role: m && m.role === 'user' ? 'user' : 'assistant',
-        content: String((m && (m.raw || m.text)) || ''),
-        ...(m && m.chatId ? { memo: String(m.chatId) } : {}),
-    }));
+    const chatList = (Array.isArray(historyMessages) ? historyMessages : []).map((m) => {
+        const isUser = Boolean(m && m.role === 'user');
+        const rawContent = String((m && (m.raw || m.text)) || '');
+        const cleanContent = isUser ? rawContent : stripReasoningTagsFromHistory(rawContent);
+        return {
+            role: isUser ? 'user' : 'assistant',
+            content: cleanContent,
+            ...(m && m.chatId ? { memo: String(m.chatId) } : {}),
+        };
+    });
     if (userText) {
         chatList.push({
             role: 'user',
@@ -5681,6 +6416,7 @@ async function executeDirectModelTurn({
 
     return callLLMNonStream(profile, outgoingMsgs, {
         source,
+        streamProgress: true,
         remotePrompt: Boolean(preset),
         presetId: preset ? String(preset.id || config.directPresetId || '') : '',
         presetName: preset ? String(preset.name || '') : '',
@@ -5997,6 +6733,7 @@ function renderWebApp() {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-capable" content="yes" />
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
 <meta name="theme-color" id="themeColorMeta" content="#ffffff" />
@@ -6130,31 +6867,83 @@ function renderWebApp() {
   .h-title { font-weight:700; font-size:15px; line-height:20px; letter-spacing:-0.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .h-sub-row {
     display:flex; align-items:center; gap:6px;
-    height:18px; min-height:18px; max-height:18px;
+    height:19px; min-height:19px; max-height:19px;
     min-width:0; overflow:hidden; white-space:nowrap; margin-top:1px;
   }
-  .h-sub { font-size:11.5px; line-height:18px; color:var(--sub); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; flex-shrink:1; }
+  .h-sub { font-size:11.5px; line-height:18px; color:var(--sub); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; flex:0 1 auto; }
   .hdr-act-bar {
     display:inline-flex; align-items:center; gap:4px; flex-wrap:nowrap;
-    height:18px; min-width:0; max-width:65%; flex-shrink:0; overflow:hidden;
+    height:19px; min-width:0; max-width:none; flex:1 1 auto; overflow:hidden;
   }
   .hdr-act-bar:empty { display:none; }
   .hdr-act-pill {
-    display:inline-flex; align-items:center; gap:4px; height:16px; padding:0 7px; border-radius:999px;
-    font-size:10.5px; font-weight:700; line-height:1; letter-spacing:-0.01em;
-    background:color-mix(in srgb, var(--accent) 14%, var(--surface));
-    color:var(--text); border:1px solid color-mix(in srgb, var(--accent) 36%, var(--border));
-    max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    display:inline-flex; align-items:center; gap:5px; height:18px; padding:0 7px 0 5px; border-radius:999px;
+    font-size:10.5px; font-weight:600; line-height:1; letter-spacing:-0.01em;
+    background:color-mix(in srgb, var(--accent) 13%, var(--surface));
+    color:var(--text); border:1px solid color-mix(in srgb, var(--accent) 34%, var(--border));
+    max-width:100%; min-width:0; cursor:pointer;
   }
+  .hdr-act-pill:hover { border-color: color-mix(in srgb, var(--accent) 60%, var(--border)); }
   .hdr-act-pill.recent {
     background:color-mix(in srgb, var(--ok) 12%, var(--surface));
-    border-color:color-mix(in srgb, var(--ok) 32%, var(--border));
+    border-color:color-mix(in srgb, var(--ok) 34%, var(--border));
     color:var(--sub);
   }
+  .hdr-act-stage {
+    flex-shrink:0; padding:1px 5px; border-radius:999px; font-size:9.5px; font-weight:800; line-height:1.15;
+    background:color-mix(in srgb, var(--accent) 22%, transparent); color:var(--accent);
+  }
+  .hdr-act-pill.recent .hdr-act-stage {
+    background:color-mix(in srgb, var(--ok) 20%, transparent); color:var(--ok);
+  }
+  .hdr-act-text { min-width:0; flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .hdr-act-meta { flex-shrink:0; font-size:9.5px; font-weight:700; opacity:0.86; font-variant-numeric:tabular-nums; }
   .hdr-act-dot {
     width:6px; height:6px; border-radius:50%; background:var(--accent); flex-shrink:0;
     animation: rsPulseDot 1.1s ease-in-out infinite;
   }
+  .hdr-act-pop {
+    position:fixed; top:calc(58px + env(safe-area-inset-top)); left:12px; right:12px; max-width:480px; z-index:48;
+    background:var(--elev); border:1px solid var(--border); border-radius:16px; padding:11px 13px;
+    box-shadow:var(--shadow); display:none; flex-direction:column; gap:8px; font-size:12px; line-height:1.45;
+  }
+  .hdr-act-pop.open { display:flex; }
+  .hdr-act-pop-row { display:flex; flex-direction:column; gap:2px; padding:6px 8px; border-radius:10px; background:var(--surface); border:1px solid var(--border); }
+  .hdr-act-pop-head { display:flex; align-items:center; justify-content:space-between; gap:6px; font-weight:700; font-size:11.5px; }
+  .hdr-act-pop-sub { font-size:11px; color:var(--sub); overflow-wrap:anywhere; }
+  .live-gen-bar {
+    position:absolute; left:0; right:0; bottom:calc(100% + 8px); z-index:32;
+    display:flex; flex-direction:column; gap:5px; padding:8px 12px; border-radius:16px;
+    background:color-mix(in srgb, var(--elev) 94%, transparent);
+    border:1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+    box-shadow:var(--shadow-sm); -webkit-backdrop-filter:blur(12px); backdrop-filter:blur(12px);
+    font-size:11.5px; line-height:1.35; pointer-events:auto;
+  }
+  .live-gen-bar:empty { display:none; }
+  .live-gen-bar.is-done { border-color:color-mix(in srgb, var(--ok) 36%, var(--border)); }
+  .live-gen-bar.is-err { border-color:color-mix(in srgb, var(--danger) 42%, var(--border)); }
+  .lgb-row { display:flex; align-items:center; flex-wrap:wrap; gap:5px 7px; min-width:0; }
+  .lgb-badge {
+    display:inline-flex; align-items:center; gap:5px; padding:2px 8px; border-radius:999px;
+    font-size:10.5px; font-weight:800; background:color-mix(in srgb, var(--accent) 16%, transparent); color:var(--accent); flex-shrink:0;
+  }
+  .lgb-badge.done { background:color-mix(in srgb, var(--ok) 16%, transparent); color:var(--ok); }
+  .lgb-badge.err { background:color-mix(in srgb, var(--danger) 16%, transparent); color:var(--danger); }
+  .lgb-prov {
+    display:inline-flex; align-items:center; padding:2px 7px; border-radius:8px;
+    font-size:10.5px; font-weight:700; background:var(--surface); border:1px solid var(--border); color:var(--text); flex-shrink:0;
+  }
+  .lgb-model {
+    display:inline-flex; align-items:center; padding:2px 7px; border-radius:8px; max-width:100%;
+    font-size:10.5px; font-weight:600; font-family:ui-monospace, SFMono-Regular, Menlo, monospace;
+    background:var(--surface); border:1px solid var(--border); color:var(--sub); overflow-wrap:anywhere;
+  }
+  .lgb-stat {
+    font-size:11px; font-weight:700; color:var(--text); font-variant-numeric:tabular-nums; flex-shrink:0;
+  }
+  .lgb-stat.muted { color:var(--sub); font-weight:600; }
+  .lgb-name { font-weight:700; color:var(--text); flex-shrink:0; }
+  .lgb-phase { color:var(--sub); overflow-wrap:anywhere; min-width:0; }
   @keyframes rsPulseDot {
     0%, 100% { opacity:1; transform:scale(1); }
     50% { opacity:0.4; transform:scale(0.75); }
@@ -6222,7 +7011,7 @@ function renderWebApp() {
   .panel-title { font-size:20px; font-weight:800; letter-spacing:-0.02em; margin:2px 2px 0; }
 
   /* ===== Chat Messages ===== */
-  #tab-chat { gap:18px; }
+  #tab-chat { gap:18px; z-index:auto; isolation:auto; }
   .msg-wrap { display:flex; flex-direction:column; max-width:88%; }
   .msg-wrap.user { align-self:flex-end; align-items:flex-end; }
   .msg-wrap.char { align-self:flex-start; align-items:flex-start; width:100%; max-width:100%; }
@@ -6311,8 +7100,7 @@ function renderWebApp() {
   .book-frame {
     flex:1; display:flex; flex-direction:column;
     background:var(--book-bg); border:1px solid var(--border); border-radius:12px;
-    box-shadow: var(--shadow); overflow:hidden; position:relative;
-    perspective:1800px; min-height:0;
+    box-shadow: var(--shadow); overflow:hidden; position:relative; min-height:0;
   }
   .book-frame:not(.single-page)::before {
     content:''; position:absolute; top:0; bottom:0; left:50%; width:1px;
@@ -6366,8 +7154,8 @@ function renderWebApp() {
   .book-frame.single-page .epub-flip-leaf { width:100%; }
   .epub-flip-leaf.flip-next { right:0; transform-origin:left center; animation: rsFlipNext 640ms cubic-bezier(0.32, 0.08, 0.24, 1) forwards; }
   .epub-flip-leaf.flip-prev { left:0; transform-origin:right center; animation: rsFlipPrev 640ms cubic-bezier(0.32, 0.08, 0.24, 1) forwards; }
-  @keyframes rsFlipNext { 0% { opacity:0.95; transform:rotateY(0deg); } 50% { opacity:0.98; transform:rotateY(-90deg); } 100% { opacity:0; transform:rotateY(-180deg); } }
-  @keyframes rsFlipPrev { 0% { opacity:0.95; transform:rotateY(0deg); } 50% { opacity:0.98; transform:rotateY(90deg); } 100% { opacity:0; transform:rotateY(180deg); } }
+  @keyframes rsFlipNext { 0% { opacity:0.95; transform:perspective(1800px) rotateY(0deg); } 50% { opacity:0.98; transform:perspective(1800px) rotateY(-90deg); } 100% { opacity:0; transform:perspective(1800px) rotateY(-180deg); } }
+  @keyframes rsFlipPrev { 0% { opacity:0.95; transform:perspective(1800px) rotateY(0deg); } 50% { opacity:0.98; transform:perspective(1800px) rotateY(90deg); } 100% { opacity:0; transform:perspective(1800px) rotateY(180deg); } }
 
   .book-nav { display:flex; align-items:center; justify-content:space-between; gap:8px; padding:10px 2px 2px; flex-shrink:0; font-size:12.5px; color:var(--sub); font-variant-numeric: tabular-nums; position:relative; }
   .book-page-btn { min-height:30px; padding:0 12px; font-size:12px; font-variant-numeric: tabular-nums; background:var(--surface); }
@@ -6403,11 +7191,42 @@ function renderWebApp() {
   .rs-bot-html { white-space:normal; word-break:keep-all; overflow-wrap:anywhere; width:100%; }
   .rs-bot-html .rs-prose-seg { white-space:pre-wrap; }
   .rs-bot-html img { max-width:100%; height:auto; border-radius:12px; }
+  .rs-bot-html .msg-img { max-height:none; }
   .rs-bot-html .image-container { max-width:100% !important; min-height:200px; background-size:cover; background-position:center 15%; border-radius:14px; }
   .book-columns .rs-bot-html .image-container {
     width:100% !important; max-width:100% !important;
     height:min(38vh, 360px) !important; min-height:180px !important; max-height:46vh !important;
     padding-bottom:0 !important; break-inside:avoid; margin:10px auto; cursor:pointer;
+  }
+  body.asset-fit-compact .rs-bot-html [data-rs-asset-fit-box="1"] {
+    width:fit-content !important; max-width:min(320px, 100%) !important;
+    height:auto !important; min-height:0 !important; max-height:none !important;
+    aspect-ratio:auto !important; padding:6px !important; overflow:visible !important;
+    display:flex !important; align-items:center !important; justify-content:center !important;
+    margin-left:auto !important; margin-right:auto !important;
+  }
+  body.asset-fit-compact .rs-bot-html img[data-rs-asset-fit-img="1"] {
+    position:static !important; inset:auto !important; transform:none !important;
+    width:auto !important; height:auto !important;
+    max-width:min(300px, 100%) !important; max-height:280px !important;
+    object-fit:contain !important; object-position:center center !important;
+    display:block !important; margin:0 auto !important; border-radius:10px !important;
+  }
+  body.asset-fit-compact .rs-bot-html [data-rs-asset-fit-bg="1"] {
+    background-size:contain !important; background-position:center center !important;
+    background-repeat:no-repeat !important;
+    width:auto !important; max-width:min(320px, 100%) !important;
+    height:min(280px, 42vh) !important; min-height:150px !important; max-height:280px !important;
+    aspect-ratio:var(--rs-fit-ar, 3 / 4) !important;
+    padding-bottom:0 !important;
+    margin-left:auto !important; margin-right:auto !important;
+    border-radius:12px !important;
+  }
+  body.asset-fit-compact .book-columns .rs-bot-html img[data-rs-asset-fit-img="1"] {
+    max-width:100% !important; max-height:min(34vh, 250px) !important;
+  }
+  body.asset-fit-compact .book-columns .rs-bot-html [data-rs-asset-fit-bg="1"] {
+    max-width:100% !important; height:min(34vh, 250px) !important; max-height:min(34vh, 250px) !important;
   }
   .book-img-preview {
     position:absolute; z-index:16; display:none;
@@ -6415,6 +7234,65 @@ function renderWebApp() {
     border-radius:14px; cursor:pointer; pointer-events:none;
     box-shadow: 0 20px 48px rgba(0, 0, 0, 0.52);
     transition: top 0.45s cubic-bezier(0.22, 1, 0.36, 1), height 0.45s cubic-bezier(0.22, 1, 0.36, 1), background-position 0.45s ease, opacity 0.2s ease;
+  }
+  .scroll-img-preview {
+    position:fixed; z-index:48; display:none;
+    background-size:cover; background-position:center 10%; background-repeat:no-repeat;
+    border-radius:14px; cursor:pointer; pointer-events:none;
+    box-shadow: 0 20px 48px rgba(0, 0, 0, 0.52);
+    transition: top 0.35s cubic-bezier(0.22, 1, 0.36, 1), height 0.35s cubic-bezier(0.22, 1, 0.36, 1), background-position 0.35s ease, opacity 0.18s ease;
+  }
+  .chat-img-lightbox {
+    position:fixed; inset:0; z-index:190; display:none; align-items:center; justify-content:center;
+    padding:56px 20px 44px; background:rgba(8, 10, 16, 0.86);
+    -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
+    cursor:zoom-out;
+  }
+  .chat-img-lightbox img {
+    max-width:92vw; max-height:84dvh; object-fit:contain;
+    border-radius:14px; box-shadow: 0 24px 64px rgba(0, 0, 0, 0.65);
+    cursor:default; user-select:none;
+  }
+  .chat-img-lightbox-close {
+    position:fixed;
+    top:calc(14px + env(safe-area-inset-top, 0px));
+    right:calc(14px + env(safe-area-inset-right, 0px));
+    width:42px; height:42px; border-radius:999px;
+    border:1px solid rgba(255, 255, 255, 0.28);
+    background:rgba(18, 20, 28, 0.82); color:#fff;
+    display:inline-flex; align-items:center; justify-content:center;
+    font-size:20px; font-weight:700; line-height:1;
+    cursor:pointer; z-index:2;
+    box-shadow:0 6px 18px rgba(0, 0, 0, 0.4);
+    transition:background 0.15s ease, transform 0.15s ease, border-color 0.15s ease;
+  }
+  .chat-img-lightbox-close:hover {
+    background:rgba(40, 44, 58, 0.96); border-color:rgba(255, 255, 255, 0.52); transform:scale(1.05);
+  }
+  .chat-img-lightbox-nav {
+    position:fixed; top:50%; transform:translateY(-50%);
+    width:42px; height:42px; border-radius:999px;
+    border:1px solid rgba(255, 255, 255, 0.24);
+    background:rgba(18, 20, 28, 0.72); color:#fff;
+    display:inline-flex; align-items:center; justify-content:center;
+    font-size:24px; font-weight:700; line-height:1;
+    cursor:pointer; z-index:2;
+    transition:background 0.15s ease, border-color 0.15s ease;
+  }
+  .chat-img-lightbox-nav:hover {
+    background:rgba(40, 44, 58, 0.94); border-color:rgba(255, 255, 255, 0.48);
+  }
+  .chat-img-lightbox-nav.prev { left:calc(14px + env(safe-area-inset-left, 0px)); }
+  .chat-img-lightbox-nav.next { right:calc(14px + env(safe-area-inset-right, 0px)); }
+  .chat-img-lightbox-counter {
+    position:fixed;
+    bottom:calc(14px + env(safe-area-inset-bottom, 0px));
+    left:50%; transform:translateX(-50%);
+    padding:5px 12px; border-radius:999px;
+    background:rgba(18, 20, 28, 0.78); color:#fff;
+    border:1px solid rgba(255, 255, 255, 0.2);
+    font-size:12px; font-weight:700; letter-spacing:0.02em;
+    pointer-events:none; z-index:2;
   }
   .book-columns .rs-bot-html > div { max-width:100% !important; min-width:0 !important; box-sizing:border-box; }
   .book-columns .rs-bot-html div,
@@ -6429,6 +7307,8 @@ function renderWebApp() {
   .book-columns .rs-bot-html pre,
   .book-columns .rs-bot-html code { white-space:pre-wrap; overflow-wrap:anywhere; }
   .rs-bot-html [risu-trigger], .rs-bot-html [risu-btn] { cursor:pointer; }
+  .rs-bot-html hr.rs-md-hr { border:0; border-top:1px solid color-mix(in srgb, currentColor 22%, transparent); margin:12px 0; opacity:0.75; }
+  .rs-bot-html .rs-prose-seg code { font-family:ui-monospace,SFMono-Regular,Consolas,monospace; font-size:0.88em; padding:1px 5px; border-radius:4px; background:color-mix(in srgb, currentColor 10%, transparent); }
   .risu-cbs-btn { padding:6px 12px; border-radius:8px; border:1px solid var(--border); background:var(--surface); color:var(--text); font-size:12.5px; font-weight:600; cursor:pointer; margin:4px 4px 4px 0; }
   .risu-cbs-btn:hover { border-color:var(--accent); }
   .leave-preset-bar {
@@ -6466,14 +7346,15 @@ function renderWebApp() {
   .leave-hud-card summary { cursor:pointer; font-weight:700; color:#93c5fd; list-style:revert; }
   .leave-hud-body { margin-top:8px; white-space:pre-line; color:#e2e8f0; }
   body.hide-leave-hud .leave-hud-card { display:none !important; }
-  body.asset-hide .rs-bot-html img, body.asset-hide .rs-bot-html .image-container { display:none !important; }
-  body.asset-blur .rs-bot-html img:not(.revealed), body.asset-blur .rs-bot-html .image-container:not(.revealed) { filter:blur(22px) brightness(0.72); cursor:pointer; transition:filter 0.25s ease; }
+  body.asset-hide .rs-bot-html img, body.asset-hide .rs-bot-html .image-container, body.asset-hide .rs-bot-html [data-rs-bg-img="1"] { display:none !important; }
+  body.asset-blur .rs-bot-html img:not(.revealed), body.asset-blur .rs-bot-html .image-container:not(.revealed), body.asset-blur .rs-bot-html [data-rs-bg-img="1"]:not(.revealed) { filter:blur(22px) brightness(0.72); cursor:pointer; transition:filter 0.25s ease; }
   html body #bookBotOverlay {
-    position:fixed !important; inset:0 !important; z-index:25 !important;
+    position:fixed !important; inset:0 !important; z-index:42 !important;
     pointer-events:none !important; isolation:isolate !important; contain:layout paint !important;
   }
   html body:not(.tab-chat-active) #bookBotOverlay { display:none !important; }
   html body #bookBotOverlay [data-rs-bot-fab="1"],
+  html body #bookBotOverlay [data-rs-bot-fixed="1"],
   html body #bookBotOverlay .side-panel,
   html body #bookBotOverlay .floating,
   html body #bookBotOverlay .buttons-container,
@@ -6486,17 +7367,21 @@ function renderWebApp() {
   html body #bookBotOverlay button,
   html body #bookBotOverlay a { pointer-events:auto; }
   #bookBotOverlay:empty { display:none; }
-  #bookBotOverlay [data-rs-bot-fab="1"] {
+  #bookBotOverlay [data-rs-bot-fab="1"]:not([data-rs-bot-custom-pos="1"]) {
     position:fixed !important; top:106px !important; right:12px !important; z-index:25 !important;
     display:flex !important; flex-direction:column !important; align-items:center !important; gap:10px !important;
     margin:0 !important; padding:0 !important; will-change: transform, opacity;
     transition: transform 0.11s cubic-bezier(0.2, 0.9, 0.3, 1), opacity 0.09s ease;
   }
-  #bookBotOverlay.bot-menu-collapsed [data-rs-bot-fab="1"] {
+  #bookBotOverlay [data-rs-bot-custom-pos="1"] {
+    transition: transform 0.11s cubic-bezier(0.2, 0.9, 0.3, 1), opacity 0.09s ease;
+  }
+  #bookBotOverlay.bot-menu-collapsed [data-rs-bot-fab="1"],
+  #bookBotOverlay.bot-menu-collapsed [data-rs-bot-custom-pos="1"] {
     opacity:0 !important; pointer-events:none !important; transform:translate3d(72px, 0, 0) !important;
   }
   #botMenuFab {
-    position:fixed; right:12px; top:62px; z-index:35;
+    position:fixed; right:12px; top:62px; z-index:44;
     display:inline-flex; align-items:center; justify-content:center; gap:5px;
     box-sizing:border-box; height:34px; min-height:34px; min-width:48px; padding:0 12px; margin:0;
     border-radius:999px; border:1px solid var(--border); background:var(--elev); color:var(--text);
@@ -6726,6 +7611,57 @@ function renderWebApp() {
     .msg-edit-textarea { font-size:16px; padding:12px; }
   }
 
+  /* ===== TTS Script Review & Manual Editor Modal ===== */
+  .turn-tts-grp { display:inline-flex; align-items:center; gap:3px; vertical-align:middle; }
+  .turn-tts-script-btn { opacity:0.86; }
+  #ttsScriptModal {
+    position:fixed; inset:0; z-index:170; background:rgba(0,0,0,0.66);
+    -webkit-backdrop-filter:blur(6px); backdrop-filter:blur(6px);
+    display:flex; align-items:center; justify-content:center; padding:14px;
+  }
+  .tts-script-card {
+    width:min(940px, 96vw); height:min(88dvh, 840px); background:var(--elev); color:var(--text);
+    border:1px solid var(--border); border-radius:18px; box-shadow:var(--shadow);
+    display:flex; flex-direction:column; overflow:hidden;
+  }
+  .tts-script-head {
+    display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
+    padding:12px 16px; border-bottom:1px solid var(--border); background:var(--surface); flex-shrink:0;
+  }
+  .tts-script-title { display:flex; align-items:center; gap:7px; flex-wrap:wrap; font-size:15px; font-weight:800; }
+  .tts-script-toolbar {
+    display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
+    padding:9px 16px; border-bottom:1px solid var(--border); background:color-mix(in srgb, var(--surface) 60%, transparent); flex-shrink:0;
+  }
+  .tts-script-body {
+    flex:1; min-height:0; overflow-y:auto; padding:12px 16px;
+    display:flex; flex-direction:column; gap:10px;
+  }
+  .tts-seg-card {
+    border:1px solid var(--border); border-left:4px solid var(--border); border-radius:12px;
+    background:var(--bg); padding:10px 12px; display:flex; flex-direction:column; gap:7px;
+  }
+  .tts-seg-card.kind-dialogue { border-left-color:var(--accent); }
+  .tts-seg-card.kind-thought { border-left-color:var(--sub); }
+  .tts-seg-head { display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap; }
+  .tts-seg-grid { display:grid; grid-template-columns:110px 1fr 88px 1.2fr; gap:6px; }
+  .tts-seg-row2 { display:grid; grid-template-columns:1fr 125px 1.3fr 78px; gap:6px; align-items:center; }
+  .tts-seg-text {
+    width:100%; min-height:54px; resize:vertical; padding:8px 10px;
+    border-radius:10px; border:1px solid var(--border); background:var(--surface); color:var(--text);
+    font-family:var(--font); font-size:13.5px; line-height:1.5; outline:none;
+  }
+  .tts-seg-text:focus { border-color:var(--accent); box-shadow:0 0 0 2px var(--accent-soft); }
+  .tts-script-foot {
+    display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
+    padding:12px 16px; border-top:1px solid var(--border); background:var(--surface); flex-shrink:0;
+  }
+  @media (max-width: 720px) {
+    #ttsScriptModal { padding:8px; }
+    .tts-script-card { width:100%; height:92dvh; border-radius:16px; }
+    .tts-seg-grid, .tts-seg-row2 { grid-template-columns:1fr 1fr; }
+  }
+
   /* ===== Backend Plugin Adapter & Native GUI Iframe Modal ===== */
   .plg-list { display:flex; flex-direction:column; gap:8px; margin-top:10px; }
   .plg-item {
@@ -6760,6 +7696,50 @@ function renderWebApp() {
   }
   #pluginGuiFrame {
     flex:1; width:100%; min-height:0; border:none; background:#0f172a;
+  }
+  .plg-gui-recall-bar {
+    display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
+    padding:7px 14px; font-size:12px;
+    background:color-mix(in srgb, var(--accent) 12%, var(--surface));
+    border-bottom:1px solid var(--border); flex-shrink:0;
+  }
+  .plg-gui-recall-pane {
+    flex:1; min-height:0; overflow-y:auto; padding:16px;
+    display:none; flex-direction:column; gap:12px;
+    background:var(--bg); color:var(--text);
+  }
+  .plg-gui-recall-pane > * { flex-shrink:0; }
+  .plg-recall-notice {
+    padding:10px 12px; border-radius:10px; border:1px solid var(--border);
+    background:var(--surface); font-size:12.5px; color:var(--sub); line-height:1.5;
+    display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
+  }
+  .plg-recall-stats {
+    display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:8px;
+  }
+  .plg-recall-stat {
+    padding:9px 11px; border-radius:10px; border:1px solid var(--border);
+    background:var(--surface); display:flex; flex-direction:column; gap:2px;
+  }
+  .plg-recall-stat-label { font-size:11px; color:var(--sub); font-weight:700; }
+  .plg-recall-stat-val { font-size:15px; font-weight:800; color:var(--text); }
+  .plg-recall-stat-sub { font-size:11px; color:var(--sub); }
+  .plg-recall-turns { display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+  .plg-recall-block {
+    border:1px solid var(--border); border-radius:12px; background:var(--elev);
+    overflow:hidden; display:flex; flex-direction:column; flex-shrink:0;
+  }
+  .plg-recall-block.is-collapsed .plg-recall-pre { display:none; }
+  .plg-recall-block-head {
+    display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
+    padding:8px 12px; background:var(--surface); border-bottom:1px solid var(--border);
+    font-size:12px; flex-shrink:0;
+  }
+  .plg-recall-pre {
+    margin:0; padding:11px 13px; background:var(--bg); color:var(--text);
+    font-family:ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size:12px; line-height:1.55; white-space:pre-wrap; overflow-wrap:anywhere;
+    min-height:44px; max-height:460px; overflow:auto; flex-shrink:0;
   }
   @media (max-width: 640px) {
     #pluginGuiModal { padding:6px; }
@@ -6811,6 +7791,10 @@ function renderWebApp() {
     position:relative; display:inline-flex; align-items:center; justify-content:center;
     width:88px; height:88px; border-radius:10px; overflow:hidden;
     border:1px solid var(--border); background:var(--surface); cursor:pointer;
+    transition:transform 0.15s ease, border-color 0.15s ease;
+  }
+  .scene-thumb-wrap:hover {
+    border-color:var(--accent); transform:translateY(-1px);
   }
   .scene-slot-thumb {
     width:88px; height:88px; object-fit:cover; display:block;
@@ -6865,8 +7849,15 @@ function renderWebApp() {
     display:flex !important; flex-wrap:wrap !important; align-items:center !important; justify-content:flex-end !important;
     gap:6px !important; padding-top:0 !important; pointer-events:auto !important;
   }
+  .rs-pfm-stage [data-am-count-region][x-am-count-visible="false"] {
+    display:block !important; visibility:visible !important; opacity:1 !important;
+  }
   .rs-pfm-stage .x-risu-am-generation-count__panel-anchor {
     position:relative !important; inset:auto !important; display:contents !important;
+  }
+  .rs-pfm-stage .x-risu-am-generation-count:not([data-am-expanded="true"]):not([x-am-expanded="true"]) .x-risu-am-generation-count__panel,
+  .rs-pfm-stage .x-risu-am-generation-count[x-am-expanded="false"] .x-risu-am-generation-count__panel {
+    display:none !important;
   }
   .rs-pfm-stage .x-risu-am-generation-count:is([data-am-expanded="true"]:not([x-am-expanded="false"]), [x-am-expanded="true"]) .x-risu-am-generation-count__panel {
     display:flex !important; position:relative !important; inset:auto !important; right:auto !important; bottom:auto !important;
@@ -6890,8 +7881,102 @@ function renderWebApp() {
   .rs-pfm-stage button, .rs-pfm-stage [role="button"], .rs-pfm-stage [data-am-runtime-generation-count-action] {
     pointer-events:auto !important; cursor:pointer;
   }
+  .rs-pfm-opt-box {
+    display:flex; flex-direction:column; gap:7px; padding:10px 12px; border-radius:12px;
+    background:var(--surface); border:1px solid var(--border);
+  }
+  .rs-pfm-opt-row {
+    display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
+  }
+  .rs-pfm-opt-label { font-size:12px; font-weight:700; color:var(--sub); }
+  .rs-pfm-opt-grp { display:flex; align-items:center; gap:5px; flex-wrap:wrap; }
+  .rs-pfm-opt-val {
+    font-size:11.5px; font-variant-numeric:tabular-nums; color:var(--text);
+    min-width:54px; text-align:center;
+  }
+  .rs-pfm-modal-rules {
+    border-top:1px dashed var(--border); padding-top:8px; margin-top:4px; font-size:12px;
+  }
+  .rs-pfm-modal-rules summary {
+    cursor:pointer; font-weight:700; color:var(--sub); user-select:none; padding:2px 0;
+  }
+  .rs-pfm-modal-rule-list {
+    display:flex; flex-direction:column; gap:6px; margin-top:8px;
+  }
+  .rs-pfm-modal-rule-row {
+    display:flex; align-items:center; justify-content:space-between; gap:8px; flex-wrap:wrap;
+    padding:6px 8px; border-radius:9px; background:var(--surface); border:1px solid var(--border);
+  }
+  .rs-pfm-modal-rule-info {
+    display:flex; align-items:center; gap:6px; flex-wrap:wrap; min-width:0;
+  }
+  .rs-pfm-modal-rule-name { font-weight:600; color:var(--text); font-size:12px; }
+  .rs-pfm-modal-rule-auto {
+    font-size:10.5px; padding:1px 6px; border-radius:999px;
+    background:color-mix(in srgb, var(--sub) 14%, transparent); color:var(--sub);
+  }
+  .rs-pfm-modal-rule-acts { display:flex; align-items:center; gap:4px; }
+  .rs-pfm-modal-rule-acts .pill { padding:3px 8px; font-size:11px; min-height:24px; }
+  .rs-chat-end-float {
+    display:flex; flex-direction:column; gap:6px; margin:10px 0 6px; padding:2px 0;
+    position:relative; z-index:8; break-inside:avoid; max-width:100%;
+  }
+  .rs-chat-float-row {
+    display:flex; align-items:center; gap:6px; max-width:100%; width:100%;
+  }
+  .rs-chat-end-float.align-left .rs-chat-float-row,
+  .rs-chat-end-float.align-left .rs-pfm-stage [x-am-root-host],
+  .rs-chat-end-float.align-left .rs-pfm-stage .x-risu-am-generation-count {
+    justify-content:flex-start !important;
+  }
+  .rs-chat-end-float.align-center .rs-chat-float-row,
+  .rs-chat-end-float.align-center .rs-pfm-stage [x-am-root-host],
+  .rs-chat-end-float.align-center .rs-pfm-stage .x-risu-am-generation-count {
+    justify-content:center !important;
+  }
+  .rs-chat-end-float.align-right .rs-chat-float-row,
+  .rs-chat-end-float.align-right .rs-pfm-stage [x-am-root-host],
+  .rs-chat-end-float.align-right .rs-pfm-stage .x-risu-am-generation-count {
+    justify-content:flex-end !important;
+  }
+  .rs-chat-end-float .rs-pfm-stage,
+  .rs-chat-pinned-float .rs-pfm-stage { flex:0 1 auto; min-width:0; }
+  .rs-chat-end-float .rs-pfm-stage .x-risu-am-generation-count,
+  .rs-chat-pinned-float .rs-pfm-stage .x-risu-am-generation-count { width:auto !important; min-height:36px !important; }
+  .rs-chat-float-cfg-btn {
+    flex-shrink:0; font-size:12px; padding:5px 8px; opacity:0.86;
+  }
+  .rs-chat-float-cfg-btn:hover { opacity:1; }
+  .rs-chat-pinned-float {
+    position:fixed; z-index:48; max-width:min(94vw, 560px);
+    display:flex; flex-direction:column; gap:6px; pointer-events:auto;
+  }
+  .rs-chat-pinned-float.place-bottom-right { right:16px; bottom:calc(82px + env(safe-area-inset-bottom)); }
+  .rs-chat-pinned-float.place-bottom-left { left:16px; bottom:calc(82px + env(safe-area-inset-bottom)); }
+  .rs-chat-pinned-float.place-top-right { right:16px; top:calc(68px + env(safe-area-inset-top)); }
+  .rs-chat-pinned-float.place-top-left { left:16px; top:calc(68px + env(safe-area-inset-top)); }
+  .rs-chat-pinned-float.place-bottom-left .rs-pfm-stage [x-am-root-host],
+  .rs-chat-pinned-float.place-bottom-left .rs-pfm-stage .x-risu-am-generation-count,
+  .rs-chat-pinned-float.place-top-left .rs-pfm-stage [x-am-root-host],
+  .rs-chat-pinned-float.place-top-left .rs-pfm-stage .x-risu-am-generation-count {
+    justify-content:flex-start !important;
+  }
+  body.asset-hide #chatPinnedPluginCtrl img,
+  body.asset-hide #chatEndPluginCtrl img { display:none !important; }
+  body.asset-blur #chatPinnedPluginCtrl img,
+  body.asset-blur #chatEndPluginCtrl img { filter:blur(14px); }
   body.asset-hide #pluginFloatingModal:not(.is-action-overlay) img { display:none !important; }
   body.asset-blur #pluginFloatingModal:not(.is-action-overlay) img { filter:blur(14px); }
+  #pluginFloatingModal.is-action-overlay { padding:14px; }
+  #pluginFloatingModal.is-action-overlay .plg-float-dialog {
+    width:min(1320px, 96vw); height:min(92dvh, 920px); max-height:min(92dvh, 920px);
+  }
+  #pluginFloatingModal.is-action-overlay .plg-float-body {
+    padding:0; overflow:auto; display:flex; flex-direction:column;
+  }
+  #pluginFloatingModal.is-action-overlay .rs-pfm-stage {
+    flex:1; min-height:0; gap:0;
+  }
   #pluginFloatingModal.is-action-overlay img { max-width:100%; height:auto; }
 
   /* ===== Asset Maid Per-Message Manual Illustration Footer & Chat Projections ===== */
@@ -6953,35 +8038,24 @@ function renderWebApp() {
   .rs-bot-html .x-risu-am-illustration-empty {
     font-size:11px; color:#bca98c; padding:0 6px;
   }
-  .rs-bot-html .am-illustration-projection,
-  .rs-bot-html .x-risu-am-illustration-projection,
-  .rs-bot-html .x-risu-am-illustration-slot {
+  .rs-bot-html :where(.am-illustration-projection, .x-risu-am-illustration-projection, .x-risu-am-illustration-slot) {
     position:relative; display:block; margin:12px auto; max-width:100%; text-align:center;
   }
-  .rs-bot-html .am-image,
-  .rs-bot-html .x-risu-am-image,
-  .rs-bot-html .am-generated-image,
-  .rs-bot-html .x-risu-am-generated-image {
-    display:inline-flex; justify-content:center; align-items:center; max-width:min(100%, 420px); margin:6px auto;
+  .rs-bot-html :where(.am-image, .x-risu-am-image, .am-generated-image, .x-risu-am-generated-image) {
+    position:relative; display:inline-flex; justify-content:center; align-items:center; max-width:min(100%, 420px); margin:6px auto;
   }
-  .rs-bot-html .am-image__media,
-  .rs-bot-html .x-risu-am-image__media,
-  .rs-bot-html .am-generated-image__img,
-  .rs-bot-html .x-risu-am-generated-image__img {
+  .rs-bot-html :where(.am-image__media, .x-risu-am-image__media, .am-generated-image__img, .x-risu-am-generated-image__img) {
     display:block; max-width:100%; height:auto; border-radius:10px;
   }
-  .rs-bot-html .am-illustration-history-sources,
-  .rs-bot-html .x-risu-am-illustration-history-sources,
-  .rs-bot-html .am-illustration-history-bank,
-  .rs-bot-html .am-native-asset-suppression,
-  .rs-bot-html .x-risu-am-native-asset-suppression { display:none !important; }
-  .rs-bot-html .am-chat-history-edge-controls,
-  .rs-bot-html .x-risu-am-chat-history-edge-controls {
+  .rs-bot-html :where(.am-image, .x-risu-am-image, .x-risu-am-illustration-projection) button {
+    pointer-events:auto; cursor:pointer;
+  }
+  .rs-bot-html :where(.am-illustration-history-sources, .x-risu-am-illustration-history-sources, .am-illustration-history-bank, .am-native-asset-suppression, .x-risu-am-native-asset-suppression) { display:none !important; }
+  .rs-bot-html :where(.am-chat-history-edge-controls, .x-risu-am-chat-history-edge-controls) {
     display:inline-flex; align-items:center; gap:4px; margin-top:4px;
     background:rgba(33,29,32,.78); color:#f1e5cf; padding:3px 6px; border-radius:999px; font-size:11px;
   }
-  .rs-bot-html .am-chat-history-edge-controls button,
-  .rs-bot-html .x-risu-am-chat-history-edge-controls button {
+  .rs-bot-html :where(.am-chat-history-edge-controls button, .x-risu-am-chat-history-edge-controls button) {
     border:0; background:rgba(13,10,12,.5); color:#f1e5cf; border-radius:999px; width:22px; height:22px; cursor:pointer;
   }
   body.asset-hide .rs-bot-html .am-illustration-projection,
@@ -7391,12 +8465,14 @@ function renderWebApp() {
       <button type="button" class="tts-bar-btn primary" id="ttsPauseBtn" title="일시정지/재개">⏸</button>
       <button type="button" class="tts-bar-btn" id="ttsNextSegBtn" title="다음 구간">⏭</button>
       <button type="button" class="tts-bar-btn" id="ttsRateBtn" title="재생 속도">1.0x</button>
+      <button type="button" class="tts-bar-btn" id="ttsEditScriptBtn" title="대본 검토·수동 편집">🎬</button>
       <button type="button" class="tts-bar-btn" id="ttsCfgJumpBtn" title="TTS 설정">⚙️</button>
       <button type="button" class="tts-bar-btn" id="ttsStopBtn" title="정지">✕</button>
     </div>
   </div>
   <div class="tts-bar-preview" id="ttsBarPreview">...</div>
 </div>
+<div id="pluginSurfaceStyleHost" style="display:none;"></div>
 <div id="botBgHost" class="rs-bg-host rs-bot-html"></div>
 <div id="bookBotOverlay" class="bot-menu-collapsed"></div>
 <div id="rsMiniBar" class="minimized" style="display:none;" aria-label="리스스탠드 플로팅 미니바"></div>
@@ -7404,10 +8480,14 @@ function renderWebApp() {
 <div id="triggerModal" style="display:none;" role="dialog" aria-modal="true"></div>
 <div id="reqLogModal" style="display:none;" role="dialog" aria-modal="true" aria-label="리퀘스트 로그"></div>
 <div id="msgEditModal" style="display:none;" role="dialog" aria-modal="true" aria-label="메시지 수정"></div>
+<div id="ttsScriptModal" style="display:none;" role="dialog" aria-modal="true" aria-label="TTS 대본 검토 및 수동 편집기"></div>
 <div id="pluginGuiModal" style="display:none;" role="dialog" aria-modal="true" aria-label="플러그인 GUI"></div>
 <div id="pluginFloatingModal" style="display:none;" role="dialog" aria-modal="true" aria-label="플러그인 플로팅 컨트롤"></div>
+<div id="chatPinnedPluginCtrl" class="rs-chat-pinned-float" style="display:none;" aria-label="플러그인 플로팅 컨트롤"></div>
 <div id="sceneCtrlModal" style="display:none;" role="dialog" aria-modal="true" aria-label="장면·삽화 제어함"></div>
 <div id="thumbPickerModal" style="display:none;" role="dialog" aria-modal="true" aria-label="봇 썸네일 변경"></div>
+<div id="scrollImgPreview" class="scroll-img-preview" style="display:none;"></div>
+<div id="chatImgLightbox" class="chat-img-lightbox" style="display:none;" role="dialog" aria-modal="true" aria-label="이미지 확대 보기"></div>
 
 <div id="login">
   <div class="login-card">
@@ -7430,10 +8510,11 @@ function renderWebApp() {
         <div class="h-title" id="hdrChar">연결 중...</div>
         <div class="h-sub-row">
           <div class="h-sub" id="hdrSub">-</div>
-          <div class="hdr-act-bar" id="hdrActivityBar" onclick="event.stopPropagation()"></div>
+          <div class="hdr-act-bar" id="hdrActivityBar" onclick="event.stopPropagation(); toggleHdrActPopover();" title="클릭하여 전체 상태 보기"></div>
         </div>
       </div>
     </div>
+    <div id="hdrActPopover" class="hdr-act-pop" onclick="event.stopPropagation()"></div>
     <div class="h-right">
       <button class="pill icon-pill" id="sceneCtrlQuickBtn" title="장면·삽화 제어함" aria-label="장면·삽화 제어함">🎨</button>
       <button class="pill icon-pill" id="reqLogQuickBtn" title="리퀘스트 로그 보기" aria-label="리퀘스트 로그">📜</button>
@@ -7481,6 +8562,10 @@ function renderWebApp() {
           <button class="pill" id="amBlur" onclick="setAssetMode('blur')">🌫️ 가리기</button>
           <button class="pill" id="amHide" onclick="setAssetMode('hide')">🙈 감추기</button>
         </div>
+        <div class="seg" style="margin-top:6px;">
+          <button class="pill" id="afCompact" onclick="setAssetFit('compact')">📐 전체 축소</button>
+          <button class="pill" id="afOriginal" onclick="setAssetFit('original')">✂️ 봇 원본</button>
+        </div>
       </div>
       <div class="rb-sec">
         <div class="rb-label">봇 정규식 UI (HTML)</div>
@@ -7498,6 +8583,7 @@ function renderWebApp() {
   <!-- TAB 1: CHAT / EPUB READER -->
   <section class="panel" id="tab-chat"></section>
   <div class="composer" id="composerBar" style="display:none;">
+    <div id="liveGenBar" class="live-gen-bar" aria-live="polite"></div>
     <button class="pill" id="inTrBtn" title="입력 한→영 자동 번역">한→영</button>
     <textarea id="msgInput" rows="1" placeholder="메시지를 입력하세요..."></textarea>
     <button class="send-btn" id="sendBtn">전송</button>
@@ -7747,14 +8833,15 @@ function renderWebApp() {
         <div><label class="f-label">Temperature 덮어쓰기</label><input class="f-inp" id="edTemp" placeholder="비우면 유지" /></div>
         <div><label class="f-label">Max Tokens 덮어쓰기</label><input class="f-inp" id="edMaxTok" placeholder="비우면 유지" /></div>
       </div>
-      <label class="f-label">원격 시스템 프롬프트 오버라이드</label>
+      <label class="f-label">이 모델 전용 추가 지침 (선택)</label>
       <select class="f-inp" id="edOvMode">
-        <option value="off">사용 안 함 (RisuAI 원본 그대로)</option>
-        <option value="append">기존 시스템 프롬프트 뒤에 추가</option>
-        <option value="prepend">맨 앞 시스템 지침으로 추가</option>
-        <option value="replace">시스템 프롬프트 전체 교체</option>
+        <option value="off">추가 안 함 (기본 · 프리셋 그대로 사용)</option>
+        <option value="append">프리셋 지침 뒤에 덧붙이기 (모델별 보정)</option>
+        <option value="prepend">프롬프트 맨 앞에 덧붙이기 (강한 우선 적용)</option>
+        <option value="replace">⚠️ 기존 프리셋·캐릭터 설정 무시하고 아래 문구만 사용</option>
       </select>
-      <textarea class="f-inp" id="edOvText" rows="3" placeholder="원격에서 덧씌울 지침/프리셋 (선택)" style="margin-top:6px;"></textarea>
+      <div class="hint" id="edOvHint" style="margin-top:4px;"></div>
+      <textarea class="f-inp" id="edOvText" rows="3" placeholder="예: 이 모델에서는 불필요한 사고 태그 없이 자연스러운 한국어 소설체로만 답변하세요." style="margin-top:6px; display:none;"></textarea>
       <div class="btn-row">
         <button class="btn" id="saveProfBtn">저장</button>
         <button class="btn sec" onclick="document.getElementById('profileEditor').style.display='none'">취소</button>
@@ -7923,12 +9010,13 @@ function renderWebApp() {
 
       <div class="tts-subbox" id="ttsVoiceProfilesBox">
         <div class="tts-subbox-title">
-          <span>📚 보이스 레퍼런스 프로필 관리 (Fish / OpenAI·Qwen)</span>
+          <span>📚 보이스 레퍼런스 프로필 관리 (Fish / OpenAI / Qwen3)</span>
           <button type="button" class="pill" id="ttsVpFetchBtn">🔄 이 영역 서버에서 불러오기</button>
         </div>
         <div class="tts-vp-tabs">
           <button type="button" class="pill active" data-vp-tab="fish">🐟 Fish 레퍼런스</button>
-          <button type="button" class="pill" data-vp-tab="openai_qwen">🎙️ OpenAI / Qwen 레퍼런스</button>
+          <button type="button" class="pill" data-vp-tab="openai">🤖 OpenAI</button>
+          <button type="button" class="pill" data-vp-tab="qwen">🎙️ Qwen3-TTS</button>
         </div>
         <div id="ttsVpList" class="tts-cast-list" style="margin-top:0;"></div>
         <div id="ttsVpLiveBox" style="display:none; margin-top:6px;">
@@ -7948,10 +9036,10 @@ function renderWebApp() {
         </div>
         <label class="f-label" style="margin-top:6px;">Voice / Reference ID</label>
         <div style="display:flex; gap:6px; align-items:center;">
-          <input class="f-inp" id="ttsVpIdInp" list="ttsVoiceDatalist" placeholder="Fish reference_id 또는 OpenAI/Qwen voice" style="flex:1; min-width:0;" />
+          <input class="f-inp" id="ttsVpIdInp" list="ttsVoiceDatalist" placeholder="Fish reference_id, OpenAI 또는 Qwen3 voice" style="flex:1; min-width:0;" />
           <button type="button" class="btn sec" id="ttsVpAddBtn" style="flex-shrink:0;">+ 프로필 저장</button>
         </div>
-        <div class="hint" id="ttsVpStatus" style="margin-top:5px;">Fish 영역과 OpenAI/Qwen 영역을 나눠 레퍼런스 ID를 미리 저장하면 2단계 드롭다운에서 바로 선택할 수 있습니다.</div>
+        <div class="hint" id="ttsVpStatus" style="margin-top:5px;">Fish / OpenAI / Qwen3 영역을 나눠 레퍼런스 ID를 미리 저장하면 2단계 드롭다운에서 바로 선택할 수 있습니다.</div>
       </div>
 
       <div class="tts-subbox">
@@ -8016,14 +9104,27 @@ function renderWebApp() {
 
       <div class="tts-subbox" id="ttsGlobalCastBox">
         <div class="tts-subbox-title">
-          <span>🎭 등장인물별 캐릭터 보이스 설정 (전역 적용)</span>
+          <span>🎭 봇별 등장인물 스피치 프로필 (LLM 성격 · 모델 태그 분석)</span>
         </div>
-        <div class="hint" style="margin:2px 0 8px;">등장인물 이름(별칭 포함)마다 서로 다른 성별 · Voice ID · 대화/속마음 톤을 등록해 두면 모든 채팅방에서 해당 화자 대사에 자동 적용됩니다.</div>
+        <div class="hint" id="ttsModelTagSpecBadge" style="margin:2px 0 6px;"></div>
+        <label class="chk-row" style="margin-top:2px;">
+          <span>봇별 등장인물 보이스 · 성격 태그 적용</span>
+          <input type="checkbox" id="ttsCharVoicesEnabledChk" checked />
+        </label>
+        <label class="chk-row" style="margin-top:2px;">
+          <span>대본 분석 시 새 인물 성격·태그 자동 학습 및 봇별 저장</span>
+          <input type="checkbox" id="ttsAutoLearnProfilesChk" checked />
+        </label>
+        <label class="f-label" style="margin-top:6px;">대상 봇 선택 (봇별 독립 저장)</label>
+        <select class="f-inp" id="ttsCastBotSel" aria-label="스피치 프로필 대상 봇"></select>
+        <div class="hint" style="margin:4px 0 8px;">선택한 TTS 모델에 맞는 스피치 태그/연기 지시문을 LLM이 인물 성격에 맞춰 자동 생성하고, 봇별로 영구 저장해 다음 대화에서도 일관되게 재사용합니다.</div>
         <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
+          <button type="button" class="btn" id="ttscAnalyzeBotBtn" style="padding:7px 12px; font-size:12.5px;">🤖 현재 봇 성격·스피치 분석</button>
           <button type="button" class="pill active" id="ttscAddBtn">+ 캐릭터 추가</button>
           <button type="button" class="pill" id="ttscFetchFishBtn">🐟 Fish 보이스 불러오기</button>
-          <button type="button" class="pill" id="ttscFetchOaBtn">🎙️ OpenAI/Qwen 불러오기</button>
+          <button type="button" class="pill" id="ttscFetchOaBtn">🎙️ OpenAI · Qwen3 불러오기</button>
         </div>
+        <div class="hint" id="ttscAnalyzeStatus" style="margin-top:5px;"></div>
         <div class="tts-cast-list" id="ttsGlobalCastList" style="margin-top:8px;"></div>
         <div id="ttsGlobalCastEditor"></div>
       </div>
@@ -8094,7 +9195,18 @@ function renderWebApp() {
 
     <div class="card">
       <h3>🌐 자체 번역기 설정</h3>
-      <label class="chk-row"><span>활성 모델 프로필을 번역에도 공용 사용</span><input type="checkbox" id="trUseActive" /></label>
+      <label class="f-label">번역에 사용할 모델</label>
+      <select class="f-inp" id="trProfileSel"></select>
+      <div class="hint" id="trActiveModelHint" style="margin-top:4px; margin-bottom:8px;"></div>
+      <div id="trProfileOverrideBox" style="margin-bottom:8px;">
+        <label class="f-label">번역 전용 모델 ID 지정 (선택 · 비우면 선택한 프로필 모델 그대로 사용)</label>
+        <div style="display:flex; gap:6px; align-items:center;">
+          <input class="f-inp" id="trProfileModelOverride" style="flex:1; min-width:0;" placeholder="예: gemini-2.5-flash, deepseek-v4.1-flash:1017-cloud (비우면 프로필 모델)" />
+          <button type="button" class="btn sec" id="trProfLoadModelsBtn" style="flex-shrink:0;">🔄 모델 불러오기</button>
+        </div>
+        <select class="f-inp" id="trProfModelPick" style="display:none; margin-top:6px;"></select>
+        <div class="hint" id="trProfModelStatus" style="margin-top:4px;"></div>
+      </div>
       <label class="chk-row"><span>AI 응답 자동 한국어 번역 표시</span><input type="checkbox" id="trAutoOut" /></label>
       <label class="chk-row"><span>내 입력 자동 한→영 번역 후 전송</span><input type="checkbox" id="trAutoIn" /></label>
       <div id="trCustomBox">
@@ -8182,6 +9294,14 @@ function renderWebApp() {
   let isStatePolling = false;
   let knownCatalogVer = -1;
   let knownSnapshotVer = -1;
+  let pendingTargetSwitch = null;
+  let targetSwitchTimers = [];
+  function clearPendingTargetSwitch() {
+    pendingTargetSwitch = null;
+    while (targetSwitchTimers.length) {
+      clearTimeout(targetSwitchTimers.pop());
+    }
+  }
   let bookSpreadIdx = -1; // -1 means auto-jump to latest spread
   let bookDesiredSpreadIdx = -1;
   let bookAnchorMode = 'last-user'; // 'last-user' | 'manual'
@@ -8208,12 +9328,78 @@ function renderWebApp() {
     fsize: Number(localStorage.getItem('rs_fsize')) || 15.5,
     lh: Number(localStorage.getItem('rs_lh')) || 1.75,
     assetMode: localStorage.getItem('rs_asset_mode') || (localStorage.getItem('rs_stealth') === '1' ? 'hide' : 'show'),
+    assetFit: localStorage.getItem('rs_asset_fit') === 'original' ? 'original' : 'compact',
     richHtml: localStorage.getItem('rs_rich_html') !== '0',
     zenMode: localStorage.getItem('rs_zen_mode') === '1',
+    floatingOnChat: localStorage.getItem('rs_floating_on_chat') !== '0',
+    floatingPlace: localStorage.getItem('rs_floating_place') || 'chat-end',
+    floatingAlign: localStorage.getItem('rs_floating_align') || 'right',
+    floatingOffsetX: Number(localStorage.getItem('rs_floating_ox')) || 0,
+    floatingOffsetY: Number(localStorage.getItem('rs_floating_oy')) || 0,
+    pluginModalRules: (() => {
+      try {
+        const raw = JSON.parse(localStorage.getItem('rs_plugin_modal_rules') || '{}');
+        return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+      } catch (_) {
+        return {};
+      }
+    })(),
   };
+  function getPluginModalRule(pluginName, key) {
+    const map = (uiPref && uiPref.pluginModalRules && typeof uiPref.pluginModalRules === 'object') ? uiPref.pluginModalRules : {};
+    const v = map[String(pluginName || '') + '::' + String(key || '')];
+    return v === 'popup' || v === 'inline' ? v : 'auto';
+  }
+  function setPluginModalRule(pluginName, key, mode) {
+    if (!uiPref.pluginModalRules || typeof uiPref.pluginModalRules !== 'object') uiPref.pluginModalRules = {};
+    const composite = String(pluginName || '') + '::' + String(key || '');
+    if (mode === 'popup' || mode === 'inline') uiPref.pluginModalRules[composite] = mode;
+    else delete uiPref.pluginModalRules[composite];
+    applyUiPrefs();
+  }
+  function extractClientTriggerKey(target) {
+    if (!target || target.nodeType !== 1 || typeof target.getAttribute !== 'function') return '';
+    const attrs = [
+      'data-am-runtime-generation-count-action',
+      'data-am-viewer-action',
+      'data-am-image-action',
+      'data-am-illustration-action',
+      'data-am-gallery-action',
+      'data-am-action',
+      'data-am-runtime-toast-action',
+    ];
+    for (const aName of attrs) {
+      const val = target.getAttribute(aName);
+      if (val !== null && String(val).trim() !== '') {
+        return 'trigger:' + aName + '=' + String(val).trim();
+      }
+    }
+    if (target.id) return 'trigger:#' + String(target.id).trim();
+    const txt = String(target.getAttribute('aria-label') || target.getAttribute('title') || target.textContent || '').replace(/\\s+/g, ' ').trim();
+    if (!txt || txt === '-' || txt === '+' || txt === '−') return '';
+    return 'trigger:label:' + txt.toLowerCase().slice(0, 40);
+  }
+  function shouldOpenPluginOverlay(overlay, triggerKey = '') {
+    if (!overlay || !overlay.html) return false;
+    const pName = String(overlay.pluginName || '');
+    const mKey = String(overlay.modalKey || '');
+    const specific = mKey ? getPluginModalRule(pName, mKey) : 'auto';
+    if (specific === 'inline') return false;
+    if (specific === 'popup') return true;
+    const trigRule = triggerKey ? getPluginModalRule(pName, triggerKey) : 'auto';
+    if (trigRule === 'inline') return false;
+    if (trigRule === 'popup') return true;
+    const defRule = getPluginModalRule(pName, '__default__');
+    if (defRule === 'inline') return false;
+    if (defRule === 'popup') return true;
+    return overlay.autoPopup !== false;
+  }
   const openToggleGroups = new Set();
   let latestPluginFloatingUi = { rev: '', buttons: [], rootWidgets: [] };
   let lastFloatingModalSig = '';
+  let lastChatFloatingSig = '';
+  let chatFloatingPrimeKey = '';
+  let chatFloatingPriming = false;
   // ===== RisuStand Floating Mini-Bar state (initialized before initial applyUiPrefs()) =====
   let rsMiniBarMinimized = localStorage.getItem('rs_minibar_min') !== '0';
   let rsMiniBarAutoTimer = null;
@@ -8231,6 +9417,7 @@ function renderWebApp() {
     document.documentElement.style.setProperty('--lh', String(uiPref.lh));
     document.body.classList.toggle('asset-blur', uiPref.assetMode === 'blur');
     document.body.classList.toggle('asset-hide', uiPref.assetMode === 'hide');
+    document.body.classList.toggle('asset-fit-compact', uiPref.assetFit !== 'original');
     document.body.classList.toggle('rs-zen-mode', Boolean(uiPref.zenMode));
     document.querySelectorAll('.theme-chip').forEach((c) => c.classList.toggle('active', c.getAttribute('data-theme-key') === uiPref.theme));
     document.body.classList.toggle('book-mode', isBookMode());
@@ -8246,6 +9433,10 @@ function renderWebApp() {
     document.getElementById('amShow').className = 'pill' + (uiPref.assetMode === 'show' ? ' active' : '');
     document.getElementById('amBlur').className = 'pill' + (uiPref.assetMode === 'blur' ? ' active' : '');
     document.getElementById('amHide').className = 'pill' + (uiPref.assetMode === 'hide' ? ' active' : '');
+    const afCompEl = document.getElementById('afCompact');
+    const afOrigEl = document.getElementById('afOriginal');
+    if (afCompEl) afCompEl.className = 'pill' + (uiPref.assetFit !== 'original' ? ' active' : '');
+    if (afOrigEl) afOrigEl.className = 'pill' + (uiPref.assetFit === 'original' ? ' active' : '');
     const rhb = document.getElementById('richHtmlBtn');
     if (rhb) {
       rhb.textContent = '✨ 봇 정규식 UI: ' + (uiPref.richHtml ? '켜짐' : '꺼짐');
@@ -8261,9 +9452,17 @@ function renderWebApp() {
     localStorage.setItem('rs_fsize', String(uiPref.fsize));
     localStorage.setItem('rs_lh', String(uiPref.lh));
     localStorage.setItem('rs_asset_mode', uiPref.assetMode);
+    localStorage.setItem('rs_asset_fit', uiPref.assetFit);
     localStorage.setItem('rs_rich_html', uiPref.richHtml ? '1' : '0');
     localStorage.setItem('rs_zen_mode', uiPref.zenMode ? '1' : '0');
+    localStorage.setItem('rs_floating_on_chat', uiPref.floatingOnChat ? '1' : '0');
+    localStorage.setItem('rs_floating_place', String(uiPref.floatingPlace || 'chat-end'));
+    localStorage.setItem('rs_floating_align', String(uiPref.floatingAlign || 'right'));
+    localStorage.setItem('rs_floating_ox', String(Number(uiPref.floatingOffsetX) || 0));
+    localStorage.setItem('rs_floating_oy', String(Number(uiPref.floatingOffsetY) || 0));
+    try { localStorage.setItem('rs_plugin_modal_rules', JSON.stringify(uiPref.pluginModalRules || {})); } catch (_) {}
     if (typeof renderRsMiniBar === 'function') renderRsMiniBar();
+    if (typeof renderChatFloatingControls === 'function') renderChatFloatingControls(true);
   }
   function setZenMode(nextZen) {
     uiPref.zenMode = Boolean(nextZen);
@@ -8309,6 +9508,16 @@ function renderWebApp() {
     const labels = { show: '에셋 표시', blur: '에셋 가리기 (터치 시 확인)', hide: '에셋 완전 감추기 (스텔스)' };
     toast(labels[mode] || mode);
   };
+  window.setAssetFit = (fit) => {
+    uiPref.assetFit = fit === 'original' ? 'original' : 'compact';
+    applyUiPrefs();
+    const chatBox = document.getElementById('tab-chat');
+    if (chatBox && typeof applyCompactBotAssetFit === 'function') applyCompactBotAssetFit(chatBox);
+    if (isBookMode() && typeof layoutBookSpreads === 'function') {
+      requestAnimationFrame(() => layoutBookSpreads(false));
+    }
+    toast(uiPref.assetFit === 'compact' ? '에셋 표시: 전체 축소 (크롭 해제)' : '에셋 표시: 봇 원본 비율');
+  };
   document.getElementById('assetCycleBtn').onclick = () => {
     const order = ['show', 'blur', 'hide'];
     const next = order[(order.indexOf(uiPref.assetMode) + 1) % order.length];
@@ -8329,6 +9538,11 @@ function renderWebApp() {
   document.addEventListener('click', (e) => {
     const bar = document.getElementById('readBar');
     if (bar.classList.contains('open') && !bar.contains(e.target)) setReadBar(false);
+    const actPop = document.getElementById('hdrActPopover');
+    const actBar = document.getElementById('hdrActivityBar');
+    if (actPop && actPop.classList.contains('open') && !actPop.contains(e.target) && (!actBar || !actBar.contains(e.target))) {
+      actPop.classList.remove('open');
+    }
     const jBar = document.getElementById('bookJumpBar');
     const jBtn = document.getElementById('bookPageJumpBtn');
     if (jBar && jBar.style.display !== 'none' && !jBar.contains(e.target) && (!jBtn || !jBtn.contains(e.target))) {
@@ -8456,7 +9670,7 @@ function renderWebApp() {
       .replace(/javascript\\s*:/gi, 'blocked:')
       .replace(/vbscript\\s*:/gi, 'blocked:')
       .replace(/-moz-binding\\s*:/gi, 'blocked:')
-      .replace(/@import\\s+(?!url\\(\\s*["']?https:\\/\\/)/gi, '/* @import */ ');
+      .replace(/@import\\s+(?!(?:url\\(\\s*)?["']?https:\\/\\/)[^;]*;?/gi, '/* @import */ ');
   }
 
   function splitCssSelectors(selText) {
@@ -8525,10 +9739,64 @@ function renderWebApp() {
     return parts.join('; ');
   }
 
+  function extractCustomPropDecls(declBody) {
+    const parts = [];
+    let start = 0;
+    let pDepth = 0;
+    let quote = '';
+    const text = String(declBody || '');
+    for (let i = 0; i <= text.length; i++) {
+      const c = i < text.length ? text[i] : ';';
+      if (i < text.length) {
+        if (quote) {
+          if (c === '\\\\') { i++; continue; }
+          if (c === quote) quote = '';
+          continue;
+        }
+        if (c === '"' || c === "'") { quote = c; continue; }
+        if (c === '(') { pDepth++; continue; }
+        if (c === ')' && pDepth > 0) { pDepth--; continue; }
+        if (c !== ';' || pDepth > 0) continue;
+      }
+      const decl = text.slice(start, i).trim();
+      start = i + 1;
+      if (!decl) continue;
+      const colon = decl.indexOf(':');
+      if (colon <= 0) continue;
+      const prop = decl.slice(0, colon).trim().toLowerCase();
+      if (prop.startsWith('--')) {
+        parts.push(decl);
+      }
+    }
+    return parts.join('; ');
+  }
+
+  function expandRisuPrefixSelectors(sels) {
+    const out = [];
+    const seen = new Set();
+    const pushUnique = (sel) => {
+      if (sel && !seen.has(sel)) {
+        seen.add(sel);
+        out.push(sel);
+      }
+    };
+    for (const sel of sels) {
+      pushUnique(sel);
+      if (sel.includes('x-risu-')) {
+        const unprefixed = sel
+          .replace(/\\.x-risu-(?=[a-zA-Z0-9_-])/g, '.')
+          .replace(/(\\[class[^\\]]*["']?)x-risu-/g, '$1');
+        pushUnique(unprefixed);
+      }
+    }
+    return out;
+  }
+
   function scopeBotCss(css, scopeSel = '.rs-bot-html') {
     const clean = String(css || '').replace(/\\/\\*[\\s\\S]*?\\*\\//g, '');
     let out = '';
     let start = 0;
+    let pDepth = 0;
     let quote = '';
     for (let i = 0; i < clean.length; i++) {
       const c = clean[i];
@@ -8538,7 +9806,9 @@ function renderWebApp() {
         continue;
       }
       if (c === '"' || c === "'") { quote = c; continue; }
-      if (c === ';') {
+      if (c === '(') { pDepth++; continue; }
+      if (c === ')' && pDepth > 0) { pDepth--; continue; }
+      if (c === ';' && pDepth === 0) {
         const stmt = clean.slice(start, i + 1).trim();
         if (stmt) out += stmt + '\\n';
         start = i + 1;
@@ -8563,6 +9833,7 @@ function renderWebApp() {
         const body = clean.slice(i + 1, Math.max(i + 1, j - 1));
         i = j - 1;
         start = j;
+        pDepth = 0;
         if (!header) continue;
         if (/^@(?:keyframes|-webkit-keyframes|font-face|property|counter-style|page)\\b/i.test(header)) {
           out += header + '{' + body + '}\\n';
@@ -8585,6 +9856,9 @@ function renderWebApp() {
               bareDocSels.push(s.replace(/^(?:html(?:\\s*>?\\s*body)?|body)/i, '#botBgHost'));
             } else if (/^(?:html|body|:root)(?=[\\s.:#[>+~]|$)/i.test(s)) {
               normalSels.push(s.replace(/^(?:html|body|:root)/i, scopeSel));
+            } else if (/^\\.(?:chattext|risu-chat|default-chat-screen|chat-width|prose|prose-invert)(?=[\\s.:#[>+~]|$)/i.test(s)) {
+              normalSels.push(s.replace(/^\\.(?:chattext|risu-chat|default-chat-screen|chat-width|prose|prose-invert)/i, scopeSel));
+              normalSels.push(scopeSel + ' ' + s);
             } else {
               normalSels.push(scopeSel + ' ' + s);
             }
@@ -8595,10 +9869,14 @@ function renderWebApp() {
           }
           if (bareDocSels.length) {
             const safeBody = stripUnsafeRootDecls(body);
-            if (safeBody) out += bareDocSels.join(', ') + '{' + safeBody + '}\\n';
+            if (safeBody) {
+              out += bareDocSels.join(', ') + '{' + safeBody + '}\\n';
+              const customProps = extractCustomPropDecls(safeBody);
+              if (customProps) out += scopeSel + '{' + customProps + '}\\n';
+            }
           }
           if (normalSels.length) {
-            out += normalSels.join(', ') + '{' + body + '}\\n';
+            out += expandRisuPrefixSelectors(normalSels).join(', ') + '{' + body + '}\\n';
           }
         }
       }
@@ -8647,11 +9925,23 @@ function renderWebApp() {
         }
         if (name === 'style') {
           ch.setAttribute('style', sanitizeBotCss(val));
+          if (scopeSel === '.rs-bot-html' && /url\\(\\s*["']?(?:\\/api\\/asset\\/|data:image\\/|https?:\\/\\/)/i.test(val)) {
+            ch.setAttribute('data-rs-bg-img', '1');
+          }
         }
       }
       if (tag === 'img') {
         if (!ch.getAttribute('loading')) ch.setAttribute('loading', 'lazy');
         if (!ch.getAttribute('decoding')) ch.setAttribute('decoding', 'async');
+      }
+      if (scopeSel === '.rs-bot-html' && ch.classList && ch.classList.length > 0 && typeof ch.classList.add === 'function') {
+        const origClasses = Array.from(ch.classList);
+        for (const cls of origClasses) {
+          if (cls && !/^(?:x-risu-|rs-|leave-|msg-|risu-)/.test(cls)) {
+            const prefixed = 'x-risu-' + cls;
+            if (!ch.classList.contains(prefixed)) ch.classList.add(prefixed);
+          }
+        }
       }
       sanitizeBotNode(ch, scopeSel, allowForms);
     }
@@ -8672,6 +9962,72 @@ function renderWebApp() {
     }
   }
 
+  function appendFormattedInlineMd(doc, parent, lineStr) {
+    const tokenRe = /\\x60([^\\x60\\n]+)\\x60|\\*\\*([^\\n]+?)\\*\\*|~~([^\\n]+?)~~|\\*([^\\s*][^\\n]*?[^\\s*]|[^\\s*])\\*/g;
+    let cursor = 0;
+    let m;
+    while ((m = tokenRe.exec(lineStr)) !== null) {
+      if (m.index > cursor) {
+        parent.appendChild(doc.createTextNode(lineStr.slice(cursor, m.index)));
+      }
+      if (m[1] !== undefined) {
+        const el = doc.createElement('code');
+        el.textContent = m[1];
+        parent.appendChild(el);
+      } else if (m[2] !== undefined) {
+        const el = doc.createElement('strong');
+        el.textContent = m[2];
+        parent.appendChild(el);
+      } else if (m[3] !== undefined) {
+        const el = doc.createElement('del');
+        el.textContent = m[3];
+        parent.appendChild(el);
+      } else if (m[4] !== undefined) {
+        const el = doc.createElement('em');
+        el.textContent = m[4];
+        parent.appendChild(el);
+      }
+      cursor = m.index + m[0].length;
+    }
+    if (cursor < lineStr.length) {
+      parent.appendChild(doc.createTextNode(lineStr.slice(cursor)));
+    }
+  }
+
+  function appendMdProseSegment(doc, parent, collapsed) {
+    const lines = collapsed.split('\\n');
+    let textBuf = [];
+    const flushBuf = () => {
+      if (!textBuf.length) return;
+      const chunk = textBuf.join('\\n');
+      textBuf = [];
+      if (!/\\S/.test(chunk) && chunk === '\\n') {
+        parent.appendChild(doc.createTextNode(chunk));
+        return;
+      }
+      const sp = doc.createElement('span');
+      sp.className = 'rs-prose-seg';
+      if (/[*\\x60~]/.test(chunk)) {
+        appendFormattedInlineMd(doc, sp, chunk);
+      } else {
+        sp.textContent = chunk;
+      }
+      parent.appendChild(sp);
+    };
+    for (let li = 0; li < lines.length; li += 1) {
+      const ln = lines[li];
+      if (/^[ \\t]*(?:---+|\\*\\*\\*+|___+)[ \\t]*$/.test(ln)) {
+        flushBuf();
+        const hr = doc.createElement('hr');
+        hr.className = 'rs-md-hr';
+        parent.appendChild(hr);
+      } else {
+        textBuf.push(ln);
+      }
+    }
+    flushBuf();
+  }
+
   function renderBotRichHtml(rawHtml, assetMap) {
     const withAssets = resolveAssetTokens(rawHtml || '', assetMap);
     if (!withAssets) return '';
@@ -8688,10 +10044,9 @@ function renderWebApp() {
             .replace(/^(?:[ \\t]*\\r?\\n){2,}/, '\\n')
             .replace(/(?:\\r?\\n[ \\t]*){2,}$/, '\\n');
           if (/\\S/.test(collapsed)) {
-            const sp = doc.createElement('span');
-            sp.className = 'rs-prose-seg';
-            sp.textContent = collapsed;
-            root.replaceChild(sp, ch);
+            const frag = doc.createDocumentFragment();
+            appendMdProseSegment(doc, frag, collapsed);
+            root.replaceChild(frag, ch);
           } else {
             root.removeChild(ch);
           }
@@ -8703,54 +10058,174 @@ function renderWebApp() {
     }
   }
 
-  const BOT_FIXED_CLASS_SEL = '[class*="buttons-container" i], [class*="side-panel" i], [class*="overlay" i], [class*="floating" i]';
+  const BOT_FIXED_CLASS_SEL = '[class*="buttons-container" i], [class*="side-panel" i], [class*="floating-menu" i], [class*="floating-btn" i], [class*="floating-bar" i], [class*="menu-btn" i], [class*="menu-toggle" i], [class*="hud-btn" i], [class*="hud-toggle" i], [class*="fixed-menu" i], [class*="bot-menu" i], .floating';
 
-  function isBotFixedMenuElement(el) {
-    if (!el || el.nodeType !== 1) return false;
-    const tag = (el.tagName || '').toLowerCase();
-    if (!['div', 'nav', 'aside', 'section'].includes(tag)) return false;
-    const cls = typeof el.className === 'string' ? el.className : '';
-    if (/(?:buttons-container|side-panel|overlay|floating)/i.test(cls)) return true;
-    const stAttr = el.getAttribute('style') || '';
-    return /position\\s*:\\s*fixed/i.test(stAttr);
-  }
-
-  function stripBotFixedMenuNodes(container) {
-    if (!container) return;
-    container.querySelectorAll('input[type="checkbox"], input[type="radio"], ' + BOT_FIXED_CLASS_SEL).forEach((n) => n.remove());
-    container.querySelectorAll('div[style], nav[style], aside[style], section[style]').forEach((n) => {
-      if (/position\\s*:\\s*fixed/i.test(n.getAttribute('style') || '')) n.remove();
-    });
-    container.querySelectorAll('style').forEach((st) => {
-      if (/position\\s*:\\s*fixed/i.test(st.textContent || '')) st.remove();
-    });
-  }
-
-  function containerHasBotFixedMenu(container) {
-    if (!container) return false;
-    let hasFixed = false;
-    container.querySelectorAll('style').forEach((st) => {
-      if (/position\\s*:\\s*fixed/i.test(st.textContent || '')) hasFixed = true;
-    });
-    if (!hasFixed && container.querySelector(BOT_FIXED_CLASS_SEL)) {
-      hasFixed = true;
+  function hasInteractiveDescendantOrSelf(node) {
+    if (!node || node.nodeType !== 1) return false;
+    const tag = (node.tagName || '').toLowerCase();
+    if (tag === 'button' || tag === 'a' || tag === 'input' || tag === 'select' || tag === 'textarea' || tag === 'label' || tag === 'details' || tag === 'summary') return true;
+    if (typeof node.getAttribute === 'function') {
+      if (node.getAttribute('risu-trigger') || node.getAttribute('risu-btn') || node.getAttribute('onclick') || node.getAttribute('role') === 'button') return true;
     }
-    if (!hasFixed) {
-      for (const ch of Array.from(container.children || [])) {
-        if (isBotFixedMenuElement(ch)) {
-          hasFixed = true;
-          break;
+    for (const ch of Array.from(node.children || [])) {
+      if (hasInteractiveDescendantOrSelf(ch)) return true;
+    }
+    return false;
+  }
+
+  function isPassiveFullViewportBg(el) {
+    if (!el || el.nodeType !== 1) return true;
+    if (hasInteractiveDescendantOrSelf(el)) return false;
+    return (el.textContent || '').trim().length === 0;
+  }
+
+  function extractFixedMenuSelectorsFromStyles(container, extraStyleContainer = null) {
+    const matched = new Set();
+    if (!container || typeof container.querySelectorAll !== 'function') return matched;
+    const styleNodes = [];
+    const seenSt = new Set();
+    for (const root of [container, extraStyleContainer]) {
+      if (!root || typeof root.querySelectorAll !== 'function') continue;
+      for (const st of Array.from(root.querySelectorAll('style') || [])) {
+        if (st && !seenSt.has(st)) {
+          seenSt.add(st);
+          styleNodes.push(st);
         }
       }
     }
-    return hasFixed;
+    if (!styleNodes.length) return matched;
+    const ruleRe = /([^{}]+)\\{([^{}]*)\\}/g;
+    for (const st of styleNodes) {
+      const css = String((st && st.textContent) || '').replace(/\\/\\*[\\s\\S]*?\\*\\//g, '');
+      let m;
+      ruleRe.lastIndex = 0;
+      while ((m = ruleRe.exec(css)) !== null) {
+        const rawHdr = String(m[1] || '').trim();
+        const decls = String(m[2] || '');
+        if (!rawHdr || rawHdr.startsWith('@')) continue;
+        if (!/position\\s*:\\s*fixed/i.test(decls)) continue;
+        const zMatch = decls.match(/z-index\\s*:\\s*(-?\\d+)/i);
+        const zVal = zMatch ? Number(zMatch[1]) : 0;
+        if (zVal < 0 && /pointer-events\\s*:\\s*none/i.test(decls)) continue;
+        for (const rawPart of rawHdr.split(',')) {
+          let sel = rawPart.trim()
+            .replace(/^(?:\\.rs-bot-html|#botBgHost|#bookBotOverlay)\\s+/i, '')
+            .replace(/:+(?:hover|focus|focus-within|focus-visible|active|visited|before|after)\\b/gi, '')
+            .trim();
+          if (!sel || sel === '*' || /^(?:html|body|:root)(?:[\\s.:#[>+~]|$)/i.test(sel)) continue;
+          try {
+            const hits = container.querySelectorAll(sel);
+            for (const el of Array.from(hits || [])) {
+              if (!isPassiveFullViewportBg(el)) matched.add(el);
+            }
+          } catch (_) {}
+        }
+      }
+    }
+    return matched;
+  }
+
+  function isSelfContainedFixedUiWrapper(el, styleFixedSet = null) {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    if (!['div', 'section', 'aside', 'nav'].includes(tag)) return false;
+    for (const ch of Array.from(el.childNodes || [])) {
+      if (ch.nodeType === 3 && /\\S/.test(ch.textContent || '')) return false;
+    }
+    const kids = Array.from(el.children || []);
+    if (!kids.length) return false;
+    let hasFixedCtrl = false;
+    for (const ch of kids) {
+      const chTag = (ch.tagName || '').toLowerCase();
+      const chCls = typeof ch.className === 'string' ? ch.className : '';
+      if (chTag === 'style') continue;
+      if (chTag === 'input' && (ch.type === 'checkbox' || ch.type === 'radio')) continue;
+      if (isBotFixedMenuElement(ch, styleFixedSet)) { hasFixedCtrl = true; continue; }
+      if (/backdrop|overlay|panel|drawer|modal|sheet/i.test(chCls) || (styleFixedSet && styleFixedSet.has(ch))) continue;
+      return false;
+    }
+    return hasFixedCtrl;
+  }
+
+  function isFixedBackdropOverlay(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const cls = typeof el.className === 'string' ? el.className : '';
+    if (!/overlay/i.test(cls)) return false;
+    const stAttr = el.getAttribute('style') || '';
+    if (/position\\s*:\\s*fixed/i.test(stAttr)) return true;
+    const parent = el.parentElement;
+    return Boolean(parent && parent.querySelector && parent.querySelector('[class*="buttons-container" i], [class*="side-panel" i]'));
+  }
+
+  function isBotFixedMenuElement(el, styleFixedSet = null) {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    if (!['div', 'nav', 'aside', 'section', 'label', 'button', 'a', 'details', 'header', 'footer', 'span'].includes(tag)) return false;
+    const cls = typeof el.className === 'string' ? el.className : '';
+    if (/(?:buttons-container|side-panel|floating-menu|floating-btn|floating-bar|menu-btn|menu-toggle|hud-btn|hud-toggle|fixed-menu|bot-menu)/i.test(cls) || /(?:^|\\s)floating(?:\\s|$)/i.test(cls)) return true;
+    if (isFixedBackdropOverlay(el)) return true;
+    const stAttr = el.getAttribute('style') || '';
+    if (/position\\s*:\\s*fixed/i.test(stAttr) && !isPassiveFullViewportBg(el)) return true;
+    if (styleFixedSet && styleFixedSet.has(el)) return true;
+    return false;
+  }
+
+  function stripBotFixedMenuNodes(container, extraStyleRoot = null) {
+    if (!container) return;
+    const bgRoot = extraStyleRoot || (typeof document !== 'undefined' ? document.getElementById('botBgHost') : null);
+    const styleFixedSet = extractFixedMenuSelectorsFromStyles(container, bgRoot === container ? null : bgRoot);
+    const affectedParents = new Set();
+    const recordAndRemove = (n) => {
+      if (!n) return;
+      if (n.parentElement) affectedParents.add(n.parentElement);
+      n.remove();
+    };
+    for (const ch of Array.from(container.children || [])) {
+      if (isSelfContainedFixedUiWrapper(ch, styleFixedSet)) recordAndRemove(ch);
+    }
+    container.querySelectorAll(BOT_FIXED_CLASS_SEL).forEach(recordAndRemove);
+    container.querySelectorAll('div[style], nav[style], aside[style], section[style], label[style], button[style], a[style]').forEach((n) => {
+      if (/position\\s*:\\s*fixed/i.test(n.getAttribute('style') || '') && !isPassiveFullViewportBg(n)) recordAndRemove(n);
+    });
+    for (const el of styleFixedSet) {
+      if (el && el.parentElement) recordAndRemove(el);
+    }
+    for (const parent of affectedParents) {
+      if (!parent || !parent.children) continue;
+      for (const ch of Array.from(parent.children)) {
+        const tag = (ch.tagName || '').toLowerCase();
+        const cls = typeof ch.className === 'string' ? ch.className : '';
+        if (tag === 'input' && (ch.type === 'checkbox' || ch.type === 'radio')) {
+          ch.remove();
+        } else if (/overlay/i.test(cls) || (/drawer|panel|modal/i.test(cls) && hasInteractiveDescendantOrSelf(ch))) {
+          ch.remove();
+        }
+      }
+    }
+  }
+
+  function containerHasBotFixedMenu(container, extraStyleRoot = null) {
+    if (!container) return false;
+    if (container.querySelector(BOT_FIXED_CLASS_SEL)) return true;
+    let hasFixed = false;
+    container.querySelectorAll('div[style], nav[style], aside[style], section[style], label[style], button[style], a[style]').forEach((n) => {
+      if (/position\\s*:\\s*fixed/i.test(n.getAttribute('style') || '') && !isPassiveFullViewportBg(n)) hasFixed = true;
+    });
+    if (hasFixed) return true;
+    const bgRoot = extraStyleRoot || (typeof document !== 'undefined' ? document.getElementById('botBgHost') : null);
+    const styleFixedSet = extractFixedMenuSelectorsFromStyles(container, bgRoot === container ? null : bgRoot);
+    if (styleFixedSet.size > 0) return true;
+    for (const ch of Array.from(container.children || [])) {
+      if (isBotFixedMenuElement(ch, styleFixedSet)) return true;
+    }
+    return false;
   }
 
   function syncBotBackground(bgHtml, assetMap) {
     const host = document.getElementById('botBgHost');
     if (!host) return;
     const raw = uiPref.richHtml ? String(bgHtml || '') : '';
-    const sig = raw ? (hashStr(raw) + ':' + Object.keys(assetMap || {}).length) : '';
+    const sig = raw ? (hashStr(raw) + ':' + hashStr(JSON.stringify(assetMap || {}))) : '';
     if (sig !== lastBgHtmlSig) {
       lastBgHtmlSig = sig;
       host.innerHTML = raw ? renderBotRichHtml(raw, assetMap) : '';
@@ -9109,6 +10584,7 @@ function renderWebApp() {
     }
     syncBotMenuVisibility();
     if (typeof renderRsMiniBar === 'function') renderRsMiniBar(false);
+    if (typeof renderChatFloatingControls === 'function') renderChatFloatingControls(false);
     if (tab === 'router') { loadRouterConfig(); if (typeof loadRequestLogs === 'function') loadRequestLogs(); }
     if (tab === 'home') {
       if (typeof renderHome === 'function') renderHome();
@@ -9118,7 +10594,11 @@ function renderWebApp() {
         api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'sync_all' }) }).catch(() => {});
       }
     }
-    if (tab === 'modules') { renderModules(); refreshUpdateStatus(); }
+    if (tab === 'modules') {
+      renderModules();
+      refreshUpdateStatus();
+      void loadRouterConfig().catch(() => {});
+    }
   }
   window.addEventListener('popstate', () => {
     if (currentTab === 'chat' && location.hash !== '#chat') {
@@ -9130,6 +10610,148 @@ function renderWebApp() {
   let activityRetryTimer = null;
   let lastActivitySig = '';
   let lastActivitySeq = -1;
+  let lastActivityPayload = { active: [], recent: [], generation: null };
+  let liveGenTicker = null;
+  let nativeGenStartedAt = 0;
+
+  function fmtStageShort(stage) {
+    if (stage === 'beforeRequest') return '전처리';
+    if (stage === 'afterRequest') return '후처리';
+    return String(stage || '');
+  }
+  function fmtElapsedSec(startedAt, endedAt) {
+    if (!startedAt) return '';
+    const ms = Math.max(0, (endedAt || Date.now()) - startedAt);
+    return (ms / 1000).toFixed(1) + 's';
+  }
+  function fmtLiveGenStats(g) {
+    if (!g) return { tokText: '', rateText: '', elapsedText: '' };
+    const elapsedMs = g.active ? Math.max(0, Date.now() - (g.startedAt || Date.now())) : Math.max(0, Number(g.elapsedMs || 0));
+    const tok = Number(g.outputTokens || 0);
+    const tokText = tok > 0 ? ((g.tokenEstimated ? '~' : '') + tok + ' tok') : (g.active ? '대기 중' : '');
+    let rate = Number(g.tokPerSec || 0);
+    if (g.active && tok > 0) {
+      const rateWin = g.firstTokenAt ? Math.max(200, Date.now() - g.firstTokenAt) : Math.max(250, elapsedMs);
+      rate = Math.round((tok / (rateWin / 1000)) * 10) / 10;
+    }
+    const rateText = rate > 0 ? (rate.toFixed(1) + ' tok/s') : '';
+    const elapsedText = (elapsedMs / 1000).toFixed(1) + 's';
+    return { tokText, rateText, elapsedText };
+  }
+  window.toggleHdrActPopover = function (forceState) {
+    const pop = document.getElementById('hdrActPopover');
+    if (!pop) return;
+    const open = forceState !== undefined ? Boolean(forceState) : !pop.classList.contains('open');
+    pop.classList.toggle('open', open);
+    if (open) renderHdrActPopover();
+  };
+  function renderHdrActPopover() {
+    const pop = document.getElementById('hdrActPopover');
+    if (!pop || !pop.classList.contains('open')) return;
+    const active = Array.isArray(lastActivityPayload.active) ? lastActivityPayload.active : [];
+    const recent = Array.isArray(lastActivityPayload.recent) ? lastActivityPayload.recent : [];
+    const gen = lastActivityPayload.generation;
+    const rows = [];
+    if (gen) {
+      const st = fmtLiveGenStats(gen);
+      const badgeTxt = gen.active ? '✨ 생성 중' : (gen.status === 'error' ? '⚠ 오류' : '✓ 완료');
+      const parts = [gen.provider, gen.model, st.tokText, st.rateText, st.elapsedText].filter(Boolean).join(' · ');
+      rows.push('<div class="hdr-act-pop-row"><div class="hdr-act-pop-head"><span>' + esc(badgeTxt) + '</span><span>' + esc(st.elapsedText) + '</span></div><div class="hdr-act-pop-sub">' + esc(parts) + '</div></div>');
+    }
+    for (const item of active) {
+      const stg = fmtStageShort(item.stage) + (item.total > 0 ? ' ' + item.step + '/' + item.total : '');
+      const elp = fmtElapsedSec(item.startedAt, 0);
+      rows.push('<div class="hdr-act-pop-row"><div class="hdr-act-pop-head"><span>' + esc((stg ? stg + ' · ' : '') + item.name) + '</span><span>' + esc(elp) + '</span></div>' + (item.phase ? '<div class="hdr-act-pop-sub">' + esc(item.phase) + '</div>' : '') + '</div>');
+    }
+    for (let i = recent.length - 1; i >= 0; i--) {
+      const r = recent[i];
+      const stg = fmtStageShort(r.stage);
+      rows.push('<div class="hdr-act-pop-row"><div class="hdr-act-pop-head"><span>✓ ' + esc((stg ? stg + ' 완료 · ' : '') + r.name) + '</span></div>' + (r.phase ? '<div class="hdr-act-pop-sub">' + esc(r.phase) + '</div>' : '') + '</div>');
+    }
+    pop.innerHTML = rows.length ? rows.join('') : '<div class="hdr-act-pop-sub">진행 중인 작업이 없습니다.</div>';
+  }
+  function renderLiveGenBar() {
+    const el = document.getElementById('liveGenBar');
+    if (!el) return;
+    const active = Array.isArray(lastActivityPayload.active) ? lastActivityPayload.active : [];
+    const gen = lastActivityPayload.generation;
+    const nativeBusy = Boolean(lastState && lastState.generating && !gen);
+    if (!active.length && !gen && !nativeBusy) {
+      el.innerHTML = '';
+      el.classList.remove('is-done', 'is-err');
+      return;
+    }
+    const rows = [];
+    let barStateCls = '';
+    if (active.length) {
+      const first = active[0];
+      const stg = fmtStageShort(first.stage) + (first.total > 0 ? ' ' + first.step + '/' + first.total : '');
+      const elp = fmtElapsedSec(first.startedAt, 0);
+      rows.push(
+        '<div class="lgb-row">'
+        + '<span class="lgb-badge"><span class="hdr-act-dot"></span><span>' + esc(stg || '실행 중') + '</span></span>'
+        + '<span class="lgb-name">' + esc(first.name) + '</span>'
+        + (first.phase ? '<span class="lgb-phase">' + esc(first.phase) + '</span>' : '')
+        + (elp ? '<span class="lgb-stat muted">' + esc(elp) + '</span>' : '')
+        + (active.length > 1 ? '<span class="lgb-stat muted">+' + (active.length - 1) + '</span>' : '')
+        + '</div>'
+      );
+    }
+    if (gen) {
+      const st = fmtLiveGenStats(gen);
+      const isDone = !gen.active && gen.status === 'done';
+      const isErr = !gen.active && gen.status === 'error';
+      if (!active.length) barStateCls = isDone ? 'is-done' : (isErr ? 'is-err' : '');
+      const badgeCls = isDone ? ' done' : (isErr ? ' err' : '');
+      const badgeTxt = gen.active ? '생성 중' : (isErr ? '오류' : '완료');
+      rows.push(
+        '<div class="lgb-row">'
+        + '<span class="lgb-badge' + badgeCls + '">' + (gen.active ? '<span class="hdr-act-dot"></span>' : (isErr ? '<span>⚠</span>' : '<span>✓</span>')) + '<span>' + badgeTxt + '</span></span>'
+        + (gen.provider ? '<span class="lgb-prov">' + esc(gen.provider) + '</span>' : '')
+        + (gen.model ? '<span class="lgb-model">' + esc(gen.model) + '</span>' : '')
+        + (st.tokText ? '<span class="lgb-stat">' + esc(st.tokText) + '</span>' : '')
+        + (st.rateText ? '<span class="lgb-stat">' + esc(st.rateText) + '</span>' : '')
+        + (st.elapsedText ? '<span class="lgb-stat muted">' + esc(st.elapsedText) + '</span>' : '')
+        + '</div>'
+      );
+    } else if (nativeBusy) {
+      if (!nativeGenStartedAt) nativeGenStartedAt = Date.now();
+      const elp = fmtElapsedSec(nativeGenStartedAt, 0);
+      rows.push(
+        '<div class="lgb-row">'
+        + '<span class="lgb-badge"><span class="hdr-act-dot"></span><span>생성 중</span></span>'
+        + '<span class="lgb-prov">PC RisuAI</span>'
+        + (elp ? '<span class="lgb-stat muted">' + esc(elp) + '</span>' : '')
+        + '</div>'
+      );
+    } else {
+      nativeGenStartedAt = 0;
+    }
+    el.classList.toggle('is-done', barStateCls === 'is-done');
+    el.classList.toggle('is-err', barStateCls === 'is-err');
+    el.innerHTML = rows.join('');
+    renderHdrActPopover();
+  }
+  function syncLiveGenTicker() {
+    const hasRunning = Boolean(
+      (lastActivityPayload.active && lastActivityPayload.active.length) ||
+      (lastActivityPayload.generation && lastActivityPayload.generation.active) ||
+      (lastState && (lastState.generating || lastState.directGenerating))
+    );
+    if (hasRunning && !liveGenTicker) {
+      liveGenTicker = setInterval(() => {
+        renderLiveGenBar();
+        if (lastActivityPayload.active && lastActivityPayload.active.length) {
+          const first = lastActivityPayload.active[0];
+          const metaEl = document.querySelector('#hdrActivityBar .hdr-act-meta');
+          if (metaEl && first && first.startedAt) metaEl.textContent = fmtElapsedSec(first.startedAt, 0);
+        }
+      }, 250);
+    } else if (!hasRunning && liveGenTicker) {
+      clearInterval(liveGenTicker);
+      liveGenTicker = null;
+    }
+  }
   function renderHdrActivity(actData) {
     const bar = document.getElementById('hdrActivityBar');
     if (!bar) return;
@@ -9139,46 +10761,72 @@ function renderWebApp() {
     }
     const active = Array.isArray(actData && actData.active) ? actData.active : [];
     const recent = Array.isArray(actData && actData.recent) ? actData.recent : [];
+    const gen = (actData && actData.generation && typeof actData.generation === 'object') ? actData.generation : null;
+    lastActivityPayload = { active, recent, generation: gen };
     const sig = JSON.stringify([
       active.map((x) => [x.kind, x.stage, x.step, x.total, x.name, x.phase]),
       recent.map((x) => [x.kind, x.stage, x.step, x.total, x.name, x.phase]),
+      gen ? [gen.id, gen.active, gen.status, gen.provider, gen.model, gen.outputTokens, gen.tokenEstimated, gen.tokPerSec] : null,
     ]);
+    renderLiveGenBar();
+    syncLiveGenTicker();
     if (sig === lastActivitySig) return;
     lastActivitySig = sig;
-    if (!active.length && !recent.length) {
+    if (!active.length && !recent.length && !gen) {
       bar.innerHTML = '';
       bar.removeAttribute('title');
+      const pop = document.getElementById('hdrActPopover');
+      if (pop) pop.classList.remove('open');
       return;
     }
-    const fmtActive = (item) => {
+    const fmtTooltip = (item) => {
       const stageTag = item.stage
-        ? ('[' + item.stage + (item.total > 0 ? ' ' + item.step + '/' + item.total : '') + '] ')
+        ? (fmtStageShort(item.stage) + (item.total > 0 ? ' ' + item.step + '/' + item.total : '') + ' · ')
         : '';
       return stageTag + item.name + (item.phase ? ' · ' + item.phase : '');
     };
-    const fmtRecent = (item) => {
-      const stageTag = item.stage ? (item.stage + ' 완료 · ') : '';
-      return stageTag + item.name;
-    };
     if (active.length) {
       const first = active[0];
-      const txt = fmtActive(first) + (active.length > 1 ? ' +' + (active.length - 1) : '');
-      bar.title = active.map(fmtActive).join('\\n');
-      bar.innerHTML = '<span class="hdr-act-pill"><span class="hdr-act-dot"></span><span>' + esc(txt) + '</span></span>';
+      const stg = fmtStageShort(first.stage) + (first.total > 0 ? ' ' + first.step + '/' + first.total : '');
+      const textPart = first.name + (first.phase ? ' · ' + first.phase : '');
+      const metaPart = fmtElapsedSec(first.startedAt, 0) + (active.length > 1 ? ' +' + (active.length - 1) : '');
+      bar.title = active.map(fmtTooltip).join('\\n');
+      bar.innerHTML = '<span class="hdr-act-pill"><span class="hdr-act-dot"></span>'
+        + (stg ? '<span class="hdr-act-stage">' + esc(stg) + '</span>' : '')
+        + '<span class="hdr-act-text">' + esc(textPart) + '</span>'
+        + (metaPart ? '<span class="hdr-act-meta">' + esc(metaPart) + '</span>' : '')
+        + '</span>';
+    } else if (gen) {
+      const st = fmtLiveGenStats(gen);
+      const isRecent = !gen.active;
+      const stg = gen.active ? '생성' : (gen.status === 'error' ? '오류' : '완료');
+      const textPart = [gen.provider, gen.model].filter(Boolean).join(' · ') || 'LLM';
+      const metaPart = [st.tokText, st.rateText].filter(Boolean).join(' · ');
+      bar.title = [stg, textPart, st.tokText, st.rateText, st.elapsedText].filter(Boolean).join(' · ');
+      bar.innerHTML = '<span class="hdr-act-pill' + (isRecent ? ' recent' : '') + '">'
+        + (gen.active ? '<span class="hdr-act-dot"></span>' : '<span>✓</span>')
+        + '<span class="hdr-act-stage">' + esc(stg) + '</span>'
+        + '<span class="hdr-act-text">' + esc(textPart) + '</span>'
+        + (metaPart ? '<span class="hdr-act-meta">' + esc(metaPart) + '</span>' : '')
+        + '</span>';
     } else {
       const latest = recent[recent.length - 1];
-      const txt = fmtRecent(latest);
-      bar.title = recent.map(fmtRecent).join('\\n');
-      bar.innerHTML = '<span class="hdr-act-pill recent"><span>✓</span><span>' + esc(txt) + '</span></span>';
+      const stg = latest.stage ? (fmtStageShort(latest.stage) + ' 완료') : '완료';
+      bar.title = recent.map(fmtTooltip).join('\\n');
+      bar.innerHTML = '<span class="hdr-act-pill recent"><span>✓</span><span class="hdr-act-stage">' + esc(stg) + '</span><span class="hdr-act-text">' + esc(latest.name) + '</span></span>';
     }
   }
   function disconnectActivityStream() {
     if (activityRetryTimer) { clearTimeout(activityRetryTimer); activityRetryTimer = null; }
     if (activityAbortCtrl) { try { activityAbortCtrl.abort(); } catch (_) {} activityAbortCtrl = null; }
+    if (liveGenTicker) { clearInterval(liveGenTicker); liveGenTicker = null; }
     lastActivitySig = '';
     lastActivitySeq = -1;
+    lastActivityPayload = { active: [], recent: [], generation: null };
     const bar = document.getElementById('hdrActivityBar');
     if (bar) { bar.innerHTML = ''; bar.removeAttribute('title'); }
+    const lgb = document.getElementById('liveGenBar');
+    if (lgb) { lgb.innerHTML = ''; lgb.classList.remove('is-done', 'is-err'); }
   }
   async function connectActivityStream() {
     disconnectActivityStream();
@@ -9330,7 +10978,7 @@ function renderWebApp() {
     const snap = (st && st.snapshot) || {};
     const msgs = snap.messages || [];
     const msgDigest = hashStr(msgs.map((m) => m.index + ':' + (m.text || '') + ':' + (m.html || '') + ':' + (m.pluginFooterHtml || '') + ':' + (m.swipeCount || 1) + ':' + (m.swipeIndex || 0) + ':' + (m.images ? m.images.length : 0)).join('\\x01'));
-    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, snap.fmIndex, snap.firstMessageCount, snap.greetingControls || [], snap.backgroundHtml || '', hashStr(snap.botWidgetHtml || ''), Object.keys(snap.assetMap || {}).length, msgs.length, msgDigest, uiPref.theme, uiPref.assetMode, uiPref.richHtml]);
+    const sig = JSON.stringify([snap.charIndex, snap.chatIndex, snap.fmIndex, snap.firstMessageCount, snap.greetingControls || [], snap.backgroundHtml || '', hashStr(snap.botWidgetHtml || ''), hashStr(JSON.stringify(snap.assetMap || {})), msgs.length, msgDigest, uiPref.theme, uiPref.assetMode, uiPref.richHtml]);
     if (sig !== lastChatRenderSig) {
       lastChatRenderSig = sig;
       try { renderChat(); }
@@ -9338,17 +10986,47 @@ function renderWebApp() {
     }
   }
 
+  let lastPluginSurfaceStyleSig = '';
+  function syncPluginSurfaceStyles(styles) {
+    const host = document.getElementById('pluginSurfaceStyleHost');
+    if (!host) return;
+    const list = Array.isArray(styles) ? styles.filter((s) => typeof s === 'string' && s.trim()) : [];
+    const sig = list.length ? hashStr(list.join('\\n/*sep*/\\n')) : '';
+    if (sig === lastPluginSurfaceStyleSig) return;
+    lastPluginSurfaceStyleSig = sig;
+    if (!list.length) { host.innerHTML = ''; return; }
+    const scopeSel = ':is(#tab-chat, #bookBotOverlay) .rs-bot-html';
+    host.innerHTML = list.map((s) => '<style>' + scopeBotCss(sanitizeBotCss(s), scopeSel) + '</style>').join('');
+  }
+
   function applyState(st) {
     lastState = st;
     if (st.runtimeActivity) renderHdrActivity(st.runtimeActivity);
     if (st.pluginFloatingUi) {
-      latestPluginFloatingUi = st.pluginFloatingUi;
+      const nextFloating = st.pluginFloatingUi;
+      const modalOpenNow = typeof isPluginFloatingModalOpen === 'function' && isPluginFloatingModalOpen();
+      const prevWidgets = (latestPluginFloatingUi && Array.isArray(latestPluginFloatingUi.rootWidgets)) ? latestPluginFloatingUi.rootWidgets : [];
+      const nextWidgets = Array.isArray(nextFloating.rootWidgets) ? nextFloating.rootWidgets : [];
+      const nextBtns = Array.isArray(nextFloating.buttons) ? nextFloating.buttons : [];
+      if ((modalOpenNow || uiPref.floatingOnChat) && !nextWidgets.length && prevWidgets.length && nextBtns.length) {
+        latestPluginFloatingUi = { ...nextFloating, rootWidgets: prevWidgets, rev: (latestPluginFloatingUi && latestPluginFloatingUi.rev) || nextFloating.rev };
+      } else {
+        latestPluginFloatingUi = nextFloating;
+      }
       if (typeof renderRsMiniBar === 'function') renderRsMiniBar(false);
-      if (typeof isPluginFloatingModalOpen === 'function' && isPluginFloatingModalOpen()) {
+      if (modalOpenNow) {
         renderPluginFloatingModal(false);
       }
+      if (typeof renderChatFloatingControls === 'function') renderChatFloatingControls(false);
     }
     const snap = st.snapshot || {};
+    if (pendingTargetSwitch) {
+      const matchedTarget = snap && Number(snap.charIndex) === pendingTargetSwitch.charIndex && Number(snap.chatIndex) === pendingTargetSwitch.chatIndex;
+      if (matchedTarget || (Date.now() - pendingTargetSwitch.at > 10000)) {
+        clearPendingTargetSwitch();
+      }
+    }
+    syncPluginSurfaceStyles(snap.pluginSurfaceStyles || []);
     syncLeaveHudVisibility(snap);
     document.getElementById('pcDot').className = 'dot' + (st.pcConnected ? ' on' : '');
     const hdrAvEl = document.getElementById('hdrAvatar');
@@ -9379,7 +11057,20 @@ function renderWebApp() {
       localRequestPending = false;
       if (localRequestTimer) { clearTimeout(localRequestTimer); localRequestTimer = null; }
     }
-    const genTag = isBusy ? ' · ✨ 생성 중...' : '';
+    if ('liveGeneration' in st && !activityAbortCtrl) {
+      lastActivityPayload.generation = st.liveGeneration || null;
+    }
+    if (st.runtimeActivity && (!activityAbortCtrl || !lastActivityPayload.active.length)) {
+      renderHdrActivity(st.runtimeActivity);
+    } else {
+      renderLiveGenBar();
+      syncLiveGenTicker();
+    }
+    const hasRichLiveIndicator = Boolean(
+      (lastActivityPayload.active && lastActivityPayload.active.length) ||
+      lastActivityPayload.generation
+    );
+    const genTag = (isBusy && !hasRichLiveIndicator) ? ' · ✨ 생성 중...' : '';
     document.getElementById('hdrSub').textContent = (uiPref.assetMode === 'hide' ? '대화' : (snap.chatName || '채팅방')) + ' · ' + modeTag + genTag;
     document.querySelector('.tab-btn[data-tab="modules"]').classList.toggle('has-update', Boolean(st.updateAvailable));
     if (st.pluginVersion) document.getElementById('updPlugin').textContent = 'v' + st.pluginVersion;
@@ -9433,6 +11124,24 @@ function renderWebApp() {
       renderBots();
     }
     if (currentTab === 'modules') renderModules();
+    if (pluginGuiState && pluginGuiState.open) {
+      const guiNotifyKey = String(st.snapshotVersion ?? 0) + ':' + (isBusy ? '1' : '0');
+      if (guiNotifyKey !== pluginGuiState.lastNotifyKey) {
+        pluginGuiState.lastNotifyKey = guiNotifyKey;
+        const guiFrame = document.getElementById('pluginGuiFrame');
+        if (guiFrame && guiFrame.contentWindow) {
+          guiFrame.contentWindow.postMessage({
+            __rsGuiChatChanged: 1,
+            payload: {
+              charIndex: snap.charIndex,
+              chatIndex: snap.chatIndex,
+              snapshotVersion: st.snapshotVersion ?? 0,
+              generating: isBusy,
+            },
+          }, '*');
+        }
+      }
+    }
   }
 
   function renderFirstMessageSwipeHtml(snap) {
@@ -9517,7 +11226,11 @@ function renderWebApp() {
       ? (ttsPlayerState.loading ? ' is-loading' : (ttsPlayerState.playing ? ' is-playing' : ''))
       : '';
     const svg = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon><path d="M15.54 8.46a5 5 0 0 1 0 7.07"></path><path d="M19.07 4.93a10 10 0 0 1 0 14.14"></path></svg>';
-    return '<button type="button" class="turn-tts-btn' + cls + '" data-tts-msg="' + m.index + '" data-tts-key="' + esc(key) + '" title="이 메시지 음성 재생 (TTS)" aria-label="이 메시지 음성 재생">' + svg + '</button>';
+    const scriptSvg = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="8" y1="13" x2="16" y2="13"></line><line x1="8" y1="17" x2="13" y2="17"></line></svg>';
+    return '<span class="turn-tts-grp">' +
+      '<button type="button" class="turn-tts-btn' + cls + '" data-tts-msg="' + m.index + '" data-tts-key="' + esc(key) + '" title="이 메시지 음성 재생 (TTS)" aria-label="이 메시지 음성 재생">' + svg + '</button>' +
+      '<button type="button" class="turn-tts-btn turn-tts-script-btn" data-tts-script-msg="' + m.index + '" data-tts-script-key="' + esc(key) + '" title="TTS 대본 검토 · 수동 편집" aria-label="TTS 대본 검토 및 수동 편집">' + scriptSvg + '</button>' +
+    '</span>';
   }
 
   function renderMsgActionBarHtml(m, snap, key, showTr, isLatestChar, isBook) {
@@ -9683,6 +11396,242 @@ function renderWebApp() {
     }
   }
 
+  const botAssetRatioCache = new Map();
+  const botAssetRatioWaiters = new Map();
+
+  function extractCssBgImageUrl(bgVal) {
+    const s = String(bgVal || '');
+    if (!s || s === 'none') return '';
+    const m = s.match(/url\\(\\s*(?:"([^"]+)"|'([^']+)'|([^)"'\\s]+))\\s*\\)/i);
+    if (!m) return '';
+    const u = (m[1] || m[2] || m[3] || '').trim();
+    if (!u || /^data:image\\/svg\\+xml/i.test(u)) return '';
+    return u;
+  }
+
+  function ensureBotAssetRatio(url, onReady = null) {
+    if (!url) return;
+    if (botAssetRatioCache.has(url)) {
+      const cached = botAssetRatioCache.get(url);
+      if (cached && typeof onReady === 'function') onReady(cached);
+      else if (!cached && typeof onReady === 'function') {
+        const list = botAssetRatioWaiters.get(url) || [];
+        list.push(onReady);
+        botAssetRatioWaiters.set(url, list);
+      }
+      return;
+    }
+    botAssetRatioCache.set(url, null);
+    if (typeof onReady === 'function') {
+      botAssetRatioWaiters.set(url, [onReady]);
+    }
+    try {
+      const probe = new Image();
+      probe.onload = () => {
+        if (probe.naturalWidth > 0 && probe.naturalHeight > 0) {
+          const ratio = { w: probe.naturalWidth, h: probe.naturalHeight };
+          botAssetRatioCache.set(url, ratio);
+          const waiters = botAssetRatioWaiters.get(url) || [];
+          botAssetRatioWaiters.delete(url);
+          for (const cb of waiters) {
+            try { cb(ratio); } catch (_) {}
+          }
+        }
+      };
+      probe.src = url;
+    } catch (_) {}
+  }
+
+  function applyCompactBotAssetFit(rootEl) {
+    if (!rootEl || typeof rootEl.querySelectorAll !== 'function') return;
+    if (uiPref.assetFit === 'original') {
+      rootEl.querySelectorAll('[data-rs-asset-fit-box], [data-rs-asset-fit-img], [data-rs-asset-fit-bg]').forEach((el) => {
+        el.removeAttribute('data-rs-asset-fit-box');
+        el.removeAttribute('data-rs-asset-fit-img');
+        el.removeAttribute('data-rs-asset-fit-bg');
+        if (el.style && el.style.removeProperty) el.style.removeProperty('--rs-fit-ar');
+      });
+      return;
+    }
+    const ignoreSel = 'button, a, summary, input, select, textarea, label, [risu-trigger], [risu-btn], [data-am-proxy], .am-image, .x-risu-am-image, .am-generated-image, .x-risu-am-generated-image, .am-illustration-projection, .x-risu-am-illustration-projection, .rs-am-footer-host, .rs-plugin-bubble-bar, .msg-actions, .leave-hud-card, .leave-thought-box, .hy-scene, .hy-ui, .hy-sb';
+    const interactiveSel = 'button, input, select, textarea, [risu-trigger], [risu-btn]';
+
+    const evaluateImg = (imgEl) => {
+      if (!imgEl || !imgEl.isConnected || imgEl.closest(ignoreSel)) return;
+      const botRoot = imgEl.closest('.rs-bot-html');
+      if (!botRoot) return;
+      const imgRect = imgEl.getBoundingClientRect();
+      let clipBox = null;
+      let clipRect = imgRect;
+      let anc = imgEl.parentElement;
+      for (let hops = 0; hops < 3 && anc && anc !== botRoot; hops += 1) {
+        if (anc.matches && anc.matches(ignoreSel)) break;
+        const ancImgs = anc.querySelectorAll ? anc.querySelectorAll('img') : [];
+        if (ancImgs.length !== 1 || (anc.textContent || '').trim().length > 48) break;
+        if (anc.querySelector && anc.querySelector(interactiveSel)) break;
+        let acs = null;
+        try { acs = getComputedStyle(anc); } catch (_) {}
+        if (acs && (acs.overflow === 'hidden' || acs.overflowY === 'hidden' || acs.overflow === 'clip' || acs.overflowY === 'clip')) {
+          const ar = anc.getBoundingClientRect();
+          if (ar.height > 0 && (ar.height < imgRect.height - 6 || (ar.width >= 120 && ar.height <= ar.width * 0.72))) {
+            clipBox = anc;
+            clipRect = ar;
+          }
+        }
+        anc = anc.parentElement;
+      }
+      let cs = null;
+      try { cs = getComputedStyle(imgEl); } catch (_) {}
+      const natW = imgEl.naturalWidth || 0;
+      const natH = imgEl.naturalHeight || 0;
+      const renW = imgRect.width || 0;
+      const renH = imgRect.height || 0;
+      let isCropped = Boolean(clipBox);
+      if (!isCropped && cs && cs.objectFit === 'cover' && Math.max(renW, renH) >= 88) isCropped = true;
+      if (!isCropped && cs && (parseFloat(cs.marginTop) < -8 || parseFloat(cs.top) < -8) && Math.max(renW, renH) >= 88) isCropped = true;
+      if (!isCropped && natW > 0 && natH > 0 && renW >= 88 && renH >= 44) {
+        const natRatio = natW / natH;
+        const renRatio = renW / renH;
+        if ((renRatio / natRatio) >= 1.22 || (natRatio / renRatio) >= 1.35) {
+          isCropped = true;
+        }
+      }
+      if (!isCropped) return;
+      const checkRect = clipBox ? clipRect : imgRect;
+      if (Math.max(checkRect.width, checkRect.height) < 88) return;
+      if (imgEl.complete && Math.min(checkRect.width, checkRect.height) < 40 && !clipBox) return;
+      imgEl.setAttribute('data-rs-asset-fit-img', '1');
+      if (clipBox) clipBox.setAttribute('data-rs-asset-fit-box', '1');
+    };
+
+    rootEl.querySelectorAll('.rs-bot-html img').forEach((img) => {
+      if (img.closest(ignoreSel)) return;
+      evaluateImg(img);
+      if (!img.complete) {
+        img.addEventListener('load', () => {
+          evaluateImg(img);
+          if (isBookMode() && typeof layoutBookSpreads === 'function') layoutBookSpreads(false);
+        }, { once: true });
+      }
+    });
+
+    rootEl.querySelectorAll('.rs-bot-html .image-container, .rs-bot-html [data-rs-bg-img="1"], .rs-bot-html div[style*="background"], .rs-bot-html span[style*="background"]').forEach((el) => {
+      if (el.closest(ignoreSel)) return;
+      if (el.querySelector && (el.querySelector('img') || el.querySelector(interactiveSel))) return;
+      if ((el.textContent || '').trim().length > 48) return;
+      let cs = null;
+      try { cs = getComputedStyle(el); } catch (_) {}
+      const bgUrl = extractCssBgImageUrl(cs && cs.backgroundImage);
+      if (!bgUrl) return;
+      const r = el.getBoundingClientRect();
+      if (r.width < 88 || r.height < 44) return;
+      if ((cs && cs.backgroundSize === 'cover') || el.classList.contains('image-container') || el.getAttribute('data-rs-bg-img') === '1') {
+        el.setAttribute('data-rs-asset-fit-bg', '1');
+        ensureBotAssetRatio(bgUrl, (ratio) => {
+          if (ratio && ratio.w > 0 && ratio.h > 0 && el.isConnected && uiPref.assetFit !== 'original') {
+            el.style.setProperty('--rs-fit-ar', ratio.w + ' / ' + ratio.h);
+            if (isBookMode() && typeof layoutBookSpreads === 'function') layoutBookSpreads(false);
+          }
+        });
+      }
+    });
+  }
+
+  function findExpandableBotAsset(target, rootEl) {
+    if (!target || target.nodeType !== 1) return null;
+    const botRoot = target.closest('.rs-bot-html');
+    if (!botRoot || (rootEl && !rootEl.contains(botRoot))) return null;
+    const ignoreSel = 'button, a, summary, input, select, textarea, label, [risu-trigger], [risu-btn], [data-am-proxy], .am-image, .x-risu-am-image, .am-generated-image, .x-risu-am-generated-image, .am-illustration-projection, .x-risu-am-illustration-projection, .rs-am-footer-host, .rs-plugin-bubble-bar, .msg-actions, .leave-hud-card, .leave-thought-box';
+    if (target.closest(ignoreSel)) return null;
+
+    let img = target.tagName === 'IMG' ? target : null;
+    if (!img && target.querySelectorAll) {
+      const childImgs = target.querySelectorAll('img');
+      if (childImgs.length === 1 && (target.textContent || '').trim().length <= 48) {
+        img = childImgs[0];
+      }
+    }
+    if (img && botRoot.contains(img) && !img.closest(ignoreSel)) {
+      const imgSrc = img.currentSrc || img.src || '';
+      if (imgSrc) {
+        const imgRect = img.getBoundingClientRect();
+        let boxEl = img;
+        let boxRect = imgRect;
+        let anc = img.parentElement;
+        for (let hops = 0; hops < 2 && anc && anc !== botRoot; hops += 1) {
+          if (anc.matches && anc.matches(ignoreSel)) break;
+          const acs = getComputedStyle(anc);
+          if (acs && (acs.overflow === 'hidden' || acs.overflowY === 'hidden' || acs.overflow === 'clip' || acs.overflowY === 'clip')) {
+            const ar = anc.getBoundingClientRect();
+            if (ar.height > 0 && ar.height < imgRect.height - 6) {
+              boxEl = anc;
+              boxRect = ar;
+            }
+          }
+          anc = anc.parentElement;
+        }
+        if (boxRect.width >= 88 && boxRect.height >= 44) {
+          const natW = img.naturalWidth || 0;
+          const natH = img.naturalHeight || 0;
+          let isCropped = boxEl !== img;
+          if (!isCropped && natW > 0 && natH > 0) {
+            const natRatio = natW / natH;
+            const renRatio = boxRect.width / boxRect.height;
+            if ((renRatio / natRatio) >= 1.22 || (natRatio / renRatio) >= 1.35) {
+              isCropped = true;
+            }
+          }
+          const fitActive = uiPref.assetFit !== 'original' && (
+            img.getAttribute('data-rs-asset-fit-img') === '1' ||
+            boxEl.getAttribute('data-rs-asset-fit-box') === '1'
+          );
+          return {
+            el: boxEl,
+            imgEl: img,
+            imgSrc,
+            bgCss: 'url("' + imgSrc.replace(/"/g, '\\\\"') + '")',
+            natW,
+            natH,
+            isCropped: fitActive ? false : isCropped,
+          };
+        }
+      }
+    }
+
+    let cur = target;
+    for (let hops = 0; hops < 6 && cur && cur !== botRoot; hops += 1) {
+      if (cur.nodeType === 1) {
+        if (cur.matches && cur.matches(ignoreSel)) break;
+        const cs = getComputedStyle(cur);
+        const url = extractCssBgImageUrl(cs && cs.backgroundImage);
+        if (url) {
+          const rect = cur.getBoundingClientRect();
+          if (
+            rect.width >= 88 &&
+            rect.height >= 44 &&
+            (cur.textContent || '').trim().length <= 48 &&
+            !(cur.querySelector && cur.querySelector('button, input, select, textarea, [risu-trigger], [risu-btn]'))
+          ) {
+            ensureBotAssetRatio(url);
+            const cached = botAssetRatioCache.get(url);
+            const bgFitActive = uiPref.assetFit !== 'original' && cur.getAttribute('data-rs-asset-fit-bg') === '1';
+            return {
+              el: cur,
+              imgEl: null,
+              imgSrc: url,
+              bgCss: cs.backgroundImage,
+              natW: cached ? cached.w : 0,
+              natH: cached ? cached.h : 0,
+              isCropped: bgFitActive ? false : true,
+            };
+          }
+        }
+      }
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+
   const bookImgPreviewState = { el: null, pinned: false, closeTimer: null };
 
   function closeBookImgPreview(immediate = false) {
@@ -9714,13 +11663,25 @@ function renderWebApp() {
     }, 360);
   }
 
-  function openBookImgPreview(el, pinned = false) {
-    if (!el) return;
-    if (document.body.classList.contains('asset-blur') && !el.classList.contains('revealed')) return;
+  function openBookImgPreview(elOrInfo, pinned = false) {
+    let info = (elOrInfo && elOrInfo.el) ? elOrInfo : null;
+    if (!info && elOrInfo && elOrInfo.nodeType === 1) {
+      info = findExpandableBotAsset(elOrInfo);
+      if (!info) {
+        const rawBg = getComputedStyle(elOrInfo).backgroundImage;
+        const rawUrl = extractCssBgImageUrl(rawBg);
+        if (rawBg && rawBg !== 'none') {
+          info = { el: elOrInfo, imgEl: null, imgSrc: rawUrl, bgCss: rawBg, natW: 0, natH: 0, isCropped: true };
+        }
+      }
+    }
+    if (!info || !info.el) return;
+    const el = info.el;
+    if (document.body.classList.contains('asset-blur') && !el.classList.contains('revealed') && !(info.imgEl && info.imgEl.classList.contains('revealed'))) return;
     const frame = document.getElementById('bookFrame');
     const preview = document.getElementById('bookImgPreview');
     if (!frame || !preview) return;
-    const bg = getComputedStyle(el).backgroundImage;
+    const bg = info.bgCss || getComputedStyle(el).backgroundImage;
     if (!bg || bg === 'none') return;
     if (bookImgPreviewState.closeTimer) {
       clearTimeout(bookImgPreviewState.closeTimer);
@@ -9737,7 +11698,11 @@ function renderWebApp() {
     const width = r.width;
     const startTop = r.top - fr.top;
     const startH = r.height;
-    const targetH = Math.min(fr.height - 24, Math.max(startH * 1.85, width * 1.65));
+    const natW = info.natW || 0;
+    const natH = info.natH || 0;
+    const targetH = (natW > 0 && natH > 0)
+      ? Math.min(fr.height - 24, Math.max(startH * 1.45, width * (natH / natW)))
+      : Math.min(fr.height - 24, Math.max(startH * 1.85, width * 1.55));
     const endTop = (startTop + targetH > fr.height - 12) ? Math.max(12, fr.height - 12 - targetH) : startTop;
 
     bookImgPreviewState.el = el;
@@ -9746,6 +11711,8 @@ function renderWebApp() {
     const savedTrans = preview.style.transition;
     preview.style.transition = 'none';
     preview.style.backgroundImage = bg;
+    preview.style.backgroundSize = (natW > 0 && natH > 0 && natW > natH * 1.15) ? 'contain' : 'cover';
+    preview.style.backgroundColor = 'var(--book-bg)';
     preview.style.left = left + 'px';
     preview.style.width = width + 'px';
     preview.style.top = startTop + 'px';
@@ -9758,6 +11725,166 @@ function renderWebApp() {
     preview.style.height = targetH + 'px';
     preview.style.backgroundPosition = 'center 5%';
     preview.style.pointerEvents = 'auto';
+  }
+
+  const scrollImgPreviewState = { el: null, info: null, hoverTimer: null, closeTimer: null };
+
+  function closeScrollImgPreview(immediate = false) {
+    if (scrollImgPreviewState.hoverTimer) {
+      clearTimeout(scrollImgPreviewState.hoverTimer);
+      scrollImgPreviewState.hoverTimer = null;
+    }
+    if (scrollImgPreviewState.closeTimer) {
+      clearTimeout(scrollImgPreviewState.closeTimer);
+      scrollImgPreviewState.closeTimer = null;
+    }
+    const preview = document.getElementById('scrollImgPreview');
+    const srcEl = scrollImgPreviewState.el;
+    scrollImgPreviewState.el = null;
+    scrollImgPreviewState.info = null;
+    if (!preview) return;
+    preview.style.pointerEvents = 'none';
+    if (immediate || !srcEl || !srcEl.isConnected) {
+      preview.style.display = 'none';
+      return;
+    }
+    const r = srcEl.getBoundingClientRect();
+    preview.style.left = r.left + 'px';
+    preview.style.width = r.width + 'px';
+    preview.style.top = r.top + 'px';
+    preview.style.height = r.height + 'px';
+    preview.style.backgroundPosition = 'center 10%';
+    scrollImgPreviewState.closeTimer = setTimeout(() => {
+      scrollImgPreviewState.closeTimer = null;
+      preview.style.display = 'none';
+    }, 280);
+  }
+
+  function openScrollImgPreview(info) {
+    if (!info || !info.el) return;
+    const el = info.el;
+    if (document.body.classList.contains('asset-blur') && !el.classList.contains('revealed') && !(info.imgEl && info.imgEl.classList.contains('revealed'))) return;
+    const preview = document.getElementById('scrollImgPreview');
+    if (!preview) return;
+    const bg = info.bgCss || getComputedStyle(el).backgroundImage;
+    if (!bg || bg === 'none') return;
+    if (scrollImgPreviewState.closeTimer) {
+      clearTimeout(scrollImgPreviewState.closeTimer);
+      scrollImgPreviewState.closeTimer = null;
+    }
+    const r = el.getBoundingClientRect();
+    const vh = window.innerHeight || 0;
+    if (!vh || !r.width || !r.height) return;
+    const natW = info.natW || 0;
+    const natH = info.natH || 0;
+    const targetH = (natW > 0 && natH > 0)
+      ? Math.min(vh - 28, Math.max(r.height * 1.45, r.width * (natH / natW)))
+      : Math.min(vh - 28, Math.max(r.height * 1.85, r.width * 1.55));
+    if (targetH <= r.height + 12) return;
+    const endTop = Math.max(14, (r.top + targetH > vh - 14) ? (vh - 14 - targetH) : r.top);
+
+    scrollImgPreviewState.el = el;
+    scrollImgPreviewState.info = info;
+    const savedTrans = preview.style.transition;
+    preview.style.transition = 'none';
+    preview.style.backgroundImage = bg;
+    preview.style.backgroundSize = (natW > 0 && natH > 0 && natW > natH * 1.15) ? 'contain' : 'cover';
+    preview.style.backgroundColor = 'var(--surface)';
+    preview.style.left = r.left + 'px';
+    preview.style.width = r.width + 'px';
+    preview.style.top = r.top + 'px';
+    preview.style.height = r.height + 'px';
+    preview.style.backgroundPosition = 'center 10%';
+    preview.style.display = 'block';
+    void preview.offsetWidth;
+    preview.style.transition = savedTrans || '';
+    preview.style.top = endTop + 'px';
+    preview.style.height = targetH + 'px';
+    preview.style.backgroundPosition = 'center 5%';
+    preview.style.pointerEvents = 'auto';
+  }
+
+  function scheduleScrollImgPreview(info) {
+    if (!info || !info.el || !info.isCropped) return;
+    if (scrollImgPreviewState.hoverTimer) {
+      clearTimeout(scrollImgPreviewState.hoverTimer);
+      scrollImgPreviewState.hoverTimer = null;
+    }
+    const targetEl = info.el;
+    const h0 = targetEl.getBoundingClientRect().height;
+    scrollImgPreviewState.hoverTimer = setTimeout(() => {
+      scrollImgPreviewState.hoverTimer = null;
+      if (!targetEl.isConnected || isBookMode()) return;
+      if (!targetEl.matches(':hover')) return;
+      if (targetEl.getBoundingClientRect().height > h0 + 4) return;
+      openScrollImgPreview(info);
+    }, 140);
+  }
+
+  let chatImgLightboxState = { items: [], index: 0 };
+
+  function sanitizeLightboxSrc(u) {
+    return safeImgSrc(u) || (/^https?:\\/\\//i.test(String(u || '')) ? String(u) : '');
+  }
+
+  function renderChatImgLightbox() {
+    const lb = document.getElementById('chatImgLightbox');
+    if (!lb) return;
+    const items = chatImgLightboxState.items || [];
+    if (!items.length) {
+      lb.style.display = 'none';
+      lb.innerHTML = '';
+      return;
+    }
+    const idx = Math.max(0, Math.min(items.length - 1, Number(chatImgLightboxState.index) || 0));
+    chatImgLightboxState.index = idx;
+    const currentSrc = items[idx];
+    const navHtml = items.length > 1
+      ? '<button type="button" class="chat-img-lightbox-nav prev" data-lb-nav="-1" aria-label="이전 삽화" title="이전 (←)">‹</button>' +
+        '<button type="button" class="chat-img-lightbox-nav next" data-lb-nav="1" aria-label="다음 삽화" title="다음 (→)">›</button>' +
+        '<div class="chat-img-lightbox-counter">' + (idx + 1) + ' / ' + items.length + '</div>'
+      : '';
+    lb.innerHTML =
+      '<button type="button" class="chat-img-lightbox-close" data-lb-close="1" aria-label="닫기" title="닫기 (Esc)">✕</button>' +
+      navHtml +
+      '<img src="' + esc(currentSrc) + '" alt="" />';
+    lb.style.display = 'flex';
+  }
+
+  function stepChatImgLightbox(delta) {
+    const items = chatImgLightboxState.items || [];
+    if (items.length <= 1) return;
+    const lb = document.getElementById('chatImgLightbox');
+    if (!lb || lb.style.display === 'none') return;
+    const len = items.length;
+    chatImgLightboxState.index = ((chatImgLightboxState.index + delta) % len + len) % len;
+    renderChatImgLightbox();
+  }
+
+  function closeChatImgLightbox() {
+    chatImgLightboxState = { items: [], index: 0 };
+    const lb = document.getElementById('chatImgLightbox');
+    if (!lb) return;
+    lb.style.display = 'none';
+    lb.innerHTML = '';
+  }
+
+  function openChatImgLightbox(src, opts) {
+    const safe = sanitizeLightboxSrc(src);
+    const rawItems = (opts && Array.isArray(opts.items)) ? opts.items : [];
+    const items = rawItems.map(sanitizeLightboxSrc).filter(Boolean);
+    if (!items.length && !safe) return;
+    const nextItems = items.length ? items : [safe];
+    let nextIdx = 0;
+    if (items.length && opts && typeof opts.index === 'number' && Number.isFinite(opts.index)) {
+      nextIdx = Math.max(0, Math.min(items.length - 1, Math.floor(opts.index)));
+    } else if (safe && items.length) {
+      const foundIdx = items.indexOf(safe);
+      nextIdx = foundIdx >= 0 ? foundIdx : 0;
+    }
+    closeScrollImgPreview(true);
+    chatImgLightboxState = { items: nextItems, index: nextIdx };
+    renderChatImgLightbox();
   }
 
   function getBookSpreadScrollLeft(spreadIdx) {
@@ -9844,7 +11971,7 @@ function renderWebApp() {
     const vpRect = vp.getBoundingClientRect();
     const measured = [];
     let maxMeasuredCol = 0;
-    cols.querySelectorAll('.book-char-block, .book-user-block').forEach((el) => {
+    cols.querySelectorAll('.book-char-block, .book-user-block, .rs-chat-end-float').forEach((el) => {
       const rects = el.getClientRects ? el.getClientRects() : [el.getBoundingClientRect()];
       for (let i = 0; i < rects.length; i++) {
         const r = rects[i];
@@ -9971,8 +12098,9 @@ function renderWebApp() {
     const overlay = document.getElementById('bookBotOverlay');
     if (!overlay || !rootEl) return;
 
+    const bgHostEl = document.getElementById('botBgHost');
     const snap = (lastState && lastState.snapshot) || null;
-    const matchedContainers = Array.from(rootEl.querySelectorAll('.rs-bot-html')).filter(containerHasBotFixedMenu);
+    const matchedContainers = Array.from(rootEl.querySelectorAll('.rs-bot-html')).filter((c) => containerHasBotFixedMenu(c, bgHostEl));
     const hasInlineFixed = matchedContainers.length > 0;
     const nextOverlaySig = JSON.stringify([
       snap ? snap.charIndex : -1,
@@ -9980,6 +12108,7 @@ function renderWebApp() {
       Boolean(uiPref.richHtml),
       snap && snap.botWidgetHtml ? hashStr(snap.botWidgetHtml) : '',
       snap && snap.backgroundHtml ? hashStr(snap.backgroundHtml) : '',
+      snap && snap.assetMap ? hashStr(JSON.stringify(snap.assetMap)) : '',
       hasInlineFixed ? lastChatRenderSig : '',
     ]);
 
@@ -9989,36 +12118,101 @@ function renderWebApp() {
       overlay.innerHTML = '';
 
       const extractFixedFromContainer = (container) => {
-        if (!container || !containerHasBotFixedMenu(container)) return;
+        if (!container || !containerHasBotFixedMenu(container, bgHostEl)) return;
+        const styleFixedSet = extractFixedMenuSelectorsFromStyles(container, bgHostEl === container ? null : bgHostEl);
         const hostWrap = document.createElement('div');
         hostWrap.className = 'rs-bot-html';
         let moved = false;
         let hasFabAttr = false;
+        const seenStText = new Set();
+        for (const stRoot of [bgHostEl, container]) {
+          if (!stRoot || !stRoot.querySelectorAll) continue;
+          stRoot.querySelectorAll('style').forEach((stEl) => {
+            const t = stEl.textContent || '';
+            if (t && !seenStText.has(t)) {
+              seenStText.add(t);
+              hostWrap.appendChild(stEl.cloneNode(true));
+            }
+          });
+        }
+        const containsFixedTarget = (node) => {
+          if (!node || !node.querySelector) return false;
+          if (node.querySelector(BOT_FIXED_CLASS_SEL)) return true;
+          for (const fx of styleFixedSet) {
+            if (node.contains && node.contains(fx)) return true;
+          }
+          let inlineFixed = false;
+          node.querySelectorAll('[style*="fixed" i]').forEach((sEl) => {
+            if (!isPassiveFullViewportBg(sEl)) inlineFixed = true;
+          });
+          return inlineFixed;
+        };
+        const tagWrapperFixedKids = (wrapper) => {
+          for (const sub of Array.from(wrapper.querySelectorAll('*') || [])) {
+            const subCls = typeof sub.className === 'string' ? sub.className : '';
+            const subTag = (sub.tagName || '').toLowerCase();
+            if (/backdrop|overlay/i.test(subCls)) continue;
+            if (subTag === 'button' || subTag === 'label' || sub.getAttribute('risu-btn') || sub.getAttribute('risu-trigger')) {
+              sub.setAttribute('data-rs-bot-fixed', '1');
+            }
+            const isPanelOrDrawer = /(?:side-panel|drawer|panel|modal|sheet)/i.test(subCls);
+            if (isPanelOrDrawer) {
+              sub.setAttribute('data-rs-bot-fixed', '1');
+              if (/(?:^|\\s)(?:hy-open|open|is-open)(?:\\s|$)/i.test(subCls)) {
+                sub.setAttribute('data-rs-bot-custom-pos', '1');
+                botMenuExpanded = true;
+              }
+              continue;
+            }
+            if (!hasFabAttr && (styleFixedSet.has(sub) || /(?:buttons-container|floating)/i.test(subCls) || /position\\s*:\\s*fixed/i.test(sub.getAttribute('style') || ''))) {
+              sub.setAttribute('data-rs-bot-fab', '1');
+              sub.setAttribute('data-rs-bot-fixed', '1');
+              if (!/(?:buttons-container|floating)/i.test(subCls)) sub.setAttribute('data-rs-bot-custom-pos', '1');
+              hasFabAttr = true;
+            }
+          }
+        };
         const collectFromParent = (parent) => {
           for (const ch of Array.from(parent.children || [])) {
             const tag = (ch.tagName || '').toLowerCase();
             const cls = typeof ch.className === 'string' ? ch.className : '';
-            if (tag === 'style' && /position\\s*:\\s*fixed/i.test(ch.textContent || '')) {
-              hostWrap.appendChild(ch.cloneNode(true));
-            } else if (tag === 'input' && (ch.type === 'checkbox' || ch.type === 'radio')) {
+            if (tag === 'style') continue;
+            if (tag === 'input' && (ch.type === 'checkbox' || ch.type === 'radio')) {
               hostWrap.appendChild(ch);
               moved = true;
-            } else if (isBotFixedMenuElement(ch)) {
-              if (/(?:buttons-container|floating)/i.test(cls)) {
+            } else if (isSelfContainedFixedUiWrapper(ch, styleFixedSet)) {
+              ch.setAttribute('data-rs-bot-fixed', '1');
+              hostWrap.appendChild(ch);
+              tagWrapperFixedKids(ch);
+              moved = true;
+            } else if (isBotFixedMenuElement(ch, styleFixedSet)) {
+              const isNamedFab = /(?:buttons-container|floating)/i.test(cls);
+              ch.setAttribute('data-rs-bot-fixed', '1');
+              if (isNamedFab) {
                 ch.setAttribute('data-rs-bot-fab', '1');
+                hasFabAttr = true;
+              } else if (styleFixedSet.has(ch) || (/position\\s*:\\s*fixed/i.test(ch.getAttribute('style') || '') && !/(?:side-panel|drawer|modal|overlay)/i.test(cls))) {
+                ch.setAttribute('data-rs-bot-fab', '1');
+                ch.setAttribute('data-rs-bot-custom-pos', '1');
                 hasFabAttr = true;
               }
               hostWrap.appendChild(ch);
               moved = true;
-            } else if (ch.querySelector && ch.querySelector(BOT_FIXED_CLASS_SEL)) {
+            } else if (containsFixedTarget(ch)) {
               collectFromParent(ch);
+            } else if (/overlay|drawer|panel|modal/i.test(cls) && hasInteractiveDescendantOrSelf(ch)) {
+              ch.setAttribute('data-rs-bot-fixed', '1');
+              hostWrap.appendChild(ch);
+              moved = true;
             }
           }
         };
         collectFromParent(container);
         if (moved && !hasFabAttr) {
-          const fallbackBar = hostWrap.querySelector('div, nav, aside, section');
-          if (fallbackBar) fallbackBar.setAttribute('data-rs-bot-fab', '1');
+          const fallbackBar = hostWrap.querySelector('div, nav, aside, section, label, button');
+          if (fallbackBar && !/(?:side-panel|drawer|modal)/i.test(fallbackBar.className || '') && !/overlay/i.test(fallbackBar.className || '')) {
+            fallbackBar.setAttribute('data-rs-bot-fab', '1');
+          }
         }
         if (moved) overlay.appendChild(hostWrap);
       };
@@ -10035,7 +12229,7 @@ function renderWebApp() {
           tmp.innerHTML = renderBotRichHtml(snap.botWidgetHtml, snap.assetMap);
           extractFixedFromContainer(tmp);
         }
-        if (!overlay.querySelector('[data-rs-bot-fab="1"]') && snap.backgroundHtml && /(?:buttons-container|side-panel|overlay|floating)/i.test(snap.backgroundHtml)) {
+        if (!overlay.querySelector('[data-rs-bot-fab="1"]') && snap.backgroundHtml && /(?:fixed|<style|<input|<label|<button|risu-trigger|risu-btn|<details|buttons-container|side-panel|floating)/i.test(snap.backgroundHtml)) {
           const tmpBg = document.createElement('div');
           tmpBg.className = 'rs-bot-html';
           tmpBg.innerHTML = renderBotRichHtml(snap.backgroundHtml, snap.assetMap);
@@ -10055,6 +12249,8 @@ function renderWebApp() {
       const vw = window.innerWidth || 0;
       const vh = window.innerHeight || 0;
       fixedStyleEls.forEach((el) => {
+        if (el.querySelector && el.querySelector('button, a, input, select, textarea, label, [risu-trigger], [risu-btn]')) return;
+        if ((el.textContent || '').trim().length > 20) return;
         const cs = window.getComputedStyle(el);
         if (cs && cs.position === 'fixed') {
           const rect = el.getBoundingClientRect();
@@ -10072,7 +12268,7 @@ function renderWebApp() {
 
   function isInteractiveBookTarget(target, rootEl) {
     if (!target || target.nodeType !== 1) return false;
-    const sel = 'button, a, summary, input, select, textarea, label, audio, video, [role="button"], [role="link"], [onclick], [tabindex]:not([tabindex="-1"]), .msg-actions, .rs-am-footer-host, .rs-plugin-bubble-bar, .x-risu-am-illustration-footer, .x-risu-am-illustration-revision-controls, .x-risu-am-chat-history-edge-controls, .x-risu-am-image, .am-image, .x-risu-am-generated-image, .am-generated-image, .x-risu-am-illustration-projection, .am-illustration-projection, .x-risu-am-illustration-slot, .turn-tts-btn, .msg-img-wrap, .image-container, #bookImgPreview, [risu-btn], [risu-trigger], [x-risu-btn], [data-am-proxy], [data-am-illustration-action], [data-am-illustration-revision-action], [data-am-revision-action], [data-am-chat-history-action], [data-am-image-action], [data-am-viewer-action], [data-tts-msg], [data-reroll-msg], [data-tr-key], [data-edit-msg], [data-del-msg], [data-swipe-msg], [data-img-reveal], [data-fm-swipe], [data-chat-var-key]';
+    const sel = 'button, a, summary, input, select, textarea, label, audio, video, [role="button"], [role="link"], [onclick], [tabindex]:not([tabindex="-1"]), .msg-actions, .rs-am-footer-host, .rs-plugin-bubble-bar, .x-risu-am-illustration-footer, .x-risu-am-illustration-revision-controls, .x-risu-am-chat-history-edge-controls, .x-risu-am-image, .am-image, .x-risu-am-generated-image, .am-generated-image, .x-risu-am-illustration-projection, .am-illustration-projection, .x-risu-am-illustration-slot, .rs-chat-end-float, .rs-pfm-stage, .rs-chat-float-cfg-btn, .turn-tts-btn, .turn-tts-script-btn, .turn-tts-grp, .msg-img-wrap, .image-container, [data-rs-bg-img="1"], #bookImgPreview, [risu-btn], [risu-trigger], [x-risu-btn], [data-am-proxy], [data-am-illustration-action], [data-am-illustration-revision-action], [data-am-revision-action], [data-am-chat-history-action], [data-am-image-action], [data-am-viewer-action], [data-tts-msg], [data-tts-script-msg], [data-reroll-msg], [data-tr-key], [data-edit-msg], [data-del-msg], [data-swipe-msg], [data-img-reveal], [data-fm-swipe], [data-chat-var-key]';
     if (target.closest(sel)) return true;
     let cur = target;
     let hops = 0;
@@ -10137,7 +12333,9 @@ function renderWebApp() {
         '</div>';
 
       hoistBotFixedWidgets(document.getElementById('bookColumns'));
+      applyCompactBotAssetFit(document.getElementById('bookColumns'));
       restoreCheckedBotIds(checkedBotIds);
+      if (typeof renderChatFloatingControls === 'function') renderChatFloatingControls(true);
 
       document.getElementById('bookPrevBtn').onclick = () => flipBook(-1);
       document.getElementById('bookNextBtn').onclick = () => flipBook(1);
@@ -10195,8 +12393,8 @@ function renderWebApp() {
       closeBookImgPreview(true);
       if (window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches) {
         frame.addEventListener('mouseover', (e) => {
-          const ic = e.target.closest('.book-columns .rs-bot-html .image-container');
-          if (ic) openBookImgPreview(ic, false);
+          const info = findExpandableBotAsset(e.target, frame);
+          if (info && info.isCropped) openBookImgPreview(info, false);
         });
         frame.addEventListener('mousemove', (e) => {
           const rect = frame.getBoundingClientRect();
@@ -10222,12 +12420,12 @@ function renderWebApp() {
         if (!bookImgPreviewState.pinned) closeBookImgPreview(false);
       };
       frame.addEventListener('click', (e) => {
-        const ic = e.target.closest('.book-columns .rs-bot-html .image-container');
-        if (ic) {
-          if (document.body.classList.contains('asset-blur') && !ic.classList.contains('revealed')) return;
+        const info = findExpandableBotAsset(e.target, frame);
+        if (info) {
+          if (document.body.classList.contains('asset-blur') && !info.el.classList.contains('revealed') && !(info.imgEl && info.imgEl.classList.contains('revealed'))) return;
           e.stopPropagation();
-          if (bookImgPreviewState.el === ic && bookImgPreviewState.pinned) closeBookImgPreview(false);
-          else openBookImgPreview(ic, true);
+          if (bookImgPreviewState.el === info.el && bookImgPreviewState.pinned) closeBookImgPreview(false);
+          else openBookImgPreview(info, true);
           return;
         }
         if (bookImgPreviewState.pinned && !e.target.closest('#bookImgPreview')) {
@@ -10326,7 +12524,9 @@ function renderWebApp() {
     }
     box.innerHTML = html;
     hoistBotFixedWidgets(box);
+    applyCompactBotAssetFit(box);
     restoreCheckedBotIds(checkedBotIds);
+    if (typeof renderChatFloatingControls === 'function') renderChatFloatingControls(true);
     if (pendingScrollToLastUser) {
       pendingScrollToLastUser = false;
       const userEls = box.querySelectorAll('.msg-wrap.user');
@@ -10399,7 +12599,7 @@ function renderWebApp() {
       }
       if (res && res.openPluginGui && res.openPluginGui.pluginName) {
         await openPluginGuiModal(res.openPluginGui.pluginName);
-      } else if (res && res.openedOverlay && res.openedOverlay.html) {
+      } else if (res && res.openedOverlay && res.openedOverlay.html && shouldOpenPluginOverlay(res.openedOverlay, '')) {
         openPluginActionOverlayModal(res.openedOverlay);
       }
       setTimeout(pollState, 250);
@@ -10426,7 +12626,7 @@ function renderWebApp() {
     fd.forEach((v, k) => { formValues[k] = typeof v === 'string' ? v : String(v || ''); });
     toast('모듈 폼 전송 중...');
     try {
-      await api('/api/modules/interaction', {
+      const modRes = await api('/api/modules/interaction', {
         method: 'POST',
         body: JSON.stringify({
           charIndex: snap.charIndex,
@@ -10436,7 +12636,16 @@ function renderWebApp() {
           formValues,
         }),
       });
-      setTimeout(pollState, 350);
+      if (modRes && modRes.triggerEvent && modRes.triggerEvent.id && modRes.triggerEvent.id !== lastHandledTriggerEventId) {
+        lastHandledTriggerEventId = modRes.triggerEvent.id;
+        if (modRes.triggerEvent.kind === 'notice' || modRes.triggerEvent.kind === 'alert_error') showTriggerModal(modRes.triggerEvent);
+      }
+      if (modRes && modRes.snapshot && lastState) {
+        if (typeof modRes.snapshotVersion === 'number') knownSnapshotVer = modRes.snapshotVersion;
+        applyState({ ...lastState, snapshot: modRes.snapshot, snapshotVersion: modRes.snapshotVersion ?? lastState.snapshotVersion });
+      } else {
+        setTimeout(pollState, 350);
+      }
       setTimeout(pollState, 1200);
     } catch (err) {
       toast('모듈 폼 오류: ' + (err && err.message ? err.message : '실패'));
@@ -10457,7 +12666,7 @@ function renderWebApp() {
       } catch (_) {}
       return true;
     }
-    const amEl = e.target.closest('[data-am-illustration-action], [data-am-illustration-revision-action], [data-am-revision-action], [data-am-chat-history-action], [data-am-chat-regenerate-action], [data-am-manual-generate-action], .x-risu-am-illustration-footer button, .x-risu-am-illustration-revision-controls button, .x-risu-am-chat-history-edge-controls button');
+    const amEl = e.target.closest('[data-am-illustration-action], [data-am-illustration-revision-action], [data-am-revision-action], [data-am-chat-history-action], [data-am-history-action], [data-am-chat-regenerate-action], [data-am-manual-generate-action], .x-risu-am-illustration-footer button, .am-illustration-footer button, .x-risu-am-illustration-revision-controls button, .am-illustration-revision-controls button, .x-risu-am-chat-history-edge-controls button, .am-chat-history-edge-controls button, .x-risu-am-image button, .am-image button, .x-risu-am-generated-image button, .am-generated-image button, .x-risu-am-illustration-projection button, .am-illustration-projection button, .x-risu-am-illustration-slot button');
     if (amEl) {
       e.preventDefault();
       e.stopPropagation();
@@ -10543,8 +12752,17 @@ function renderWebApp() {
         });
         if (modRes && modRes.handled) {
           toast('모듈 버튼 실행됨');
-          setTimeout(pollState, 300);
-          setTimeout(pollState, 1000);
+          if (modRes.triggerEvent && modRes.triggerEvent.id && modRes.triggerEvent.id !== lastHandledTriggerEventId) {
+            lastHandledTriggerEventId = modRes.triggerEvent.id;
+            if (modRes.triggerEvent.kind === 'notice' || modRes.triggerEvent.kind === 'alert_error') showTriggerModal(modRes.triggerEvent);
+          }
+          if (modRes.snapshot && lastState) {
+            if (typeof modRes.snapshotVersion === 'number') knownSnapshotVer = modRes.snapshotVersion;
+            applyState({ ...lastState, snapshot: modRes.snapshot, snapshotVersion: modRes.snapshotVersion ?? lastState.snapshotVersion });
+          } else {
+            setTimeout(pollState, 200);
+          }
+          setTimeout(pollState, 700);
           return true;
         }
       } catch (_) {}
@@ -10566,7 +12784,7 @@ function renderWebApp() {
       return true;
     }
     if (document.body.classList.contains('asset-blur')) {
-      const richImg = e.target.closest('.rs-bot-html img, .rs-bot-html .image-container');
+      const richImg = e.target.closest('.rs-bot-html img, .rs-bot-html .image-container, .rs-bot-html [data-rs-bg-img="1"]');
       if (richImg) { richImg.classList.toggle('revealed'); return true; }
     }
     return false;
@@ -10579,6 +12797,29 @@ function renderWebApp() {
   document.getElementById('botBgHost').addEventListener('submit', handleRisuFormSubmit);
 
   document.getElementById('tab-chat').addEventListener('click', async (e) => {
+    if (e.target.closest('[data-chat-float-cfg]')) {
+      e.preventDefault();
+      e.stopPropagation();
+      openPluginFloatingModal();
+      return;
+    }
+    const endFloatStage = e.target.closest('#chatEndPluginCtrl [data-rs-rw-plugin]');
+    if (endFloatStage) {
+      if (e.target.closest('input, textarea, select, option') && !e.target.closest('button, [role="button"], [type="submit"], [type="button"], [type="checkbox"], [type="radio"]')) {
+        return;
+      }
+      const pTarget = e.target.closest('button, [data-am-runtime-generation-count-action], [data-am-runtime-toast-action], a, [role="button"], [data-am-slot], [data-am-count-node]') || e.target;
+      if (pTarget && pTarget !== endFloatStage) {
+        e.preventDefault();
+        e.stopPropagation();
+        try {
+          await sendPluginRootInteraction(pTarget, endFloatStage, 'click');
+        } catch (err) {
+          toast('컨트롤 실행 오류: ' + (err && err.message ? err.message : '실패'));
+        }
+        return;
+      }
+    }
     if (await handleBotWidgetClick(e)) return;
     const fmBtn = e.target.closest('[data-fm-step]');
     if (fmBtn) {
@@ -10645,12 +12886,19 @@ function renderWebApp() {
       return;
     }
     const imgWrap = e.target.closest('[data-img-reveal]');
-    if (imgWrap) { toggleImgReveal(imgWrap); return; }
+    if (imgWrap && document.body.classList.contains('asset-blur')) { toggleImgReveal(imgWrap); return; }
     const ttsBtn = e.target.closest('[data-tts-msg]');
     if (ttsBtn) {
       e.stopPropagation();
       e.preventDefault();
       toggleTurnTts(ttsBtn.getAttribute('data-tts-key'), Number(ttsBtn.getAttribute('data-tts-msg')));
+      return;
+    }
+    const ttsScriptBtn = e.target.closest('[data-tts-script-msg]');
+    if (ttsScriptBtn) {
+      e.stopPropagation();
+      e.preventDefault();
+      openTtsScriptEditorModal(ttsScriptBtn.getAttribute('data-tts-script-key'), Number(ttsScriptBtn.getAttribute('data-tts-script-msg')));
       return;
     }
     const trBtn = e.target.closest('[data-tr-key]');
@@ -10659,8 +12907,103 @@ function renderWebApp() {
     if (edBtn) { editMsg(Number(edBtn.getAttribute('data-edit-msg'))); return; }
     const delBtn = e.target.closest('[data-del-msg]');
     if (delBtn) { delMsg(Number(delBtn.getAttribute('data-del-msg'))); return; }
+    if (!isBookMode()) {
+      const tabChatEl = document.getElementById('tab-chat');
+      const info = findExpandableBotAsset(e.target, tabChatEl);
+      if (info && info.imgSrc) {
+        if (document.body.classList.contains('asset-blur') && !info.el.classList.contains('revealed') && !(info.imgEl && info.imgEl.classList.contains('revealed'))) return;
+        openChatImgLightbox(info.imgSrc);
+        return;
+      }
+      const inlineImg = e.target.closest('.msg-img-wrap img');
+      if (inlineImg && inlineImg.getAttribute('src')) {
+        const wrap = inlineImg.closest('.msg-img-wrap');
+        if (document.body.classList.contains('asset-blur') && wrap && !wrap.classList.contains('revealed')) return;
+        openChatImgLightbox(inlineImg.currentSrc || inlineImg.getAttribute('src'));
+        return;
+      }
+    }
+  });
+  (function initChatImgPreviewAndLightbox() {
+    const tabChatEl = document.getElementById('tab-chat');
+    const scrollPrevEl = document.getElementById('scrollImgPreview');
+    const lightboxEl = document.getElementById('chatImgLightbox');
+    if (scrollPrevEl) {
+      scrollPrevEl.onmouseleave = (e) => {
+        if (e.relatedTarget && scrollImgPreviewState.el && (e.relatedTarget === scrollImgPreviewState.el || scrollImgPreviewState.el.contains(e.relatedTarget))) return;
+        closeScrollImgPreview(false);
+      };
+      scrollPrevEl.onclick = (e) => {
+        e.stopPropagation();
+        const src = scrollImgPreviewState.info && scrollImgPreviewState.info.imgSrc;
+        if (src) openChatImgLightbox(src);
+        else closeScrollImgPreview(false);
+      };
+    }
+    if (lightboxEl) {
+      lightboxEl.onclick = (e) => {
+        if (e.target.closest('[data-lb-close]') || e.target === lightboxEl) {
+          closeChatImgLightbox();
+          return;
+        }
+        const navBtn = e.target.closest('[data-lb-nav]');
+        if (navBtn) {
+          e.stopPropagation();
+          stepChatImgLightbox(Number(navBtn.getAttribute('data-lb-nav')) || 0);
+        }
+      };
+    }
+    document.addEventListener('keydown', (e) => {
+      const lb = document.getElementById('chatImgLightbox');
+      if (!lb || lb.style.display === 'none') return;
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        closeChatImgLightbox();
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        stepChatImgLightbox(-1);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        stepChatImgLightbox(1);
+      }
+    });
+    if (tabChatEl) {
+      tabChatEl.addEventListener('scroll', () => closeScrollImgPreview(true));
+      if (window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches) {
+        tabChatEl.addEventListener('mouseover', (e) => {
+          if (isBookMode()) return;
+          const info = findExpandableBotAsset(e.target, tabChatEl);
+          if (info && info.isCropped) scheduleScrollImgPreview(info);
+        });
+        tabChatEl.addEventListener('mouseout', (e) => {
+          if (isBookMode()) return;
+          if (scrollImgPreviewState.el && (!e.relatedTarget || (!scrollImgPreviewState.el.contains(e.relatedTarget) && e.relatedTarget.id !== 'scrollImgPreview'))) {
+            closeScrollImgPreview(false);
+          }
+        });
+      }
+    }
+  })();
+  let chatEndFloatInputTimer = null;
+  document.getElementById('tab-chat').addEventListener('input', (e) => {
+    const endFloatStage = e.target && e.target.closest ? e.target.closest('#chatEndPluginCtrl [data-rs-rw-plugin]') : null;
+    if (!endFloatStage) return;
+    const pTarget = e.target.closest('input, textarea, select');
+    if (!pTarget) return;
+    if (chatEndFloatInputTimer) clearTimeout(chatEndFloatInputTimer);
+    chatEndFloatInputTimer = setTimeout(() => {
+      void sendPluginRootInteraction(pTarget, endFloatStage, 'input').catch(() => {});
+    }, 120);
   });
   document.getElementById('tab-chat').addEventListener('change', async (e) => {
+    const endFloatStage = e.target && e.target.closest ? e.target.closest('#chatEndPluginCtrl [data-rs-rw-plugin]') : null;
+    if (endFloatStage) {
+      const pTarget = e.target.closest('input, textarea, select');
+      if (pTarget) {
+        void sendPluginRootInteraction(pTarget, endFloatStage, 'change').catch(() => {});
+        return;
+      }
+    }
     const sel = e.target.closest('[data-chat-var-key]');
     if (!sel) return;
     const snap = lastState && lastState.snapshot;
@@ -10753,7 +13096,7 @@ function renderWebApp() {
   }
 
   function updateTtsButtonsDom() {
-    document.querySelectorAll('.turn-tts-btn').forEach((btn) => {
+    document.querySelectorAll('.turn-tts-btn[data-tts-msg]').forEach((btn) => {
       const k = btn.getAttribute('data-tts-key') || '';
       const isThis = Boolean(ttsPlayerState.activeKey && k === ttsPlayerState.activeKey);
       btn.classList.toggle('is-loading', isThis && ttsPlayerState.loading);
@@ -10837,18 +13180,18 @@ function renderWebApp() {
     renderTtsPlayerBar();
   }
 
-  async function fetchTtsSegmentAudio(seg, charName, signal) {
+  async function fetchTtsSegmentAudio(seg, charName, signal, botKey) {
     const ttsCfg = (routerCfg && routerCfg.tts) || {};
     const sig = hashStr(JSON.stringify({
       p: ttsCfg.provider, u: ttsCfg.apiUrl, m: ttsCfg.model, f: ttsCfg.format, ts: ttsCfg.fishTagStyle,
-      k: seg.kind, s: seg.speaker, g: seg.gender, v: seg.voiceId, t: seg.toneTags, txt: seg.text,
+      bk: botKey || '', k: seg.kind, s: seg.speaker, g: seg.gender, v: seg.voiceId, t: seg.toneTags, ins: seg.instruction || '', txt: seg.text,
     }));
     if (ttsAudioBufferCache.has(sig)) return ttsAudioBufferCache.get(sig);
     const res = await fetch('/api/tts/synthesize', {
       method: 'POST',
       signal,
       headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
-      body: JSON.stringify({ segment: seg, charName }),
+      body: JSON.stringify({ segment: seg, charName, botKey: botKey || '' }),
     });
     if (!res.ok) {
       const errData = await res.json().catch(() => ({}));
@@ -10967,10 +13310,10 @@ function renderWebApp() {
 
       // Prefetch next 2 segments while fetching/playing current
       const signal = ttsPlayerState.abortCtrl ? ttsPlayerState.abortCtrl.signal : undefined;
-      const curProm = fetchTtsSegmentAudio(seg, ttsPlayerState.charName, signal);
+      const curProm = fetchTtsSegmentAudio(seg, ttsPlayerState.charName, signal, ttsPlayerState.botKey);
       for (let look = 1; look <= 2; look += 1) {
         if (idx + look < ttsPlayerState.segments.length) {
-          fetchTtsSegmentAudio(ttsPlayerState.segments[idx + look], ttsPlayerState.charName, signal).catch(() => {});
+          fetchTtsSegmentAudio(ttsPlayerState.segments[idx + look], ttsPlayerState.charName, signal, ttsPlayerState.botKey).catch(() => {});
         }
       }
 
@@ -10993,9 +13336,9 @@ function renderWebApp() {
     }
   }
 
-  window.toggleTurnTts = async (key, msgIndex) => {
+  window.toggleTurnTts = async (key, msgIndex, forceRestart) => {
     ensureTtsAudioCtx();
-    if (ttsPlayerState.activeKey === key && (ttsPlayerState.loading || ttsPlayerState.playing)) {
+    if (!forceRestart && ttsPlayerState.activeKey === key && (ttsPlayerState.loading || ttsPlayerState.playing)) {
       stopTtsPlayback();
       return;
     }
@@ -11009,10 +13352,13 @@ function renderWebApp() {
     const abortCtrl = new AbortController();
     ttsPlayerState.abortCtrl = abortCtrl;
     ttsPlayerState.activeKey = key;
+    ttsPlayerState.msgIndex = msgIndex;
     ttsPlayerState.loading = true;
     ttsPlayerState.playing = false;
     ttsPlayerState.paused = false;
     ttsPlayerState.charName = snap.charName || 'Character';
+    const curBotInfo = (typeof getCurrentSnapBotInfo === 'function') ? getCurrentSnapBotInfo() : { botKey: '', botName: snap.charName || '' };
+    ttsPlayerState.botKey = curBotInfo.botKey || '';
     ttsPlayerState.segments = [];
     ttsPlayerState.segIdx = 0;
     updateTtsButtonsDom();
@@ -11020,8 +13366,8 @@ function renderWebApp() {
 
     try {
       const ttsCfg = (routerCfg && routerCfg.tts) || {};
-      const cacheKey = key + ':' + hashStr((found.text || '') + '|' + (found.html || '') + '|' + (ttsCfg.parseMode || 'hybrid'));
-      let segments = ttsAnalyzeCache.get(cacheKey);
+      const cacheKey = key + ':' + hashStr((found.text || '') + '|' + (found.html || '') + '|' + (ttsCfg.parseMode || 'hybrid') + '|' + (curBotInfo.botKey || '') + '|' + (ttsCfg.provider || '') + '|' + (ttsCfg.model || '') + '|' + (ttsCfg.fishTagStyle || '') + '|' + String(ttsCfg.characterVoicesEnabled !== false));
+      let segments = forceRestart ? null : ttsAnalyzeCache.get(cacheKey);
       if (!segments) {
         const res = await fetch('/api/tts/analyze', {
           method: 'POST',
@@ -11031,13 +13377,26 @@ function renderWebApp() {
             text: found.text || '',
             html: found.html || '',
             role: found.role || 'char',
+            msgIndex,
             charName: snap.charName || 'Character',
             personaName: snap.personaName || '나',
+            botKey: curBotInfo.botKey || '',
+            botName: curBotInfo.botName || snap.charName || '',
           }),
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.error || ('대본 분석 실패 (' + res.status + ')'));
         segments = Array.isArray(data.segments) ? data.segments : [];
+        if (data.botProfilesUpdated && data.botKey && Array.isArray(data.botCharacters) && routerCfg && routerCfg.tts) {
+          if (!routerCfg.tts.botCharacters || typeof routerCfg.tts.botCharacters !== 'object') routerCfg.tts.botCharacters = {};
+          routerCfg.tts.botCharacters[data.botKey] = {
+            botKey: data.botKey,
+            botName: curBotInfo.botName || data.botKey,
+            updatedAt: Date.now(),
+            characters: data.botCharacters,
+          };
+          if (typeof renderGlobalTtsCastBox === 'function') renderGlobalTtsCastBox();
+        }
         if (ttsAnalyzeCache.size > 40) ttsAnalyzeCache.clear();
         ttsAnalyzeCache.set(cacheKey, segments);
       }
@@ -11064,6 +13423,7 @@ function renderWebApp() {
     const pauseBtn = document.getElementById('ttsPauseBtn');
     const stopBtn = document.getElementById('ttsStopBtn');
     const rateBtn = document.getElementById('ttsRateBtn');
+    const editScriptBtn = document.getElementById('ttsEditScriptBtn');
     const cfgBtn = document.getElementById('ttsCfgJumpBtn');
     if (prevBtn) prevBtn.onclick = () => {
       if (!ttsPlayerState.segments.length) return;
@@ -11100,6 +13460,13 @@ function renderWebApp() {
       renderTtsPlayerBar();
       toast('TTS 배속: ' + ttsPlayerState.rateMult + 'x');
     };
+    if (editScriptBtn) editScriptBtn.onclick = () => {
+      if (!ttsPlayerState.activeKey || ttsPlayerState.msgIndex === undefined || ttsPlayerState.msgIndex === null) {
+        toast('먼저 메시지 옆 TTS 재생 버튼이나 대본 버튼을 눌러 주세요.');
+        return;
+      }
+      openTtsScriptEditorModal(ttsPlayerState.activeKey, ttsPlayerState.msgIndex);
+    };
     if (cfgBtn) cfgBtn.onclick = () => {
       switchTab('router');
       setTimeout(() => {
@@ -11108,6 +13475,505 @@ function renderWebApp() {
       }, 60);
     };
   })();
+
+  let ttsScriptModalState = null;
+  let ttsScriptModalKeyHandler = null;
+
+  function closeTtsScriptEditorModal(force) {
+    if (!force && ttsScriptModalState && ttsScriptModalState.dirty) {
+      if (!confirm('저장하지 않은 대본 수정 내용이 있습니다. 닫을까요?')) return false;
+    }
+    const modal = document.getElementById('ttsScriptModal');
+    if (modal) {
+      modal.style.display = 'none';
+      modal.innerHTML = '';
+    }
+    ttsScriptModalState = null;
+    if (ttsScriptModalKeyHandler) {
+      document.removeEventListener('keydown', ttsScriptModalKeyHandler);
+      ttsScriptModalKeyHandler = null;
+    }
+    return true;
+  }
+
+  function readSegmentsFromScriptModalDom() {
+    const listEl = document.getElementById('ttsScriptSegList');
+    if (!listEl || !ttsScriptModalState) return [];
+    const cards = Array.from(listEl.querySelectorAll('.tts-seg-card[data-seg-idx]'));
+    const next = [];
+    for (const card of cards) {
+      const kind = (card.querySelector('[data-seg-field="kind"]') && card.querySelector('[data-seg-field="kind"]').value) || 'dialogue';
+      const speaker = (card.querySelector('[data-seg-field="speaker"]') && card.querySelector('[data-seg-field="speaker"]').value.trim()) || (kind === 'narration' ? 'Narrator' : 'Character');
+      const gender = kind === 'narration'
+        ? 'neutral'
+        : ((card.querySelector('[data-seg-field="gender"]') && card.querySelector('[data-seg-field="gender"]').value) || 'neutral');
+      const voiceId = (card.querySelector('[data-seg-field="voiceId"]') && card.querySelector('[data-seg-field="voiceId"]').value.trim()) || '';
+      const rawTagsStr = (card.querySelector('[data-seg-field="toneTags"]') && card.querySelector('[data-seg-field="toneTags"]').value) || '';
+      const toneTags = rawTagsStr.split(',').map((s) => s.trim().replace(/^[\\[(]+|[\\])]+$/g, '')).filter(Boolean).slice(0, 3);
+      const instruction = (card.querySelector('[data-seg-field="instruction"]') && card.querySelector('[data-seg-field="instruction"]').value.trim()) || '';
+      const speedVal = Number(card.querySelector('[data-seg-field="speed"]') && card.querySelector('[data-seg-field="speed"]').value);
+      const speed = (Number.isFinite(speedVal) && speedVal >= 0.5 && speedVal <= 2.0) ? speedVal : 1.0;
+      const text = (card.querySelector('[data-seg-field="text"]') && card.querySelector('[data-seg-field="text"]').value.trim()) || '';
+      next.push({
+        kind,
+        speaker,
+        gender,
+        voiceId,
+        tone: toneTags[0] || '',
+        toneTags,
+        instruction,
+        speed,
+        text,
+        manualOverride: true,
+      });
+    }
+    ttsScriptModalState.segments = next;
+    return next;
+  }
+
+  function updateTtsScriptModalHeaderBadges() {
+    const statusBadge = document.getElementById('ttsScriptStatusBadge');
+    const countBadge = document.getElementById('ttsScriptCountBadge');
+    if (countBadge && ttsScriptModalState) {
+      countBadge.textContent = (ttsScriptModalState.segments || []).length + '개 구간' + (ttsScriptModalState.dirty ? ' · 수정됨' : '');
+    }
+    if (statusBadge && ttsScriptModalState) {
+      if (ttsScriptModalState.manuallyEdited) {
+        statusBadge.textContent = '✏️ 수동 편집됨 (저장됨)';
+      } else if (ttsScriptModalState.scriptSaved) {
+        statusBadge.textContent = '💾 저장된 대본 (재분석 생략)';
+      } else {
+        statusBadge.textContent = '🤖 미저장 초안';
+      }
+    }
+  }
+
+  function renderTtsScriptModalRows() {
+    const listEl = document.getElementById('ttsScriptSegList');
+    if (!listEl || !ttsScriptModalState) return;
+    updateTtsScriptModalHeaderBadges();
+    const segs = Array.isArray(ttsScriptModalState.segments) ? ttsScriptModalState.segments : [];
+    if (!segs.length) {
+      listEl.innerHTML = '<div class="hint" style="padding:18px; text-align:center;">구간이 없습니다. 아래 또는 상단의 <b>+ 구간 추가</b>를 누르거나 <b>🔄 LLM 재분석</b>을 실행하세요.</div>';
+      return;
+    }
+    const tonePresetOpts = buildToneTagOptionsHtml('', '+ 태그 추가');
+    listEl.innerHTML = segs.map((seg, idx) => {
+      const kind = seg.kind === 'thought' ? 'thought' : (seg.kind === 'narration' ? 'narration' : 'dialogue');
+      const tagsStr = Array.isArray(seg.toneTags) && seg.toneTags.length
+        ? seg.toneTags.join(', ')
+        : (seg.tone || '');
+      const spd = (seg.speed !== undefined && Number.isFinite(Number(seg.speed))) ? Number(seg.speed) : (kind === 'thought' ? 0.94 : (kind === 'narration' ? 0.96 : 1.0));
+      return '<div class="tts-seg-card kind-' + kind + '" data-seg-idx="' + idx + '">' +
+        '<div class="tts-seg-head">' +
+          '<div style="display:flex; align-items:center; gap:6px;">' +
+            '<span class="badge">#' + (idx + 1) + '</span>' +
+            '<span style="font-size:12px; font-weight:700;">' + (kind === 'dialogue' ? '💬 대화' : (kind === 'thought' ? '💭 속마음' : '📖 나레이션')) + '</span>' +
+            (seg.matchedCharacter ? '<span class="pill" style="font-size:10.5px; padding:1px 7px;">🎭 ' + esc(seg.matchedCharacter) + '</span>' : '') +
+          '</div>' +
+          '<div style="display:flex; gap:4px; align-items:center; flex-wrap:wrap;">' +
+            '<button type="button" class="pill" data-seg-act="up" title="위로" style="padding:3px 7px; font-size:11px;">▲</button>' +
+            '<button type="button" class="pill" data-seg-act="down" title="아래로" style="padding:3px 7px; font-size:11px;">▼</button>' +
+            '<button type="button" class="pill" data-seg-act="insert" title="아래에 구간 추가" style="padding:3px 7px; font-size:11px;">+ 삽입</button>' +
+            '<button type="button" class="pill" data-seg-act="preview" title="이 구간 미리듣기" style="padding:3px 8px; font-size:11px;">▶ 미리듣기</button>' +
+            '<button type="button" class="pill" data-seg-act="delete" title="삭제" style="padding:3px 7px; font-size:11px; color:var(--danger);">✕</button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="tts-seg-grid">' +
+          '<div><label class="f-label" style="margin-top:0;">유형</label><select class="f-inp" data-seg-field="kind" style="padding:6px 8px; font-size:12.5px;">' +
+            '<option value="dialogue"' + (kind === 'dialogue' ? ' selected' : '') + '>💬 대화</option>' +
+            '<option value="thought"' + (kind === 'thought' ? ' selected' : '') + '>💭 속마음</option>' +
+            '<option value="narration"' + (kind === 'narration' ? ' selected' : '') + '>📖 나레이션</option>' +
+          '</select></div>' +
+          '<div><label class="f-label" style="margin-top:0;">화자 이름</label><input class="f-inp" data-seg-field="speaker" list="ttsScriptSpeakerList" value="' + esc(seg.speaker || '') + '" placeholder="Narrator / 캐릭터명" style="padding:6px 8px; font-size:12.5px;" /></div>' +
+          '<div><label class="f-label" style="margin-top:0;">성별</label><select class="f-inp" data-seg-field="gender" style="padding:6px 8px; font-size:12.5px;">' +
+            '<option value="female"' + (seg.gender === 'female' ? ' selected' : '') + '>여성</option>' +
+            '<option value="male"' + (seg.gender === 'male' ? ' selected' : '') + '>남성</option>' +
+            '<option value="neutral"' + (seg.gender !== 'female' && seg.gender !== 'male' ? ' selected' : '') + '>중성</option>' +
+          '</select></div>' +
+          '<div><label class="f-label" style="margin-top:0;">보이스 ID (선택)</label><input class="f-inp" data-seg-field="voiceId" list="ttsVoiceDatalist" value="' + esc(seg.voiceId || '') + '" placeholder="비우면 캐릭터/기본 풀" style="padding:6px 8px; font-size:12.5px;" /></div>' +
+        '</div>' +
+        '<div class="tts-seg-row2">' +
+          '<div><label class="f-label" style="margin-top:0;">감정·발성 태그 (Fish)</label><input class="f-inp" data-seg-field="toneTags" value="' + esc(tagsStr) + '" placeholder="예: playful, whispering" style="padding:6px 8px; font-size:12px;" /></div>' +
+          '<div><label class="f-label" style="margin-top:0;">태그 추가</label><select class="f-inp" data-seg-field="tonePick" style="padding:6px 6px; font-size:11.5px;">' + tonePresetOpts + '</select></div>' +
+          '<div><label class="f-label" style="margin-top:0;">연기 지시문 (OpenAI · Qwen3)</label><input class="f-inp" data-seg-field="instruction" value="' + esc(seg.instruction || '') + '" placeholder="예: 밝고 장난스럽게 속삭이듯" style="padding:6px 8px; font-size:12px;" /></div>' +
+          '<div><label class="f-label" style="margin-top:0;">속도</label><input class="f-inp" data-seg-field="speed" type="number" step="0.05" min="0.5" max="2.0" value="' + esc(String(spd)) + '" style="padding:6px 6px; font-size:12px;" /></div>' +
+        '</div>' +
+        '<textarea class="tts-seg-text" data-seg-field="text" rows="2" placeholder="실제 낭독될 대사 또는 지문...">' + esc(seg.text || '') + '</textarea>' +
+      '</div>';
+    }).join('');
+  }
+
+  async function saveTtsScriptEditorModal() {
+    if (!ttsScriptModalState) return false;
+    const segments = readSegmentsFromScriptModalDom().filter((s) => s && s.text);
+    if (!segments.length) {
+      toast('최소 1개 이상의 유효한 대본 구간이 필요합니다.');
+      return false;
+    }
+    const saveBtn = document.getElementById('ttsScriptSaveBtn');
+    const savePlayBtn = document.getElementById('ttsScriptSavePlayBtn');
+    if (saveBtn) saveBtn.disabled = true;
+    if (savePlayBtn) savePlayBtn.disabled = true;
+    try {
+      const snap = (lastState && lastState.snapshot) || {};
+      const r = await api('/api/tts/script/save', {
+        method: 'POST',
+        body: JSON.stringify({
+          scriptKey: ttsScriptModalState.scriptKey,
+          botKey: ttsScriptModalState.botKey,
+          botName: ttsScriptModalState.botName,
+          msgIndex: ttsScriptModalState.msgIndex,
+          role: (ttsScriptModalState.found && ttsScriptModalState.found.role) || 'char',
+          charName: snap.charName || 'Character',
+          text: (ttsScriptModalState.found && ttsScriptModalState.found.text) || '',
+          html: (ttsScriptModalState.found && ttsScriptModalState.found.html) || '',
+          segments,
+        }),
+      });
+      ttsAnalyzeCache.clear();
+      ttsAudioBufferCache.clear();
+      ttsScriptModalState.scriptKey = r.scriptKey || ttsScriptModalState.scriptKey;
+      ttsScriptModalState.segments = (r.script && Array.isArray(r.script.segments)) ? r.script.segments : segments;
+      ttsScriptModalState.manuallyEdited = true;
+      ttsScriptModalState.scriptSaved = true;
+      ttsScriptModalState.dirty = false;
+      if (ttsPlayerState.activeKey === ttsScriptModalState.key) {
+        ttsPlayerState.segments = ttsScriptModalState.segments.slice();
+        if (ttsPlayerState.segIdx >= ttsPlayerState.segments.length) ttsPlayerState.segIdx = 0;
+        renderTtsPlayerBar();
+      }
+      renderTtsScriptModalRows();
+      toast('대본 저장됨 (다음 재생 시 LLM 재분석 없이 바로 사용)');
+      return true;
+    } catch (err) {
+      toast('대본 저장 실패: ' + err.message);
+      return false;
+    } finally {
+      if (saveBtn) saveBtn.disabled = false;
+      if (savePlayBtn) savePlayBtn.disabled = false;
+    }
+  }
+
+  async function openTtsScriptEditorModal(key, msgIndex) {
+    const snap = (lastState && lastState.snapshot) || {};
+    const found = (snap.messages || []).find((x) => x.index === msgIndex);
+    if (!found) {
+      toast('대본을 편집할 메시지를 찾지 못했습니다.');
+      return;
+    }
+    const modal = document.getElementById('ttsScriptModal');
+    if (!modal) return;
+    if (!closeTtsScriptEditorModal(false)) return;
+
+    const botInfo = (typeof getCurrentSnapBotInfo === 'function') ? getCurrentSnapBotInfo() : { botKey: '', botName: snap.charName || '' };
+    const botChars = (typeof getCastCharactersForTargetKey === 'function') ? getCastCharactersForTargetKey(botInfo.botKey) : [];
+    const speakerSet = new Set(['Narrator', snap.charName || 'Character', snap.personaName || '나']);
+    for (const bc of botChars) { if (bc && bc.name) speakerSet.add(bc.name); }
+    const activeSpec = (typeof getActiveSpeechModelSpecClient === 'function') ? getActiveSpeechModelSpecClient() : { label: 'TTS' };
+
+    ttsScriptModalState = {
+      key,
+      msgIndex,
+      found,
+      botKey: botInfo.botKey || '',
+      botName: botInfo.botName || snap.charName || '',
+      scriptKey: '',
+      modeUsed: '',
+      scriptSaved: false,
+      manuallyEdited: false,
+      dirty: false,
+      segments: [],
+    };
+
+    const speakerOptionsHtml = Array.from(speakerSet).map((n) => '<option value="' + esc(n) + '"></option>').join('');
+    modal.innerHTML =
+      '<div class="tts-script-card">' +
+        '<div class="tts-script-head">' +
+          '<div class="tts-script-title">' +
+            '<span>🎬 TTS 대본 검토 · 수동 편집기</span>' +
+            '<span class="badge">' + esc(found.role === 'user' ? '사용자' : (snap.charName || '캐릭터')) + ' · #' + Number(msgIndex) + '</span>' +
+            '<span class="badge" id="ttsScriptCountBadge">불러오는 중...</span>' +
+            '<span class="badge" id="ttsScriptStatusBadge">확인 중</span>' +
+          '</div>' +
+          '<button type="button" class="pill" id="ttsScriptCloseBtn">✕ 닫기</button>' +
+        '</div>' +
+        '<div class="tts-script-toolbar">' +
+          '<div style="font-size:11.5px; color:var(--sub);">활성 모델 규격: <b>' + esc(activeSpec.label || '') + '</b></div>' +
+          '<div style="display:flex; gap:6px; flex-wrap:wrap;">' +
+            '<button type="button" class="pill" id="ttsScriptReanalyzeBtn">🔄 LLM 재분석</button>' +
+            '<button type="button" class="pill active" id="ttsScriptAddSegBtn">+ 구간 추가</button>' +
+            '<button type="button" class="pill" id="ttsScriptDeleteBtn" style="color:var(--danger);">🗑️ 저장 대본 삭제</button>' +
+          '</div>' +
+        '</div>' +
+        '<datalist id="ttsScriptSpeakerList">' + speakerOptionsHtml + '</datalist>' +
+        '<div class="tts-script-body" id="ttsScriptSegList"><div class="hint" style="padding:18px; text-align:center;">⏳ 저장된 대본을 확인하고 있습니다...</div></div>' +
+        '<div class="tts-script-foot">' +
+          '<span style="font-size:11.5px; color:var(--sub);">저장된 대본은 다음 재생 시 LLM 호출 없이 즉시 사용됩니다 · Ctrl+Enter 저장</span>' +
+          '<div style="display:flex; gap:6px; align-items:center; margin-left:auto; flex-wrap:wrap;">' +
+            '<button type="button" class="btn sec" id="ttsScriptCancelBtn">닫기</button>' +
+            '<button type="button" class="btn sec" id="ttsScriptSaveBtn">💾 대본 저장</button>' +
+            '<button type="button" class="btn" id="ttsScriptSavePlayBtn">💾 저장 후 재생 ▶</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    modal.style.display = 'flex';
+
+    document.getElementById('ttsScriptCloseBtn').onclick = () => closeTtsScriptEditorModal(false);
+    document.getElementById('ttsScriptCancelBtn').onclick = () => closeTtsScriptEditorModal(false);
+    document.getElementById('ttsScriptSaveBtn').onclick = () => saveTtsScriptEditorModal();
+    document.getElementById('ttsScriptSavePlayBtn').onclick = async () => {
+      const ok = await saveTtsScriptEditorModal();
+      if (!ok) return;
+      closeTtsScriptEditorModal(true);
+      toggleTurnTts(key, msgIndex, true);
+    };
+    modal.onclick = (e) => {
+      if (e.target === modal) closeTtsScriptEditorModal(false);
+    };
+    ttsScriptModalKeyHandler = (ev) => {
+      if (ev.key === 'Escape') {
+        ev.preventDefault();
+        closeTtsScriptEditorModal(false);
+      } else if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') {
+        ev.preventDefault();
+        saveTtsScriptEditorModal();
+      }
+    };
+    document.addEventListener('keydown', ttsScriptModalKeyHandler);
+
+    const listEl = document.getElementById('ttsScriptSegList');
+    if (listEl) {
+      listEl.addEventListener('input', () => {
+        if (ttsScriptModalState) {
+          ttsScriptModalState.dirty = true;
+          updateTtsScriptModalHeaderBadges();
+        }
+      });
+      listEl.addEventListener('change', (e) => {
+        if (!ttsScriptModalState) return;
+        const card = e.target.closest('.tts-seg-card[data-seg-idx]');
+        if (!card) return;
+        const field = e.target.getAttribute('data-seg-field');
+        if (field === 'tonePick') {
+          const picked = e.target.value;
+          if (picked && picked !== '__custom__') {
+            const tagsInp = card.querySelector('[data-seg-field="toneTags"]');
+            if (tagsInp) {
+              const curArr = tagsInp.value.split(',').map((s) => s.trim()).filter(Boolean);
+              if (!curArr.some((t) => t.toLowerCase() === picked.toLowerCase())) {
+                curArr.push(picked);
+                tagsInp.value = curArr.slice(0, 3).join(', ');
+              }
+            }
+          }
+          e.target.value = '';
+          ttsScriptModalState.dirty = true;
+          updateTtsScriptModalHeaderBadges();
+          return;
+        }
+        if (field === 'kind') {
+          readSegmentsFromScriptModalDom();
+          ttsScriptModalState.dirty = true;
+          renderTtsScriptModalRows();
+          return;
+        }
+        ttsScriptModalState.dirty = true;
+        updateTtsScriptModalHeaderBadges();
+      });
+      listEl.addEventListener('click', async (e) => {
+        const actBtn = e.target.closest('[data-seg-act]');
+        if (!actBtn || !ttsScriptModalState) return;
+        const card = actBtn.closest('.tts-seg-card[data-seg-idx]');
+        if (!card) return;
+        const idx = Number(card.getAttribute('data-seg-idx'));
+        const act = actBtn.getAttribute('data-seg-act');
+        readSegmentsFromScriptModalDom();
+        const segs = ttsScriptModalState.segments;
+        if (act === 'up' && idx > 0) {
+          const tmp = segs[idx - 1]; segs[idx - 1] = segs[idx]; segs[idx] = tmp;
+          ttsScriptModalState.dirty = true;
+          renderTtsScriptModalRows();
+        } else if (act === 'down' && idx + 1 < segs.length) {
+          const tmp = segs[idx + 1]; segs[idx + 1] = segs[idx]; segs[idx] = tmp;
+          ttsScriptModalState.dirty = true;
+          renderTtsScriptModalRows();
+        } else if (act === 'insert') {
+          const base = segs[idx] || {};
+          segs.splice(idx + 1, 0, {
+            kind: 'dialogue',
+            speaker: base.speaker || snap.charName || 'Character',
+            gender: base.gender || 'female',
+            voiceId: base.voiceId || '',
+            toneTags: [],
+            instruction: '',
+            speed: 1.0,
+            text: '',
+            manualOverride: true,
+          });
+          ttsScriptModalState.dirty = true;
+          renderTtsScriptModalRows();
+        } else if (act === 'delete') {
+          if (segs.length <= 1) { toast('최소 1개 구간은 유지해야 합니다.'); return; }
+          segs.splice(idx, 1);
+          ttsScriptModalState.dirty = true;
+          renderTtsScriptModalRows();
+        } else if (act === 'preview') {
+          const seg = segs[idx];
+          if (!seg || !seg.text) { toast('미리들을 텍스트를 먼저 입력하세요.'); return; }
+          actBtn.disabled = true;
+          try {
+            ensureTtsAudioCtx();
+            toast('구간 #' + (idx + 1) + ' 미리듣기 생성 중...');
+            const res = await fetch('/api/tts/test', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+              body: JSON.stringify({
+                text: seg.text,
+                kind: seg.kind,
+                speaker: seg.speaker,
+                gender: seg.gender,
+                voiceId: seg.voiceId,
+                toneTags: seg.toneTags,
+                instruction: seg.instruction,
+                speed: seg.speed,
+                manualOverride: true,
+                botKey: ttsScriptModalState.botKey,
+                ttsOverride: (typeof collectTtsFormPayload === 'function') ? collectTtsFormPayload() : undefined,
+              }),
+            });
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}));
+              throw new Error(err.error || ('HTTP ' + res.status));
+            }
+            const buf = await res.arrayBuffer();
+            await playTtsArrayBuffer(buf, { kind: seg.kind });
+          } catch (err) {
+            toast('미리듣기 실패: ' + err.message);
+          } finally {
+            actBtn.disabled = false;
+          }
+        }
+      });
+    }
+
+    const addSegBtn = document.getElementById('ttsScriptAddSegBtn');
+    if (addSegBtn) addSegBtn.onclick = () => {
+      if (!ttsScriptModalState) return;
+      readSegmentsFromScriptModalDom();
+      ttsScriptModalState.segments.push({
+        kind: 'dialogue',
+        speaker: snap.charName || 'Character',
+        gender: 'female',
+        voiceId: '',
+        toneTags: [],
+        instruction: '',
+        speed: 1.0,
+        text: '',
+        manualOverride: true,
+      });
+      ttsScriptModalState.dirty = true;
+      renderTtsScriptModalRows();
+      if (listEl) listEl.scrollTop = listEl.scrollHeight;
+    };
+
+    const runScriptLoad = async (forceReanalyze) => {
+      if (!ttsScriptModalState) return;
+      if (forceReanalyze && ttsScriptModalState.manuallyEdited && !confirm('수동 편집한 대본을 덮어쓰고 LLM으로 다시 분석할까요?')) return;
+      if (listEl) listEl.innerHTML = '<div class="hint" style="padding:18px; text-align:center;">⏳ ' + (forceReanalyze ? 'LLM이 대본을 다시 분석 중입니다...' : '저장된 대본을 불러오는 중입니다...') + '</div>';
+      try {
+        if (!forceReanalyze) {
+          const got = await api('/api/tts/script/get', {
+            method: 'POST',
+            body: JSON.stringify({
+              botKey: ttsScriptModalState.botKey,
+              role: found.role || 'char',
+              charName: snap.charName || 'Character',
+              text: found.text || '',
+              html: found.html || '',
+            }),
+          });
+          if (!ttsScriptModalState) return;
+          if (got && got.exists && got.script && Array.isArray(got.script.segments)) {
+            ttsScriptModalState.scriptKey = got.scriptKey || '';
+            ttsScriptModalState.segments = got.script.segments;
+            ttsScriptModalState.scriptSaved = true;
+            ttsScriptModalState.manuallyEdited = Boolean(got.script.manuallyEdited);
+            ttsScriptModalState.dirty = false;
+            renderTtsScriptModalRows();
+            return;
+          }
+        }
+        const analyzed = await api('/api/tts/analyze', {
+          method: 'POST',
+          body: JSON.stringify({
+            text: found.text || '',
+            html: found.html || '',
+            role: found.role || 'char',
+            msgIndex,
+            charName: snap.charName || 'Character',
+            personaName: snap.personaName || '나',
+            botKey: ttsScriptModalState.botKey,
+            botName: ttsScriptModalState.botName,
+            forceReanalyze: Boolean(forceReanalyze),
+          }),
+        });
+        if (!ttsScriptModalState) return;
+        ttsScriptModalState.scriptKey = analyzed.scriptKey || '';
+        ttsScriptModalState.segments = Array.isArray(analyzed.segments) ? analyzed.segments : [];
+        ttsScriptModalState.scriptSaved = Boolean(analyzed.scriptSaved);
+        ttsScriptModalState.manuallyEdited = Boolean(analyzed.manuallyEdited);
+        ttsScriptModalState.dirty = false;
+        ttsAnalyzeCache.clear();
+        if (analyzed.botProfilesUpdated && analyzed.botKey && Array.isArray(analyzed.botCharacters) && routerCfg && routerCfg.tts) {
+          if (!routerCfg.tts.botCharacters || typeof routerCfg.tts.botCharacters !== 'object') routerCfg.tts.botCharacters = {};
+          routerCfg.tts.botCharacters[analyzed.botKey] = {
+            botKey: analyzed.botKey,
+            botName: ttsScriptModalState.botName || analyzed.botKey,
+            updatedAt: Date.now(),
+            characters: analyzed.botCharacters,
+          };
+          if (typeof renderGlobalTtsCastBox === 'function') renderGlobalTtsCastBox();
+        }
+        renderTtsScriptModalRows();
+        if (forceReanalyze) toast('LLM 대본 재분석 및 저장 완료');
+      } catch (err) {
+        if (listEl) listEl.innerHTML = '<div class="hint" style="padding:18px; color:var(--danger);">대본 불러오기 실패: ' + esc(err.message) + '</div>';
+      }
+    };
+
+    const reanalyzeBtn = document.getElementById('ttsScriptReanalyzeBtn');
+    if (reanalyzeBtn) reanalyzeBtn.onclick = () => runScriptLoad(true);
+
+    const deleteBtn = document.getElementById('ttsScriptDeleteBtn');
+    if (deleteBtn) deleteBtn.onclick = async () => {
+      if (!ttsScriptModalState) return;
+      if (!confirm('이 메시지에 저장된 대본을 삭제할까요? (다음 재생 시 LLM이 다시 분석합니다)')) return;
+      try {
+        await api('/api/tts/script/delete', {
+          method: 'POST',
+          body: JSON.stringify({
+            scriptKey: ttsScriptModalState.scriptKey,
+            botKey: ttsScriptModalState.botKey,
+            role: found.role || 'char',
+            text: found.text || '',
+            html: found.html || '',
+          }),
+        });
+        ttsAnalyzeCache.clear();
+        ttsAudioBufferCache.clear();
+        if (!ttsScriptModalState) return;
+        ttsScriptModalState.scriptSaved = false;
+        ttsScriptModalState.manuallyEdited = false;
+        ttsScriptModalState.dirty = true;
+        updateTtsScriptModalHeaderBadges();
+        toast('저장된 대본 삭제됨');
+      } catch (err) { toast('삭제 실패: ' + err.message); }
+    };
+
+    await runScriptLoad(false);
+  }
+  window.openTtsScriptEditorModal = openTtsScriptEditorModal;
 
   let msgEditState = null;
   let msgEditKeyHandler = null;
@@ -11664,15 +14530,38 @@ function renderWebApp() {
   };
   window.toggleBot = (idx) => { expandedBotIdx = expandedBotIdx === idx ? -2 : idx; renderBots(true); };
   window.selectTarget = async (charIndex, chatIndex) => {
-    recordRecentOpen(charIndex, chatIndex);
+    const targetChar = Number(charIndex);
+    const targetChat = Number(chatIndex);
+    recordRecentOpen(targetChar, targetChat);
     bookAnchorMode = 'last-user';
     bookSpreadIdx = -1;
     bookDesiredSpreadIdx = -1;
     pendingReplyTarget = null;
-    await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'select_target', payload: { charIndex, chatIndex } }) });
-    toast('채팅방 전환 중...');
-    switchTab('chat');
-    setTimeout(pollState, 700);
+    clearPendingTargetSwitch();
+    pendingTargetSwitch = { charIndex: targetChar, chatIndex: targetChat, at: Date.now() };
+    lastChatRenderSig = '';
+    lastBotOverlaySig = '';
+    lastBgHtmlSig = '';
+    try {
+      const res = await api('/api/command', { method: 'POST', body: JSON.stringify({ type: 'select_target', payload: { charIndex: targetChar, chatIndex: targetChat } }) });
+      if (res && res.snapshot && Number(res.snapshot.charIndex) === targetChar && Number(res.snapshot.chatIndex) === targetChat) {
+        clearPendingTargetSwitch();
+        if (typeof res.snapshotVersion === 'number') knownSnapshotVer = res.snapshotVersion;
+        applyState({ ...(lastState || {}), snapshot: res.snapshot, snapshotVersion: res.snapshotVersion ?? (lastState && lastState.snapshotVersion) });
+        switchTab('chat');
+        return;
+      }
+      toast('채팅방 전환 중...');
+      switchTab('chat');
+      [250, 650, 1300, 2200].forEach((ms) => {
+        targetSwitchTimers.push(setTimeout(() => {
+          if (pendingTargetSwitch) pollState();
+        }, ms));
+      });
+    } catch (err) {
+      clearPendingTargetSwitch();
+      toast('채팅방 전환 실패: ' + (err && err.message ? err.message : String(err)));
+    }
   };
   window.createChat = async (charIndex) => {
     const name = prompt('새 채팅방 이름 (비우면 자동 생성):', '');
@@ -11903,6 +14792,22 @@ function renderWebApp() {
     return keys;
   }
 
+  function mergeNonEmptyToggles(...maps) {
+    const out = {};
+    for (const m of maps) {
+      if (!m || typeof m !== 'object' || Array.isArray(m)) continue;
+      for (const [rawKey, rawVal] of Object.entries(m)) {
+        const k = String(rawKey || '').trim();
+        if (!k || rawVal === undefined || rawVal === null) continue;
+        const v = String(rawVal);
+        if (v === '') continue;
+        out[k] = v;
+        if (!k.startsWith('toggle_')) out['toggle_' + k] = v;
+      }
+    }
+    return out;
+  }
+
   function renderCustomToggles(force = false) {
     const snap = (lastState && lastState.snapshot) || {};
     const modBlocks = (snap.customToggleBlocks || []).map((b) => ({ source: b.source, syntax: b.syntax, isPreset: false }));
@@ -11948,15 +14853,31 @@ function renderWebApp() {
       for (const k of Object.keys(optimisticVars)) delete optimisticVars[k];
       optimisticUseLocal = null;
       optimisticUntil = 0;
+      if (typeof refreshTtsCastForBotChange === 'function') refreshTtsCastForBotChange();
     }
 
     const now = Date.now();
     const useLocal = (now < optimisticUntil && optimisticUseLocal !== null) ? optimisticUseLocal : Boolean(snap.useLocallySetGlobalVariables);
+    const presetDefaults = (routerCfg && routerCfg.presetDefaultToggleValues && typeof routerCfg.presetDefaultToggleValues === 'object') ? routerCfg.presetDefaultToggleValues : {};
     const remoteGlobals = (routerCfg && routerCfg.remoteToggleValues && typeof routerCfg.remoteToggleValues === 'object') ? routerCfg.remoteToggleValues : {};
     const baseVals = useLocal
-      ? { ...(snap.globalToggleValues || {}), ...remoteGlobals, ...(snap.localToggleValues || {}) }
-      : { ...(snap.globalToggleValues || {}), ...remoteGlobals };
-    const vals = { ...baseVals, ...(now < optimisticUntil ? optimisticVars : {}) };
+      ? mergeNonEmptyToggles(presetDefaults, snap.globalToggleValues, remoteGlobals, snap.localToggleValues)
+      : mergeNonEmptyToggles(presetDefaults, snap.globalToggleValues, remoteGlobals);
+    const vals = { ...baseVals };
+    if (now < optimisticUntil) {
+      for (const [okKey, okVal] of Object.entries(optimisticVars)) {
+        const ov = (okVal === null || okVal === undefined) ? '' : String(okVal);
+        if (ov === '') {
+          if (presetDefaults[okKey] !== undefined && presetDefaults[okKey] !== '') {
+            vals[okKey] = String(presetDefaults[okKey]);
+          } else {
+            delete vals[okKey];
+          }
+        } else {
+          vals[okKey] = ov;
+        }
+      }
+    }
     syncLeaveHudVisibility({ ...snap, useLocallySetGlobalVariables: useLocal, localToggleValues: { ...(snap.localToggleValues || {}), ...(now < optimisticUntil ? optimisticVars : {}) } });
     const sig = JSON.stringify([snap.charIndex, snap.chatIndex, curDirectId, useLocal, vals, blocks.map((b) => (b.id || '') + ':' + b.source + ':' + b.syntax.length), Array.from(openToggleGroups)]);
     if (!force && sig === lastToggleRenderSig) return;
@@ -12046,7 +14967,8 @@ function renderWebApp() {
     lastToggleRenderSig = '';
     if (!curUseLocal && routerCfg) {
       if (!routerCfg.remoteToggleValues || typeof routerCfg.remoteToggleValues !== 'object') routerCfg.remoteToggleValues = {};
-      routerCfg.remoteToggleValues[fullKey] = String(value);
+      if (String(value ?? '') === '') delete routerCfg.remoteToggleValues[fullKey];
+      else routerCfg.remoteToggleValues[fullKey] = String(value);
     }
     await api('/api/command', {
       method: 'POST',
@@ -12556,6 +15478,7 @@ function renderWebApp() {
     routerCfg = await api('/api/router/config');
     syncToggleBadges();
     renderRouterUI();
+    if (typeof renderCustomToggles === 'function') renderCustomToggles(true);
   }
   function getProviderMeta(pid) {
     return AI_PROVIDERS.find((x) => x.id === pid) || AI_PROVIDERS.find((x) => x.id === 'custom') || AI_PROVIDERS[0];
@@ -12663,7 +15586,26 @@ function renderWebApp() {
     }).join('');
     const tr = routerCfg.translator || {};
     const trPid = inferClientProviderId(tr.provider, tr.providerType, tr.baseUrl);
-    document.getElementById('trUseActive').checked = Boolean(tr.useActiveProfile);
+    const trSel = document.getElementById('trProfileSel');
+    if (trSel) {
+      const opts = ['<option value="active">활성 모델 프로필 공용 사용 (기본)</option>'];
+      profs.forEach((p) => {
+        if (!p || !p.id) return;
+        opts.push('<option value="' + esc('profile:' + p.id) + '">' + esc('저장된 프로필: ' + (p.name || p.id) + ' (' + (p.model || p.providerType || '') + ')') + '</option>');
+      });
+      opts.push('<option value="custom">전용 번역 모델 직접 설정 (별도 프로바이더 · API 키 · 모델 ID)</option>');
+      trSel.innerHTML = opts.join('');
+      const savedPid = typeof tr.profileId === 'string' ? tr.profileId.trim() : '';
+      if (savedPid === 'custom' || (!savedPid && !tr.useActiveProfile)) {
+        trSel.value = 'custom';
+      } else if (savedPid && savedPid !== 'active' && profs.some((p) => p && p.id === savedPid)) {
+        trSel.value = 'profile:' + savedPid;
+      } else {
+        trSel.value = 'active';
+      }
+    }
+    const trOverrideEl = document.getElementById('trProfileModelOverride');
+    if (trOverrideEl) trOverrideEl.value = tr.profileModelOverride || '';
     document.getElementById('trAutoOut').checked = Boolean(tr.autoTranslateOutput);
     document.getElementById('trAutoIn').checked = Boolean(tr.autoTranslateInput);
     document.getElementById('trProvider').value = trPid;
@@ -12673,13 +15615,13 @@ function renderWebApp() {
     document.getElementById('trKey').placeholder = tr.hasKey ? ('저장됨: ' + tr.keyPreview) : 'API 키 입력';
     document.getElementById('trModel').value = tr.model || 'gemini-2.5-flash';
     document.getElementById('trPrompt').value = tr.prompt || '';
-    document.getElementById('trCustomBox').style.display = tr.useActiveProfile ? 'none' : 'block';
     const trMeta = getProviderMeta(trPid);
     if (trMeta && Array.isArray(trMeta.builtinModels) && trMeta.builtinModels.length) {
       setModelPickList('trModelPick', 'trModelStatus', trMeta.builtinModels, trMeta.label + ' 내장 모델 ' + trMeta.builtinModels.length + '개');
     } else {
       setModelPickList('trModelPick', 'trModelStatus', [], '');
     }
+    if (typeof syncTranslatorModeUI === 'function') syncTranslatorModeUI();
     const dpSel = document.getElementById('directPresetSel');
     const dpDel = document.getElementById('directPresetDelBtn');
     const dpHint = document.getElementById('directPresetHint');
@@ -12809,7 +15751,113 @@ function renderWebApp() {
     const edBtn = e.target.closest('[data-edit-prof]');
     if (edBtn) { editProfile(edBtn.getAttribute('data-edit-prof')); }
   });
-  document.getElementById('trUseActive').onchange = (e) => { document.getElementById('trCustomBox').style.display = e.target.checked ? 'none' : 'block'; };
+  function getSelectedTranslatorTargetProfile() {
+    const selEl = document.getElementById('trProfileSel');
+    const val = selEl ? selEl.value : 'active';
+    const profs = (routerCfg && Array.isArray(routerCfg.profiles)) ? routerCfg.profiles : [];
+    if (val === 'custom') return null;
+    if (val.startsWith('profile:')) {
+      const pid = val.slice(8);
+      return profs.find((p) => p && p.id === pid) || null;
+    }
+    const activeId = routerCfg && routerCfg.activeProfileId;
+    return profs.find((p) => p && p.id === activeId) || profs[0] || null;
+  }
+
+  let lastTrProfSeedKey = '';
+  function syncTranslatorModeUI() {
+    const selEl = document.getElementById('trProfileSel');
+    const overrideBox = document.getElementById('trProfileOverrideBox');
+    const customBox = document.getElementById('trCustomBox');
+    const hintEl = document.getElementById('trActiveModelHint');
+    const overrideInp = document.getElementById('trProfileModelOverride');
+    const customModelInp = document.getElementById('trModel');
+    const customProvSel = document.getElementById('trProvider');
+    const val = selEl ? selEl.value : 'active';
+    const isCustom = val === 'custom';
+    if (overrideBox) overrideBox.style.display = isCustom ? 'none' : 'block';
+    if (customBox) customBox.style.display = isCustom ? 'block' : 'none';
+    const overrideModel = overrideInp ? overrideInp.value.trim() : '';
+
+    if (isCustom) {
+      const cm = (customModelInp && customModelInp.value.trim()) || 'gemini-2.5-flash';
+      const cp = (customProvSel && customProvSel.value) || '';
+      if (hintEl) hintEl.textContent = '현재 적용: 전용 번역 설정 · ' + (cp ? cp + ' · ' : '') + cm;
+      return;
+    }
+
+    const targetProf = getSelectedTranslatorTargetProfile();
+    const seedKey = val + ':' + (targetProf ? (targetProf.id + ':' + targetProf.provider + ':' + targetProf.baseUrl) : 'none');
+    if (seedKey !== lastTrProfSeedKey) {
+      lastTrProfSeedKey = seedKey;
+      if (targetProf) {
+        const meta = getProviderMeta(inferClientProviderId(targetProf.provider, targetProf.providerType, targetProf.baseUrl));
+        if (meta && Array.isArray(meta.builtinModels) && meta.builtinModels.length) {
+          setModelPickList('trProfModelPick', 'trProfModelStatus', meta.builtinModels, meta.label + ' 내장 모델 ' + meta.builtinModels.length + '개 (선택하거나 위 입력창에 직접 입력)');
+        } else {
+          setModelPickList('trProfModelPick', 'trProfModelStatus', [], '🔄 모델 불러오기 버튼 또는 모델 ID 직접 입력이 가능합니다.');
+        }
+      } else {
+        setModelPickList('trProfModelPick', 'trProfModelStatus', [], '저장된 모델 프로필이 없습니다.');
+      }
+    }
+
+    if (hintEl) {
+      if (!targetProf) {
+        hintEl.textContent = '현재 적용: 활성 모델 프로필 없음 (프로필을 추가하거나 전용 설정을 선택하세요)';
+      } else {
+        const effModel = overrideModel || targetProf.model || targetProf.providerType || '-';
+        hintEl.textContent = '현재 적용: ' + (targetProf.name || targetProf.id) + ' · ' + effModel + (overrideModel ? ' (번역 전용 지정)' : ' (프로필 기본)');
+      }
+    }
+  }
+
+  const trProfileSelEl = document.getElementById('trProfileSel');
+  if (trProfileSelEl) trProfileSelEl.onchange = () => syncTranslatorModeUI();
+  const trProfileModelOverrideEl = document.getElementById('trProfileModelOverride');
+  if (trProfileModelOverrideEl) trProfileModelOverrideEl.oninput = () => syncTranslatorModeUI();
+  const trModelInpEl = document.getElementById('trModel');
+  if (trModelInpEl) trModelInpEl.oninput = () => syncTranslatorModeUI();
+  const trProfModelPickEl = document.getElementById('trProfModelPick');
+  if (trProfModelPickEl) {
+    trProfModelPickEl.onchange = (e) => {
+      const val = e.target.value;
+      if (!val || !trProfileModelOverrideEl) return;
+      trProfileModelOverrideEl.value = val;
+      syncTranslatorModeUI();
+      toast('번역 모델 선택됨: ' + val);
+    };
+  }
+  const trProfLoadBtnEl = document.getElementById('trProfLoadModelsBtn');
+  if (trProfLoadBtnEl) {
+    trProfLoadBtnEl.onclick = async () => {
+      const targetProf = getSelectedTranslatorTargetProfile();
+      if (!targetProf) return toast('먼저 저장된 모델 프로필을 선택해 주세요.');
+      const st = document.getElementById('trProfModelStatus');
+      trProfLoadBtnEl.disabled = true;
+      if (st) st.textContent = '선택한 프로필의 모델 목록을 불러오는 중...';
+      try {
+        const r = await api('/api/router/models', {
+          method: 'POST',
+          body: JSON.stringify({
+            provider: targetProf.provider || '',
+            providerType: targetProf.providerType || 'openai_compat',
+            baseUrl: targetProf.baseUrl || '',
+            profileId: targetProf.id,
+            target: 'profile',
+          }),
+        });
+        const models = r.models || [];
+        setModelPickList('trProfModelPick', 'trProfModelStatus', models, models.length + '개 모델을 불러왔습니다. 아래에서 선택하면 자동 입력됩니다.');
+        toast(models.length + '개 모델 불러옴');
+      } catch (e) {
+        if (st) st.textContent = '⚠️ ' + (e && e.message ? e.message : '불러오기 실패');
+        toast('모델 불러오기 실패: ' + (e && e.message ? e.message : '오류'));
+      } finally {
+        trProfLoadBtnEl.disabled = false;
+      }
+    };
+  }
   window.activateProfile = async (id) => {
     routerCfg.activeProfileId = id;
     routerCfg = await api('/api/router/config', { method: 'POST', body: JSON.stringify(routerCfg) });
@@ -12916,6 +15964,27 @@ function renderWebApp() {
       btn.disabled = false;
     }
   };
+  function syncProfileOverrideUI() {
+    const modeEl = document.getElementById('edOvMode');
+    const txtEl = document.getElementById('edOvText');
+    const hintEl = document.getElementById('edOvHint');
+    const mode = modeEl ? modeEl.value : 'off';
+    if (txtEl) txtEl.style.display = mode === 'off' ? 'none' : 'block';
+    if (hintEl) {
+      if (mode === 'append') {
+        hintEl.textContent = 'Leave 등 선택한 프리셋과 캐릭터 설정을 유지한 채, 이 모델을 쓸 때만 시스템 지침 끝에 한두 문장을 덧붙입니다.';
+      } else if (mode === 'prepend') {
+        hintEl.textContent = 'Leave 등 선택한 프리셋과 캐릭터 설정을 유지한 채, 프롬프트 가장 앞쪽에 이 모델 전용 규칙을 강하게 우선 배치합니다.';
+      } else if (mode === 'replace') {
+        hintEl.textContent = '주의: Leave 프리셋·캐릭터 시트·로어북 같은 시스템 지침을 전부 지우고 아래 문구만 보냅니다. 테스트·단순 챗 용도 외에는 권장하지 않습니다.';
+      } else {
+        hintEl.textContent = 'Leave 프리셋 등 아래 [원격 직접 요청 프롬프트 프리셋]이나 PC RisuAI가 만든 프롬프트를 그대로 사용합니다.';
+      }
+    }
+  }
+  const edOvModeEl = document.getElementById('edOvMode');
+  if (edOvModeEl) edOvModeEl.onchange = syncProfileOverrideUI;
+
   window.openNewProfile = (preset) => {
     const pid = inferClientProviderId(preset, '', '');
     const meta = getProviderMeta(pid);
@@ -12929,6 +15998,7 @@ function renderWebApp() {
     document.getElementById('edOvMode').value = 'off';
     document.getElementById('edOvText').value = '';
     document.getElementById('delProfBtn').style.display = 'none';
+    syncProfileOverrideUI();
     applyEditorProvider(meta.id, { updateName: false, fillDefaultModel: true });
     document.getElementById('profileEditor').style.display = 'block';
   };
@@ -12951,6 +16021,7 @@ function renderWebApp() {
     document.getElementById('edOvMode').value = p.overrideMode || 'off';
     document.getElementById('edOvText').value = p.systemOverride || '';
     document.getElementById('delProfBtn').style.display = 'inline-block';
+    syncProfileOverrideUI();
     if (Array.isArray(meta.builtinModels) && meta.builtinModels.length) {
       setModelPickList('edModelPick', 'edModelStatus', meta.builtinModels, meta.label + ' 기본 제공 모델 ' + meta.builtinModels.length + '개 (API 조회 병합 가능)');
     } else {
@@ -13042,40 +16113,58 @@ function renderWebApp() {
   const TTS_VOICE_GROUPS_CLIENT = ${JSON.stringify(TTS_VOICE_GROUPS)};
   const TTS_BUILTIN_VOICE_REFS_CLIENT = ${JSON.stringify(TTS_BUILTIN_VOICE_REFERENCES)};
   const TTS_TONE_TAG_PRESETS_CLIENT = ${JSON.stringify(TTS_TONE_TAG_PRESETS)};
-  let ttsLiveVoices = { fish: [], openai_qwen: [] };
+  const TTS_SPEECH_MODEL_SPECS_CLIENT = ${JSON.stringify(TTS_SPEECH_MODEL_SPECS)};
+  let ttsLiveVoices = { fish: [], openai: [], qwen: [] };
   let activeVpTab = 'fish';
+
+  function normalizeClientVoiceGroup(g, fallback = 'fish') {
+    if (g === 'fish' || g === 'openai' || g === 'qwen') return g;
+    if (g === 'openai_qwen') return 'openai';
+    return fallback;
+  }
+
+  function voiceGroupDisplayName(g) {
+    if (g === 'fish') return 'Fish';
+    if (g === 'openai') return 'OpenAI';
+    if (g === 'qwen') return 'Qwen3-TTS';
+    return String(g || 'Fish');
+  }
 
   function getSavedVoiceProfiles() {
     const vp = (routerCfg && routerCfg.tts && routerCfg.tts.voiceProfiles) || {};
     return {
       fish: Array.isArray(vp.fish) ? vp.fish : [],
-      openai_qwen: Array.isArray(vp.openai_qwen) ? vp.openai_qwen : [],
+      openai: Array.isArray(vp.openai) ? vp.openai : [],
+      qwen: Array.isArray(vp.qwen) ? vp.qwen : [],
     };
   }
 
   function getActiveTtsGroup() {
     const provEl = document.getElementById('ttsProviderSel');
     const prov = (provEl && provEl.value) || (routerCfg && routerCfg.tts && routerCfg.tts.provider) || 'fish_local';
-    return (prov === 'fish_local' || prov === 'fish_cloud') ? 'fish' : 'openai_qwen';
+    if (prov === 'fish_local' || prov === 'fish_cloud') return 'fish';
+    return prov === 'openai_compat_cloud' ? 'openai' : 'qwen';
   }
 
   function inferClientVoiceGroup(voiceId, preferredGroup) {
-    if (preferredGroup === 'fish' || preferredGroup === 'openai_qwen') return preferredGroup;
+    if (preferredGroup === 'fish' || preferredGroup === 'openai' || preferredGroup === 'qwen') return preferredGroup;
     const id = String(voiceId || '').trim();
     const saved = getSavedVoiceProfiles();
     if (id) {
       if (saved.fish.some((v) => v.id === id)) return 'fish';
-      if (saved.openai_qwen.some((v) => v.id === id)) return 'openai_qwen';
+      if (saved.openai.some((v) => v.id === id)) return 'openai';
+      if (saved.qwen.some((v) => v.id === id)) return 'qwen';
       if ((ttsLiveVoices.fish || []).some((v) => v.id === id)) return 'fish';
-      if ((ttsLiveVoices.openai_qwen || []).some((v) => v.id === id)) return 'openai_qwen';
-      const bi = (TTS_BUILTIN_VOICE_REFS_CLIENT.openai_qwen || []);
-      if (bi.some((v) => v.id.toLowerCase() === id.toLowerCase())) return 'openai_qwen';
+      if ((ttsLiveVoices.openai || []).some((v) => v.id === id)) return 'openai';
+      if ((ttsLiveVoices.qwen || []).some((v) => v.id === id)) return 'qwen';
+      if ((TTS_BUILTIN_VOICE_REFS_CLIENT.openai || []).some((v) => v.id.toLowerCase() === id.toLowerCase())) return 'openai';
+      if ((TTS_BUILTIN_VOICE_REFS_CLIENT.qwen || []).some((v) => v.id.toLowerCase() === id.toLowerCase())) return 'qwen';
     }
     return getActiveTtsGroup();
   }
 
   function getTtsVoiceOptionsForGroup(group) {
-    const grp = group === 'openai_qwen' ? 'openai_qwen' : 'fish';
+    const grp = normalizeClientVoiceGroup(group, 'fish');
     const out = [];
     const seen = new Set();
     const pushItem = (id, label, badge) => {
@@ -13096,7 +16185,7 @@ function renderWebApp() {
   }
 
   function buildVoiceGroupOptionsHtml(selectedGroup) {
-    const grp = selectedGroup === 'openai_qwen' ? 'openai_qwen' : 'fish';
+    const grp = normalizeClientVoiceGroup(selectedGroup, 'fish');
     return TTS_VOICE_GROUPS_CLIENT.map((g) =>
       '<option value="' + esc(g.id) + '"' + (g.id === grp ? ' selected' : '') + '>' + esc(g.label) + '</option>'
     ).join('');
@@ -13136,7 +16225,11 @@ function renderWebApp() {
   function syncVoiceDatalistOptions() {
     const dl = document.getElementById('ttsVoiceDatalist');
     if (!dl) return;
-    const all = [...getTtsVoiceOptionsForGroup('fish'), ...getTtsVoiceOptionsForGroup('openai_qwen')];
+    const all = [
+      ...getTtsVoiceOptionsForGroup('fish'),
+      ...getTtsVoiceOptionsForGroup('openai'),
+      ...getTtsVoiceOptionsForGroup('qwen'),
+    ];
     const seen = new Set();
     const opts = [];
     for (const item of all) {
@@ -13223,7 +16316,7 @@ function renderWebApp() {
       const iEl = document.getElementById(iId);
       if (gEl && rEl && iEl) {
         const curGrp = gEl.value || inferClientVoiceGroup(iEl.value);
-        syncVoicePickerControl(gEl, rEl, iEl, lbl, iEl.value ? inferClientVoiceGroup(iEl.value, curGrp) : curGrp);
+        syncVoicePickerControl(gEl, rEl, iEl, lbl, iEl.value ? inferClientVoiceGroup(iEl.value) : curGrp);
       }
     }
   }
@@ -13239,11 +16332,12 @@ function renderWebApp() {
     const listEl = document.getElementById('ttsVpList');
     if (listEl) {
       if (!list.length) {
-        listEl.innerHTML = '<div class="hint" style="margin:2px 0 4px;">' +
-          (activeVpTab === 'fish'
-            ? '등록된 Fish 레퍼런스 프로필이 없습니다. 직접 ID를 저장하거나 [이 영역 서버에서 불러오기]를 누르세요.'
-            : '등록된 사용자 OpenAI/Qwen 프로필이 없습니다. (기본 내장 보이스 20종은 드롭다운에 자동 포함됩니다)') +
-          '</div>';
+        const emptyHint = activeVpTab === 'fish'
+          ? '등록된 Fish 레퍼런스 프로필이 없습니다. 직접 ID를 저장하거나 [이 영역 서버에서 불러오기]를 누르세요.'
+          : (activeVpTab === 'openai'
+            ? '등록된 사용자 OpenAI 프로필이 없습니다. (기본 내장 OpenAI 보이스 11종은 드롭다운에 자동 포함됩니다)'
+            : '등록된 사용자 Qwen3-TTS 프로필이 없습니다. (기본 내장 Qwen3 보이스 9종은 드롭다운에 자동 포함됩니다)');
+        listEl.innerHTML = '<div class="hint" style="margin:2px 0 4px;">' + emptyHint + '</div>';
       } else {
         listEl.innerHTML = list.map((item) => {
           const gLabel = item.gender === 'female' ? '♀' : (item.gender === 'male' ? '♂' : '·');
@@ -13277,9 +16371,7 @@ function renderWebApp() {
 
   function storeLiveVoicesFromResponse(r, fallbackGroup) {
     if (!r || !Array.isArray(r.voices)) return;
-    const grp = r.voiceGroup === 'fish' || r.voiceGroup === 'openai_qwen'
-      ? r.voiceGroup
-      : (fallbackGroup === 'openai_qwen' ? 'openai_qwen' : 'fish');
+    const grp = normalizeClientVoiceGroup(r.voiceGroup, normalizeClientVoiceGroup(fallbackGroup, 'fish'));
     const items = Array.isArray(r.voiceItems) && r.voiceItems.length
       ? r.voiceItems.map((x) => ({ id: x.id, label: x.label || x.id }))
       : r.voices.map((v) => ({ id: String(v), label: String(v) }));
@@ -13299,8 +16391,148 @@ function renderWebApp() {
   };
   let ttsGlobalCastDraft = [];
   let ttsGlobalCastEditIdx = null;
+  let selectedTtsCastBotKey = '';
+
+  function getActiveSpeechModelSpecClient() {
+    const provEl = document.getElementById('ttsProviderSel');
+    const modEl = document.getElementById('ttsModel');
+    const tagEl = document.getElementById('ttsFishTagStyle');
+    const tCfg = (routerCfg && routerCfg.tts) || {};
+    const prov = String((provEl && provEl.value) || tCfg.provider || 'fish_local').toLowerCase().trim();
+    const model = String((modEl && modEl.value) || tCfg.model || '').trim();
+    const fishTagStyle = String((tagEl && tagEl.value) || tCfg.fishTagStyle || 'brackets').toLowerCase().trim();
+    if (prov === 'fish_local' || prov === 'fish_cloud') {
+      if (fishTagStyle === 'none') return TTS_SPEECH_MODEL_SPECS_CLIENT.fish_plain;
+      if (fishTagStyle === 'parens' || /^s1\b|speech-1/i.test(model)) return TTS_SPEECH_MODEL_SPECS_CLIENT.fish_s1;
+      return TTS_SPEECH_MODEL_SPECS_CLIENT.fish_s2;
+    }
+    if (prov === 'openai_compat_cloud') return TTS_SPEECH_MODEL_SPECS_CLIENT.openai_tts;
+    return TTS_SPEECH_MODEL_SPECS_CLIENT.qwen3_tts;
+  }
+
+  function updateTtsModelSpecBadge() {
+    const el = document.getElementById('ttsModelTagSpecBadge');
+    if (!el) return;
+    const spec = getActiveSpeechModelSpecClient();
+    const modeDesc = spec.deliveryMode === 'inline_tag'
+      ? ('LLM이 ' + (spec.tagSyntax === 'parens' ? '(소괄호)' : '[대괄호]') + ' 감정·발성 태그를 자동 생성')
+      : (spec.deliveryMode === 'instruction'
+        ? 'LLM이 인물 성격·감정 기반 instructions 연기 지시문을 자동 생성'
+        : '태그 삽입 비활성 (인물 성격·보이스 매칭만 사용)');
+    el.innerHTML = '🎯 현재 스피치 모델 규격: <b>' + esc(spec.label) + '</b> — ' + esc(modeDesc);
+  }
+
+  function getCurrentSnapBotInfo() {
+    const snap = (lastState && lastState.snapshot) || {};
+    const rawCtx = (snap.charContext && typeof snap.charContext === 'object') ? snap.charContext : {};
+    const rawId = rawCtx.charId || rawCtx.chaId || snap.chaId || snap.charId || '';
+    const idxNum = Number(snap.charIndex);
+    const botName = String(snap.charName || rawCtx.name || '').trim();
+    let botKey = String(rawId || '').trim();
+    if (!botKey && snap.charIndex !== undefined && snap.charIndex !== null && Number.isFinite(idxNum) && idxNum >= 0) {
+      botKey = 'c' + Math.trunc(idxNum);
+    } else if (!botKey && botName) {
+      botKey = 'name:' + botName;
+    }
+    return { botKey, botName: botName || botKey };
+  }
+
+  function getCastCharactersForTargetKey(targetKey) {
+    const t = (routerCfg && routerCfg.tts) || {};
+    if (!targetKey || targetKey === '__global__') {
+      return Array.isArray(t.characters) ? t.characters : [];
+    }
+    const map = (t.botCharacters && typeof t.botCharacters === 'object') ? t.botCharacters : {};
+    const entry = map[targetKey];
+    return (entry && Array.isArray(entry.characters)) ? entry.characters : [];
+  }
+
+  function resolveActiveCastTarget() {
+    const activeInfo = getCurrentSnapBotInfo();
+    const t = (routerCfg && routerCfg.tts) || {};
+    const botMap = (t.botCharacters && typeof t.botCharacters === 'object') ? t.botCharacters : {};
+    const catChars = (lastState && lastState.catalog && Array.isArray(lastState.catalog.chars)) ? lastState.catalog.chars : [];
+
+    let targetKey = selectedTtsCastBotKey || activeInfo.botKey || '__global__';
+    let targetName = '';
+    if (targetKey === '__global__') {
+      targetName = '전역 기본 (모든 봇 공용)';
+    } else if (activeInfo.botKey && targetKey === activeInfo.botKey) {
+      targetName = activeInfo.botName || targetKey;
+    } else if (botMap[targetKey] && botMap[targetKey].botName) {
+      targetName = botMap[targetKey].botName;
+    } else {
+      const catMatch = catChars.find((c) => c && (String(c.chaId || '') === targetKey || ('c' + c.index) === targetKey || ('name:' + c.name) === targetKey));
+      targetName = catMatch ? catMatch.name : targetKey;
+    }
+    return { targetKey, targetName, activeBotKey: activeInfo.botKey, activeBotName: activeInfo.botName };
+  }
+
+  function syncDraftFromTargetKey(targetKey) {
+    const saved = getCastCharactersForTargetKey(targetKey);
+    ttsGlobalCastDraft = JSON.parse(JSON.stringify(saved));
+  }
+
+  function populateTtsCastBotSelector() {
+    const sel = document.getElementById('ttsCastBotSel');
+    if (!sel) return;
+    const t = (routerCfg && routerCfg.tts) || {};
+    const botMap = (t.botCharacters && typeof t.botCharacters === 'object') ? t.botCharacters : {};
+    const catChars = (lastState && lastState.catalog && Array.isArray(lastState.catalog.chars)) ? lastState.catalog.chars : [];
+    const target = resolveActiveCastTarget();
+    const opts = [];
+    const added = new Set();
+
+    const pushOpt = (key, label) => {
+      if (!key || added.has(key)) return;
+      added.add(key);
+      const count = getCastCharactersForTargetKey(key).length;
+      opts.push('<option value="' + esc(key) + '"' + (key === target.targetKey ? ' selected' : '') + '>' + esc(label + ' (' + count + '명)') + '</option>');
+    };
+
+    if (target.activeBotKey) {
+      pushOpt(target.activeBotKey, '📍 현재 봇: ' + (target.activeBotName || target.activeBotKey));
+    }
+    for (const c of catChars) {
+      if (!c) continue;
+      const bk = String(c.chaId || (c.index !== undefined ? ('c' + c.index) : '') || '').trim();
+      if (bk) pushOpt(bk, '🤖 ' + (c.name || bk));
+    }
+    for (const [bk, entry] of Object.entries(botMap)) {
+      pushOpt(bk, '💾 ' + ((entry && entry.botName) || bk));
+    }
+    if (target.targetKey && target.targetKey !== '__global__' && !added.has(target.targetKey)) {
+      pushOpt(target.targetKey, '🤖 ' + (target.targetName || target.targetKey));
+    }
+    const globalCount = Array.isArray(t.characters) ? t.characters.length : 0;
+    opts.push('<option value="__global__"' + (target.targetKey === '__global__' ? ' selected' : '') + '>' + esc('🌐 전역 기본 공용 (' + globalCount + '명)') + '</option>');
+    sel.innerHTML = opts.join('');
+    sel.value = target.targetKey;
+  }
+
+  function refreshTtsCastForBotChange() {
+    if (!selectedTtsCastBotKey || selectedTtsCastBotKey !== '__global__') {
+      const info = getCurrentSnapBotInfo();
+      if (!selectedTtsCastBotKey || (info.botKey && selectedTtsCastBotKey !== info.botKey)) {
+        if (!selectedTtsCastBotKey && info.botKey) {
+          syncDraftFromTargetKey(info.botKey);
+          ttsGlobalCastEditIdx = null;
+        }
+      }
+    }
+    renderGlobalTtsCastBox();
+  }
 
   function renderGlobalTtsCastBox() {
+    const boxEl = document.getElementById('ttsGlobalCastBox');
+    if (!boxEl) return;
+    updateTtsModelSpecBadge();
+    populateTtsCastBotSelector();
+    const target = resolveActiveCastTarget();
+    if (ttsGlobalCastEditIdx === null) {
+      syncDraftFromTargetKey(target.targetKey);
+    }
+    const activeSpec = getActiveSpeechModelSpecClient();
     const listEl = document.getElementById('ttsGlobalCastList');
     const editorEl = document.getElementById('ttsGlobalCastEditor');
     if (listEl) {
@@ -13309,11 +16541,23 @@ function renderWebApp() {
             const gLabel = c.gender === 'female' ? '♀ 여성' : (c.gender === 'male' ? '♂ 남성' : '중성');
             const vTxt = c.voiceId ? ('Voice: ' + c.voiceId) : '기본 성별 풀';
             const aliasTxt = (c.aliases && c.aliases.length) ? (' (' + c.aliases.join(', ') + ')') : '';
-            const toneTxt = [c.dialogueToneTag ? ('대화:' + c.dialogueToneTag) : '', c.thoughtToneTag ? ('속마음:' + c.thoughtToneTag) : ''].filter(Boolean).join(' · ');
+            const modelEntry = (c.speechTagsByModel && c.speechTagsByModel[activeSpec.id]) || {};
+            const dTag = modelEntry.dialogueTag || c.dialogueToneTag || '';
+            const tTag = modelEntry.thoughtTag || c.thoughtToneTag || '';
+            const dInstr = modelEntry.dialogueInstruction || c.dialogueInstruction || '';
+            let stylePreview = '';
+            if (activeSpec.deliveryMode === 'instruction') {
+              stylePreview = dInstr ? ('연기 지시: ' + dInstr) : '';
+            } else {
+              stylePreview = [dTag ? ('대화:' + dTag) : '', tTag ? ('속마음:' + tTag) : ''].filter(Boolean).join(' · ');
+            }
+            const traitTxt = [c.personality ? ('성격: ' + c.personality) : '', c.speechStyle ? ('말투: ' + c.speechStyle) : ''].filter(Boolean).join(' / ');
+            const autoBadge = c.autoGenerated ? ' <span class="pill" style="font-size:10px; padding:1px 6px;">🤖 LLM 분석</span>' : '';
             return '<div class="tts-cast-item">' +
               '<div style="min-width:0;">' +
-                '<div style="font-size:13.5px; font-weight:700;">' + esc(c.name) + '<span style="font-weight:500; color:var(--sub); font-size:11.5px;">' + esc(aliasTxt) + '</span></div>' +
-                '<div style="font-size:11.5px; color:var(--sub);">' + esc(gLabel + ' · ' + vTxt + (toneTxt ? ' · ' + toneTxt : '')) + '</div>' +
+                '<div style="font-size:13.5px; font-weight:700;">' + esc(c.name) + '<span style="font-weight:500; color:var(--sub); font-size:11.5px;">' + esc(aliasTxt) + '</span>' + autoBadge + '</div>' +
+                '<div style="font-size:11.5px; color:var(--sub);">' + esc(gLabel + ' · ' + vTxt + (stylePreview ? ' · ' + stylePreview : '')) + '</div>' +
+                (traitTxt ? '<div style="font-size:11px; color:var(--sub); margin-top:2px;">' + esc(traitTxt) + '</div>' : '') +
               '</div>' +
               '<div style="display:flex; gap:5px; flex-shrink:0;">' +
                 '<button type="button" class="pill" data-ttsc-preview="' + idx + '" title="미리듣기">▶</button>' +
@@ -13322,7 +16566,7 @@ function renderWebApp() {
               '</div>' +
             '</div>';
           }).join('')
-        : '<div class="hint" style="margin:2px 0;">등록된 등장인물 보이스가 없습니다. <b>+ 캐릭터 추가</b>로 화자별 목소리를 등록하거나, 미등록 화자는 위 기본 성별 풀을 사용합니다.</div>';
+        : '<div class="hint" style="margin:2px 0;">이 봇에 저장된 등장인물 프로필이 없습니다. <b>🤖 현재 봇 성격·스피치 분석</b>을 누르거나 TTS 재생 시 자동으로 학습·저장됩니다.</div>';
     }
     if (editorEl) {
       if (ttsGlobalCastEditIdx === null) {
@@ -13331,15 +16575,19 @@ function renderWebApp() {
       }
       const c = (ttsGlobalCastEditIdx >= 0 && ttsGlobalCastDraft[ttsGlobalCastEditIdx]) ? ttsGlobalCastDraft[ttsGlobalCastEditIdx] : {
         id: 'tts-char-' + Date.now(), name: '', aliases: [], gender: 'female', voiceGroup: '', voiceId: '',
-        dialogueToneTag: '', thoughtToneTag: 'whispering', speed: 1.0, thoughtSpeed: 0.94,
+        personality: '', speechStyle: '', dialogueToneTag: '', thoughtToneTag: 'whispering', dialogueInstruction: '', thoughtInstruction: '', speed: 1.0, thoughtSpeed: 0.94,
       };
+      const curModelTags = (c.speechTagsByModel && c.speechTagsByModel[activeSpec.id]) || {};
+      const effDlgTag = curModelTags.dialogueTag || c.dialogueToneTag || '';
+      const effThTag = curModelTags.thoughtTag || (c.thoughtToneTag !== undefined ? c.thoughtToneTag : 'whispering');
+      const effDlgInstr = curModelTags.dialogueInstruction || c.dialogueInstruction || '';
+      const effThInstr = curModelTags.thoughtInstruction || c.thoughtInstruction || '';
       const curVoiceGroup = inferClientVoiceGroup(c.voiceId || '', c.voiceGroup || '');
-      const dlgPresetMatch = !c.dialogueToneTag || TTS_TONE_TAG_PRESETS_CLIENT.some((t) => t.value.toLowerCase() === String(c.dialogueToneTag).toLowerCase());
-      const thVal = c.thoughtToneTag !== undefined ? c.thoughtToneTag : 'whispering';
-      const thPresetMatch = !thVal || TTS_TONE_TAG_PRESETS_CLIENT.some((t) => t.value.toLowerCase() === String(thVal).toLowerCase());
+      const dlgPresetMatch = !effDlgTag || TTS_TONE_TAG_PRESETS_CLIENT.some((t) => t.value.toLowerCase() === String(effDlgTag).toLowerCase());
+      const thPresetMatch = !effThTag || TTS_TONE_TAG_PRESETS_CLIENT.some((t) => t.value.toLowerCase() === String(effThTag).toLowerCase());
       editorEl.innerHTML =
         '<div class="tts-subbox" id="ttsGlobalEditorCard" style="margin-top:8px;">' +
-          '<div class="tts-subbox-title"><span>' + (ttsGlobalCastEditIdx >= 0 ? '✏️ 등장인물 보이스 편집' : '➕ 새 등장인물 보이스 추가') + '</span></div>' +
+          '<div class="tts-subbox-title"><span>' + (ttsGlobalCastEditIdx >= 0 ? '✏️ 등장인물 스피치 프로필 편집' : '➕ 새 등장인물 스피치 프로필 추가') + '</span></div>' +
           '<div class="grid-2">' +
             '<div><label class="f-label" style="margin-top:2px;">등장인물 이름</label><input class="f-inp" id="ttscNameInp" value="' + esc(c.name || '') + '" placeholder="예: 주시은" /></div>' +
             '<div><label class="f-label" style="margin-top:2px;">성별</label>' +
@@ -13352,27 +16600,35 @@ function renderWebApp() {
           '</div>' +
           '<label class="f-label" style="margin-top:4px;">별칭 (쉼표 구분)</label>' +
           '<input class="f-inp" id="ttscAliasesInp" value="' + esc(Array.isArray(c.aliases) ? c.aliases.join(', ') : '') + '" placeholder="예: 시은, Sieun, 그녀" />' +
+          '<div class="grid-2">' +
+            '<div><label class="f-label" style="margin-top:4px;">성격 요약 (LLM 태그 생성 근거)</label><input class="f-inp" id="ttscPersonalityInp" value="' + esc(c.personality || '') + '" placeholder="예: 도도하지만 내면은 다정함" /></div>' +
+            '<div><label class="f-label" style="margin-top:4px;">말투 · 발성 특징</label><input class="f-inp" id="ttscSpeechStyleInp" value="' + esc(c.speechStyle || '') + '" placeholder="예: 차분하고 약간 나긋한 말투" /></div>' +
+          '</div>' +
           '<label class="f-label" style="margin-top:6px;">전용 Voice / Reference ID (1단계: 영역 → 2단계: 보이스 ID)</label>' +
           '<div class="tts-voice-tier">' +
             '<select class="f-inp" id="ttscVoiceGroupSel" aria-label="캐릭터 보이스 영역">' + buildVoiceGroupOptionsHtml(curVoiceGroup) + '</select>' +
             '<select class="f-inp" id="ttscVoiceRefSel" aria-label="캐릭터 보이스 레퍼런스">' + buildVoiceRefOptionsHtml(curVoiceGroup, c.voiceId || '', '-- 기본 성별 풀 사용 --') + '</select>' +
           '</div>' +
           '<div style="display:flex; gap:6px; align-items:center; margin-top:6px;">' +
-            '<input class="f-inp" id="ttscVoiceIdInp" list="ttsVoiceDatalist" value="' + esc(c.voiceId || '') + '" placeholder="Fish reference_id 또는 OpenAI/Qwen voice (직접 입력 가능)" style="flex:1; min-width:0;" />' +
+            '<input class="f-inp" id="ttscVoiceIdInp" list="ttsVoiceDatalist" value="' + esc(c.voiceId || '') + '" placeholder="Fish reference_id, OpenAI 또는 Qwen3 voice (직접 입력 가능)" style="flex:1; min-width:0;" />' +
             '<button type="button" class="pill" id="ttscSaveVoiceProfileBtn" title="현재 영역 프로필로 저장" style="flex-shrink:0;">+ 프로필 저장</button>' +
           '</div>' +
           '<div class="grid-2">' +
             '<div>' +
-              '<label class="f-label" style="margin-top:6px;">대화 톤 태그</label>' +
-              '<select class="f-inp" id="ttscDlgTagSel" aria-label="대화 톤 태그">' + buildToneTagOptionsHtml(c.dialogueToneTag || '', '-- 톤 태그 없음 (기본) --') + '</select>' +
-              '<input class="f-inp" id="ttscDlgTagInp" value="' + esc(c.dialogueToneTag || '') + '" placeholder="직접 입력 (예: soft)" style="margin-top:4px; display:' + (dlgPresetMatch ? 'none' : 'block') + ';" />' +
+              '<label class="f-label" style="margin-top:6px;">대화 톤 태그 (Fish S2/S1용)</label>' +
+              '<select class="f-inp" id="ttscDlgTagSel" aria-label="대화 톤 태그">' + buildToneTagOptionsHtml(effDlgTag, '-- 톤 태그 없음 (기본) --') + '</select>' +
+              '<input class="f-inp" id="ttscDlgTagInp" value="' + esc(effDlgTag) + '" placeholder="직접 입력 (예: soft)" style="margin-top:4px; display:' + (dlgPresetMatch ? 'none' : 'block') + ';" />' +
             '</div>' +
             '<div>' +
-              '<label class="f-label" style="margin-top:6px;">속마음 톤 태그</label>' +
-              '<select class="f-inp" id="ttscThTagSel" aria-label="속마음 톤 태그">' + buildToneTagOptionsHtml(thVal, '-- 톤 태그 없음 (기본) --') + '</select>' +
-              '<input class="f-inp" id="ttscThTagInp" value="' + esc(thVal) + '" placeholder="직접 입력 (예: whispering)" style="margin-top:4px; display:' + (thPresetMatch ? 'none' : 'block') + ';" />' +
+              '<label class="f-label" style="margin-top:6px;">속마음 톤 태그 (Fish S2/S1용)</label>' +
+              '<select class="f-inp" id="ttscThTagSel" aria-label="속마음 톤 태그">' + buildToneTagOptionsHtml(effThTag, '-- 톤 태그 없음 (기본) --') + '</select>' +
+              '<input class="f-inp" id="ttscThTagInp" value="' + esc(effThTag) + '" placeholder="직접 입력 (예: whispering)" style="margin-top:4px; display:' + (thPresetMatch ? 'none' : 'block') + ';" />' +
             '</div>' +
           '</div>' +
+          '<label class="f-label" style="margin-top:4px;">대화 연기 지시문 (OpenAI / Qwen3 instructions용)</label>' +
+          '<input class="f-inp" id="ttscDlgInstrInp" value="' + esc(effDlgInstr) + '" placeholder="예: 차분하고 장난기 섞인 부드러운 여성 어조" />' +
+          '<label class="f-label" style="margin-top:4px;">속마음 연기 지시문 (OpenAI / Qwen3 instructions용)</label>' +
+          '<input class="f-inp" id="ttscThInstrInp" value="' + esc(effThInstr) + '" placeholder="예: 속으로 조용히 되뇌는 낮은 속삭임" />' +
           '<div class="grid-2">' +
             '<div><label class="f-label" style="margin-top:4px;">대화 속도</label><input class="f-inp" id="ttscSpeedInp" type="number" step="0.02" min="0.5" max="2.0" value="' + esc(String(c.speed || 1.0)) + '" /></div>' +
             '<div><label class="f-label" style="margin-top:4px;">속마음 속도</label><input class="f-inp" id="ttscThSpeedInp" type="number" step="0.02" min="0.5" max="2.0" value="' + esc(String(c.thoughtSpeed || 0.94)) + '" /></div>' +
@@ -13414,7 +16670,8 @@ function renderWebApp() {
         male: { ...(dv.male || {}), voiceId: document.getElementById('ttsMaleVoiceId').value.trim(), thoughtToneTag: document.getElementById('ttsMaleThoughtTag').value.trim(), thoughtSpeed: Number(document.getElementById('ttsDefThoughtSpeed').value) || 0.94 },
         neutral: { ...(dv.neutral || {}), voiceId: document.getElementById('ttsNeuVoiceId').value.trim(), thoughtSpeed: Number(document.getElementById('ttsDefThoughtSpeed').value) || 0.94 },
       },
-      characters: ttsGlobalCastDraft.slice(),
+      characterVoicesEnabled: document.getElementById('ttsCharVoicesEnabledChk') ? document.getElementById('ttsCharVoicesEnabledChk').checked : (cur && cur.characterVoicesEnabled !== false),
+      autoLearnBotProfiles: document.getElementById('ttsAutoLearnProfilesChk') ? document.getElementById('ttsAutoLearnProfilesChk').checked : (cur && cur.autoLearnBotProfiles !== false),
       effects: {
         ...fx,
         thoughtFxEnabled: document.getElementById('ttsFxEnabledChk').checked,
@@ -13439,6 +16696,7 @@ function renderWebApp() {
     }
     if (modelEl && overwriteUrlModel) modelEl.value = meta.model;
     if (tagRow) tagRow.style.display = meta.isFish ? 'block' : 'none';
+    if (typeof updateTtsModelSpecBadge === 'function') updateTtsModelSpecBadge();
   }
 
   function hydrateTtsConfigUI() {
@@ -13484,7 +16742,12 @@ function renderWebApp() {
     syncToneTagControl(document.getElementById('ttsNarToneTagSel'), document.getElementById('ttsNarToneTag'), document.getElementById('ttsNarToneTag').value, '-- 톤 태그 없음 (기본) --');
     syncToneTagControl(document.getElementById('ttsFemThoughtTagSel'), document.getElementById('ttsFemThoughtTag'), document.getElementById('ttsFemThoughtTag').value, '-- 톤 태그 없음 (기본) --');
     syncToneTagControl(document.getElementById('ttsMaleThoughtTagSel'), document.getElementById('ttsMaleThoughtTag'), document.getElementById('ttsMaleThoughtTag').value, '-- 톤 태그 없음 (기본) --');
-    ttsGlobalCastDraft = Array.isArray(t.characters) ? JSON.parse(JSON.stringify(t.characters)) : [];
+    const charEnChk = document.getElementById('ttsCharVoicesEnabledChk');
+    if (charEnChk) charEnChk.checked = t.characterVoicesEnabled !== false;
+    const autoLearnChk = document.getElementById('ttsAutoLearnProfilesChk');
+    if (autoLearnChk) autoLearnChk.checked = t.autoLearnBotProfiles !== false;
+    const activeTarget = resolveActiveCastTarget();
+    syncDraftFromTargetKey(activeTarget.targetKey);
     ttsGlobalCastEditIdx = null;
     renderGlobalTtsCastBox();
     refreshAllTtsPickers();
@@ -13503,7 +16766,12 @@ function renderWebApp() {
     if (provSel) provSel.onchange = () => {
       syncTtsProviderUI(provSel.value, true);
       setModelPickList('ttsModelPick', 'ttsModelStatus', [], '');
+      renderGlobalTtsCastBox();
     };
+    const modInp = document.getElementById('ttsModel');
+    if (modInp) modInp.addEventListener('input', () => { updateTtsModelSpecBadge(); });
+    const tagStyleSel = document.getElementById('ttsFishTagStyle');
+    if (tagStyleSel) tagStyleSel.addEventListener('change', () => { renderGlobalTtsCastBox(); });
 
     const TTS_PRESET_MAP = {
       fish_local_8081: { provider: 'fish_local', apiUrl: 'http://127.0.0.1:8081/v1/tts', model: 's2-pro', fishTagStyle: 'brackets' },
@@ -13717,7 +16985,7 @@ function renderWebApp() {
       vpBox.addEventListener('click', async (e) => {
         const tabBtn = e.target.closest('[data-vp-tab]');
         if (tabBtn) {
-          activeVpTab = tabBtn.getAttribute('data-vp-tab') === 'openai_qwen' ? 'openai_qwen' : 'fish';
+          activeVpTab = normalizeClientVoiceGroup(tabBtn.getAttribute('data-vp-tab'), 'fish');
           renderVoiceProfilesManager();
           return;
         }
@@ -13778,7 +17046,7 @@ function renderWebApp() {
       if (vpFetchBtn) vpFetchBtn.onclick = async () => {
         const stEl = document.getElementById('ttsVpStatus');
         vpFetchBtn.disabled = true;
-        if (stEl) stEl.textContent = (activeVpTab === 'fish' ? 'Fish' : 'OpenAI/Qwen') + ' 서버에서 보이스 목록 조회 중...';
+        if (stEl) stEl.textContent = voiceGroupDisplayName(activeVpTab) + ' 서버에서 보이스 목록 조회 중...';
         try {
           const payload = { group: activeVpTab };
           if (getActiveTtsGroup() === activeVpTab) {
@@ -13793,7 +17061,7 @@ function renderWebApp() {
           storeLiveVoicesFromResponse(r, activeVpTab);
           const cnt = Array.isArray(r.voices) ? r.voices.length : 0;
           if (stEl) stEl.textContent = r.statusMsg || ('보이스 ' + cnt + '개 불러옴');
-          toast((activeVpTab === 'fish' ? 'Fish' : 'OpenAI/Qwen') + ' 보이스 ' + cnt + '개 불러옴');
+          toast(voiceGroupDisplayName(activeVpTab) + ' 보이스 ' + cnt + '개 불러옴');
         } catch (err) {
           if (stEl) stEl.textContent = '조회 실패: ' + err.message;
           toast('보이스 조회 실패: ' + err.message);
@@ -13819,16 +17087,30 @@ function renderWebApp() {
     }
 
     async function saveGlobalTtsCast(nextList) {
-      routerCfg = await api('/api/tts/chat-cast', {
+      const target = resolveActiveCastTarget();
+      const payload = {
+        characters: Array.isArray(nextList) ? nextList : [],
+        ...(target.targetKey && target.targetKey !== '__global__'
+          ? { botKey: target.targetKey, botName: target.targetName }
+          : {}),
+      };
+      routerCfg = await api('/api/tts/characters', {
         method: 'POST',
-        body: JSON.stringify({ characters: Array.isArray(nextList) ? nextList : [] }),
+        body: JSON.stringify(payload),
       });
       ttsAnalyzeCache.clear();
       ttsAudioBufferCache.clear();
-      const savedChars = (routerCfg && routerCfg.tts && Array.isArray(routerCfg.tts.characters)) ? routerCfg.tts.characters : [];
-      ttsGlobalCastDraft = JSON.parse(JSON.stringify(savedChars));
+      syncDraftFromTargetKey(target.targetKey);
       renderGlobalTtsCastBox();
     }
+
+    const castBotSel = document.getElementById('ttsCastBotSel');
+    if (castBotSel) castBotSel.onchange = () => {
+      selectedTtsCastBotKey = castBotSel.value || '';
+      ttsGlobalCastEditIdx = null;
+      syncDraftFromTargetKey(selectedTtsCastBotKey || resolveActiveCastTarget().targetKey);
+      renderGlobalTtsCastBox();
+    };
 
     const castBox = document.getElementById('ttsGlobalCastBox');
     if (castBox) {
@@ -13863,6 +17145,41 @@ function renderWebApp() {
         }
       });
       castBox.addEventListener('click', async (e) => {
+        if (e.target.closest('#ttscAnalyzeBotBtn')) {
+          const btn = document.getElementById('ttscAnalyzeBotBtn');
+          const stEl = document.getElementById('ttscAnalyzeStatus');
+          const target = resolveActiveCastTarget();
+          const sendBotKey = target.targetKey !== '__global__' ? target.targetKey : target.activeBotKey;
+          const sendBotName = target.targetKey !== '__global__' ? target.targetName : target.activeBotName;
+          if (!sendBotKey) {
+            toast('먼저 채팅방에서 봇을 연 뒤 실행하세요.');
+            return;
+          }
+          if (btn) btn.disabled = true;
+          if (stEl) stEl.textContent = '⏳ LLM이 [' + (sendBotName || sendBotKey) + '] 봇의 성격·말투와 현재 TTS 모델 규격을 분석 중입니다...';
+          try {
+            const r = await api('/api/tts/analyze-bot-cast', {
+              method: 'POST',
+              body: JSON.stringify({ botKey: sendBotKey, botName: sendBotName }),
+            });
+            if (r && r.config) routerCfg = r.config;
+            selectedTtsCastBotKey = r.botKey || sendBotKey;
+            ttsGlobalCastEditIdx = null;
+            syncDraftFromTargetKey(selectedTtsCastBotKey);
+            ttsAnalyzeCache.clear();
+            ttsAudioBufferCache.clear();
+            renderGlobalTtsCastBox();
+            const msg = '✅ ' + (r.botName || sendBotKey) + ' 인물 ' + (r.characters ? r.characters.length : 0) + '명 프로파일링 완료 (추가 ' + (r.addedCount || 0) + ', 갱신 ' + (r.updatedCount || 0) + ') · 규격: ' + ((r.modelSpec && r.modelSpec.label) || '');
+            if (stEl) stEl.textContent = msg;
+            toast('봇 스피치 프로필 생성·저장 완료');
+          } catch (err) {
+            if (stEl) stEl.textContent = '❌ 분석 실패: ' + err.message;
+            toast('봇 성격·스피치 분석 실패: ' + err.message);
+          } finally {
+            if (btn) btn.disabled = false;
+          }
+          return;
+        }
         if (e.target.closest('#ttscAddBtn')) {
           ttsGlobalCastEditIdx = -1;
           renderGlobalTtsCastBox();
@@ -13874,7 +17191,7 @@ function renderWebApp() {
           return;
         }
         if (e.target.closest('#ttscFetchFishBtn') || e.target.closest('#ttscFetchOaBtn')) {
-          const reqGroup = e.target.closest('#ttscFetchOaBtn') ? 'openai_qwen' : 'fish';
+          const reqGroup = e.target.closest('#ttscFetchOaBtn') ? (getActiveTtsGroup() === 'openai' ? 'openai' : 'qwen') : 'fish';
           try {
             const r = await api('/api/tts/models', { method: 'POST', body: JSON.stringify({ group: reqGroup }) });
             storeLiveVoicesFromResponse(r, reqGroup);
@@ -13886,7 +17203,7 @@ function renderWebApp() {
               rSel.innerHTML = buildVoiceRefOptionsHtml(reqGroup, idInp.value, '-- 기본 성별 풀 사용 --');
             }
             const cnt = Array.isArray(r.voices) ? r.voices.length : 0;
-            toast((reqGroup === 'fish' ? 'Fish' : 'OpenAI/Qwen') + ' 보이스 ' + cnt + '개를 불러왔습니다.');
+            toast(voiceGroupDisplayName(reqGroup) + ' 보이스 ' + cnt + '개를 불러왔습니다.');
           } catch (err) { toast('보이스 조회 실패: ' + err.message); }
           return;
         }
@@ -13909,24 +17226,46 @@ function renderWebApp() {
             renderVoiceProfilesManager();
             const rSel = document.getElementById('ttscVoiceRefSel');
             if (rSel) rSel.innerHTML = buildVoiceRefOptionsHtml(grp, voiceIdVal, '-- 기본 성별 풀 사용 --');
-            toast((grp === 'fish' ? 'Fish' : 'OpenAI/Qwen') + ' 프로필에 저장됨');
+            toast(voiceGroupDisplayName(grp) + ' 프로필에 저장됨');
           } catch (err) { toast('프로필 저장 실패: ' + err.message); }
           return;
         }
         if (e.target.closest('#ttscApplyEditBtn')) {
           const name = (document.getElementById('ttscNameInp') && document.getElementById('ttscNameInp').value.trim()) || '';
           if (!name) { toast('등장인물 이름을 입력하세요.'); return; }
+          const prevChar = (ttsGlobalCastEditIdx >= 0 && ttsGlobalCastDraft[ttsGlobalCastEditIdx]) ? ttsGlobalCastDraft[ttsGlobalCastEditIdx] : {};
+          const activeSpec = getActiveSpeechModelSpecClient();
+          const dTagVal = (document.getElementById('ttscDlgTagInp') && document.getElementById('ttscDlgTagInp').value.trim()) || '';
+          const tTagVal = (document.getElementById('ttscThTagInp') && document.getElementById('ttscThTagInp').value.trim()) || '';
+          const dInstrVal = (document.getElementById('ttscDlgInstrInp') && document.getElementById('ttscDlgInstrInp').value.trim()) || '';
+          const tInstrVal = (document.getElementById('ttscThInstrInp') && document.getElementById('ttscThInstrInp').value.trim()) || '';
+          const nextTagsByModel = { ...(prevChar.speechTagsByModel || {}) };
+          if (activeSpec && (activeSpec.id === 'fish_s2' || activeSpec.id === 'fish_s1' || activeSpec.id === 'openai_tts' || activeSpec.id === 'qwen3_tts')) {
+            nextTagsByModel[activeSpec.id] = {
+              dialogueTag: dTagVal,
+              thoughtTag: tTagVal,
+              dialogueInstruction: dInstrVal,
+              thoughtInstruction: tInstrVal,
+            };
+          }
           const item = {
-            id: (ttsGlobalCastEditIdx >= 0 && ttsGlobalCastDraft[ttsGlobalCastEditIdx]) ? ttsGlobalCastDraft[ttsGlobalCastEditIdx].id : ('tts-char-' + Date.now()),
+            id: prevChar.id || ('tts-char-' + Date.now()),
             name,
             gender: (document.getElementById('ttscGenderSel') && document.getElementById('ttscGenderSel').value) || 'female',
             aliases: ((document.getElementById('ttscAliasesInp') && document.getElementById('ttscAliasesInp').value) || '').split(',').map((s) => s.trim()).filter(Boolean),
+            personality: (document.getElementById('ttscPersonalityInp') && document.getElementById('ttscPersonalityInp').value.trim()) || '',
+            speechStyle: (document.getElementById('ttscSpeechStyleInp') && document.getElementById('ttscSpeechStyleInp').value.trim()) || '',
             voiceGroup: (document.getElementById('ttscVoiceGroupSel') && document.getElementById('ttscVoiceGroupSel').value) || '',
             voiceId: (document.getElementById('ttscVoiceIdInp') && document.getElementById('ttscVoiceIdInp').value.trim()) || '',
-            dialogueToneTag: (document.getElementById('ttscDlgTagInp') && document.getElementById('ttscDlgTagInp').value.trim()) || '',
-            thoughtToneTag: (document.getElementById('ttscThTagInp') && document.getElementById('ttscThTagInp').value.trim()) || '',
+            dialogueToneTag: dTagVal,
+            thoughtToneTag: tTagVal,
+            dialogueInstruction: dInstrVal,
+            thoughtInstruction: tInstrVal,
+            speechTagsByModel: nextTagsByModel,
             speed: Number(document.getElementById('ttscSpeedInp') && document.getElementById('ttscSpeedInp').value) || 1.0,
             thoughtSpeed: Number(document.getElementById('ttscThSpeedInp') && document.getElementById('ttscThSpeedInp').value) || 0.94,
+            autoGenerated: false,
+            updatedAt: Date.now(),
           };
           const nextDraft = ttsGlobalCastDraft.slice();
           if (ttsGlobalCastEditIdx >= 0) nextDraft[ttsGlobalCastEditIdx] = item;
@@ -13934,19 +17273,22 @@ function renderWebApp() {
           try {
             ttsGlobalCastEditIdx = null;
             await saveGlobalTtsCast(nextDraft);
-            toast('등장인물 보이스 저장됨 (전역 적용)');
+            toast('등장인물 스피치 프로필 저장됨');
           } catch (err) { toast('저장 실패: ' + err.message); }
           return;
         }
         if (e.target.closest('#ttscEditorPreviewBtn')) {
           try {
+            const target = resolveActiveCastTarget();
             await previewTtsVoiceItem({
-              text: '안녕하세요. 이 목소리로 대사를 들려드릴게요.',
+              text: '안녕하세요. 이 목소리와 말투로 대사를 들려드릴게요.',
               kind: 'dialogue',
               speaker: (document.getElementById('ttscNameInp') && document.getElementById('ttscNameInp').value.trim()) || 'Tester',
               gender: (document.getElementById('ttscGenderSel') && document.getElementById('ttscGenderSel').value) || 'female',
               voiceId: (document.getElementById('ttscVoiceIdInp') && document.getElementById('ttscVoiceIdInp').value.trim()) || '',
               toneTag: (document.getElementById('ttscDlgTagInp') && document.getElementById('ttscDlgTagInp').value.trim()) || '',
+              instruction: (document.getElementById('ttscDlgInstrInp') && document.getElementById('ttscDlgInstrInp').value.trim()) || '',
+              botKey: target.targetKey !== '__global__' ? target.targetKey : '',
             });
           } catch (err) { toast('미리듣기 실패: ' + err.message); }
           return;
@@ -13957,13 +17299,18 @@ function renderWebApp() {
           const c = ttsGlobalCastDraft[idx];
           if (!c) return;
           try {
+            const target = resolveActiveCastTarget();
+            const activeSpec = getActiveSpeechModelSpecClient();
+            const mEntry = (c.speechTagsByModel && c.speechTagsByModel[activeSpec.id]) || {};
             await previewTtsVoiceItem({
-              text: '안녕하세요. 이 목소리로 대사를 들려드릴게요.',
+              text: '안녕하세요. 이 목소리와 말투로 대사를 들려드릴게요.',
               kind: 'dialogue',
               speaker: c.name,
               gender: c.gender,
               voiceId: c.voiceId,
-              toneTag: c.dialogueToneTag,
+              toneTag: mEntry.dialogueTag || c.dialogueToneTag,
+              instruction: mEntry.dialogueInstruction || c.dialogueInstruction || '',
+              botKey: target.targetKey !== '__global__' ? target.targetKey : '',
             });
           } catch (err) { toast('미리듣기 실패: ' + err.message); }
           return;
@@ -13996,9 +17343,17 @@ function renderWebApp() {
     renderGlobalTtsCastBox();
   })();
   document.getElementById('saveTrBtn').onclick = async () => {
+    const selEl = document.getElementById('trProfileSel');
+    const selVal = selEl ? selEl.value : 'active';
+    const isCustom = selVal === 'custom';
+    const isActive = selVal === 'active';
+    const profileId = isCustom ? 'custom' : (selVal.startsWith('profile:') ? selVal.slice(8) : 'active');
+    const overrideEl = document.getElementById('trProfileModelOverride');
     routerCfg.translator = {
       ...routerCfg.translator,
-      useActiveProfile: document.getElementById('trUseActive').checked,
+      useActiveProfile: isActive,
+      profileId,
+      profileModelOverride: overrideEl ? overrideEl.value.trim() : '',
       autoTranslateOutput: document.getElementById('trAutoOut').checked,
       autoTranslateInput: document.getElementById('trAutoIn').checked,
       provider: document.getElementById('trProvider').value,
@@ -14722,6 +18077,10 @@ function renderWebApp() {
     displayName: '',
     entryId: '',
     uiItems: [],
+    viewMode: 'gui',
+    recallData: null,
+    selectedRecallIdx: 0,
+    bannerDismissed: false,
   };
 
   function renderBackendPluginsList() {
@@ -14800,10 +18159,222 @@ function renderWebApp() {
     }
   }
 
+  function formatRecallTime(ts) {
+    const n = Number(ts) || 0;
+    if (!n) return '-';
+    try {
+      return new Date(n).toLocaleTimeString('ko-KR', { hour12: false });
+    } catch (_) {
+      return String(n);
+    }
+  }
+
+  async function copyPluginRecallText(txt) {
+    const val = String(txt ?? '');
+    if (!val) return;
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(val);
+        toast('주입된 기억 텍스트를 복사했습니다.');
+        return;
+      }
+    } catch (_) {}
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = val;
+      ta.style.cssText = 'position:fixed;left:-9999px;top:-9999px;';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+      toast('주입된 기억 텍스트를 복사했습니다.');
+    } catch (_) {
+      toast('복사에 실패했습니다.');
+    }
+  }
+
+  function renderPluginGuiRecallUi() {
+    const toggleBtn = document.getElementById('pluginGuiRecallToggleBtn');
+    const barEl = document.getElementById('pluginGuiRecallBar');
+    const frameEl = document.getElementById('pluginGuiFrame');
+    const paneEl = document.getElementById('pluginGuiRecallPane');
+    const rec = pluginGuiState.recallData;
+    const history = rec && Array.isArray(rec.history) ? rec.history : [];
+    const latest = history.length ? history[0] : null;
+    const isRecallView = pluginGuiState.viewMode === 'recall';
+
+    if (toggleBtn) {
+      if (isRecallView) {
+        toggleBtn.textContent = '🖥️ 플러그인 GUI로 돌아가기';
+        toggleBtn.className = 'pill active';
+      } else if (latest && latest.totalInjectedChars > 0) {
+        toggleBtn.textContent = '🧠 이번 회상·주입 (' + latest.injectedCount + '블록 · ' + latest.totalInjectedChars.toLocaleString() + '자)';
+        toggleBtn.className = 'pill active';
+      } else if (rec && rec.beforeRequestRuns > 0) {
+        toggleBtn.textContent = '🧠 백엔드 실행 기록 (' + rec.beforeRequestRuns + '회)';
+        toggleBtn.className = 'pill';
+      } else {
+        toggleBtn.textContent = '🧠 백엔드 회상 기록 (0)';
+        toggleBtn.className = 'pill';
+      }
+    }
+
+    if (barEl) {
+      if (!isRecallView && !pluginGuiState.bannerDismissed && rec && rec.beforeRequestRuns > 0) {
+        const summaryTxt = (latest && latest.totalInjectedChars > 0)
+          ? '<b>🧠 백엔드에서 최근 회상·주입 완료</b> (' + latest.injectedCount + '블록 · ' + latest.totalInjectedChars.toLocaleString() + '자)'
+          : '<b>🧠 백엔드 훅 ' + rec.beforeRequestRuns + '회 실행됨</b> (최근 주입 0자)';
+        barEl.innerHTML =
+          '<div style="min-width:0; flex:1 1 260px;">' +
+            summaryTxt +
+            ' <span style="color:var(--sub);">· 원격 GUI 내부 "이번 회상"은 별도 브라우저 샌드박스라 0으로 표시됩니다.</span>' +
+          '</div>' +
+          '<div style="display:flex; gap:6px; align-items:center;">' +
+            '<button type="button" class="pill active" data-plg-gui-open-recall="1">주입 내역 보기</button>' +
+            '<button type="button" class="pill" data-plg-gui-dismiss-bar="1" aria-label="배너 닫기">✕</button>' +
+          '</div>';
+        barEl.style.display = 'flex';
+      } else {
+        barEl.style.display = 'none';
+      }
+    }
+
+    if (frameEl) frameEl.style.display = isRecallView ? 'none' : 'block';
+    if (!paneEl) return;
+    paneEl.style.display = isRecallView ? 'flex' : 'none';
+    if (!isRecallView) return;
+
+    const idx = history.length ? Math.max(0, Math.min(history.length - 1, Number(pluginGuiState.selectedRecallIdx) || 0)) : 0;
+    pluginGuiState.selectedRecallIdx = idx;
+    const item = history.length ? history[idx] : null;
+    const blocks = item && Array.isArray(item.injectedBlocks) ? item.injectedBlocks : [];
+
+    const noticeHtml =
+      '<div class="plg-recall-notice">' +
+        '<div>💡 RisuStand에서는 플러그인 본체(<code>beforeRequest</code> / <code>afterRequest</code> / <code>chatOutput</code>)가 <b>PC 백엔드 VM</b>에서 실행되고, GUI 화면은 별도 iframe 샌드박스에서 열립니다. 따라서 실제 회상·프롬프트 주입 내역은 아래 백엔드 기록에 저장됩니다.</div>' +
+        '<div style="display:flex; gap:6px; align-items:center;">' +
+          '<button type="button" class="pill" data-plg-gui-recall-refresh="1">↻ 기록 새로고침</button>' +
+          (blocks.length ? '<button type="button" class="pill" data-plg-recall-copy-all="1">📋 전체 주입 텍스트 복사</button>' : '') +
+        '</div>' +
+      '</div>';
+
+    const statsHtml =
+      '<div class="plg-recall-stats">' +
+        '<div class="plg-recall-stat">' +
+          '<div class="plg-recall-stat-label">beforeRequest (회상·주입)</div>' +
+          '<div class="plg-recall-stat-val">' + ((rec && rec.beforeRequestRuns) || 0) + '회</div>' +
+          '<div class="plg-recall-stat-sub">최근: ' + formatRecallTime(rec && rec.lastBeforeRequestAt) + '</div>' +
+        '</div>' +
+        '<div class="plg-recall-stat">' +
+          '<div class="plg-recall-stat-label">afterRequest (후처리)</div>' +
+          '<div class="plg-recall-stat-val">' + ((rec && rec.afterRequestRuns) || 0) + '회</div>' +
+          '<div class="plg-recall-stat-sub">최근: ' + formatRecallTime(rec && rec.lastAfterRequestAt) + '</div>' +
+        '</div>' +
+        '<div class="plg-recall-stat">' +
+          '<div class="plg-recall-stat-label">chatOutput (턴 확정 캡처)</div>' +
+          '<div class="plg-recall-stat-val">' + ((rec && rec.outputRuns) || 0) + '회</div>' +
+          '<div class="plg-recall-stat-sub">최근: ' + formatRecallTime(rec && rec.lastOutputAt) + '</div>' +
+        '</div>' +
+        '<div class="plg-recall-stat">' +
+          '<div class="plg-recall-stat-label">선택 턴 주입 요약</div>' +
+          '<div class="plg-recall-stat-val">' + (item ? (item.injectedCount + '블록 · ' + item.totalInjectedChars.toLocaleString() + '자') : '-') + '</div>' +
+          '<div class="plg-recall-stat-sub">' + (item ? ('소요 ' + item.durationMs + 'ms · API ' + (item.fetchCount || 0) + '회 · LLM ' + (item.llmCount || 0) + '회') : '실행 기록 없음') + '</div>' +
+        '</div>' +
+      '</div>';
+
+    let bodyHtml = '';
+    if (!item) {
+      bodyHtml =
+        '<div style="padding:20px; border:1px dashed var(--border); border-radius:12px; color:var(--sub); font-size:13px; text-align:center;">' +
+          '현재 릴레이 서버 세션에서 아직 백엔드 요청(채팅 전송/생성)이 실행되지 않았습니다.<br/>메시지를 한 번 전송한 뒤 다시 확인하면 실제로 프롬프트에 주입된 기억 텍스트를 그대로 볼 수 있습니다.' +
+        '</div>';
+    } else {
+      const turnsHtml =
+        '<div class="plg-recall-turns">' +
+          '<span style="font-size:12px; font-weight:700; color:var(--sub); margin-right:2px;">최근 실행 이력 (' + history.length + '건):</span>' +
+          history.map((h, i) => {
+            const activeCls = i === idx ? 'pill active' : 'pill';
+            const chatBadge = h.matchesCurrentChat ? '현재 채팅 · ' : '';
+            const label = chatBadge + formatRecallTime(h.at) + ' (' + h.injectedCount + '블록/' + h.totalInjectedChars.toLocaleString() + '자)';
+            return '<button type="button" class="' + activeCls + '" data-plg-recall-turn="' + i + '">' + esc(label) + '</button>';
+          }).join('') +
+        '</div>';
+
+      const metaLine =
+        '<div style="font-size:12px; color:var(--sub); display:flex; flex-wrap:wrap; gap:8px; align-items:center;">' +
+          '<span>대상: <b>' + esc(item.charName || '현재 캐릭터') + '</b>' + (item.chatName ? ' · ' + esc(item.chatName) : '') + '</span>' +
+          (item.userPreview ? '<span>· 입력: <code>' + esc(item.userPreview) + '</code></span>' : '') +
+          '<span>· 메시지 ' + item.beforeCount + ' → ' + item.afterCount + '개</span>' +
+          (item.strippedCount > 0 ? '<span>· 기존 메시지 정리 ' + item.strippedCount + '건 (-' + (item.totalRemovedChars || 0).toLocaleString() + '자)</span>' : '') +
+        '</div>';
+
+      const errHtml = item.error
+        ? '<div style="padding:10px 12px; border-radius:10px; border:1px solid #ef4444; background:rgba(239,68,68,0.12); color:#fca5a5; font-size:12.5px;"><b>훅 실행 오류:</b> ' + esc(item.error) + '</div>'
+        : '';
+
+      const blocksHtml = blocks.length
+        ? blocks.map((b, bi) => {
+            const kindLabel = b.kind === 'added' ? '신규 메시지 추가' : '기존 메시지 삽입';
+            const roleBadge = b.role ? ' [' + esc(b.role) + ']' : '';
+            const truncNote = b.truncated ? ' (앞 48,000자 표시)' : '';
+            const rawBlockText = String(b.text || '');
+            const lineCount = rawBlockText ? rawBlockText.split('\\n').length : 0;
+            return (
+              '<div class="plg-recall-block">' +
+                '<div class="plg-recall-block-head">' +
+                  '<div><b>#' + (bi + 1) + ' ' + kindLabel + roleBadge + '</b> <span style="color:var(--sub);">· 위치 #' + ((b.index || 0) + 1) + ' · +' + (b.addedChars || 0).toLocaleString() + '자' + (lineCount ? ' · ' + lineCount + '줄' : '') + (b.removedChars ? ' / -' + b.removedChars.toLocaleString() + '자' : '') + truncNote + '</span></div>' +
+                  '<div style="display:flex; gap:6px; align-items:center;">' +
+                    '<button type="button" class="pill" data-plg-recall-toggle-block="' + bi + '">▾ 접기</button>' +
+                    '<button type="button" class="pill" data-plg-recall-copy-idx="' + bi + '">📋 복사</button>' +
+                  '</div>' +
+                '</div>' +
+                '<pre class="plg-recall-pre">' + esc(rawBlockText) + '</pre>' +
+              '</div>'
+            );
+          }).join('')
+        : '<div style="padding:16px; border:1px dashed var(--border); border-radius:12px; color:var(--sub); font-size:12.5px;">이 실행에서는 프롬프트에 새로 추가되거나 삽입된 기억 텍스트가 없었습니다 (0자 주입).</div>';
+
+      const afterReq = rec && rec.lastAfterRequest;
+      const hasDetails = Boolean((item.stepLogs && item.stepLogs.length) || afterReq);
+      const detailsHtml = hasDetails
+        ? '<details style="border:1px solid var(--border); border-radius:10px; padding:8px 12px; background:var(--surface);">' +
+            '<summary style="cursor:pointer; font-size:12px; font-weight:700;">단계별 로그 및 afterRequest 상태</summary>' +
+            '<div style="margin-top:8px; font-size:12px; color:var(--sub); display:flex; flex-direction:column; gap:6px;">' +
+              (afterReq ? '<div><b>최근 afterRequest:</b> ' + formatRecallTime(afterReq.at) + ' · 소요 ' + afterReq.durationMs + 'ms · API ' + (afterReq.fetchCount || 0) + '회 · LLM ' + (afterReq.llmCount || 0) + '회' + (afterReq.error ? ' · 오류: ' + esc(afterReq.error) : '') + '</div>' : '') +
+              ((item.stepLogs && item.stepLogs.length) ? '<div><b>단계 로그:</b><ul style="margin:4px 0 0 18px; padding:0;">' + item.stepLogs.map((l) => '<li>' + esc(l) + '</li>').join('') + '</ul></div>' : '') +
+            '</div>' +
+          '</details>'
+        : '';
+
+      bodyHtml = turnsHtml + metaLine + errHtml + blocksHtml + detailsHtml;
+    }
+
+    paneEl.innerHTML = noticeHtml + statsHtml + bodyHtml;
+  }
+
+  async function loadPluginGuiRecall(pluginName) {
+    if (!pluginName) return;
+    try {
+      const snap = (lastState && lastState.snapshot) || {};
+      const chatUuid = String(snap.chatUuid || '');
+      const res = await api('/api/plugins/runtime-recall?name=' + encodeURIComponent(pluginName) + '&chatUuid=' + encodeURIComponent(chatUuid));
+      if (!pluginGuiState.open || pluginGuiState.pluginName !== pluginName) return;
+      pluginGuiState.recallData = (res && res.recall) || null;
+      const hist = (pluginGuiState.recallData && Array.isArray(pluginGuiState.recallData.history)) ? pluginGuiState.recallData.history : [];
+      const curIdx = hist.findIndex((h) => h && h.matchesCurrentChat);
+      pluginGuiState.selectedRecallIdx = curIdx >= 0 ? curIdx : 0;
+      renderPluginGuiRecallUi();
+    } catch (_) {}
+  }
+
   function closePluginGuiModal() {
     pluginGuiState.open = false;
     pluginGuiState.pluginName = '';
     pluginGuiState.uiItems = [];
+    pluginGuiState.viewMode = 'gui';
+    pluginGuiState.recallData = null;
+    pluginGuiState.selectedRecallIdx = 0;
+    pluginGuiState.bannerDismissed = false;
     const modal = document.getElementById('pluginGuiModal');
     if (modal) {
       modal.style.display = 'none';
@@ -14820,19 +18391,29 @@ function renderWebApp() {
     pluginGuiState.displayName = (plg && plg.displayName) || pluginName;
     pluginGuiState.entryId = entryId || '';
     pluginGuiState.uiItems = (plg && Array.isArray(plg.uiItems)) ? plg.uiItems : [];
+    pluginGuiState.viewMode = 'gui';
+    pluginGuiState.recallData = null;
+    pluginGuiState.selectedRecallIdx = 0;
+    pluginGuiState.bannerDismissed = false;
+    pluginGuiState.lastNotifyKey = String((lastState && lastState.snapshotVersion) || 0) + ':' + ((lastState && (lastState.generating || lastState.directGenerating)) ? '1' : '0');
 
     modal.innerHTML =
       '<div class="plg-gui-dialog">' +
         '<div class="plg-gui-head">' +
           '<div style="font-size:14.5px; font-weight:800; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🖥️ ' + esc(pluginGuiState.displayName) + '</div>' +
-          '<div style="display:flex; gap:6px; align-items:center;">' +
+          '<div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">' +
+            '<button type="button" class="pill" id="pluginGuiRecallToggleBtn" data-plg-gui-recall-toggle="1">🧠 백엔드 회상 기록</button>' +
             '<button type="button" class="pill" data-plg-gui-reload="1">↻ 새로고침</button>' +
             '<button type="button" class="pill" data-plg-gui-close="1">✕ 닫기</button>' +
           '</div>' +
         '</div>' +
+        '<div id="pluginGuiRecallBar" class="plg-gui-recall-bar" style="display:none;"></div>' +
         '<iframe id="pluginGuiFrame" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads"></iframe>' +
+        '<div id="pluginGuiRecallPane" class="plg-gui-recall-pane" style="display:none;"></div>' +
       '</div>';
     modal.style.display = 'flex';
+
+    void loadPluginGuiRecall(pluginName);
 
     try {
       const isNight = /night|midnight|dark|claude/i.test(uiPref.theme || '');
@@ -14866,15 +18447,49 @@ function renderWebApp() {
       }
       return;
     }
+    if (d.__rsGuiRpcBatch === 1 && Array.isArray(d.calls)) {
+      const targetPlugin = d.pluginName || pluginGuiState.pluginName;
+      if (!targetPlugin) return;
+      try {
+        const res = await api('/api/plugins/gui-rpc-batch', {
+          method: 'POST',
+          body: JSON.stringify({
+            pluginName: targetPlugin,
+            calls: d.calls,
+          }),
+        });
+        if (document.getElementById('pluginGuiFrame') === frame && frame.contentWindow) {
+          frame.contentWindow.postMessage({
+            __rsGuiRpcBatchRes: 1,
+            results: Array.isArray(res && res.results) ? res.results : [],
+          }, '*');
+        }
+      } catch (err) {
+        if (document.getElementById('pluginGuiFrame') === frame && frame.contentWindow) {
+          const msg = (err && err.message) ? err.message : 'RPC batch error';
+          frame.contentWindow.postMessage({
+            __rsGuiRpcBatchRes: 1,
+            results: d.calls.map((c) => ({ reqId: c && c.reqId, ok: false, error: msg })),
+          }, '*');
+        }
+      }
+      return;
+    }
     if (d.__rsGuiRpc === 1 && d.reqId) {
+      const targetPlugin = d.pluginName || pluginGuiState.pluginName;
+      if (!targetPlugin) return;
       try {
         const res = await api('/api/plugins/gui-rpc', {
           method: 'POST',
-          body: JSON.stringify({ pluginName: d.pluginName || pluginGuiState.pluginName, method: d.method, args: d.args || [] }),
+          body: JSON.stringify({ pluginName: targetPlugin, method: d.method, args: d.args || [] }),
         });
-        frame.contentWindow.postMessage({ __rsGuiRpcRes: 1, reqId: d.reqId, ok: true, value: res ? res.value : undefined }, '*');
+        if (document.getElementById('pluginGuiFrame') === frame && frame.contentWindow) {
+          frame.contentWindow.postMessage({ __rsGuiRpcRes: 1, reqId: d.reqId, ok: true, value: res ? res.value : undefined }, '*');
+        }
       } catch (err) {
-        frame.contentWindow.postMessage({ __rsGuiRpcRes: 1, reqId: d.reqId, ok: false, error: (err && err.message) ? err.message : 'RPC error' }, '*');
+        if (document.getElementById('pluginGuiFrame') === frame && frame.contentWindow) {
+          frame.contentWindow.postMessage({ __rsGuiRpcRes: 1, reqId: d.reqId, ok: false, error: (err && err.message) ? err.message : 'RPC error' }, '*');
+        }
       }
     }
   });
@@ -14888,6 +18503,61 @@ function renderWebApp() {
       }
       if (e.target.closest('[data-plg-gui-reload]')) {
         openPluginGuiModal(pluginGuiState.pluginName, pluginGuiState.entryId);
+        return;
+      }
+      if (e.target.closest('[data-plg-gui-recall-toggle]')) {
+        pluginGuiState.viewMode = pluginGuiState.viewMode === 'recall' ? 'gui' : 'recall';
+        renderPluginGuiRecallUi();
+        if (pluginGuiState.viewMode === 'recall') {
+          void loadPluginGuiRecall(pluginGuiState.pluginName);
+        }
+        return;
+      }
+      if (e.target.closest('[data-plg-gui-open-recall]')) {
+        pluginGuiState.viewMode = 'recall';
+        renderPluginGuiRecallUi();
+        return;
+      }
+      if (e.target.closest('[data-plg-gui-dismiss-bar]')) {
+        pluginGuiState.bannerDismissed = true;
+        renderPluginGuiRecallUi();
+        return;
+      }
+      if (e.target.closest('[data-plg-gui-recall-refresh]')) {
+        void loadPluginGuiRecall(pluginGuiState.pluginName);
+        return;
+      }
+      const turnBtn = e.target.closest('[data-plg-recall-turn]');
+      if (turnBtn) {
+        pluginGuiState.selectedRecallIdx = Number(turnBtn.getAttribute('data-plg-recall-turn')) || 0;
+        renderPluginGuiRecallUi();
+        return;
+      }
+      const foldBtn = e.target.closest('[data-plg-recall-toggle-block]');
+      if (foldBtn) {
+        const blkCard = foldBtn.closest('.plg-recall-block');
+        if (blkCard) {
+          const collapsed = blkCard.classList.toggle('is-collapsed');
+          foldBtn.textContent = collapsed ? '▸ 펼치기' : '▾ 접기';
+        }
+        return;
+      }
+      const copyOneBtn = e.target.closest('[data-plg-recall-copy-idx]');
+      if (copyOneBtn) {
+        const bIdx = Number(copyOneBtn.getAttribute('data-plg-recall-copy-idx')) || 0;
+        const hist = (pluginGuiState.recallData && Array.isArray(pluginGuiState.recallData.history)) ? pluginGuiState.recallData.history : [];
+        const item = hist[pluginGuiState.selectedRecallIdx] || null;
+        const blk = item && Array.isArray(item.injectedBlocks) ? item.injectedBlocks[bIdx] : null;
+        if (blk && blk.text) void copyPluginRecallText(blk.text);
+        return;
+      }
+      if (e.target.closest('[data-plg-recall-copy-all]')) {
+        const hist = (pluginGuiState.recallData && Array.isArray(pluginGuiState.recallData.history)) ? pluginGuiState.recallData.history : [];
+        const item = hist[pluginGuiState.selectedRecallIdx] || null;
+        const blks = item && Array.isArray(item.injectedBlocks) ? item.injectedBlocks : [];
+        if (blks.length) {
+          void copyPluginRecallText(blks.map((b) => b.text || '').filter(Boolean).join('\\n\\n---\\n\\n'));
+        }
         return;
       }
     });
@@ -15234,11 +18904,15 @@ function renderWebApp() {
       .join('');
     const bodyHtml = sanitizePluginWidgetHtml(overlay.html || '', scopeSel, snap.assetMap || {});
     modal.classList.add('is-action-overlay');
+    const modalKeyAttr = String(overlay.modalKey || '__default__');
     modal.innerHTML =
       '<div class="plg-float-dialog">' +
         '<div class="plg-float-head">' +
-          '<div style="font-size:15px; font-weight:800;">🖼️ ' + esc(overlay.displayName || activeActionOverlayPlugin || '플러그인 GUI') + '</div>' +
-          '<button type="button" class="pill" data-pfm-close="1">✕ 닫기</button>' +
+          '<div style="font-size:15px; font-weight:800;">🖼️ ' + esc(overlay.modalLabel || overlay.displayName || activeActionOverlayPlugin || '플러그인 GUI') + '</div>' +
+          '<div style="display:flex; align-items:center; gap:6px;">' +
+            '<button type="button" class="pill" data-pfm-suppress-modal="1" data-plugin="' + esc(activeActionOverlayPlugin) + '" data-modal-key="' + esc(modalKeyAttr) + '" title="이 모달이 전체 화면 팝업으로 열리지 않게 끕니다">🚫 이 모달 팝업 끄기</button>' +
+            '<button type="button" class="pill" data-pfm-close="1">✕ 닫기</button>' +
+          '</div>' +
         '</div>' +
         '<div class="plg-float-body">' +
           '<div class="rs-pfm-stage" data-rs-rw-plugin="' + esc(safeAttrName) + '" data-rs-plugin-raw="' + esc(activeActionOverlayPlugin) + '">' +
@@ -15247,6 +18921,154 @@ function renderWebApp() {
         '</div>' +
       '</div>';
     modal.style.display = 'flex';
+  }
+
+  function buildPluginRootStageHtml(w, snap) {
+    const safeAttrName = w.pluginName.replace(/[^a-zA-Z0-9_-]/g, '');
+    const scopeSel = '.rs-pfm-stage[data-rs-rw-plugin="' + safeAttrName + '"]';
+    const styleHtml = (w.styles || []).map((s) => '<style>' + scopeBotCss(sanitizeBotCss(s), scopeSel) + '</style>').join('');
+    const bodyHtml = sanitizePluginWidgetHtml(w.html || '', scopeSel, snap.assetMap || {});
+    return '<div class="rs-pfm-stage" data-rs-rw-plugin="' + esc(safeAttrName) + '" data-rs-plugin-raw="' + esc(w.pluginName) + '">' +
+      styleHtml + bodyHtml +
+    '</div>';
+  }
+
+  function renderFloatingControlOptionsHtml() {
+    const place = uiPref.floatingPlace || 'chat-end';
+    const align = uiPref.floatingAlign || 'right';
+    const ox = Math.max(-240, Math.min(240, Number(uiPref.floatingOffsetX) || 0));
+    const oy = Math.max(-240, Math.min(240, Number(uiPref.floatingOffsetY) || 0));
+    const placeBtn = (key, label) => '<button type="button" class="pill' + (place === key ? ' active' : '') + '" data-pfm-opt-place="' + key + '">' + label + '</button>';
+    const alignBtn = (key, label) => '<button type="button" class="pill' + (align === key ? ' active' : '') + '" data-pfm-opt-align="' + key + '">' + label + '</button>';
+    return '<div class="rs-pfm-opt-box">' +
+      '<div class="rs-pfm-opt-row">' +
+        '<span class="rs-pfm-opt-label">채팅 화면 노출</span>' +
+        '<div class="rs-pfm-opt-grp">' +
+          '<button type="button" class="pill' + (uiPref.floatingOnChat ? ' active' : '') + '" data-pfm-opt-show="1">화면에 노출: ' + (uiPref.floatingOnChat ? '켜짐' : '꺼짐') + '</button>' +
+          '<button type="button" class="pill" data-pfm-opt-reset="1">위치 초기화</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="rs-pfm-opt-row">' +
+        '<span class="rs-pfm-opt-label">표시 위치</span>' +
+        '<div class="rs-pfm-opt-grp">' +
+          placeBtn('chat-end', '채팅 마지막') +
+          placeBtn('bottom-left', '좌하단') +
+          placeBtn('bottom-right', '우하단') +
+          placeBtn('top-left', '좌상단') +
+          placeBtn('top-right', '우상단') +
+        '</div>' +
+      '</div>' +
+      (place === 'chat-end'
+        ? '<div class="rs-pfm-opt-row">' +
+            '<span class="rs-pfm-opt-label">가로 정렬</span>' +
+            '<div class="rs-pfm-opt-grp">' +
+              alignBtn('left', '왼쪽') +
+              alignBtn('center', '가운데') +
+              alignBtn('right', '오른쪽') +
+            '</div>' +
+          '</div>'
+        : '') +
+      '<div class="rs-pfm-opt-row">' +
+        '<span class="rs-pfm-opt-label">위치 미세 조정 (충돌 회피)</span>' +
+        '<div class="rs-pfm-opt-grp">' +
+          '<button type="button" class="pill" data-pfm-opt-nudge="x:-12" title="왼쪽으로 12px">◀</button>' +
+          '<span class="rs-pfm-opt-val">X: ' + ox + 'px</span>' +
+          '<button type="button" class="pill" data-pfm-opt-nudge="x:12" title="오른쪽으로 12px">▶</button>' +
+          '<button type="button" class="pill" data-pfm-opt-nudge="y:-12" title="위로 12px">▲</button>' +
+          '<span class="rs-pfm-opt-val">Y: ' + oy + 'px</span>' +
+          '<button type="button" class="pill" data-pfm-opt-nudge="y:12" title="아래로 12px">▼</button>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function primeChatFloatingWidgetsIfNeeded() {
+    const snap = (lastState && lastState.snapshot) || {};
+    if (!uiPref.floatingOnChat || currentTab !== 'chat' || typeof snap.charIndex !== 'number' || snap.charIndex < 0) return;
+    const widgets = (latestPluginFloatingUi && Array.isArray(latestPluginFloatingUi.rootWidgets)) ? latestPluginFloatingUi.rootWidgets : [];
+    const btns = (latestPluginFloatingUi && Array.isArray(latestPluginFloatingUi.buttons)) ? latestPluginFloatingUi.buttons : [];
+    if (widgets.length > 0 || !btns.length || chatFloatingPriming) return;
+    const key = snap.charIndex + ':' + snap.chatIndex + ':' + btns.length;
+    if (chatFloatingPrimeKey === key) return;
+    chatFloatingPrimeKey = key;
+    chatFloatingPriming = true;
+    void api('/api/plugins/floating-open', {
+      method: 'POST',
+      body: JSON.stringify({
+        charIndex: snap.charIndex,
+        chatIndex: Number.isFinite(Number(snap.chatIndex)) ? Number(snap.chatIndex) : 0,
+        autoExpand: false,
+      }),
+    }).then((res) => {
+      if (res && res.pluginFloatingUi) {
+        latestPluginFloatingUi = res.pluginFloatingUi;
+        renderRsMiniBar(false);
+        renderChatFloatingControls(true);
+      }
+    }).catch(() => {}).finally(() => {
+      chatFloatingPriming = false;
+    });
+  }
+
+  function renderChatFloatingControls(force = false) {
+    const snap = (lastState && lastState.snapshot) || {};
+    const canShow = Boolean(uiPref.floatingOnChat && currentTab === 'chat' && typeof snap.charIndex === 'number' && snap.charIndex >= 0);
+    const widgets = (latestPluginFloatingUi && Array.isArray(latestPluginFloatingUi.rootWidgets)) ? latestPluginFloatingUi.rootWidgets : [];
+    if (canShow && !widgets.length) primeChatFloatingWidgetsIfNeeded();
+
+    const pinnedEl = document.getElementById('chatPinnedPluginCtrl');
+    const oldInline = document.getElementById('chatEndPluginCtrl');
+    if (!canShow || !widgets.length) {
+      if (pinnedEl) { pinnedEl.style.display = 'none'; pinnedEl.innerHTML = ''; }
+      if (oldInline) oldInline.remove();
+      lastChatFloatingSig = '';
+      return;
+    }
+
+    const place = uiPref.floatingPlace || 'chat-end';
+    const align = uiPref.floatingAlign || 'right';
+    const ox = Math.max(-240, Math.min(240, Number(uiPref.floatingOffsetX) || 0));
+    const oy = Math.max(-240, Math.min(240, Number(uiPref.floatingOffsetY) || 0));
+    const tf = (ox || oy) ? ('translate(' + ox + 'px, ' + oy + 'px)') : '';
+    const innerHtml = widgets.map((w, idx) => (
+      '<div class="rs-chat-float-row">' +
+        buildPluginRootStageHtml(w, snap) +
+        (idx === 0 ? '<button type="button" class="pill rs-chat-float-cfg-btn" data-chat-float-cfg="1" title="플로팅 컨트롤 노출 · 위치 설정">🎛️</button>' : '') +
+      '</div>'
+    )).join('');
+
+    if (place === 'chat-end') {
+      if (pinnedEl) { pinnedEl.style.display = 'none'; pinnedEl.innerHTML = ''; }
+      const hostEl = isBookMode() ? document.getElementById('bookColumns') : document.getElementById('tab-chat');
+      if (!hostEl) return;
+      const sig = JSON.stringify([latestPluginFloatingUi.rev || '', widgets.length, uiPref.assetMode, place, align, ox, oy, isBookMode() ? 1 : 0]);
+      if (!force && sig === lastChatFloatingSig && oldInline && oldInline.parentElement === hostEl && !oldInline.nextElementSibling) {
+        return;
+      }
+      lastChatFloatingSig = sig;
+      const el = oldInline || document.createElement('div');
+      el.id = 'chatEndPluginCtrl';
+      el.className = 'rs-chat-end-float align-' + align;
+      el.style.transform = tf;
+      el.innerHTML = innerHtml;
+      if (el.parentElement !== hostEl || el.nextElementSibling) {
+        hostEl.appendChild(el);
+      }
+      if (isBookMode() && typeof layoutBookSpreads === 'function') {
+        requestAnimationFrame(() => layoutBookSpreads(false));
+      }
+      return;
+    }
+
+    if (oldInline) oldInline.remove();
+    if (!pinnedEl) return;
+    const sig = JSON.stringify([latestPluginFloatingUi.rev || '', widgets.length, uiPref.assetMode, place, align, ox, oy]);
+    if (!force && sig === lastChatFloatingSig && pinnedEl.style.display === 'flex') return;
+    lastChatFloatingSig = sig;
+    pinnedEl.className = 'rs-chat-pinned-float place-' + place;
+    pinnedEl.style.transform = tf;
+    pinnedEl.innerHTML = innerHtml;
+    pinnedEl.style.display = 'flex';
   }
 
   function renderPluginFloatingModal(force = false) {
@@ -15260,24 +19082,55 @@ function renderWebApp() {
     const snap = (lastState && lastState.snapshot) || {};
     const uiData = latestPluginFloatingUi || { rev: '', buttons: [], rootWidgets: [] };
     const widgets = Array.isArray(uiData.rootWidgets) ? uiData.rootWidgets : [];
-    const sig = JSON.stringify([uiData.rev || '', widgets.length, uiPref.assetMode]);
+    const sig = JSON.stringify([
+      uiData.rev || '',
+      widgets.length,
+      uiPref.assetMode,
+      Boolean(uiPref.floatingOnChat),
+      uiPref.floatingPlace || 'chat-end',
+      uiPref.floatingAlign || 'right',
+      Number(uiPref.floatingOffsetX) || 0,
+      Number(uiPref.floatingOffsetY) || 0,
+      uiPref.pluginModalRules || {},
+    ]);
     if (!force && sig === lastFloatingModalSig) return;
     lastFloatingModalSig = sig;
 
-    const cardsHtml = widgets.map((w) => {
-      const safeAttrName = w.pluginName.replace(/[^a-zA-Z0-9_-]/g, '');
-      const scopeSel = '.rs-pfm-stage[data-rs-rw-plugin="' + safeAttrName + '"]';
-      const styleHtml = (w.styles || []).map((s) => '<style>' + scopeBotCss(sanitizeBotCss(s), scopeSel) + '</style>').join('');
-      const bodyHtml = sanitizePluginWidgetHtml(w.html || '', scopeSel, snap.assetMap || {});
-      return '<div class="rs-pfm-card">' +
+    const renderModalRulesHtml = (pluginName, modalsArr) => {
+      const fromMap = (uiData.modalsByPlugin && Array.isArray(uiData.modalsByPlugin[pluginName])) ? uiData.modalsByPlugin[pluginName] : [];
+      const baseList = (Array.isArray(modalsArr) && modalsArr.length) ? modalsArr : fromMap;
+      const items = [...baseList, { key: '__default__', label: '기타 팝업 기본 동작', kind: 'default', autoPopup: true }];
+      const rows = items.map((it) => {
+        const curRule = getPluginModalRule(pluginName, it.key);
+        const autoTxt = it.autoPopup === false ? '자동: 인라인' : (it.autoPopup === null ? '자동: 모달 감지' : '자동: 팝업');
+        const mkBtn = (mode, txt) => '<button type="button" class="pill' + (curRule === mode ? ' active' : '') + '" data-pfm-modal-rule="1" data-plugin="' + esc(pluginName) + '" data-modal-key="' + esc(it.key) + '" data-rule-mode="' + mode + '">' + txt + '</button>';
+        return '<div class="rs-pfm-modal-rule-row">' +
+          '<div class="rs-pfm-modal-rule-info">' +
+            '<span class="rs-pfm-modal-rule-name">' + esc(it.label || it.key) + '</span>' +
+            '<span class="rs-pfm-modal-rule-auto">' + autoTxt + '</span>' +
+          '</div>' +
+          '<div class="rs-pfm-modal-rule-acts">' +
+            mkBtn('auto', '자동') +
+            mkBtn('popup', '팝업') +
+            mkBtn('inline', '팝업 끔') +
+          '</div>' +
+        '</div>';
+      }).join('');
+      return '<details class="rs-pfm-modal-rules">' +
+        '<summary>모달 · 팝업 동작 규칙 (' + items.length + ')</summary>' +
+        '<div class="rs-pfm-modal-rule-list">' + rows + '</div>' +
+      '</details>';
+    };
+
+    const cardsHtml = widgets.map((w) => (
+      '<div class="rs-pfm-card">' +
         '<div class="rs-pfm-card-head">' +
           '<b style="font-size:13.5px;">🧩 ' + esc(w.displayName || w.pluginName) + '</b>' +
         '</div>' +
-        '<div class="rs-pfm-stage" data-rs-rw-plugin="' + esc(safeAttrName) + '" data-rs-plugin-raw="' + esc(w.pluginName) + '">' +
-          styleHtml + bodyHtml +
-        '</div>' +
-      '</div>';
-    }).join('');
+        buildPluginRootStageHtml(w, snap) +
+        renderModalRulesHtml(w.pluginName, w.modals) +
+      '</div>'
+    )).join('');
 
     const emptyHtml = !widgets.length
       ? '<div style="font-size:13px; color:var(--sub); padding:10px 2px; line-height:1.6;">' +
@@ -15294,6 +19147,7 @@ function renderWebApp() {
           '<button type="button" class="pill" data-pfm-close="1">✕ 닫기</button>' +
         '</div>' +
         '<div class="plg-float-body">' +
+          renderFloatingControlOptionsHtml() +
           cardsHtml +
           emptyHtml +
         '</div>' +
@@ -15309,15 +19163,149 @@ function renderWebApp() {
         body: JSON.stringify({
           charIndex: Number.isFinite(Number(snap.charIndex)) ? Number(snap.charIndex) : -1,
           chatIndex: Number.isFinite(Number(snap.chatIndex)) ? Number(snap.chatIndex) : -1,
+          autoExpand: false,
         }),
       });
       if (res && res.pluginFloatingUi) {
         latestPluginFloatingUi = res.pluginFloatingUi;
         renderRsMiniBar(false);
+        renderChatFloatingControls(true);
       }
     } catch (_) {}
     lastFloatingModalSig = '';
     renderPluginFloatingModal(true);
+  }
+
+  async function sendPluginRootInteraction(target, stage, eventType = 'click') {
+    const pName = stage.getAttribute('data-rs-plugin-raw') || stage.getAttribute('data-rs-rw-plugin');
+    if (!pName || !target || target === stage) return;
+    const snap = (lastState && lastState.snapshot) || {};
+    const cIdx = Number.isFinite(Number(snap.charIndex)) ? Number(snap.charIndex) : -1;
+    const chIdx = Number.isFinite(Number(snap.chatIndex)) ? Number(snap.chatIndex) : -1;
+    const meta = collectAmElementMeta(target);
+    const countNode = target.getAttribute('data-am-count-node') || '';
+    const actionAttrNames = [
+      'data-am-runtime-generation-count-action',
+      'data-am-runtime-toast-action',
+      'data-am-viewer-action',
+      'data-am-image-action',
+      'data-am-illustration-action',
+      'data-am-illustration-revision-action',
+      'data-am-revision-action',
+      'data-am-history-action',
+      'data-am-chat-history-action',
+      'data-am-gallery-action',
+      'data-am-action',
+      'data-am-slot',
+    ];
+    let selector = '';
+    if (target.id) selector = '#' + target.id.replace(/[^a-zA-Z0-9_-]/g, '');
+    else {
+      for (const aName of actionAttrNames) {
+        const val = target.getAttribute(aName);
+        if (val !== null && val !== '') {
+          selector = '[' + aName + '="' + String(val).replace(/"/g, '\\\\"') + '"]';
+          break;
+        }
+      }
+    }
+
+    const payload = {
+      pluginName: pName,
+      charIndex: cIdx,
+      chatIndex: chIdx,
+      countNode,
+      selector,
+      actionHtml: meta.actionHtml,
+      dataset: meta.dataset,
+      textContent: meta.textContent,
+      ariaLabel: meta.ariaLabel,
+      title: meta.title,
+      className: meta.className,
+      siblingIndex: meta.siblingIndex,
+      eventType,
+      x: 24,
+      y: 24,
+    };
+    if (eventType !== 'click') {
+      payload.value = target.value !== undefined ? target.value : '';
+      if (target.type === 'checkbox' || target.type === 'radio') payload.checked = Boolean(target.checked);
+    }
+
+    const triggerKey = extractClientTriggerKey(target);
+    const res = await api('/api/plugins/root-click', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+    if (res && res.pluginFloatingUi) {
+      latestPluginFloatingUi = res.pluginFloatingUi;
+      renderRsMiniBar(false);
+      renderChatFloatingControls(true);
+    }
+    if (res && res.snapshot && lastState) {
+      if (typeof res.snapshotVersion === 'number') knownSnapshotVer = res.snapshotVersion;
+      applyState({ ...lastState, snapshot: res.snapshot, snapshotVersion: res.snapshotVersion ?? lastState.snapshotVersion });
+    }
+    if (activeActionOverlayPlugin) {
+      if (res && res.activeOverlay && res.activeOverlay.html) {
+        if (eventType === 'click') openPluginActionOverlayModal(res.activeOverlay);
+      } else if (res && res.activeOverlay === null && eventType === 'click') {
+        closePluginFloatingModal();
+      }
+    } else if (isPluginFloatingModalOpen() && eventType === 'click') {
+      renderPluginFloatingModal(true);
+      if (res && res.activeOverlay && res.activeOverlay.html && res.overlayChanged !== false && shouldOpenPluginOverlay(res.activeOverlay, triggerKey)) {
+        openPluginActionOverlayModal(res.activeOverlay);
+      }
+    } else if (res && res.activeOverlay && res.activeOverlay.html && eventType === 'click' && shouldOpenPluginOverlay(res.activeOverlay, triggerKey)) {
+      openPluginActionOverlayModal(res.activeOverlay);
+    }
+  }
+
+  function bindPluginRootStageEvents(rootEl) {
+    if (!rootEl) return;
+    rootEl.addEventListener('submit', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+    });
+    let inputTimer = null;
+    rootEl.addEventListener('input', (e) => {
+      const target = e.target && e.target.closest ? e.target.closest('input, textarea, select') : null;
+      const stage = target && target.closest ? target.closest('[data-rs-rw-plugin]') : null;
+      if (!target || !stage) return;
+      if (inputTimer) clearTimeout(inputTimer);
+      inputTimer = setTimeout(() => {
+        void sendPluginRootInteraction(target, stage, 'input').catch(() => {});
+      }, 120);
+    });
+    rootEl.addEventListener('change', (e) => {
+      const target = e.target && e.target.closest ? e.target.closest('input, textarea, select') : null;
+      const stage = target && target.closest ? target.closest('[data-rs-rw-plugin]') : null;
+      if (!target || !stage) return;
+      void sendPluginRootInteraction(target, stage, 'change').catch(() => {});
+    });
+    rootEl.addEventListener('click', async (e) => {
+      if (e.target.closest('[data-chat-float-cfg]')) {
+        e.preventDefault();
+        e.stopPropagation();
+        openPluginFloatingModal();
+        return;
+      }
+      const stage = e.target.closest('[data-rs-rw-plugin]');
+      if (!stage) return;
+      if (e.target.closest('input, textarea, select, option') && !e.target.closest('button, [role="button"], [type="submit"], [type="button"], [type="checkbox"], [type="radio"]')) {
+        return;
+      }
+      const target = e.target.closest('button, [data-am-runtime-generation-count-action], [data-am-runtime-toast-action], [data-am-viewer-action], [data-am-image-action], [data-am-illustration-action], [data-am-illustration-revision-action], [data-am-revision-action], [data-am-history-action], [data-am-chat-history-action], [data-am-gallery-action], [data-am-action], [data-risu-action], [risu-btn], [x-risu-btn], a, [role="button"], [data-am-slot], [data-am-count-node]') || e.target;
+      if (!target || target === stage) return;
+      e.preventDefault();
+      e.stopPropagation();
+      try {
+        await sendPluginRootInteraction(target, stage, 'click');
+      } catch (err) {
+        toast('컨트롤 실행 오류: ' + (err && err.message ? err.message : '실패'));
+      }
+    });
   }
 
   (function bindPluginFloatingModalEvents() {
@@ -15328,108 +19316,79 @@ function renderWebApp() {
         openPluginFloatingModal();
       };
     }
+    bindPluginRootStageEvents(document.getElementById('chatPinnedPluginCtrl'));
     const modal = document.getElementById('pluginFloatingModal');
     if (!modal) return;
-    const sendPluginRootInteraction = async (target, stage, eventType = 'click') => {
-      const pName = stage.getAttribute('data-rs-plugin-raw') || stage.getAttribute('data-rs-rw-plugin');
-      if (!pName || !target || target === stage) return;
-      const snap = (lastState && lastState.snapshot) || {};
-      const cIdx = Number.isFinite(Number(snap.charIndex)) ? Number(snap.charIndex) : -1;
-      const chIdx = Number.isFinite(Number(snap.chatIndex)) ? Number(snap.chatIndex) : -1;
-      const meta = collectAmElementMeta(target);
-      const countNode = target.getAttribute('data-am-count-node') || '';
-      const actionAttr = target.getAttribute('data-am-runtime-generation-count-action');
-      const toastAttr = target.getAttribute('data-am-runtime-toast-action');
-      let selector = '';
-      if (target.id) selector = '#' + target.id.replace(/[^a-zA-Z0-9_-]/g, '');
-      else if (actionAttr) selector = '[data-am-runtime-generation-count-action="' + actionAttr + '"]';
-      else if (toastAttr) selector = '[data-am-runtime-toast-action="' + toastAttr + '"]';
-
-      const payload = {
-        pluginName: pName,
-        charIndex: cIdx,
-        chatIndex: chIdx,
-        countNode,
-        selector,
-        actionHtml: meta.actionHtml,
-        dataset: meta.dataset,
-        textContent: meta.textContent,
-        ariaLabel: meta.ariaLabel,
-        title: meta.title,
-        className: meta.className,
-        siblingIndex: meta.siblingIndex,
-        eventType,
-        x: 24,
-        y: 24,
-      };
-      if (eventType !== 'click') {
-        payload.value = target.value !== undefined ? target.value : '';
-        if (target.type === 'checkbox' || target.type === 'radio') payload.checked = Boolean(target.checked);
-      }
-
-      const res = await api('/api/plugins/root-click', {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      });
-      if (res && res.pluginFloatingUi) {
-        latestPluginFloatingUi = res.pluginFloatingUi;
-        renderRsMiniBar(false);
-      }
-      if (res && res.snapshot && lastState) {
-        if (typeof res.snapshotVersion === 'number') knownSnapshotVer = res.snapshotVersion;
-        applyState({ ...lastState, snapshot: res.snapshot, snapshotVersion: res.snapshotVersion ?? lastState.snapshotVersion });
-      }
-      if (activeActionOverlayPlugin) {
-        if (res && res.activeOverlay && res.activeOverlay.html) {
-          if (eventType === 'click') openPluginActionOverlayModal(res.activeOverlay);
-        } else if (res && res.activeOverlay === null && eventType === 'click') {
-          closePluginFloatingModal();
-        }
-      } else if (eventType === 'click') {
-        renderPluginFloatingModal(true);
-      }
-    };
-
-    modal.addEventListener('submit', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-    });
-    let pfmInputTimer = null;
-    modal.addEventListener('input', (e) => {
-      const target = e.target && e.target.closest ? e.target.closest('input, textarea, select') : null;
-      const stage = target && target.closest ? target.closest('[data-rs-rw-plugin]') : null;
-      if (!target || !stage) return;
-      if (pfmInputTimer) clearTimeout(pfmInputTimer);
-      pfmInputTimer = setTimeout(() => {
-        void sendPluginRootInteraction(target, stage, 'input').catch(() => {});
-      }, 120);
-    });
-    modal.addEventListener('change', (e) => {
-      const target = e.target && e.target.closest ? e.target.closest('input, textarea, select') : null;
-      const stage = target && target.closest ? target.closest('[data-rs-rw-plugin]') : null;
-      if (!target || !stage) return;
-      void sendPluginRootInteraction(target, stage, 'change').catch(() => {});
-    });
-    modal.addEventListener('click', async (e) => {
+    modal.addEventListener('click', (e) => {
       if (e.target === modal || e.target.closest('[data-pfm-close]')) {
         closePluginFloatingModal();
         return;
       }
-      const stage = e.target.closest('[data-rs-rw-plugin]');
-      if (!stage) return;
-      if (e.target.closest('input, textarea, select, option') && !e.target.closest('button, [role="button"], [type="submit"], [type="button"], [type="checkbox"], [type="radio"]')) {
+      const optShow = e.target.closest('[data-pfm-opt-show]');
+      if (optShow) {
+        uiPref.floatingOnChat = !uiPref.floatingOnChat;
+        applyUiPrefs();
+        renderPluginFloatingModal(true);
         return;
       }
-      const target = e.target.closest('button, [data-am-runtime-generation-count-action], [data-am-runtime-toast-action], a, [role="button"], [data-am-slot], [data-am-count-node]') || e.target;
-      if (!target || target === stage) return;
-      e.preventDefault();
-      e.stopPropagation();
-      try {
-        await sendPluginRootInteraction(target, stage, 'click');
-      } catch (err) {
-        toast('컨트롤 실행 오류: ' + (err && err.message ? err.message : '실패'));
+      const optPlace = e.target.closest('[data-pfm-opt-place]');
+      if (optPlace) {
+        uiPref.floatingPlace = optPlace.getAttribute('data-pfm-opt-place') || 'chat-end';
+        applyUiPrefs();
+        renderPluginFloatingModal(true);
+        return;
+      }
+      const optAlign = e.target.closest('[data-pfm-opt-align]');
+      if (optAlign) {
+        uiPref.floatingAlign = optAlign.getAttribute('data-pfm-opt-align') || 'right';
+        applyUiPrefs();
+        renderPluginFloatingModal(true);
+        return;
+      }
+      const optNudge = e.target.closest('[data-pfm-opt-nudge]');
+      if (optNudge) {
+        const parts = String(optNudge.getAttribute('data-pfm-opt-nudge') || '').split(':');
+        const axis = parts[0];
+        const delta = Number(parts[1]) || 0;
+        if (axis === 'x') uiPref.floatingOffsetX = Math.max(-240, Math.min(240, (Number(uiPref.floatingOffsetX) || 0) + delta));
+        if (axis === 'y') uiPref.floatingOffsetY = Math.max(-240, Math.min(240, (Number(uiPref.floatingOffsetY) || 0) + delta));
+        applyUiPrefs();
+        renderPluginFloatingModal(true);
+        return;
+      }
+      const suppressBtn = e.target.closest('[data-pfm-suppress-modal]');
+      if (suppressBtn) {
+        const pName = suppressBtn.getAttribute('data-plugin') || '';
+        const mKey = suppressBtn.getAttribute('data-modal-key') || '__default__';
+        if (pName) {
+          setPluginModalRule(pName, mKey, 'inline');
+          closePluginFloatingModal();
+          toast('이 모달의 자동 팝업을 껐습니다.');
+        }
+        return;
+      }
+      const ruleBtn = e.target.closest('[data-pfm-modal-rule]');
+      if (ruleBtn) {
+        const pName = ruleBtn.getAttribute('data-plugin') || '';
+        const mKey = ruleBtn.getAttribute('data-modal-key') || '';
+        const mode = ruleBtn.getAttribute('data-rule-mode') || 'auto';
+        if (pName && mKey) {
+          setPluginModalRule(pName, mKey, mode);
+          renderPluginFloatingModal(true);
+        }
+        return;
+      }
+      const optReset = e.target.closest('[data-pfm-opt-reset]');
+      if (optReset) {
+        uiPref.floatingPlace = 'chat-end';
+        uiPref.floatingAlign = 'right';
+        uiPref.floatingOffsetX = 0;
+        uiPref.floatingOffsetY = 0;
+        applyUiPrefs();
+        renderPluginFloatingModal(true);
       }
     });
+    bindPluginRootStageEvents(modal);
   })();
 
   function closeSceneCtrlModal() {
@@ -15464,7 +19423,7 @@ function renderWebApp() {
         const itemsHtml = imgs.map((im) => {
           const src = String(im).startsWith('[[RSASSET:') ? resolveAssetTokens(im, snap.assetMap) : safeImgSrc(im);
           if (!src) return '';
-          return '<span class="scene-thumb-wrap" data-scene-thumb-reveal="1"><img class="scene-slot-thumb" src="' + esc(src) + '" /><span class="scene-thumb-veil">' + (isBlur ? '🌫️ 보기' : '') + '</span></span>';
+          return '<span class="scene-thumb-wrap" data-scene-thumb-reveal="1" title="클릭하여 크게 보기"><img class="scene-slot-thumb" src="' + esc(src) + '" /><span class="scene-thumb-veil">' + (isBlur ? '🌫️ 보기' : '') + '</span></span>';
         }).join('');
         if (itemsHtml) thumbsHtml = '<div class="scene-slot-thumbs">' + itemsHtml + '</div>';
       }
@@ -15519,8 +19478,20 @@ function renderWebApp() {
         return;
       }
       const revealWrap = e.target.closest('[data-scene-thumb-reveal]');
-      if (revealWrap && document.body.classList.contains('asset-blur')) {
-        revealWrap.classList.toggle('revealed');
+      if (revealWrap) {
+        if (document.body.classList.contains('asset-blur') && !revealWrap.classList.contains('revealed')) {
+          revealWrap.classList.add('revealed');
+          return;
+        }
+        const clickedImg = revealWrap.querySelector('img.scene-slot-thumb');
+        const src = clickedImg && (clickedImg.getAttribute('src') || clickedImg.currentSrc);
+        if (src) {
+          const thumbsWrap = revealWrap.closest('.scene-slot-thumbs');
+          const allImgs = thumbsWrap ? Array.from(thumbsWrap.querySelectorAll('img.scene-slot-thumb')) : [clickedImg];
+          const items = allImgs.map((im) => im && (im.getAttribute('src') || im.currentSrc)).filter(Boolean);
+          const idx = allImgs.indexOf(clickedImg);
+          openChatImgLightbox(src, { items, index: idx >= 0 ? idx : 0 });
+        }
         return;
       }
       if (e.target.closest('[data-scene-open-floating]')) {
@@ -15566,16 +19537,31 @@ function sanitizeConfigForClient() {
     if (syncDirectPresetToggles(config)) {
         saveConfig();
     }
+    const activeDirectId = typeof config.directPresetId === 'string' ? config.directPresetId : 'bundled:leave';
+    const activeDirectPreset = resolveDirectPreset(activeDirectId);
+    const presetDefaultToggleValues = {};
+    if (activeDirectPreset) {
+        const parsedDefs = parsePresetDefaultToggles(
+            activeDirectPreset.toggleSyntax || activeDirectPreset.customPromptTemplateToggle || '',
+            activeDirectPreset.defaultVariables || activeDirectPreset.templateDefaultVariables || ''
+        );
+        for (const [k, v] of Object.entries(parsedDefs)) {
+            if (k.startsWith('toggle_')) {
+                presetDefaultToggleValues[k] = String(v ?? '');
+            }
+        }
+    }
     const remoteToggleValues = (config.remoteToggleValues && typeof config.remoteToggleValues === 'object' && !Array.isArray(config.remoteToggleValues))
         ? { ...config.remoteToggleValues }
         : {};
     return {
         activeProfileId: config.activeProfileId,
         auxProfileId: typeof config.auxProfileId === 'string' && config.auxProfileId ? config.auxProfileId : 'inherit',
-        directPresetId: typeof config.directPresetId === 'string' ? config.directPresetId : 'bundled:leave',
+        directPresetId: activeDirectId,
         directHistoryMode: normalizeDirectHistoryMode(config.directHistoryMode),
         directPipelineMode: normalizeDirectPipelineMode(config.directPipelineMode),
         directPresets: listDirectPresets(),
+        presetDefaultToggleValues,
         remoteToggleValues,
         disabledLoreEntries: (config.disabledLoreEntries && typeof config.disabledLoreEntries === 'object') ? config.disabledLoreEntries : {},
         enabledModuleLoreEntries: (config.enabledModuleLoreEntries && typeof config.enabledModuleLoreEntries === 'object') ? config.enabledModuleLoreEntries : {},
@@ -15811,7 +19797,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             if (!w || w.done) continue;
             w.done = true;
             clearTimeout(w.timer);
-            const batch = rpcState.queue.splice(0, 25);
+            const batch = rpcState.queue.splice(0, 64);
             try { w.respond(batch); } catch (_) {}
         }
     }
@@ -15843,6 +19829,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
     const prevPluginAdapter = activePluginAdapter;
     const prevModuleAdapter = activeModuleAdapter;
     const prevHostRpc = activeHostRpc;
+    const prevGenerationTracker = activeGenerationTracker;
     activeHostRpc = hostRpc;
 
     let llmHookDepth = 0;
@@ -15853,6 +19840,8 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         recentList: [], // [{ id, kind, name, phase, endedAt }]
         subscribers: new Set(), // Set<{ res, kaTimer }>
         cleanupTimer: null,
+        generation: null,
+        genCleanupTimer: null,
     };
     const snapshotWaiters = new Set();
 
@@ -15921,6 +19910,35 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         });
     }
 
+    function getLiveGenerationSnapshot() {
+        const g = activityState.generation;
+        if (!g) return null;
+        const now = Date.now();
+        if (!g.active && g.endedAt && (now - g.endedAt > 5000)) return null;
+        const endRef = g.active ? now : (g.endedAt || now);
+        const elapsedMs = Math.max(0, endRef - g.startedAt);
+        const rateWindowMs = g.firstTokenAt ? Math.max(200, endRef - g.firstTokenAt) : Math.max(250, elapsedMs);
+        const tokPerSec = g.outputTokens > 0 ? Math.round((g.outputTokens / (rateWindowMs / 1000)) * 10) / 10 : 0;
+        return {
+            id: g.id,
+            active: Boolean(g.active),
+            status: g.status,
+            source: g.source,
+            provider: g.provider,
+            profileName: g.profileName,
+            providerType: g.providerType,
+            model: g.model,
+            outputTokens: g.outputTokens,
+            tokenEstimated: g.tokenEstimated,
+            tokPerSec,
+            startedAt: g.startedAt,
+            firstTokenAt: g.firstTokenAt,
+            endedAt: g.endedAt,
+            elapsedMs,
+            error: g.error,
+        };
+    }
+
     function getActivitySnapshot() {
         const now = Date.now();
         activityState.recentList = activityState.recentList.filter((x) => now - x.endedAt < 1400);
@@ -15928,6 +19946,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             seq: activityState.seq,
             active: Array.from(activityState.activeMap.values()),
             recent: activityState.recentList.slice(-4),
+            generation: getLiveGenerationSnapshot(),
         };
     }
 
@@ -16003,6 +20022,97 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         };
         return finish;
     }
+
+    const generationTracker = {
+        begin({ source = 'llm', provider = '', profileName = '', providerType = '', model = '' } = {}) {
+            if (activityState.genCleanupTimer) {
+                clearTimeout(activityState.genCleanupTimer);
+                activityState.genCleanupTimer = null;
+            }
+            const id = ++activityState.nextId;
+            const entry = {
+                id,
+                active: true,
+                status: 'generating',
+                source: String(source || 'llm'),
+                provider: String(provider || 'LLM'),
+                profileName: String(profileName || ''),
+                providerType: String(providerType || ''),
+                model: String(model || ''),
+                outputTokens: 0,
+                tokenEstimated: true,
+                startedAt: Date.now(),
+                firstTokenAt: 0,
+                endedAt: 0,
+                error: '',
+            };
+            activityState.generation = entry;
+            activityState.seq += 1;
+            broadcastActivity();
+            let lastBroadcastAt = Date.now();
+            let finished = false;
+            return {
+                progress({ text = '', model: nextModel = '', usage = null } = {}) {
+                    if (finished || !activityState.generation || activityState.generation.id !== id) return;
+                    if (nextModel) entry.model = String(nextModel);
+                    const exactTok = extractCompletionTokens(usage);
+                    if (exactTok !== null && exactTok > 0) {
+                        entry.outputTokens = exactTok;
+                        entry.tokenEstimated = false;
+                    } else if (text) {
+                        const est = estimateOutputTokens(text);
+                        if (est > entry.outputTokens) {
+                            entry.outputTokens = est;
+                            entry.tokenEstimated = true;
+                        }
+                    }
+                    if (!entry.firstTokenAt && (entry.outputTokens > 0 || text)) {
+                        entry.firstTokenAt = Date.now();
+                    }
+                    const now = Date.now();
+                    if (now - lastBroadcastAt >= 250) {
+                        lastBroadcastAt = now;
+                        activityState.seq += 1;
+                        broadcastActivity();
+                    }
+                },
+                end({ ok = true, text = '', model: finalModel = '', usage = null, error = '' } = {}) {
+                    if (finished) return;
+                    finished = true;
+                    if (!activityState.generation || activityState.generation.id !== id) return;
+                    if (finalModel) entry.model = String(finalModel);
+                    const exactTok = extractCompletionTokens(usage);
+                    if (exactTok !== null && exactTok > 0) {
+                        entry.outputTokens = exactTok;
+                        entry.tokenEstimated = false;
+                    } else if (text) {
+                        const est = estimateOutputTokens(text);
+                        if (est > entry.outputTokens) {
+                            entry.outputTokens = est;
+                            entry.tokenEstimated = true;
+                        }
+                    }
+                    entry.active = false;
+                    entry.endedAt = Date.now();
+                    entry.status = ok ? 'done' : 'error';
+                    entry.error = ok ? '' : String(error || '요청 오류');
+                    activityState.seq += 1;
+                    broadcastActivity();
+                    if (activityState.genCleanupTimer) clearTimeout(activityState.genCleanupTimer);
+                    activityState.genCleanupTimer = setTimeout(() => {
+                        activityState.genCleanupTimer = null;
+                        if (activityState.generation && activityState.generation.id === id && !activityState.generation.active) {
+                            activityState.generation = null;
+                            activityState.seq += 1;
+                            broadcastActivity();
+                        }
+                    }, 5100);
+                    if (typeof activityState.genCleanupTimer.unref === 'function') activityState.genCleanupTimer.unref();
+                },
+            };
+        },
+    };
+    activeGenerationTracker = generationTracker;
 
     async function runUnifiedBackendLLM(req, callerLabel = 'plugin', customProviders = null) {
         const mode = String((req && req.mode) || 'model');
@@ -16108,6 +20218,11 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
     });
 
     const ttsProvider = createTtsProvider();
+    const ttsScriptStore = createTtsScriptStore({
+        filePath: TTS_SCRIPTS_PATH,
+        maxEntries: 500,
+        isPersistDisabled: () => configPersistDisabled,
+    });
 
     function resolveTtsLlmProfile() {
         const ttsCfg = normalizeTtsConfig(config.tts);
@@ -16118,22 +20233,59 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             return getAuxProfile();
         }
         const tr = config.translator || {};
-        if (tr.useActiveProfile) {
+        const resolvedTr = resolveTranslatorProfile();
+        const isCustomTr = (tr.profileId === 'custom' || (!tr.profileId && !tr.useActiveProfile));
+        if (isCustomTr && resolvedTr && !resolvedTr.apiKey && resolvedTr.providerType !== 'openai_compat') {
             return getActiveProfile();
         }
-        const trProf = {
+        return resolvedTr ? {
+            ...resolvedTr,
             name: 'TTS Script Director (Translator)',
-            providerType: tr.providerType || 'gemini',
-            baseUrl: tr.baseUrl || '',
-            apiKey: tr.apiKey || '',
-            model: tr.model || 'gemini-2.5-flash',
             temperature: 0.15,
             maxTokens: 2048,
-        };
-        if (!trProf.apiKey && trProf.providerType !== 'openai_compat') {
-            return getActiveProfile();
+        } : getActiveProfile();
+    }
+
+    function extractTtsBotContext(snap, fallbackBotKey = '', fallbackBotName = '') {
+        const s = (snap && typeof snap === 'object') ? snap : {};
+        const rawCtx = (s.charContext && typeof s.charContext === 'object') ? s.charContext : {};
+        const botKey = buildTtsBotKey(fallbackBotKey || s);
+        const botName = String(fallbackBotName || s.charName || rawCtx.name || '').trim();
+        const loreList = Array.isArray(rawCtx.loreEntries) ? rawCtx.loreEntries : [];
+        const loreSnips = [];
+        let loreChars = 0;
+        for (const raw of loreList) {
+            if (!raw || raw.enabled === false || raw.mode === 'folder') continue;
+            if (isModuleLoreEntry(raw)) continue;
+            const dec = parseLoreDecorators(raw.content || '');
+            const cleanBody = String((dec && dec.content) || raw.content || '').trim();
+            if (!cleanBody) continue;
+            const title = String(raw.comment || raw.key || '').trim();
+            const entryLine = title ? `[${title}] ${cleanBody}` : cleanBody;
+            if (loreChars + entryLine.length > 3400 && loreSnips.length > 0) break;
+            loreSnips.push(entryLine);
+            loreChars += entryLine.length;
         }
-        return trProf;
+        const msgs = Array.isArray(s.messages) ? s.messages.slice(-10) : [];
+        const recentDialogue = msgs
+            .map((m) => {
+                const who = (m && m.role === 'user') ? (s.personaName || rawCtx.personaName || 'User') : (botName || 'Character');
+                const txt = String((m && m.text) || '').replace(/\s+/g, ' ').trim().slice(0, 320);
+                return txt ? `${who}: ${txt}` : '';
+            })
+            .filter(Boolean)
+            .join('\n')
+            .slice(0, 2400);
+
+        return {
+            botKey,
+            botName,
+            desc: String(rawCtx.desc || '').trim().slice(0, 2500),
+            firstMessage: String(rawCtx.firstMessage || '').trim().slice(0, 1200),
+            note: String(rawCtx.note || '').trim().slice(0, 800),
+            loreSummary: loreSnips.join('\n').slice(0, 3500),
+            recentDialogue,
+        };
     }
 
     const moduleAdapter = createModuleAdapter({
@@ -16313,6 +20465,53 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         try { fs.rmSync(path.join(THUMBS_DIR, file), { force: true }); } catch (_) {}
     }
 
+    const pcAssetInFlight = new Map();
+
+    async function fetchPcAssetById(id) {
+        const cached = assetStore.get(id);
+        if (cached) return { status: 200, entry: cached };
+        const ref = pcAssetRefMap.get(id);
+        if (!ref) return { status: 404, entry: null };
+        if (!hostRpc.isConnected()) return { status: 503, entry: null };
+        if (pcAssetInFlight.has(id)) return pcAssetInFlight.get(id);
+        const p = (async () => {
+            try {
+                let buf = null;
+                let mime = '';
+                if (ref.type === 'pcpath') {
+                    const r = await hostRpc.invoke('asset.readImage', [ref.path], 15000);
+                    if (!r || typeof r !== 'object' || typeof r.__b64 !== 'string') return { status: 404, entry: null };
+                    mime = String(r.mime || '').toLowerCase();
+                    if (!mime.startsWith('image/')) return { status: 404, entry: null };
+                    buf = Buffer.from(r.__b64, 'base64');
+                } else if (ref.type === 'pcinlay') {
+                    const r = await hostRpc.invoke('asset.readInlay', [ref.inlayId], 15000);
+                    const dataStr = r && typeof r.data === 'string' ? r.data : '';
+                    const m = dataStr.match(/^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/i);
+                    if (!m) return { status: 404, entry: null };
+                    mime = m[1].toLowerCase();
+                    buf = Buffer.from(m[2].replace(/\s+/g, ''), 'base64');
+                }
+                if (!buf || !buf.length || buf.length > PC_ASSET_MAX_SINGLE_BYTES) {
+                    return { status: 404, entry: null };
+                }
+                const entry = { buf, mime };
+                putAssetStoreEntry(id, buf, mime);
+                return { status: 200, entry };
+            } catch (err) {
+                const msg = err && err.message ? String(err.message) : '';
+                if (/연결되어 있지 않습니다|timeout/i.test(msg)) {
+                    return { status: 503, entry: null };
+                }
+                return { status: 404, entry: null };
+            } finally {
+                pcAssetInFlight.delete(id);
+            }
+        })();
+        pcAssetInFlight.set(id, p);
+        return p;
+    }
+
     const server = http.createServer(async (req, res) => {
         const urlObj = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
         const pathname = urlObj.pathname;
@@ -16327,6 +20526,11 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
             res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
             res.end(renderWebApp());
+            return;
+        }
+        if (req.method === 'GET' && pathname === '/favicon.ico') {
+            res.writeHead(204, { 'Cache-Control': 'public, max-age=86400' });
+            res.end();
             return;
         }
 
@@ -16410,9 +20614,21 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         const assetMatch = req.method === 'GET' && pathname.match(/^\/api\/asset\/([a-f0-9]{32})$/);
         if (assetMatch) {
             if (!requireAssetAuth(req, res)) return;
-            const entry = assetStore.get(assetMatch[1]);
+            const assetId = assetMatch[1];
+            let entry = assetStore.get(assetId);
+            if (!entry && pcAssetRefMap.has(assetId)) {
+                const fetched = await fetchPcAssetById(assetId);
+                if (fetched.status === 503) {
+                    res.writeHead(503, { ...corsHeaders(req), 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+                    res.end(JSON.stringify({ error: 'PC RisuAI bridge disconnected' }));
+                    return;
+                }
+                entry = fetched.entry;
+            }
             if (!entry) {
-                return sendJson(res, 404, { error: 'Asset not found' }, req);
+                res.writeHead(404, { ...corsHeaders(req), 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+                res.end(JSON.stringify({ error: 'Asset not found' }));
+                return;
             }
             res.writeHead(200, {
                 'Content-Type': entry.mime,
@@ -16461,8 +20677,35 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     state.catalogVersion += 1;
                 }
                 if (body.snapshot) {
+                    pluginAdapter.invalidateReadCache();
                     state.baseSnapshot = externalizeSnapshotAssets(body.snapshot);
-                    await rebuildDisplayedSnapshot(state.baseSnapshot, pluginAdapter);
+                    state.snapshot = state.baseSnapshot;
+                    let timedOut = false;
+                    let timeoutTimer = null;
+                    const rebuildPromise = rebuildDisplayedSnapshot(state.baseSnapshot, pluginAdapter);
+                    try {
+                        await Promise.race([
+                            rebuildPromise,
+                            new Promise((resolve) => {
+                                timeoutTimer = setTimeout(() => {
+                                    timedOut = true;
+                                    resolve();
+                                }, 4500);
+                                if (typeof timeoutTimer.unref === 'function') timeoutTimer.unref();
+                            }),
+                        ]);
+                    } catch (rebuildErr) {
+                        console.warn('[Relay] rebuildDisplayedSnapshot error:', rebuildErr && rebuildErr.message ? rebuildErr.message : rebuildErr);
+                        state.snapshot = state.baseSnapshot;
+                    } finally {
+                        if (timeoutTimer) clearTimeout(timeoutTimer);
+                    }
+                    if (timedOut) {
+                        void rebuildPromise.then(() => {
+                            state.snapshotVersion += 1;
+                            notifySnapshotWaiters();
+                        }).catch(() => {});
+                    }
                     state.snapshotVersion += 1;
                     notifySnapshotWaiters();
                 }
@@ -16471,7 +20714,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
 
                 pruneCommandQueue();
                 const inlineRpcCalls = (!rpcState.waiters.length && rpcState.queue.length)
-                    ? rpcState.queue.splice(0, 25)
+                    ? rpcState.queue.splice(0, 64)
                     : [];
                 if (body.supportsBatchCommands === true) {
                     const commands = [];
@@ -16514,7 +20757,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     }, 20);
                 }
                 if (rpcState.queue.length) {
-                    return sendJson(res, 200, { ok: true, calls: rpcState.queue.splice(0, 25) }, req);
+                    return sendJson(res, 200, { ok: true, calls: rpcState.queue.splice(0, 64) }, req);
                 }
                 const timeoutMs = Math.max(500, Math.min(15000, Number(body.timeoutMs) || 12000));
                 const waiter = {
@@ -16640,6 +20883,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 updateAvailable: Boolean(updateState.info && updateState.info.available),
                 generating: Boolean(state.generating || nativePending),
                 directGenerating: state.directGenerating,
+                liveGeneration: getLiveGenerationSnapshot(),
                 lastDirectError: state.lastDirectError,
                 lastTriggerEvent: state.lastTriggerEvent,
                 catalogVersion: state.catalogVersion,
@@ -16649,13 +20893,15 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 botThumbs: publicBotThumbs(),
             };
             if (reqCv === null || reqCv !== state.catalogVersion) payload.catalog = state.catalog;
-            if (reqSv === null || reqSv !== state.snapshotVersion) {
-                if (state.snapshot && state.snapshot.charContext && Object.prototype.hasOwnProperty.call(state.snapshot.charContext, 'loreEntries')) {
-                    const { loreEntries: _omitLoreEntries, ...lightCtx } = state.snapshot.charContext;
-                    payload.snapshot = { ...state.snapshot, charContext: lightCtx };
-                } else {
-                    payload.snapshot = state.snapshot;
+            const toLightClientSnapshot = (snapObj) => {
+                if (snapObj && snapObj.charContext && Object.prototype.hasOwnProperty.call(snapObj.charContext, 'loreEntries')) {
+                    const { loreEntries: _omitLoreEntries, ...lightCtx } = snapObj.charContext;
+                    return { ...snapObj, charContext: lightCtx };
                 }
+                return snapObj;
+            };
+            if (reqSv === null || reqSv !== state.snapshotVersion) {
+                payload.snapshot = toLightClientSnapshot(state.snapshot);
             }
             return sendJson(res, 200, payload, req, {
                 'Set-Cookie': `rs_asset_sid=${assetCookieVal}; Path=/api/asset; HttpOnly; SameSite=Strict`,
@@ -16863,6 +21109,50 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                         state.snapshotVersion += 1;
                     }
                 }
+                if (body.type === 'toggle_module') {
+                    moduleAdapter.invalidateDisplayCache();
+                }
+                if (body.type === 'select_target' && body.payload && typeof body.payload === 'object') {
+                    const cIdx = Number(body.payload.charIndex);
+                    const rawChat = body.payload.chatIndex;
+                    const chIdx = (rawChat === undefined || rawChat === null || Number.isNaN(Number(rawChat))) ? 0 : Math.max(0, Math.trunc(Number(rawChat)));
+                    if (Number.isInteger(cIdx) && cIdx >= 0) {
+                        state.commandQueue = state.commandQueue.filter((c) => c && c.type !== 'select_target' && c.type !== 'sync_all');
+                        if (hostRpc.isConnected()) {
+                            try {
+                                const prevVer = state.snapshotVersion;
+                                await hostRpc.invoke('bridge.selectTarget', [cIdx, chIdx], 2000);
+                                const deadline = Date.now() + 1200;
+                                while (Date.now() < deadline) {
+                                    if (state.snapshot && Number(state.snapshot.charIndex) === cIdx && Number(state.snapshot.chatIndex) === chIdx) {
+                                        break;
+                                    }
+                                    const curVer = state.snapshotVersion;
+                                    const rem = deadline - Date.now();
+                                    if (rem <= 0) break;
+                                    const bumped = await waitForSnapshotBump(Math.max(prevVer, curVer), Math.min(rem, 400));
+                                    if (!bumped) break;
+                                }
+                                if (state.snapshot && Number(state.snapshot.charIndex) === cIdx && Number(state.snapshot.chatIndex) === chIdx) {
+                                    const lightSnap = (state.snapshot.charContext && Object.prototype.hasOwnProperty.call(state.snapshot.charContext, 'loreEntries'))
+                                        ? (() => { const { loreEntries: _omit, ...restCtx } = state.snapshot.charContext; return { ...state.snapshot, charContext: restCtx }; })()
+                                        : state.snapshot;
+                                    return sendJson(res, 200, {
+                                        ok: true,
+                                        fastSwitch: true,
+                                        snapshot: lightSnap,
+                                        snapshotVersion: state.snapshotVersion,
+                                    }, req);
+                                }
+                                return sendJson(res, 200, { ok: true, fastSwitch: true }, req);
+                            } catch (_) {
+                                // Fall through to prioritized commandQueue entry on older plugins or RPC timeout
+                            }
+                        }
+                        queueCommand('select_target', { charIndex: cIdx, chatIndex: chIdx }, { front: true });
+                        return sendJson(res, 200, { ok: true }, req);
+                    }
+                }
                 queueCommand(body.type, body.payload || {});
                 return sendJson(res, 200, { ok: true }, req);
             } catch (e) {
@@ -16999,21 +21289,68 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             }
         }
 
-        // 7b) Multi-Speaker TTS Script Analysis, Synthesis & Connection Test
+        // 7b) Multi-Speaker TTS Script Analysis, Persistent Script Store, Synthesis & Connection Test
         if (pathname === '/api/tts/analyze' && req.method === 'POST') {
             if (!requireAuth(req, res)) return;
             try {
                 const body = JSON.parse((await readBody(req)) || '{}');
+                const activeSnap = state.baseSnapshot || state.snapshot;
                 const effectiveTtsCfg = normalizeTtsConfig({
                     ...config.tts,
                     ...(body.parseMode ? { parseMode: body.parseMode } : {}),
                 });
+                const charName = body.charName || ((activeSnap && activeSnap.charName) || 'Character');
+                const personaName = body.personaName || ((activeSnap && (activeSnap.personaName || (activeSnap.charContext && activeSnap.charContext.personaName))) || '나');
+                const effectiveBotKey = buildTtsBotKey(body.botKey || body.chatKey || activeSnap);
+                const effectiveChatKey = String(body.chatKey || buildTtsChatKey(activeSnap) || '');
+                const role = body.role || 'char';
+                const modelSpec = resolveTtsSpeechModelSpec(effectiveTtsCfg);
+                const modelSpecSummary = {
+                    id: modelSpec.id,
+                    label: modelSpec.label,
+                    deliveryMode: modelSpec.deliveryMode,
+                    tagSyntax: modelSpec.tagSyntax,
+                    voiceGroup: modelSpec.voiceGroup,
+                };
+                const scriptKey = String(body.scriptKey || '').trim() || buildTtsScriptKey({
+                    botKey: effectiveBotKey,
+                    role,
+                    text: body.text || '',
+                    html: body.html || '',
+                });
+
+                if (scriptKey && !body.forceReanalyze && !body.skipSaved) {
+                    const saved = ttsScriptStore.get(scriptKey);
+                    if (saved && Array.isArray(saved.segments) && saved.segments.length) {
+                        const segments = hydrateSavedScriptSegments(saved, effectiveTtsCfg, charName, effectiveBotKey || effectiveChatKey);
+                        return sendJson(res, 200, {
+                            ok: true,
+                            segments,
+                            modeUsed: saved.modeUsed || 'saved',
+                            warning: '',
+                            learnedProfiles: [],
+                            modelSpec: modelSpecSummary,
+                            botKey: effectiveBotKey,
+                            scriptKey,
+                            scriptSaved: true,
+                            scriptHit: true,
+                            manuallyEdited: Boolean(saved.manuallyEdited),
+                            updatedAt: saved.updatedAt,
+                            botProfilesUpdated: false,
+                        }, req);
+                    }
+                }
+
+                const botCtx = extractTtsBotContext(activeSnap, effectiveBotKey, charName);
                 const result = await analyzeTtsSegments({
                     text: body.text || '',
                     html: body.html || '',
-                    role: body.role || 'char',
-                    charName: body.charName || ((state.snapshot && state.snapshot.charName) || 'Character'),
-                    personaName: body.personaName || ((state.snapshot && state.snapshot.personaName) || '나'),
+                    role,
+                    charName,
+                    personaName,
+                    chatKey: effectiveChatKey,
+                    botKey: effectiveBotKey,
+                    botContext: botCtx,
                     ttsConfig: effectiveTtsCfg,
                     callLlm: async (messages) => {
                         const profile = resolveTtsLlmProfile();
@@ -17026,19 +21363,207 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                         return llmRes && llmRes.text ? llmRes.text : '';
                     },
                 });
-                return sendJson(res, 200, { ok: true, ...result }, req);
+                let botProfilesUpdated = false;
+                let botCharacters = null;
+                if (effectiveTtsCfg.characterVoicesEnabled && effectiveTtsCfg.autoLearnBotProfiles && effectiveBotKey && Array.isArray(result.learnedProfiles) && result.learnedProfiles.length) {
+                    const curTts = normalizeTtsConfig(config.tts);
+                    const existingEntry = curTts.botCharacters[effectiveBotKey];
+                    const existingList = (existingEntry && Array.isArray(existingEntry.characters)) ? existingEntry.characters : [];
+                    const merged = mergeCharacterSpeechProfiles(existingList, result.learnedProfiles, {
+                        modelSpecId: (result.modelSpec && result.modelSpec.id) || resolveTtsSpeechModelSpec(curTts).id,
+                        overwriteTags: false,
+                        overwriteVoices: false,
+                    });
+                    if (merged.changed) {
+                        curTts.botCharacters[effectiveBotKey] = {
+                            botKey: effectiveBotKey,
+                            botName: String(body.botName || botCtx.botName || (existingEntry && existingEntry.botName) || effectiveBotKey).trim(),
+                            updatedAt: Date.now(),
+                            characters: merged.characters,
+                        };
+                        config.tts = normalizeTtsConfig(curTts);
+                        ttsProvider.clearCache();
+                        saveConfig();
+                        botProfilesUpdated = true;
+                        botCharacters = config.tts.botCharacters[effectiveBotKey].characters;
+                    }
+                }
+
+                let scriptSaved = false;
+                let updatedAt = 0;
+                const shouldSaveScript = Boolean(
+                    scriptKey
+                    && Array.isArray(result.segments)
+                    && result.segments.length
+                    && body.saveScript !== false
+                    && (result.modeUsed === 'llm' || (effectiveTtsCfg.parseMode === 'rule' && result.modeUsed === 'rule') || body.forceSave)
+                );
+                if (shouldSaveScript) {
+                    const savedRec = ttsScriptStore.set(scriptKey, {
+                        scriptKey,
+                        botKey: effectiveBotKey,
+                        botName: String(body.botName || botCtx.botName || '').trim(),
+                        chatKey: effectiveChatKey,
+                        msgIndex: body.msgIndex,
+                        role,
+                        charName,
+                        sourceTextPreview: cleanTextForTts(body.text || '', body.html || '').slice(0, 140),
+                        modelSpecId: (result.modelSpec && result.modelSpec.id) || modelSpec.id,
+                        modeUsed: result.modeUsed,
+                        manuallyEdited: false,
+                        segments: result.segments,
+                    });
+                    if (savedRec) {
+                        scriptSaved = true;
+                        updatedAt = savedRec.updatedAt;
+                    }
+                }
+
+                return sendJson(res, 200, {
+                    ok: true,
+                    ...result,
+                    botKey: effectiveBotKey,
+                    scriptKey,
+                    scriptSaved,
+                    scriptHit: false,
+                    manuallyEdited: false,
+                    updatedAt,
+                    botProfilesUpdated,
+                    ...(botCharacters ? { botCharacters } : {}),
+                }, req);
             } catch (e) {
                 return sendJson(res, 500, { error: e.message }, req);
             }
+        }
+
+        if (pathname === '/api/tts/script/get' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const activeSnap = state.baseSnapshot || state.snapshot;
+                const curTts = normalizeTtsConfig(config.tts);
+                const modelSpec = resolveTtsSpeechModelSpec(curTts);
+                const charName = body.charName || ((activeSnap && activeSnap.charName) || 'Character');
+                const effectiveBotKey = buildTtsBotKey(body.botKey || body.chatKey || activeSnap);
+                const effectiveChatKey = String(body.chatKey || buildTtsChatKey(activeSnap) || '');
+                const scriptKey = String(body.scriptKey || '').trim() || buildTtsScriptKey({
+                    botKey: effectiveBotKey,
+                    role: body.role || 'char',
+                    text: body.text || '',
+                    html: body.html || '',
+                });
+                const saved = scriptKey ? ttsScriptStore.get(scriptKey) : null;
+                const hydrated = saved ? hydrateSavedScriptSegments(saved, curTts, charName, effectiveBotKey || effectiveChatKey) : [];
+                return sendJson(res, 200, {
+                    ok: true,
+                    exists: Boolean(saved),
+                    scriptKey,
+                    modelSpec: {
+                        id: modelSpec.id,
+                        label: modelSpec.label,
+                        deliveryMode: modelSpec.deliveryMode,
+                        tagSyntax: modelSpec.tagSyntax,
+                        voiceGroup: modelSpec.voiceGroup,
+                    },
+                    script: saved ? { ...saved, segments: hydrated } : null,
+                }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/tts/script/save' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const activeSnap = state.baseSnapshot || state.snapshot;
+                const curTts = normalizeTtsConfig(config.tts);
+                const modelSpec = resolveTtsSpeechModelSpec(curTts);
+                const charName = body.charName || ((activeSnap && activeSnap.charName) || 'Character');
+                const effectiveBotKey = buildTtsBotKey(body.botKey || body.chatKey || activeSnap);
+                const effectiveChatKey = String(body.chatKey || buildTtsChatKey(activeSnap) || '');
+                const scriptKey = String(body.scriptKey || '').trim() || buildTtsScriptKey({
+                    botKey: effectiveBotKey,
+                    role: body.role || 'char',
+                    text: body.text || '',
+                    html: body.html || '',
+                });
+                if (!scriptKey) {
+                    return sendJson(res, 400, { error: '유효한 대본 식별자(scriptKey 또는 원문 텍스트)가 필요합니다.' }, req);
+                }
+                if (!Array.isArray(body.segments) || !body.segments.length) {
+                    return sendJson(res, 400, { error: '저장할 대본 구간(segments)이 비어 있습니다.' }, req);
+                }
+                const normalizedSegments = body.segments
+                    .map((seg) => normalizeTtsScriptSegment(seg, modelSpec, true))
+                    .filter(Boolean);
+                if (!normalizedSegments.length) {
+                    return sendJson(res, 400, { error: '발화 가능한 텍스트가 포함된 구간이 최소 1개 이상 필요합니다.' }, req);
+                }
+                const prev = ttsScriptStore.get(scriptKey);
+                const saved = ttsScriptStore.set(scriptKey, {
+                    ...(prev || {}),
+                    scriptKey,
+                    botKey: effectiveBotKey || (prev && prev.botKey) || '',
+                    botName: String(body.botName || (activeSnap && activeSnap.charName) || (prev && prev.botName) || '').trim(),
+                    chatKey: effectiveChatKey || (prev && prev.chatKey) || '',
+                    msgIndex: body.msgIndex !== undefined ? body.msgIndex : (prev ? prev.msgIndex : null),
+                    role: body.role || (prev && prev.role) || 'char',
+                    charName,
+                    sourceTextPreview: String(body.sourceTextPreview || cleanTextForTts(body.text || '', body.html || '') || (prev && prev.sourceTextPreview) || '').slice(0, 140),
+                    modelSpecId: modelSpec.id,
+                    modeUsed: 'manual',
+                    manuallyEdited: true,
+                    segments: normalizedSegments,
+                });
+                ttsProvider.clearCache();
+                const hydrated = hydrateSavedScriptSegments(saved, curTts, charName, effectiveBotKey || effectiveChatKey);
+                return sendJson(res, 200, {
+                    ok: true,
+                    scriptKey,
+                    script: { ...saved, segments: hydrated },
+                }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/tts/script/delete' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const activeSnap = state.baseSnapshot || state.snapshot;
+                const effectiveBotKey = buildTtsBotKey(body.botKey || body.chatKey || activeSnap);
+                const scriptKey = String(body.scriptKey || '').trim() || buildTtsScriptKey({
+                    botKey: effectiveBotKey,
+                    role: body.role || 'char',
+                    text: body.text || '',
+                    html: body.html || '',
+                });
+                const deleted = scriptKey ? ttsScriptStore.delete(scriptKey) : false;
+                ttsProvider.clearCache();
+                return sendJson(res, 200, { ok: true, deleted, scriptKey }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e.message }, req);
+            }
+        }
+
+        if (pathname === '/api/tts/scripts' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            const botKey = urlObj.searchParams.get('botKey') || '';
+            const scripts = ttsScriptStore.list({ botKey });
+            return sendJson(res, 200, { ok: true, total: scripts.length, scripts }, req);
         }
 
         if (pathname === '/api/tts/synthesize' && req.method === 'POST') {
             if (!requireAuth(req, res)) return;
             try {
                 const body = JSON.parse((await readBody(req)) || '{}');
+                const activeSnap = state.baseSnapshot || state.snapshot;
                 const result = await ttsProvider.synthesizeSegment(body.segment, config.tts, {
-                    charName: body.charName || ((state.snapshot && state.snapshot.charName) || 'Character'),
+                    charName: body.charName || ((activeSnap && activeSnap.charName) || 'Character'),
                     overrideVoiceId: body.overrideVoiceId || '',
+                    chatKey: body.botKey || body.chatKey || buildTtsBotKey(activeSnap),
                 });
                 res.writeHead(200, {
                     'Content-Type': result.mime || 'audio/mpeg',
@@ -17075,6 +21600,12 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     gender: body.gender || 'female',
                     voiceId: body.voiceId || '',
                     toneTag: body.toneTag || '',
+                    ...(Array.isArray(body.toneTags) ? { toneTags: body.toneTags } : {}),
+                    instruction: body.instruction || '',
+                    ...(body.speed !== undefined ? { speed: body.speed } : {}),
+                    manualOverride: Boolean(body.manualOverride),
+                    botKey: body.botKey || '',
+                    chatKey: body.chatKey || '',
                 });
                 const elapsedMs = Date.now() - t0;
                 res.writeHead(200, {
@@ -17109,10 +21640,16 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                         targetProvider = curIsFish ? curCfg.provider : 'fish_local';
                         if (targetApiUrl === undefined && !curIsFish) targetApiUrl = 'http://127.0.0.1:8081/v1/tts';
                         if (!targetModel && !curIsFish) targetModel = 's2-pro';
+                    } else if (reqGroup === 'openai') {
+                        const curIsOpenAi = curCfg.provider === 'openai_compat_cloud';
+                        targetProvider = 'openai_compat_cloud';
+                        if (targetApiUrl === undefined && !curIsOpenAi) targetApiUrl = TTS_PROVIDER_DEFAULTS.openai_compat_cloud.apiUrl;
+                        if (!targetModel && !curIsOpenAi) targetModel = TTS_PROVIDER_DEFAULTS.openai_compat_cloud.model;
                     } else {
-                        targetProvider = !curIsFish ? curCfg.provider : 'openai_compat_local';
-                        if (targetApiUrl === undefined && curIsFish) targetApiUrl = TTS_PROVIDER_DEFAULTS.openai_compat_local.apiUrl;
-                        if (!targetModel && curIsFish) targetModel = TTS_PROVIDER_DEFAULTS.openai_compat_local.model;
+                        const curIsQwenLocal = curCfg.provider === 'openai_compat_local';
+                        targetProvider = 'openai_compat_local';
+                        if (targetApiUrl === undefined && !curIsQwenLocal) targetApiUrl = TTS_PROVIDER_DEFAULTS.openai_compat_local.apiUrl;
+                        if (!targetModel && !curIsQwenLocal) targetModel = TTS_PROVIDER_DEFAULTS.openai_compat_local.model;
                     }
                 }
                 const mergedCfg = normalizeTtsConfig({
@@ -17136,15 +21673,17 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 const curTts = normalizeTtsConfig(config.tts);
                 const nextProfiles = {
                     fish: [...(curTts.voiceProfiles.fish || [])],
-                    openai_qwen: [...(curTts.voiceProfiles.openai_qwen || [])],
+                    openai: [...(curTts.voiceProfiles.openai || [])],
+                    qwen: [...(curTts.voiceProfiles.qwen || [])],
                 };
                 if (body.voiceProfiles && typeof body.voiceProfiles === 'object') {
                     const normAll = normalizeVoiceProfiles(body.voiceProfiles);
                     nextProfiles.fish = normAll.fish;
-                    nextProfiles.openai_qwen = normAll.openai_qwen;
+                    nextProfiles.openai = normAll.openai;
+                    nextProfiles.qwen = normAll.qwen;
                 } else {
                     const grp = normalizeVoiceGroup(body.group, '');
-                    if (!grp) return sendJson(res, 400, { error: '유효한 보이스 영역(fish | openai_qwen)을 지정하세요.' }, req);
+                    if (!grp) return sendJson(res, 400, { error: '유효한 보이스 영역(fish | openai | qwen)을 지정하세요.' }, req);
                     const action = String(body.action || '').toLowerCase().trim();
                     if (action === 'delete') {
                         const delId = String(body.id || '').trim();
@@ -17193,13 +21732,113 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             }
         }
 
+        if (pathname === '/api/tts/analyze-bot-cast' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const activeSnap = state.baseSnapshot || state.snapshot;
+                const snapCtx = extractTtsBotContext(activeSnap, body.botKey || '', body.botName || '');
+                const botCtx = {
+                    ...snapCtx,
+                    ...(typeof body.desc === 'string' && body.desc.trim() ? { desc: body.desc.trim().slice(0, 2500) } : {}),
+                    ...(typeof body.loreSummary === 'string' && body.loreSummary.trim() ? { loreSummary: body.loreSummary.trim().slice(0, 3500) } : {}),
+                    ...(typeof body.firstMessage === 'string' && body.firstMessage.trim() ? { firstMessage: body.firstMessage.trim().slice(0, 1200) } : {}),
+                    ...(typeof body.note === 'string' && body.note.trim() ? { note: body.note.trim().slice(0, 800) } : {}),
+                    ...(typeof body.recentDialogue === 'string' && body.recentDialogue.trim() ? { recentDialogue: body.recentDialogue.trim().slice(0, 2400) } : {}),
+                };
+                if (!botCtx.botKey) {
+                    return sendJson(res, 400, { error: '분석할 봇 정보를 찾을 수 없습니다. 먼저 채팅방에서 봇을 열어주세요.' }, req);
+                }
+                const curTts = normalizeTtsConfig(config.tts);
+                const modelSpec = resolveTtsSpeechModelSpec(curTts);
+                const availableVoices = [
+                    ...((curTts.voiceProfiles && curTts.voiceProfiles[modelSpec.voiceGroup]) || []),
+                    ...(TTS_BUILTIN_VOICE_REFERENCES[modelSpec.voiceGroup] || []),
+                ];
+                const existingEntry = curTts.botCharacters[botCtx.botKey];
+                const existingChars = (existingEntry && Array.isArray(existingEntry.characters)) ? existingEntry.characters : [];
+                const profile = resolveTtsLlmProfile();
+                if (!profile) {
+                    return sendJson(res, 400, { error: '대본 분석용 모델 프로필이 설정되지 않았습니다.' }, req);
+                }
+                const analyzed = await analyzeBotCharacterProfiles({
+                    botContext: botCtx,
+                    existingCharacters: existingChars,
+                    ttsConfig: curTts,
+                    availableVoices,
+                    callLlm: async (messages) => {
+                        const llmRes = await callLLMNonStream(profile, messages, {
+                            forceTemperature: 0.2,
+                            timeoutMs: 60000,
+                            source: 'tts_cast_analyze',
+                        });
+                        return llmRes && llmRes.text ? llmRes.text : '';
+                    },
+                });
+                const merged = mergeCharacterSpeechProfiles(existingChars, analyzed.characters, {
+                    modelSpecId: modelSpec.id,
+                    overwriteTags: true,
+                    overwriteVoices: Boolean(body.overwriteVoices),
+                });
+                curTts.characterVoicesEnabled = true;
+                curTts.botCharacters[botCtx.botKey] = {
+                    botKey: botCtx.botKey,
+                    botName: String(botCtx.botName || (existingEntry && existingEntry.botName) || botCtx.botKey).trim(),
+                    updatedAt: Date.now(),
+                    characters: merged.characters,
+                };
+                config.tts = normalizeTtsConfig(curTts);
+                ttsProvider.clearCache();
+                saveConfig();
+                const savedBotChars = config.tts.botCharacters[botCtx.botKey].characters;
+                return sendJson(res, 200, {
+                    ok: true,
+                    botKey: botCtx.botKey,
+                    botName: config.tts.botCharacters[botCtx.botKey].botName,
+                    modelSpec: {
+                        id: modelSpec.id,
+                        label: modelSpec.label,
+                        deliveryMode: modelSpec.deliveryMode,
+                        tagSyntax: modelSpec.tagSyntax,
+                        voiceGroup: modelSpec.voiceGroup,
+                    },
+                    addedCount: merged.addedCount,
+                    updatedCount: merged.updatedCount,
+                    characters: savedBotChars,
+                    config: sanitizeConfigForClient(),
+                }, req);
+            } catch (e) {
+                return sendJson(res, 500, { error: e.message }, req);
+            }
+        }
+
         if ((pathname === '/api/tts/chat-cast' || pathname === '/api/tts/characters') && req.method === 'POST') {
             if (!requireAuth(req, res)) return;
             try {
                 const body = JSON.parse((await readBody(req)) || '{}');
                 const chars = Array.isArray(body.characters) ? body.characters : [];
                 const curTts = normalizeTtsConfig(config.tts);
-                curTts.characters = chars;
+                const rawBotKey = (typeof body.botKey === 'string' && body.botKey.trim() && body.botKey.trim() !== '__global__')
+                    ? buildTtsBotKey(body.botKey)
+                    : '';
+                if (rawBotKey) {
+                    if (body.action === 'deleteBot') {
+                        delete curTts.botCharacters[rawBotKey];
+                    } else {
+                        const existingEntry = curTts.botCharacters[rawBotKey];
+                        curTts.botCharacters[rawBotKey] = {
+                            botKey: rawBotKey,
+                            botName: String(body.botName || (existingEntry && existingEntry.botName) || rawBotKey).trim(),
+                            updatedAt: Date.now(),
+                            characters: chars,
+                        };
+                    }
+                } else {
+                    curTts.characters = chars;
+                }
+                if (typeof body.characterVoicesEnabled === 'boolean') {
+                    curTts.characterVoicesEnabled = body.characterVoicesEnabled;
+                }
                 curTts.chatCharacters = {};
                 config.tts = normalizeTtsConfig(curTts);
                 ttsProvider.clearCache();
@@ -17259,13 +21898,17 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     const existingCharacters = (config.tts && Array.isArray(config.tts.characters))
                         ? config.tts.characters
                         : [];
+                    const existingBotCharacters = (config.tts && config.tts.botCharacters && typeof config.tts.botCharacters === 'object')
+                        ? config.tts.botCharacters
+                        : {};
                     const existingVoiceProfiles = (config.tts && config.tts.voiceProfiles && typeof config.tts.voiceProfiles === 'object')
                         ? config.tts.voiceProfiles
-                        : { fish: [], openai_qwen: [] };
+                        : { fish: [], openai: [], qwen: [] };
                     config.tts = normalizeTtsConfig({
                         ...config.tts,
                         ...body.tts,
                         characters: Array.isArray(body.tts.characters) ? body.tts.characters : existingCharacters,
+                        botCharacters: body.tts.botCharacters !== undefined ? body.tts.botCharacters : existingBotCharacters,
                         chatCharacters: {},
                         voiceProfiles: body.tts.voiceProfiles !== undefined ? body.tts.voiceProfiles : existingVoiceProfiles,
                         apiKey: body.tts.apiKey ? String(body.tts.apiKey) : (config.tts ? config.tts.apiKey : ''),
@@ -17304,8 +21947,11 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     config.translator = {
                         ...config.translator,
                         ...body.translator,
+                        profileId: body.translator.profileId !== undefined ? String(body.translator.profileId || '').trim() : String((config.translator && config.translator.profileId) || ''),
+                        profileModelOverride: body.translator.profileModelOverride !== undefined ? String(body.translator.profileModelOverride || '').trim() : String((config.translator && config.translator.profileModelOverride) || ''),
                         apiKey: body.translator.apiKey ? String(body.translator.apiKey) : config.translator.apiKey,
                     };
+                    translationCache.clear();
                 }
                 saveConfig();
                 return sendJson(res, 200, sanitizeConfigForClient(), req);
@@ -17730,12 +22376,23 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
 
         if (pathname === '/api/plugins/gui-srcdoc' && req.method === 'GET') {
             if (!requireAuth(req, res)) return;
+            pluginAdapter.invalidateReadCache();
             const pName = urlObj.searchParams.get('name') || '';
             const entryId = urlObj.searchParams.get('entryId') || '';
             const theme = urlObj.searchParams.get('theme') || 'dark';
             const out = pluginAdapter.getGuiSrcdoc(pName, entryId, theme);
             if (!out) return sendJson(res, 404, { error: '플러그인을 찾을 수 없습니다.' }, req);
             return sendJson(res, 200, { ok: true, ...out }, req);
+        }
+
+        if (pathname === '/api/plugins/runtime-recall' && req.method === 'GET') {
+            if (!requireAuth(req, res)) return;
+            const pName = urlObj.searchParams.get('name') || '';
+            const chatUuid = urlObj.searchParams.get('chatUuid') || '';
+            const data = typeof pluginAdapter.getPluginRuntimeRecall === 'function'
+                ? pluginAdapter.getPluginRuntimeRecall(pName, { chatUuid })
+                : null;
+            return sendJson(res, 200, pName ? { ok: true, recall: data } : { ok: true, plugins: data || [] }, req);
         }
 
         if (pathname === '/api/plugins/gui-rpc' && req.method === 'POST') {
@@ -17748,6 +22405,20 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     args: body.args || [],
                 });
                 return sendJson(res, 200, { ok: true, value }, req);
+            } catch (e) {
+                return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
+            }
+        }
+
+        if (pathname === '/api/plugins/gui-rpc-batch' && req.method === 'POST') {
+            if (!requireAuth(req, res)) return;
+            try {
+                const body = JSON.parse((await readBody(req)) || '{}');
+                const results = await pluginAdapter.handleGuiRpcBatch({
+                    pluginName: body.pluginName,
+                    calls: Array.isArray(body.calls) ? body.calls : [],
+                });
+                return sendJson(res, 200, { ok: true, results }, req);
             } catch (e) {
                 return sendJson(res, 400, { error: e && e.message ? e.message : String(e) }, req);
             }
@@ -17807,7 +22478,8 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 const snapNow = state.snapshot || {};
                 const charIndex = Number.isFinite(Number(body.charIndex)) ? Number(body.charIndex) : snapNow.charIndex;
                 const chatIndex = Number.isFinite(Number(body.chatIndex)) ? Number(body.chatIndex) : snapNow.chatIndex;
-                const rawUi = await pluginAdapter.prepareFloatingPopupWidgets({ charIndex, chatIndex });
+                const autoExpand = body.autoExpand !== false;
+                const rawUi = await pluginAdapter.prepareFloatingPopupWidgets({ charIndex, chatIndex, autoExpand });
                 const ui = await resolvePluginUiAssets(rawUi, pluginAdapter, state.baseSnapshot);
                 return sendJson(res, 200, { ok: true, pluginFloatingUi: ui }, req);
             } catch (e) {
@@ -17952,6 +22624,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                 const charIndex = Number.isFinite(Number(body.charIndex)) ? Number(body.charIndex) : snapNow.charIndex;
                 const chatIndex = Number.isFinite(Number(body.chatIndex)) ? Number(body.chatIndex) : snapNow.chatIndex;
                 await pluginAdapter.prepareTurn(charIndex, chatIndex, state.snapshot);
+                const prevNoticeId = (state.lastTriggerEvent && state.lastTriggerEvent.id) || '';
                 try {
                     const tCtx = pluginAdapter.getTurnContext();
                     const resInt = await moduleAdapter.runInteraction({
@@ -17959,6 +22632,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                         chatIndex,
                         charObj: tCtx.charObj,
                         chatObj: tCtx.chatObj,
+                        personaName: resolveActivePersonaName(state.baseSnapshot, state.catalog),
                         kind: body.kind === 'form' ? 'form' : 'button',
                         code: String(body.code || ''),
                         key: String(body.key || ''),
@@ -17967,8 +22641,62 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
                     if (resInt && resInt.chatObj && hostRpc.isConnected()) {
                         await hostRpc.invoke('db.setChat', [Number(charIndex), Number(chatIndex), cloneJsonSafe(resInt.chatObj)]);
                     }
+                    if (resInt && resInt.chatObj && state.baseSnapshot
+                        && Number(state.baseSnapshot.charIndex) === Number(charIndex)
+                        && Number(state.baseSnapshot.chatIndex) === Number(chatIndex)) {
+                        const nextChatVars = {};
+                        if (resInt.chatObj.scriptstate && typeof resInt.chatObj.scriptstate === 'object') {
+                            for (const [vk, vv] of Object.entries(resInt.chatObj.scriptstate)) {
+                                const cleanVk = String(vk || '').startsWith('$') ? String(vk).slice(1) : String(vk || '');
+                                if (cleanVk && vv !== undefined && vv !== null) nextChatVars[cleanVk] = String(vv);
+                            }
+                        }
+                        let nextBaseMessages;
+                        if (Array.isArray(resInt.chatObj.message)) {
+                            const prevMsgs = Array.isArray(state.baseSnapshot.messages) ? state.baseSnapshot.messages : [];
+                            const preservedHead = prevMsgs.filter((m) => m && (m.isFirstMessage || Number(m.index) < 0));
+                            const byIdx = new Map();
+                            for (const m of prevMsgs) {
+                                if (m && !m.isFirstMessage && Number(m.index) >= 0) byIdx.set(Number(m.index), m);
+                            }
+                            const updatedBody = resInt.chatObj.message.map((cm, idx) => {
+                                const cmRole = cm && cm.role === 'user' ? 'user' : 'char';
+                                const cmData = String((cm && cm.data) || '');
+                                const cmChatId = String((cm && cm.chatId) || '');
+                                const existing = byIdx.get(idx);
+                                if (existing && String(existing.raw || '') === cmData && existing.role === cmRole) {
+                                    return (!existing.chatId && cmChatId) ? { ...existing, chatId: cmChatId } : existing;
+                                }
+                                return {
+                                    index: idx,
+                                    role: cmRole,
+                                    raw: cmData,
+                                    html: cmData,
+                                    text: cmData,
+                                    images: [],
+                                    chatId: cmChatId,
+                                };
+                            });
+                            nextBaseMessages = [...preservedHead, ...updatedBody];
+                        }
+                        state.baseSnapshot = {
+                            ...state.baseSnapshot,
+                            chatVariables: nextChatVars,
+                            ...(nextBaseMessages ? { messages: nextBaseMessages, totalMessages: resInt.chatObj.message.length } : {}),
+                        };
+                    }
+                    moduleAdapter.invalidateDisplayCache();
                     await refreshDisplaySnapshot();
-                    return sendJson(res, 200, { ok: true, handled: Boolean(resInt && resInt.handled) }, req);
+                    const newTriggerEvent = (state.lastTriggerEvent && state.lastTriggerEvent.id !== prevNoticeId)
+                        ? state.lastTriggerEvent
+                        : null;
+                    return sendJson(res, 200, {
+                        ok: true,
+                        handled: Boolean(resInt && resInt.handled),
+                        triggerEvent: newTriggerEvent,
+                        snapshot: state.snapshot,
+                        snapshotVersion: state.snapshotVersion,
+                    }, req);
                 } finally {
                     moduleAdapter.endTurn();
                     pluginAdapter.endTurn();
@@ -18007,6 +22735,10 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
             clearTimeout(activityState.cleanupTimer);
             activityState.cleanupTimer = null;
         }
+        if (activityState.genCleanupTimer) {
+            clearTimeout(activityState.genCleanupTimer);
+            activityState.genCleanupTimer = null;
+        }
         for (const sub of [...activityState.subscribers]) {
             clearInterval(sub.kaTimer);
             try { sub.res.end(); } catch (_) {}
@@ -18026,6 +22758,7 @@ function createRelayServer({ token, limiter = createAuthRateLimiter(), configOve
         if (activePluginAdapter === pluginAdapter) activePluginAdapter = prevPluginAdapter;
         if (activeModuleAdapter === moduleAdapter) activeModuleAdapter = prevModuleAdapter;
         if (activeHostRpc === hostRpc) activeHostRpc = prevHostRpc;
+        if (activeGenerationTracker === generationTracker) activeGenerationTracker = prevGenerationTracker;
     });
     if (prevConfig !== null) {
         server.once('close', () => {
@@ -18127,6 +22860,7 @@ module.exports = {
     selectCacheFriendlyHistory,
     detectLeaveModelAdapterCode,
     reconcileLeaveHayakuFooterContract,
+    stripReasoningTagsFromHistory,
     dedupeTrailingStatusLines,
     extractTerminalSceneTail,
     auditDraftWithDeterministicGuards,

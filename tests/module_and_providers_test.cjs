@@ -8,7 +8,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const { createRelayServer } = require('../risustand-relay-server.js');
+const { createRelayServer, evalPresetCbs } = require('../risustand-relay-server.js');
 const { buildSingleFileZip, extractFirstImageFromZip, createImageProvider } = require('../risustand-image-provider.cjs');
 const { createModuleAdapter, runRegexScripts } = require('../risustand-module-adapter.cjs');
 
@@ -1004,12 +1004,21 @@ test('StatusPanel Lua LLM/axLLM without :await(), instant /api/triggers/run, flo
         assert.equal(trigRes.handled, true);
         assert.equal(bridge.dbState.chat.scriptstate.$menu_mode, 'open');
 
-        // 3) Floating UI state starts collapsed & /api/plugins/floating-open auto-expands it (with sibling region preserved)
+        // 3) Floating UI state starts collapsed, stays collapsed with autoExpand:false, and expands when explicitly requested
         const stAfter = await fetch(`${baseUrl}/api/state`, { headers: { 'X-RisuStand-Token': token } }).then((r) => r.json());
         assert.ok(stAfter.pluginFloatingUi && Array.isArray(stAfter.pluginFloatingUi.rootWidgets));
         const amWidget0 = stAfter.pluginFloatingUi.rootWidgets.find((w) => w.pluginName === 'maid_fab_test');
         assert.ok(amWidget0 && amWidget0.html.includes('data-am-expanded="false"'));
         assert.ok(amWidget0.html.includes('data-am-toast-region'));
+
+        const floatNoExpandRes = await fetch(`${baseUrl}/api/plugins/floating-open`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-RisuStand-Token': token },
+            body: JSON.stringify({ charIndex: 0, chatIndex: 0, autoExpand: false }),
+        }).then((r) => r.json());
+        assert.equal(floatNoExpandRes.ok, true);
+        const amWidgetCollapsed = floatNoExpandRes.pluginFloatingUi.rootWidgets.find((w) => w.pluginName === 'maid_fab_test');
+        assert.ok(amWidgetCollapsed && amWidgetCollapsed.html.includes('data-am-expanded="false"'), 'floating-open with autoExpand:false must keep floating bar collapsed');
 
         const floatOpenRes = await fetch(`${baseUrl}/api/plugins/floating-open`, {
             method: 'POST',
@@ -1047,6 +1056,8 @@ test('StatusPanel Lua LLM/axLLM without :await(), instant /api/triggers/run, flo
         assert.ok(html.includes('id="openPlgFloatingBtn"'));
         assert.ok(html.includes('stripBotFixedMenuNodes'));
         assert.ok(!html.includes('data-pfm-open-gui'), 'Floating popup must not contain main-DOM GUI entry buttons');
+        assert.ok(html.includes('autoExpand: false'), 'Client floating widget init/modal must pass autoExpand: false');
+        assert.ok(html.includes('.x-risu-am-generation-count:not([data-am-expanded="true"])'), 'CSS must hide collapsed floating panel');
         assert.ok(!html.includes('id="pluginFloatingDock"'));
         assert.ok(!html.includes('id="pluginRootFloatingHost"'));
         assert.ok(html.includes('scene-stealth-note'));
@@ -1982,6 +1993,1609 @@ test('Asset Maid image click opens dedicated GUI overlay, showContainer triggers
         if (typeof relay.closeAllConnections === 'function') relay.closeAllConnections();
         await closeServer(relay);
         try { fs.rmSync(tmpCfgPath, { force: true }); } catch (_) {}
+        try { fs.rmSync(tmpPluginsPath, { force: true }); } catch (_) {}
+    }
+});
+
+test('rebuildDisplayedSnapshot runs Lua 5.4 listenEdit(editDisplay) for [LBDATA] modules without double-running regexes', async () => {
+    const tmpCfgPath = path.join(os.tmpdir(), `rs-lua-disp-cfg-${Date.now()}.json`);
+    const tmpPluginsPath = path.join(os.tmpdir(), `rs-lua-disp-plg-${Date.now()}.json`);
+    const lbModule = {
+        id: 'mod-lb-display',
+        name: 'Lightboard Display Mock',
+        trigger: [
+            {
+                type: 'manual',
+                effect: [{
+                    type: 'triggerlua',
+                    code: `
+listenEdit('editDisplay', function(id, text)
+    if type(text) ~= 'string' then return text end
+    return text:gsub('%[LBDATA START%]%s*([%s%S]-)%s*%[LBDATA END%]', '<div class="lb-panel">%1</div>')
+end)
+`,
+                }],
+            },
+        ],
+        regex: [],
+    };
+    const charObj = {
+        chaId: 'char-hyeyeon-lb',
+        name: 'Hyeyeon',
+        customscript: [
+            {
+                type: 'editdisplay',
+                comment: 'once_regex',
+                in: '\\[COUNT_ME\\]',
+                out: 'X',
+                ableFlag: true,
+                flag: 'g',
+            },
+        ],
+        chats: [],
+    };
+    const chatObj = {
+        id: 'chat-lb-1',
+        name: 'Chat 1',
+        modules: [lbModule.id],
+        message: [
+            { role: 'user', data: '안녕', chatId: 'lb-m0' },
+            { role: 'char', data: '본문 [COUNT_ME]\n[LBDATA START]상태: 안정[LBDATA END]', chatId: 'lb-m1' },
+        ],
+    };
+    charObj.chats = [chatObj];
+
+    const bridge = createFakeHostBridge({ charObj, chatObj, modules: [lbModule] });
+    const relay = createRelayServer({
+        token: 'test-lua-editdisplay-tok',
+        configPath: tmpCfgPath,
+        pluginsPath: tmpPluginsPath,
+        configOverride: { activeProfileId: '' },
+    });
+    const baseUrl = await listenServer(relay);
+    const headers = { 'Content-Type': 'application/json', 'X-RisuStand-Token': 'test-lua-editdisplay-tok' };
+
+    try {
+        bridge.startRpcLoop(baseUrl, 'test-lua-editdisplay-tok');
+        await new Promise((r) => setTimeout(r, 80));
+        await fetch(`${baseUrl}/api/pc/poll`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                bridgeVersion: '2.0.0',
+                pluginVersion: '1.1.0',
+                generating: false,
+                catalog: {
+                    pcActiveCharIndex: 0,
+                    pcActiveChatIndex: 0,
+                    selectedPersona: 0,
+                    params: { temperature: 80, maxContext: 8000, maxResponse: 1000 },
+                    characters: [{ index: 0, name: 'Hyeyeon', activeChatIndex: 0, chats: [{ index: 0, name: 'Chat 1' }] }],
+                    modules: [{ id: lbModule.id, name: lbModule.name, enabled: true }],
+                    personas: [{ index: 0, name: 'User' }],
+                },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: 'Hyeyeon',
+                    chatName: 'Chat 1',
+                    chatUuid: 'chat-lb-1',
+                    isPcActive: true,
+                    totalMessages: 2,
+                    chatModules: [{ id: lbModule.id, name: lbModule.name, enabled: true }],
+                    chatVariables: {},
+                    assetMap: {},
+                    messages: [
+                        { index: 0, role: 'user', raw: chatObj.message[0].data, html: '안녕', text: '안녕', images: [], chatId: 'lb-m0' },
+                        { index: 1, role: 'char', raw: chatObj.message[1].data, html: '본문 X\n[LBDATA START]상태: 안정[LBDATA END]', text: '본문 X', images: [], chatId: 'lb-m1' },
+                    ],
+                },
+            }),
+        });
+
+        let st = null;
+        for (let i = 0; i < 20; i += 1) {
+            const candidate = await fetch(`${baseUrl}/api/state`, { headers }).then((r) => r.json());
+            const msg1 = candidate && candidate.snapshot && Array.isArray(candidate.snapshot.messages)
+                ? candidate.snapshot.messages.find((m) => m.index === 1)
+                : null;
+            if (msg1 && msg1.html && msg1.html.includes('<div class="lb-panel">상태: 안정</div>')) {
+                st = candidate;
+                break;
+            }
+            await new Promise((r) => setTimeout(r, 40));
+        }
+        assert.ok(st, 'Lua listenEdit(editDisplay) must project transformed Lightboard HTML into /api/state');
+        const finalMsg1 = st.snapshot.messages.find((m) => m.index === 1);
+        assert.ok(finalMsg1.html.includes('<div class="lb-panel">상태: 안정</div>'));
+        assert.ok(!finalMsg1.html.includes('[LBDATA START]'));
+    } finally {
+        await bridge.stop();
+        if (typeof relay.closeAllConnections === 'function') relay.closeAllConnections();
+        await closeServer(relay);
+        try { fs.rmSync(tmpCfgPath, { force: true }); } catch (_) {}
+        try { fs.rmSync(tmpPluginsPath, { force: true }); } catch (_) {}
+    }
+});
+
+test('1-arg cbs(), {{history::role}}, log(), Lua {{asset::}} resolution, and /api/modules/interaction instant snapshot update', async () => {
+    const tmpCfgPath = path.join(os.tmpdir(), `rs-hyeyeon-parity-cfg-${Date.now()}.json`);
+    const tmpPluginsPath = path.join(os.tmpdir(), `rs-hyeyeon-parity-plg-${Date.now()}.json`);
+    const sampleImg = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
+    const sampleUrl = `data:image/png;base64,${sampleImg.toString('base64')}`;
+    const hyLua = `
+log('Hyeyeon parity boot')
+onButtonClick = function(id, code)
+    if code == 'hy_toggle' then
+        local cur = cbs('{{getvar::hy_ui_open}}')
+        setChatVar(id, 'hy_ui_open', cur == '1' and '0' or '1')
+    end
+end
+listenEdit('editDisplay', function(id, text, meta)
+    local idx = tonumber(meta and meta.index) or -1
+    if idx ~= getChatLength(id) - 1 then return text end
+    local h = hash(cbs('{{history::role}}'))
+    local isOpen = cbs('{{getvar::hy_ui_open}}') == '1'
+    local clean = tostring(text):gsub('<hy%-status[^>]*/>', '')
+    return clean .. '<div class="hy-sb" data-h="' .. h:sub(1, 8) .. '">{{asset::hy_portrait}}</div>' ..
+        '<div class="hy-ui"><button type="button" class="hy-float" risu-btn="hy_toggle">열기</button>' ..
+        '<div class="hy-panel' .. (isOpen and ' hy-open' or '') .. '"><span>상태패널</span></div></div>'
+end)
+`;
+    const charObj = {
+        chaId: 'hyeyeon-parity',
+        name: 'Hyeyeon',
+        additionalAssets: [['hy_portrait', 'assets/hy_portrait.png', 'png']],
+        triggerscript: [{
+            comment: 'HyeyeonMock',
+            type: 'output',
+            lowLevelAccess: true,
+            effect: [{ type: 'triggerlua', code: hyLua }],
+        }],
+        chats: [],
+    };
+    const chatObj = {
+        id: 'chat-hy-1',
+        name: 'Chat 1',
+        scriptstate: { $hy_ui_open: '0', $complex_state: { tab: 'relation' } },
+        message: [
+            { role: 'user', data: '안녕', chatId: 'hy-m0' },
+            { role: 'char', data: '본문 <hy-status time="13:06"/>', chatId: 'hy-m1' },
+        ],
+    };
+    charObj.chats = [chatObj];
+
+    const bridge = createFakeHostBridge({
+        charObj,
+        chatObj,
+        modules: [],
+        onReadImage: (p) => (p === 'assets/hy_portrait.png' ? sampleUrl : null),
+    });
+    const relay = createRelayServer({
+        token: 'test-hyeyeon-parity-tok',
+        configPath: tmpCfgPath,
+        pluginsPath: tmpPluginsPath,
+        configOverride: { activeProfileId: '' },
+    });
+    const baseUrl = await listenServer(relay);
+    const headers = { 'Content-Type': 'application/json', 'X-RisuStand-Token': 'test-hyeyeon-parity-tok' };
+
+    try {
+        bridge.startRpcLoop(baseUrl, 'test-hyeyeon-parity-tok');
+        await new Promise((r) => setTimeout(r, 80));
+        await fetch(`${baseUrl}/api/pc/poll`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                bridgeVersion: '2.0.0',
+                pluginVersion: '1.1.0',
+                generating: false,
+                catalog: {
+                    pcActiveCharIndex: 0,
+                    pcActiveChatIndex: 0,
+                    selectedPersona: 0,
+                    params: { temperature: 80, maxContext: 8000, maxResponse: 1000 },
+                    characters: [{ index: 0, name: 'Hyeyeon', activeChatIndex: 0, chats: [{ index: 0, name: 'Chat 1' }] }],
+                    modules: [],
+                    personas: [{ index: 0, name: 'User' }],
+                },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: 'Hyeyeon',
+                    chatName: 'Chat 1',
+                    chatUuid: 'chat-hy-1',
+                    isPcActive: true,
+                    totalMessages: 2,
+                    chatModules: [],
+                    chatVariables: { hy_ui_open: '0' },
+                    assetMap: {},
+                    messages: [
+                        { index: 0, role: 'user', raw: chatObj.message[0].data, html: '안녕', text: '안녕', images: [], chatId: 'hy-m0' },
+                        { index: 1, role: 'char', raw: chatObj.message[1].data, html: '본문 <hy-status time="13:06"/>', text: '본문', images: [], chatId: 'hy-m1' },
+                    ],
+                },
+            }),
+        });
+
+        let msg1 = null;
+        for (let i = 0; i < 20; i += 1) {
+            const st = await fetch(`${baseUrl}/api/state`, { headers }).then((r) => r.json());
+            const m = st && st.snapshot && Array.isArray(st.snapshot.messages) ? st.snapshot.messages.find((x) => x.index === 1) : null;
+            if (m && m.html && m.html.includes('hy-sb')) {
+                msg1 = m;
+                break;
+            }
+            await new Promise((r) => setTimeout(r, 40));
+        }
+        assert.ok(msg1, 'Lua editDisplay must strip <hy-status> and inject hy-sb / hy-ui');
+        assert.ok(!msg1.html.includes('<hy-status'));
+        assert.match(msg1.html, /<img class="msg-img" src="\/api\/asset\/[a-f0-9]{32}" \/>/, '{{asset::hy_portrait}} must resolve to /api/asset/<id>');
+        assert.ok(msg1.html.includes('class="hy-panel"'));
+
+        // Toggle hy_ui_open via /api/modules/interaction and verify instant refreshed snapshot
+        const intRes = await fetch(`${baseUrl}/api/modules/interaction`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ charIndex: 0, chatIndex: 0, kind: 'button', code: 'hy_toggle' }),
+        }).then((r) => r.json());
+        assert.equal(intRes.ok, true);
+        assert.equal(intRes.handled, true);
+        const updatedMsg1 = intRes.snapshot && Array.isArray(intRes.snapshot.messages)
+            ? intRes.snapshot.messages.find((x) => x.index === 1)
+            : null;
+        assert.ok(updatedMsg1 && updatedMsg1.html.includes('hy-panel hy-open'), 'interaction response must include refreshed snapshot with hy-open');
+    } finally {
+        await bridge.stop();
+        if (typeof relay.closeAllConnections === 'function') relay.closeAllConnections();
+        await closeServer(relay);
+        try { fs.rmSync(tmpCfgPath, { force: true }); } catch (_) {}
+        try { fs.rmSync(tmpPluginsPath, { force: true }); } catch (_) {}
+    }
+});
+
+test('Asset Maid DOM mutation preserves Lua editDisplay (.hy-sb/.hy-ui/assets/LBDATA) via db.getDisplayLuaBundle', async () => {
+    const tmpCfgPath = path.join(os.tmpdir(), `rs-hy-am-coexist-cfg-${Date.now()}.json`);
+    const tmpPluginsPath = path.join(os.tmpdir(), `rs-hy-am-coexist-plg-${Date.now()}.json`);
+    const sampleImg = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
+    const sampleUrl = `data:image/png;base64,${sampleImg.toString('base64')}`;
+    const luaCode = `
+listenEdit('editDisplay', function(id, text, meta)
+    local idx = tonumber(meta and meta.index) or -1
+    if idx ~= getChatLength(id) - 1 then return text end
+    local clean = tostring(text):gsub('<hy%-status[^>]*/>', '')
+    clean = clean:gsub('%[LBDATA START%](.-)%[LBDATA END%]', '<div class="lb-card">%1</div>')
+    return clean .. '<div class="hy-sb">시각 13:06</div><div class="hy-scene">{{asset::hy_portrait}}</div>' ..
+        '<div class="hy-ui"><button type="button" class="hy-float" risu-btn="hy_toggle">혜연</button></div>'
+end)
+`;
+    const charObj = {
+        chaId: 'hy-am-coexist',
+        name: 'Hyeyeon',
+        additionalAssets: [['hy_portrait', 'assets/hy_portrait.png', 'png']],
+        triggerscript: [{ comment: 'HyCoexist', type: 'output', lowLevelAccess: true, effect: [{ type: 'triggerlua', code: luaCode }] }],
+        chats: [{
+            id: 'chat-coexist-1',
+            name: 'Chat 1',
+            scriptstate: {},
+            message: [
+                { role: 'user', data: '안녕', chatId: 'co-m0' },
+                { role: 'char', data: '본문 <hy-status time="13:06"/>\n[LBDATA START]단서[LBDATA END]', chatId: 'co-m1' },
+            ],
+        }],
+    };
+    let bundleCalls = 0;
+    let stopRpc = false;
+    const relay = createRelayServer({ token: 'test-hy-am-coexist-tok', configPath: tmpCfgPath, pluginsPath: tmpPluginsPath, configOverride: { activeProfileId: '' } });
+    const baseUrl = await listenServer(relay);
+    const headers = { 'Content-Type': 'application/json', 'X-RisuStand-Token': 'test-hy-am-coexist-tok' };
+    const rpcLoop = (async () => {
+        while (!stopRpc) {
+            try {
+                const w = await fetch(`${baseUrl}/api/pc/rpc-wait`, { method: 'POST', headers, body: JSON.stringify({ timeoutMs: 1500 }) }).then((r) => r.json());
+                if (Array.isArray(w.calls) && w.calls.length) {
+                    const results = w.calls.map((c) => {
+                        if (c.op === 'db.getDisplayLuaBundle') {
+                            bundleCalls += 1;
+                            return { id: c.id, ok: true, value: { charObj, chatObj: charObj.chats[0], modules: [], globalChatVariables: {} } };
+                        }
+                        if (c.op === 'db.getCharacter') return { id: c.id, ok: true, value: charObj };
+                        if (c.op === 'db.getChat') return { id: c.id, ok: true, value: charObj.chats[0] };
+                        if (c.op === 'db.getActiveModules') return { id: c.id, ok: true, value: { modules: [], globalChatVariables: {} } };
+                        if (c.op === 'asset.readImage') {
+                            const b64 = sampleUrl.split(',')[1];
+                            return { id: c.id, ok: true, value: { __b64: b64, mime: 'image/png' } };
+                        }
+                        if (c.op === 'db.getPlugins') return { id: c.id, ok: true, value: [] };
+                        return { id: c.id, ok: true, value: null };
+                    });
+                    await fetch(`${baseUrl}/api/pc/rpc-result`, { method: 'POST', headers, body: JSON.stringify({ results }) });
+                }
+            } catch (_) {
+                if (stopRpc) break;
+                await new Promise((r) => setTimeout(r, 30));
+            }
+        }
+    })();
+
+    try {
+        // Upload a DOM plugin that mutates .chattext (setting _rsBodyMutated) AND appends an Asset Maid footer
+        const amSimPlugin = `
+        //@name AssetMaidCoexistSim
+        //@api 3.0
+        (async () => {
+            const doc = await risuai.getRootDocument();
+            const reconcile = async () => {
+                const rows = await doc.querySelectorAll('.risu-chat');
+                for (const row of rows) {
+                    if ((await row.getAttribute('data-role')) !== 'char') continue;
+                    const ct = await row.querySelector('.chattext');
+                    if (!ct) continue;
+                    const cur = await ct.getInnerHTML();
+                    if (!cur.includes('data-am-marked="1"')) {
+                        const marker = await doc.createElement('span');
+                        await marker.setAttribute('data-am-marked', '1');
+                        await ct.appendChild(marker);
+                    }
+                    const ex = await ct.querySelector('.x-risu-am-illustration-footer');
+                    if (!ex) {
+                        const f = await doc.createElement('div');
+                        await f.setAttribute('class', 'x-risu-am-illustration-footer');
+                        await f.setInnerHTML('<button type="button">삽화 제어</button>');
+                        await ct.appendChild(f);
+                    }
+                }
+            };
+            const body = await doc.querySelector('body');
+            const obs = await risuai.createMutationObserver(() => { void reconcile(); });
+            await obs.observe(body, { childList: true, subtree: true });
+            await reconcile();
+        })();
+        `;
+        await fetch(`${baseUrl}/api/plugins/upload`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ filename: 'AssetMaidCoexistSim.js', script: amSimPlugin, enabled: true }),
+        }).then((r) => assert.equal(r.status, 200));
+
+        await fetch(`${baseUrl}/api/pc/poll`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                bridgeVersion: '2.0.0',
+                pluginVersion: '1.2.0',
+                catalog: { pcActiveCharIndex: 0, pcActiveChatIndex: 0, selectedPersona: 0, params: {}, characters: [{ index: 0, name: 'Hyeyeon', chats: [{ index: 0, name: 'Chat 1' }] }], modules: [], personas: [{ index: 0, name: 'User' }] },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: 'Hyeyeon',
+                    chatName: 'Chat 1',
+                    chatUuid: 'chat-coexist-1',
+                    isPcActive: false,
+                    totalMessages: 2,
+                    chatModules: [],
+                    chatVariables: {},
+                    assetMap: {},
+                    messages: [
+                        { index: 0, role: 'user', raw: '안녕', html: '안녕', text: '안녕', images: [], chatId: 'co-m0' },
+                        { index: 1, role: 'char', raw: charObj.chats[0].message[1].data, html: '본문 <hy-status time="13:06"/>\n[LBDATA START]단서[LBDATA END]', text: '본문', images: [], chatId: 'co-m1' },
+                    ],
+                },
+            }),
+        }).then((r) => assert.equal(r.status, 200));
+
+        let msg1 = null;
+        for (let i = 0; i < 20; i += 1) {
+            const st = await fetch(`${baseUrl}/api/state`, { headers }).then((r) => r.json());
+            const m = st && st.snapshot && Array.isArray(st.snapshot.messages) ? st.snapshot.messages.find((x) => x.index === 1) : null;
+            if (m && m.html && m.html.includes('hy-sb') && m.pluginFooterHtml && m.pluginFooterHtml.includes('삽화 제어')) {
+                msg1 = m;
+                break;
+            }
+            await new Promise((r) => setTimeout(r, 40));
+        }
+        assert.ok(bundleCalls >= 1, 'db.getDisplayLuaBundle single-RPC path must be used');
+        assert.ok(msg1, 'Lua editDisplay HTML and Asset Maid footer must both appear on message 1');
+        assert.ok(!msg1.html.includes('<hy-status'), 'raw <hy-status> must be stripped');
+        assert.ok(msg1.html.includes('hy-ui') && msg1.html.includes('hy-float'), 'floating menu .hy-ui/.hy-float must survive Asset Maid bodyHtml mutation');
+        assert.ok(msg1.html.includes('lb-card'), 'Lightboard transform must survive Asset Maid bodyHtml mutation');
+        assert.match(msg1.html, /<img class="msg-img" src="\/api\/asset\/[a-f0-9]{32}" \/>/, 'Lua {{asset::hy_portrait}} must resolve to /api/asset/<id>');
+    } finally {
+        stopRpc = true;
+        if (typeof relay.closeAllConnections === 'function') relay.closeAllConnections();
+        await closeServer(relay);
+        await rpcLoop;
+        try { fs.rmSync(tmpCfgPath, { force: true }); } catch (_) {}
+        try { fs.rmSync(tmpPluginsPath, { force: true }); } catch (_) {}
+    }
+});
+
+test('rebuildDisplayedSnapshot never passes [[RSASSET:...]] placeholders to asset.readImage and survives missing asset read errors', async () => {
+    const tmpCfgPath = path.join(os.tmpdir(), `rs-rsasset-guard-cfg-${Date.now()}.json`);
+    const tmpPluginsPath = path.join(os.tmpdir(), `rs-rsasset-guard-plg-${Date.now()}.json`);
+    const luaCode = `
+listenEdit('editDisplay', function(id, text, meta)
+    local idx = tonumber(meta and meta.index) or -1
+    if idx ~= getChatLength(id) - 1 then return text end
+    return tostring(text) .. '<div class="hy-sb">시각 13:06</div><img src="[[RSASSET:a0]]"><div style="background-image:url(\\'[[RSASSET:a0]]\\')"></div>{{asset::missing_file}}'
+end)
+`;
+    const charObj = {
+        chaId: 'rsasset-guard',
+        name: 'Hyeyeon',
+        additionalAssets: [],
+        triggerscript: [{ comment: 'HyLua', type: 'output', lowLevelAccess: true, effect: [{ type: 'triggerlua', code: luaCode }] }],
+        chats: [{
+            id: 'chat-rsasset-1',
+            name: 'Chat 1',
+            scriptstate: {},
+            message: [
+                { role: 'user', data: '안녕', chatId: 'rg-m0' },
+                { role: 'char', data: '본문 <img src="[[RSASSET:a0]]">', chatId: 'rg-m1' },
+            ],
+        }],
+    };
+    const readImageRequests = [];
+    let stopRpc = false;
+    const relay = createRelayServer({ token: 'test-rsasset-guard-tok', configPath: tmpCfgPath, pluginsPath: tmpPluginsPath, configOverride: { activeProfileId: '' } });
+    const baseUrl = await listenServer(relay);
+    const headers = { 'Content-Type': 'application/json', 'X-RisuStand-Token': 'test-rsasset-guard-tok' };
+    const rpcLoop = (async () => {
+        while (!stopRpc) {
+            try {
+                const w = await fetch(`${baseUrl}/api/pc/rpc-wait`, { method: 'POST', headers, body: JSON.stringify({ timeoutMs: 1500 }) }).then((r) => r.json());
+                if (Array.isArray(w.calls) && w.calls.length) {
+                    const results = w.calls.map((c) => {
+                        if (c.op === 'db.getDisplayLuaBundle') {
+                            return { id: c.id, ok: true, value: { charObj, chatObj: charObj.chats[0], modules: [], globalChatVariables: {} } };
+                        }
+                        if (c.op === 'db.getCharacter') return { id: c.id, ok: true, value: charObj };
+                        if (c.op === 'db.getChat') return { id: c.id, ok: true, value: charObj.chats[0] };
+                        if (c.op === 'db.getActiveModules') return { id: c.id, ok: true, value: { modules: [], globalChatVariables: {} } };
+                        if (c.op === 'asset.readImage') {
+                            const reqPath = c.args && c.args[0];
+                            readImageRequests.push(String(reqPath || ''));
+                            return { id: c.id, ok: false, error: `failed to open file at path: C:\\assets\\${reqPath} (os error 2)` };
+                        }
+                        if (c.op === 'db.getPlugins') return { id: c.id, ok: true, value: [] };
+                        return { id: c.id, ok: true, value: null };
+                    });
+                    await fetch(`${baseUrl}/api/pc/rpc-result`, { method: 'POST', headers, body: JSON.stringify({ results }) });
+                }
+            } catch (_) {
+                if (stopRpc) break;
+                await new Promise((r) => setTimeout(r, 30));
+            }
+        }
+    })();
+
+    try {
+        await fetch(`${baseUrl}/api/pc/poll`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                bridgeVersion: '2.0.0',
+                pluginVersion: '1.2.0',
+                catalog: { pcActiveCharIndex: 0, pcActiveChatIndex: 0, selectedPersona: 0, params: {}, characters: [{ index: 0, name: 'Hyeyeon', chats: [{ index: 0, name: 'Chat 1' }] }], modules: [], personas: [{ index: 0, name: 'User' }] },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: 'Hyeyeon',
+                    chatName: 'Chat 1',
+                    chatUuid: 'chat-rsasset-1',
+                    isPcActive: false,
+                    totalMessages: 2,
+                    chatModules: [],
+                    chatVariables: {},
+                    assetMap: { a0: '/api/asset/sample-a0' },
+                    messages: [
+                        { index: 0, role: 'user', raw: '안녕', html: '안녕', text: '안녕', images: [], chatId: 'rg-m0' },
+                        { index: 1, role: 'char', raw: charObj.chats[0].message[1].data, html: '본문 <img src="[[RSASSET:a0]]">', text: '본문', images: [], chatId: 'rg-m1' },
+                    ],
+                },
+            }),
+        }).then((r) => assert.equal(r.status, 200));
+
+        let msg1 = null;
+        for (let i = 0; i < 25; i += 1) {
+            const st = await fetch(`${baseUrl}/api/state`, { headers }).then((r) => r.json());
+            const m = st && st.snapshot && Array.isArray(st.snapshot.messages) ? st.snapshot.messages.find((x) => x.index === 1) : null;
+            if (m && m.html && m.html.includes('hy-sb')) {
+                msg1 = m;
+                break;
+            }
+            await new Promise((r) => setTimeout(r, 40));
+        }
+        assert.ok(msg1, 'rebuildDisplayedSnapshot must complete and preserve Lua .hy-sb despite [[RSASSET:a0]] and missing asset');
+        assert.ok(readImageRequests.every((p) => !/^\[\[RS/i.test(p)), `asset.readImage must never be called with [[RS... placeholder, got: ${JSON.stringify(readImageRequests)}`);
+        assert.ok(msg1.html.includes('src="[[RSASSET:a0]]"'), 'img [[RSASSET:a0]] placeholder must remain intact for client resolution');
+        assert.ok(msg1.html.includes("url('[[RSASSET:a0]]')"), 'CSS url([[RSASSET:a0]]) placeholder must remain intact for client resolution');
+        assert.ok(!msg1.html.includes('{{asset::missing_file}}'), 'unresolvable asset token must resolve cleanly to empty string');
+    } finally {
+        stopRpc = true;
+        if (typeof relay.closeAllConnections === 'function') relay.closeAllConnections();
+        await closeServer(relay);
+        await rpcLoop;
+        try { fs.rmSync(tmpCfgPath, { force: true }); } catch (_) {}
+        try { fs.rmSync(tmpPluginsPath, { force: true }); } catch (_) {}
+    }
+});
+
+test('Hyeyeon start menu Engine.save cbs(getvar) optimistic lock passes on unset hy_state and addChat/removeChat updates snapshot immediately', async () => {
+    const tmpCfgPath = path.join(os.tmpdir(), `rs-hy-start-cfg-${Date.now()}.json`);
+    const tmpPluginsPath = path.join(os.tmpdir(), `rs-hy-start-plg-${Date.now()}.json`);
+    const luaCode = `
+local json = require('json')
+
+local function readState(id)
+    local raw = getChatVar(id, 'hy_state')
+    if raw == nil or raw == '' or raw == 'null' then return nil, raw end
+    return json.decode(raw), raw
+end
+
+local function saveState(id, state, expected)
+    if getChatVar(id, 'hy_state') ~= expected or cbs('{{getvar::hy_state}}') ~= expected then
+        return nil
+    end
+    state.revision = (state.revision or 0) + 1
+    local raw = json.encode(state)
+    setChatVar(id, 'hy_state', raw)
+    return raw
+end
+
+onButtonClick = async(function(id, action)
+    if action == 'hy_start_1' then
+        if getChatLength(id) ~= 0 then
+            alertNormal(id, '이미 시작한 채팅이에요.')
+            return true
+        end
+        local state, raw = readState(id)
+        if not state then
+            state = { revision = 0, events = {} }
+            if not saveState(id, state, raw) then
+                alertNormal(id, '다른 변경과 겹쳐 저장하지 못했습니다. 다시 눌러 주세요.')
+                return true
+            end
+        end
+        setChatVar(id, 'hy_episode', '1')
+        addChat(id, 'char', '혜연은 {{user}}를 알아보았다. {{char}}는 고개를 끄덕였다.')
+        return true
+    elseif action == 'hy_restart' then
+        if getChatLength(id) ~= 1 then
+            alertNormal(id, '이미 대화를 시작해서 장면을 바꿀 수 없어요.')
+            return true
+        end
+        removeChat(id, 0)
+        setChatVar(id, 'hy_episode', '')
+        return true
+    end
+end)
+
+listenEdit('editDisplay', function(id, text, meta)
+    local index = tonumber(meta and meta.index) or -1
+    if index < 0 and text:find('@HY_START@', 1, true) then
+        local html = getChatLength(id) == 0
+            and '<button type="button" risu-btn="hy_start_1">EPISODE 01</button>'
+            or '<button type="button" risu-btn="hy_restart">다른 장면 고르기</button>'
+        return (text:gsub('@HY_START@', html))
+    end
+    if index < 0 then return text end
+    if index == getChatLength(id) - 1 then
+        return tostring(text) .. '<div class="hy-sb" data-p="' .. tostring(getPersonaName(id)) .. '">시각 13:06</div>'
+    end
+    return text
+end)
+`;
+    const charObj = {
+        chaId: 'hy-start-test',
+        name: 'Hyeyeon',
+        firstMessage: '@HY_START@',
+        additionalAssets: [],
+        triggerscript: [{ comment: 'HyStart', type: 'output', lowLevelAccess: true, effect: [{ type: 'triggerlua', code: luaCode }] }],
+        chats: [{
+            id: 'chat-hy-start-1',
+            name: 'Chat 1',
+            scriptstate: {},
+            message: [],
+        }],
+    };
+    const bridge = createFakeHostBridge({ charObj, chatObj: charObj.chats[0], modules: [] });
+    const relay = createRelayServer({
+        token: 'test-hy-start-tok',
+        configPath: tmpCfgPath,
+        pluginsPath: tmpPluginsPath,
+        configOverride: { activeProfileId: '' },
+    });
+    const baseUrl = await listenServer(relay);
+    const headers = { 'Content-Type': 'application/json', 'X-RisuStand-Token': 'test-hy-start-tok' };
+
+    try {
+        bridge.startRpcLoop(baseUrl, 'test-hy-start-tok');
+        await new Promise((r) => setTimeout(r, 80));
+        await fetch(`${baseUrl}/api/pc/poll`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                bridgeVersion: '2.0.0',
+                pluginVersion: '1.2.0',
+                generating: false,
+                catalog: {
+                    pcActiveCharIndex: 0,
+                    pcActiveChatIndex: 0,
+                    selectedPersona: 1,
+                    params: {},
+                    characters: [{ index: 0, name: 'Hyeyeon', activeChatIndex: 0, chats: [{ index: 0, name: 'Chat 1' }] }],
+                    modules: [],
+                    personas: [{ index: 0, name: 'User' }, { index: 1, name: '푸딩' }],
+                },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: 'Hyeyeon',
+                    chatName: 'Chat 1',
+                    chatUuid: 'chat-hy-start-1',
+                    isPcActive: false,
+                    totalMessages: 0,
+                    chatModules: [],
+                    chatVariables: {},
+                    assetMap: {},
+                    messages: [
+                        { index: -1, isFirstMessage: true, role: 'char', raw: '@HY_START@', html: '@HY_START@', text: '', images: [], chatId: 'first-0' },
+                    ],
+                },
+            }),
+        }).then((r) => assert.equal(r.status, 200));
+
+        // 1. Click hy_start_1 -> Engine.save optimistic lock must succeed and addChat + {{user}}/{{char}} must reflect immediately
+        const startRes = await fetch(`${baseUrl}/api/modules/interaction`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ charIndex: 0, chatIndex: 0, kind: 'button', code: 'hy_start_1' }),
+        }).then((r) => r.json());
+        assert.equal(startRes.ok, true);
+        assert.equal(startRes.handled, true);
+        assert.equal(startRes.triggerEvent, null, 'Engine.save must not emit conflict alert on unset hy_state');
+        assert.equal(charObj.chats[0].message.length, 1);
+        assert.equal(charObj.chats[0].message[0].data, '혜연은 {{user}}를 알아보았다. {{char}}는 고개를 끄덕였다.');
+        assert.equal(charObj.chats[0].scriptstate.$hy_episode, '1');
+        assert.ok(charObj.chats[0].scriptstate.$hy_state && charObj.chats[0].scriptstate.$hy_state.includes('"revision":1'));
+
+        const firstAfterStart = startRes.snapshot.messages.find((m) => m.index === -1);
+        const msg0AfterStart = startRes.snapshot.messages.find((m) => m.index === 0);
+        assert.ok(firstAfterStart && firstAfterStart.html.includes('risu-btn="hy_restart"'), 'firstMessage must switch to hy_restart');
+        assert.ok(msg0AfterStart && msg0AfterStart.html.includes('혜연은 푸딩를 알아보았다.') && msg0AfterStart.html.includes('Hyeyeon는 고개를 끄덕였다.') && msg0AfterStart.html.includes('hy-sb'), 'new episode message must expand {{user}}/{{char}} and keep .hy-sb');
+        assert.ok(!msg0AfterStart.html.includes('{{user}}') && !msg0AfterStart.html.includes('{{char}}'));
+        assert.ok(msg0AfterStart.html.includes('data-p="푸딩"'), 'Lua getPersonaName() must resolve active persona name 푸딩');
+
+        // 2. Click hy_restart -> removeChat(id, 0) must clear message 0 and show start cards again
+        const restartRes = await fetch(`${baseUrl}/api/modules/interaction`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ charIndex: 0, chatIndex: 0, kind: 'button', code: 'hy_restart' }),
+        }).then((r) => r.json());
+        assert.equal(restartRes.ok, true);
+        assert.equal(restartRes.handled, true);
+        assert.equal(restartRes.triggerEvent, null);
+        assert.equal(charObj.chats[0].message.length, 0);
+        const firstAfterRestart = restartRes.snapshot.messages.find((m) => m.index === -1);
+        assert.ok(firstAfterRestart && firstAfterRestart.html.includes('risu-btn="hy_start_1"'), 'firstMessage must revert to hy_start_1 after restart');
+    } finally {
+        await bridge.stop();
+        if (typeof relay.closeAllConnections === 'function') relay.closeAllConnections();
+        await closeServer(relay);
+        try { fs.rmSync(tmpCfgPath, { force: true }); } catch (_) {}
+        try { fs.rmSync(tmpPluginsPath, { force: true }); } catch (_) {}
+    }
+});
+
+test('Relay evalPresetCbs and rebuildDisplayedSnapshot evaluate {{source::user}}, nested asset CBS, string/array/var CBS, and plugin footer CBS', async () => {
+    const tmpCfgPath = path.join(os.tmpdir(), `rs-cbs-parity-cfg-${Date.now()}.json`);
+    const tmpPluginsPath = path.join(os.tmpdir(), `rs-cbs-parity-plg-${Date.now()}.json`);
+    const relay = createRelayServer({
+        token: 'test-cbs-parity-tok',
+        configPath: tmpCfgPath,
+        pluginsPath: tmpPluginsPath,
+        configOverride: { activeProfileId: '' },
+    });
+    const baseUrl = await listenServer(relay);
+    const headers = { 'Content-Type': 'application/json', 'X-RisuStand-Token': 'test-cbs-parity-tok' };
+
+    try {
+        // Direct evalPresetCbs parity checks
+        const cbsCtx = {
+            charName: '혜연',
+            personaName: '푸딩',
+            userIconUrl: '/api/asset/user-avatar-1',
+            charImageUrl: '/api/asset/char-avatar-1',
+            charAssetNames: ['hy_pick_01', 'hy_portrait'],
+            emotionNames: ['happy'],
+            chatVars: { mood: 'happy', hp: '10' },
+            globalVars: { toggle_hud: '1' },
+            chatList: [{ role: 'user', content: '안녕' }, { role: 'assistant', content: '반가워' }],
+        };
+        assert.equal(
+            evalPresetCbs(
+                '{{source::user}}|{{source::char}}|{{asset::{{getvar::mood}}}}|{{var::hp}}|{{toggle::hud}}|{{subvar::hp::3}}{{getvar::hp}}|{{mulvar::hp::2}}{{getvar::hp}}|{{divvar::hp::7}}{{getvar::hp}}|{{capitalize::hello}}|{{reverse::abc}}|{{spread::{{range::1::4}}}}|{{object_keys::{{makedict::k1=v1::k2=v2}}}}|{{message_count}}|{{button::열기::act_open}}|{{#pure_display}}{{user}}{{/pure_display}}',
+                cbsCtx
+            ),
+            '/api/asset/user-avatar-1|/api/asset/char-avatar-1|{{asset::happy}}|10|1|7|14|2|Hello|cba|1::2::3|["k1","k2"]|2|<button type="button" class="risu-cbs-btn" risu-trigger="act_open">열기</button>|푸딩'
+        );
+
+        // Plugin footer + display message CBS evaluation via rebuildDisplayedSnapshot
+        const footerPlugin = `
+        //@name CbsFooterSim
+        //@api 3.0
+        (async () => {
+            const doc = await risuai.getRootDocument();
+            const reconcile = async () => {
+                const rows = await doc.querySelectorAll('.risu-chat');
+                for (const row of rows) {
+                    if ((await row.getAttribute('data-role')) !== 'char') continue;
+                    const ct = await row.querySelector('.chattext');
+                    if (!ct) continue;
+                    const ex = await ct.querySelector('.x-risu-am-illustration-footer');
+                    if (!ex) {
+                        const f = await doc.createElement('div');
+                        await f.setAttribute('class', 'x-risu-am-illustration-footer');
+                        await f.setInnerHTML('<img src="{{source::user}}" alt="{{user}}">');
+                        await ct.appendChild(f);
+                    }
+                }
+            };
+            const body = await doc.querySelector('body');
+            const obs = await risuai.createMutationObserver(() => { void reconcile(); });
+            await obs.observe(body, { childList: true, subtree: true });
+            await reconcile();
+        })();
+        `;
+        await fetch(`${baseUrl}/api/plugins/upload`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ filename: 'CbsFooterSim.js', script: footerPlugin, enabled: true }),
+        }).then((r) => assert.equal(r.status, 200));
+
+        await fetch(`${baseUrl}/api/pc/poll`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                bridgeVersion: '2.0.0',
+                pluginVersion: '1.2.0',
+                catalog: {
+                    pcActiveCharIndex: 0,
+                    pcActiveChatIndex: 0,
+                    selectedPersona: 1,
+                    params: {},
+                    characters: [{ index: 0, name: '혜연', chats: [{ index: 0, name: 'Chat 1' }] }],
+                    modules: [],
+                    personas: [{ index: 0, name: 'User' }, { index: 1, name: '푸딩' }],
+                },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: '혜연',
+                    chatName: 'Chat 1',
+                    chatUuid: 'chat-cbs-parity-1',
+                    isPcActive: false,
+                    totalMessages: 1,
+                    chatModules: [],
+                    chatVariables: { mood: 'happy' },
+                    globalToggleValues: { toggle_hud: '1' },
+                    assetMap: { happy: '/api/asset/mood-happy' },
+                    charContext: {
+                        name: '혜연',
+                        personaName: '푸딩',
+                        personaIcon: 'assets/user_icon.png',
+                        charImage: 'assets/char_icon.png',
+                    },
+                    messages: [
+                        { index: 0, role: 'char', chatId: 'cp-m0', raw: '테스트', html: '<div><img src="{{source::user}}"><span>{{var::mood}}|{{toggle::hud}}|{{asset::{{getvar::mood}}}}</span></div>', text: '테스트', images: [] },
+                    ],
+                },
+            }),
+        }).then((r) => assert.equal(r.status, 200));
+
+        let m0 = null;
+        for (let i = 0; i < 20; i += 1) {
+            const st = await fetch(`${baseUrl}/api/state`, { headers }).then((r) => r.json());
+            const m = st && st.snapshot && Array.isArray(st.snapshot.messages) ? st.snapshot.messages[0] : null;
+            if (m && m.pluginFooterHtml) {
+                m0 = m;
+                break;
+            }
+            await new Promise((r) => setTimeout(r, 40));
+        }
+        assert.ok(m0);
+        assert.match(m0.html, /<img src="\/api\/asset\/[a-f0-9-]+">/, '{{source::user}} must resolve to /api/asset/... ref');
+        assert.ok(m0.html.includes('happy|1|<img class="msg-img" src="/api/asset/mood-happy" />'), `nested {{asset::{{getvar::mood}}}} and {{var}}/{{toggle}} must resolve, got: ${m0.html}`);
+        assert.match(m0.pluginFooterHtml || '', /<img src="\/api\/asset\/[a-f0-9-]+" alt="푸딩">/, 'plugin footer must also resolve {{source::user}} and {{user}}');
+    } finally {
+        if (typeof relay.closeAllConnections === 'function') relay.closeAllConnections();
+        await closeServer(relay);
+        try { fs.rmSync(tmpCfgPath, { force: true }); } catch (_) {}
+        try { fs.rmSync(tmpPluginsPath, { force: true }); } catch (_) {}
+    }
+});
+
+test('Live SSE generation telemetry streams provider, model, output tokens, tok/s and UI renders non-clipping liveGenBar & hdrActPopover', async () => {
+    const tmpCfgPath = path.join(os.tmpdir(), `rs-live-gen-cfg-${Date.now()}.json`);
+    const tmpPluginsPath = path.join(os.tmpdir(), `rs-live-gen-plg-${Date.now()}.json`);
+    const mockLLM = http.createServer(async (req, res) => {
+        const chunks = [];
+        for await (const c of req) chunks.push(c);
+        const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        assert.equal(body.stream, true, 'executeDirectModelTurn must request streaming progress when streamProgress is enabled');
+        res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+        res.write(`data: ${JSON.stringify({ model: 'anthropic/claude-sonnet-4', choices: [{ index: 0, delta: { content: '안' } }] })}\n\n`);
+        await new Promise((r) => setTimeout(r, 40));
+        res.write(`data: ${JSON.stringify({ model: 'anthropic/claude-sonnet-4', choices: [{ index: 0, delta: { content: '녕하세요 혜연입니다.' } }] })}\n\n`);
+        await new Promise((r) => setTimeout(r, 40));
+        res.write(`data: ${JSON.stringify({ model: 'anthropic/claude-sonnet-4', choices: [{ index: 0, delta: {} }], usage: { prompt_tokens: 120, completion_tokens: 42 } })}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+    });
+    const llmUrl = await listenServer(mockLLM);
+
+    const token = 'test-live-gen-tok';
+    const relay = createRelayServer({
+        token,
+        configPath: tmpCfgPath,
+        pluginsPath: tmpPluginsPath,
+        configOverride: {
+            activeProfileId: 'p-or',
+            directPresetId: 'off',
+            remoteDirectOnly: true,
+            profiles: [{
+                id: 'p-or',
+                name: 'OR Main',
+                providerType: 'openai_compat',
+                baseUrl: `${llmUrl}/openrouter.ai/api/v1/chat/completions`,
+                apiKey: 'k',
+                model: 'anthropic/claude-sonnet-4',
+            }],
+        },
+    });
+    const baseUrl = await listenServer(relay);
+    const headers = { 'Content-Type': 'application/json', 'X-RisuStand-Token': token };
+
+    const sseCtrl = new AbortController();
+    const ssePayloads = [];
+    const ssePromise = (async () => {
+        const resp = await fetch(`${baseUrl}/api/activity/stream`, { headers: { 'X-RisuStand-Token': token }, signal: sseCtrl.signal });
+        const reader = resp.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        try {
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buf += dec.decode(value, { stream: true });
+                let nl;
+                while ((nl = buf.indexOf('\n')) >= 0) {
+                    const line = buf.slice(0, nl).trim();
+                    buf = buf.slice(nl + 1);
+                    if (line.startsWith('data:')) ssePayloads.push(JSON.parse(line.slice(5).trim()));
+                }
+            }
+        } catch (_) {}
+    })();
+
+    try {
+        await fetch(`${baseUrl}/api/pc/poll`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                bridgeVersion: '2.0.0',
+                pluginVersion: '1.2.0',
+                catalog: { pcActiveCharIndex: 0, pcActiveChatIndex: 0, selectedPersona: 0, params: {}, characters: [{ index: 0, name: 'Hyeyeon', chats: [{ index: 0, name: 'Chat 1' }] }], modules: [], personas: [{ index: 0, name: 'User' }] },
+                snapshot: { charIndex: 0, chatIndex: 0, charName: 'Hyeyeon', chatName: 'Chat 1', chatUuid: 'c-lg-1', isPcActive: false, totalMessages: 0, chatModules: [], chatVariables: {}, assetMap: {}, messages: [] },
+            }),
+        }).then((r) => assert.equal(r.status, 200));
+
+        await fetch(`${baseUrl}/api/chat/send`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ charIndex: 0, chatIndex: 0, text: '안녕' }),
+        }).then((r) => assert.equal(r.status, 200));
+
+        for (let i = 0; i < 50; i += 1) {
+            if (ssePayloads.some((p) => p.generation && !p.generation.active && p.generation.status === 'done')) break;
+            await new Promise((r) => setTimeout(r, 30));
+        }
+        const genStarted = ssePayloads.find((p) => p.generation && p.generation.active && p.generation.status === 'generating');
+        const genDone = [...ssePayloads].reverse().find((p) => p.generation && !p.generation.active && p.generation.status === 'done');
+        assert.ok(genStarted, 'SSE /api/activity/stream must emit active generation telemetry');
+        assert.ok(genDone, 'SSE /api/activity/stream must emit completed generation telemetry');
+        assert.equal(genDone.generation.provider, 'OR Main');
+        assert.equal(genDone.generation.model, 'anthropic/claude-sonnet-4');
+        assert.equal(genDone.generation.outputTokens, 42);
+        assert.equal(genDone.generation.tokenEstimated, false);
+        assert.ok(genDone.generation.tokPerSec > 0, 'tokPerSec must be computed > 0');
+
+        const stateRes = await fetch(`${baseUrl}/api/state`, { headers }).then((r) => r.json());
+        assert.ok(stateRes.liveGeneration && stateRes.liveGeneration.model === 'anthropic/claude-sonnet-4', '/api/state must expose liveGeneration');
+
+        const uiHtml = await fetch(`${baseUrl}/`).then((r) => r.text());
+        assert.ok(uiHtml.includes('id="liveGenBar"'));
+        assert.ok(uiHtml.includes('id="hdrActPopover"'));
+        assert.ok(uiHtml.includes('hdr-act-stage'));
+        assert.ok(uiHtml.includes("fmtStageShort"));
+        const scriptMatch = uiHtml.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
+        assert.ok(scriptMatch && scriptMatch[1]);
+        assert.doesNotThrow(() => new Function(scriptMatch[1]));
+    } finally {
+        sseCtrl.abort();
+        await ssePromise;
+        if (typeof relay.closeAllConnections === 'function') relay.closeAllConnections();
+        await closeServer(relay);
+        await closeServer(mockLLM);
+        try { fs.rmSync(tmpCfgPath, { force: true }); } catch (_) {}
+        try { fs.rmSync(tmpPluginsPath, { force: true }); } catch (_) {}
+    }
+});
+
+test('Scene control drawer thumbnails open enlarged lightbox with X close button', async () => {
+    const tmpCfgPath = path.join(os.tmpdir(), `rs-scene-lb-cfg-${Date.now()}.json`);
+    const tmpPluginsPath = path.join(os.tmpdir(), `rs-scene-lb-plug-${Date.now()}.json`);
+    const relay = createRelayServer({
+        token: 'tok-scene-lb',
+        pluginsPath: tmpPluginsPath,
+        configPath: tmpCfgPath,
+    });
+    const baseUrl = await listenServer(relay);
+    try {
+        const uiHtml = await fetch(`${baseUrl}/`).then((r) => r.text());
+        assert.ok(uiHtml.includes('.chat-img-lightbox-close'), 'Lightbox must style X close button');
+        assert.ok(uiHtml.includes('data-lb-close="1"'), 'Lightbox must render data-lb-close="1" button');
+        assert.ok(uiHtml.includes('>✕</button>'), 'Lightbox close button must show ✕');
+        assert.ok(uiHtml.includes('z-index:190'), 'Lightbox z-index must stack above #sceneCtrlModal (168)');
+        assert.ok(
+            uiHtml.includes("openChatImgLightbox(src, { items, index: idx >= 0 ? idx : 0 })"),
+            'Scene control drawer thumbnail click must open enlarged lightbox'
+        );
+        const scriptMatch = uiHtml.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
+        assert.ok(scriptMatch && scriptMatch[1]);
+        assert.doesNotThrow(() => new Function(scriptMatch[1]));
+    } finally {
+        if (typeof relay.closeAllConnections === 'function') relay.closeAllConnections();
+        await closeServer(relay);
+        try { fs.rmSync(tmpCfgPath, { force: true }); } catch (_) {}
+        try { fs.rmSync(tmpPluginsPath, { force: true }); } catch (_) {}
+    }
+});
+
+test('diffPluginPromptInjection & /api/plugins/runtime-recall attribute recalled memories per plugin and serve GUI recall viewer', async () => {
+    const { diffPluginPromptInjection } = require('../risustand-plugin-adapter.cjs');
+
+    // 1. Unit tests for diffPluginPromptInjection
+    const baseMsgs = [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'user', content: '오늘 일정이 뭐지?' },
+    ];
+    const unchanged = diffPluginPromptInjection(baseMsgs, [...baseMsgs]);
+    assert.equal(unchanged.changed, false);
+    assert.equal(unchanged.injectedCount, 0);
+    assert.equal(unchanged.totalInjectedChars, 0);
+
+    const addedMsgs = [
+        { role: 'system', content: 'You are helpful.' },
+        { role: 'system', content: '[HAYAKU PACKET]\nTurn 72: 5층 복도 라운지' },
+        { role: 'user', content: '오늘 일정이 뭐지?' },
+    ];
+    const addedDiff = diffPluginPromptInjection(baseMsgs, addedMsgs);
+    assert.equal(addedDiff.changed, true);
+    assert.equal(addedDiff.injectedCount, 1);
+    assert.equal(addedDiff.injectedBlocks[0].kind, 'added');
+    assert.equal(addedDiff.injectedBlocks[0].role, 'system');
+    assert.ok(addedDiff.injectedBlocks[0].text.includes('[HAYAKU PACKET]'));
+
+    const modMsgs = [
+        ...addedMsgs.slice(0, 2),
+        { role: 'user', content: '[FLASHBACK RECALL]\n지난주 동아리 회식 약속\n\n오늘 일정이 뭐지?' },
+    ];
+    const modDiff = diffPluginPromptInjection(addedMsgs, modMsgs);
+    assert.equal(modDiff.changed, true);
+    assert.equal(modDiff.injectedCount, 1);
+    assert.equal(modDiff.injectedBlocks[0].kind, 'modified');
+    assert.equal(modDiff.injectedBlocks[0].role, 'user');
+    assert.ok(modDiff.injectedBlocks[0].text.includes('[FLASHBACK RECALL]'));
+    assert.ok(!modDiff.injectedBlocks[0].text.includes('오늘 일정이 뭐지?'));
+
+    // Stripped historical turns (pure removals / whitespace cleanups) must NOT pollute injectedBlocks
+    const histBefore = [
+        { role: 'system', content: 'System Core' },
+        ...Array.from({ length: 12 }, (_, idx) => ({ role: 'assistant', content: `Turn ${idx} text <hayaku_packet>old ${idx}</hayaku_packet>` })),
+        { role: 'user', content: '지금 뭐 해?' },
+    ];
+    const histAfter = [
+        { role: 'system', content: 'System Core' },
+        { role: 'system', content: '[HAYAKU MEMORY]\n실제 주입된 회상 기억 블록' },
+        ...Array.from({ length: 12 }, (_, idx) => ({ role: 'assistant', content: `Turn ${idx} text ` })),
+        { role: 'user', content: '[CHAR STATUS]\n상태 블록\n지금 뭐 해?' },
+    ];
+    const strippedNoiseDiff = diffPluginPromptInjection(histBefore, histAfter);
+    assert.equal(strippedNoiseDiff.injectedCount, 2);
+    assert.equal(strippedNoiseDiff.strippedCount, 12);
+    assert.ok(strippedNoiseDiff.totalRemovedChars > 0);
+    assert.ok(strippedNoiseDiff.injectedBlocks.every((b) => b.addedChars > 0 && b.text.trim().length > 0));
+    assert.ok(strippedNoiseDiff.injectedBlocks[0].text.includes('[HAYAKU MEMORY]'));
+    assert.ok(strippedNoiseDiff.injectedBlocks[1].text.includes('[CHAR STATUS]'));
+
+    // 2. End-to-end relay integration with 2 plugins + mock LLM
+    const mockLLM = http.createServer(async (req, res) => {
+        let raw = '';
+        for await (const c of req) raw += c;
+        const body = JSON.parse(raw || '{}');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            id: 'chatcmpl-recall-1',
+            choices: [{ index: 0, message: { role: 'assistant', content: '라벨이 붙은 기억을 반영해 응답합니다.' }, finish_reason: 'stop' }],
+            usage: { completion_tokens: 18 },
+            echoMsgCount: Array.isArray(body.messages) ? body.messages.length : 0,
+        }));
+    });
+    const llmUrl = await listenServer(mockLLM);
+
+    const chatUuid = 'chat-recall-uuid-1';
+    const charObj = {
+        chaId: 'char-recall-1',
+        name: '혜연',
+        desc: '선배 캐릭터',
+        personality: '',
+        scenario: '',
+        systemPrompt: '',
+        replaceGlobalNote: '',
+        lowLevelAccess: false,
+        triggerscript: [],
+        customscript: [],
+        globalLore: [],
+        chatPage: 0,
+        chats: [],
+    };
+    const chatObj = {
+        id: chatUuid,
+        name: 'Chat 1',
+        note: '',
+        localLore: [],
+        modules: [],
+        message: [],
+    };
+    const bridge = createFakeHostBridge({ charObj, chatObj });
+    const tmpCfgPath = path.join(os.tmpdir(), `rs-recall-cfg-${Date.now()}.json`);
+    const tmpPluginsPath = path.join(os.tmpdir(), `rs-recall-plug-${Date.now()}.json`);
+    const token = 'tok-runtime-recall';
+    const relay = createRelayServer({
+        token,
+        pluginsPath: tmpPluginsPath,
+        configPath: tmpCfgPath,
+        configOverride: {
+            profiles: [{
+                id: 'prof-recall',
+                name: 'Mock Recall LLM',
+                provider: 'custom',
+                providerType: 'openai_compat',
+                baseUrl: `${llmUrl}/v1/chat/completions`,
+                apiKey: 'k-test',
+                model: 'mock-recall-model',
+            }],
+            activeProfileId: 'prof-recall',
+            directPresetId: 'off',
+            remoteDirectOnly: true,
+        },
+    });
+    const baseUrl = await listenServer(relay);
+    const headers = { 'Content-Type': 'application/json', 'X-RisuStand-Token': token };
+    bridge.startRpcLoop(baseUrl, token);
+
+    const hayakuMockScript = [
+        '//@name hayaku_mock',
+        '//@display-name HAYAKU Mock',
+        '//@api 3.0',
+        'risuai.addRisuReplacer("beforeRequest", async (msgs) => {',
+        '  const out = msgs.map((m) => ({ ...m }));',
+        '  out.splice(Math.max(0, out.length - 1), 0, { role: "system", content: "[HAYAKU_MEMORY_PACKET]\\nTurn 71: 우산 정류장 재회" });',
+        '  return out;',
+        '});',
+        'risuai.addRisuReplacer("afterRequest", async (txt) => txt);',
+        'risuai.addRisuChatListener("output", async () => {});',
+    ].join('\n');
+
+    const flashbackMockScript = [
+        '//@name flashback_mock',
+        '//@display-name FLASHBACK Mock',
+        '//@api 3.0',
+        'risuai.addRisuReplacer("beforeRequest", async (msgs) => {',
+        '  const out = msgs.map((m) => ({ ...m }));',
+        '  const last = out[out.length - 1];',
+        '  if (last && last.role === "user") {',
+        '    last.content = "[FLASHBACK_RECALLED]\\n2년 전 스터디 모임 일지\\n\\n" + last.content;',
+        '  }',
+        '  return out;',
+        '});',
+        'risuai.addRisuReplacer("afterRequest", async (txt) => txt);',
+        'risuai.addRisuChatListener("output", async () => {});',
+    ].join('\n');
+
+    try {
+        await fetch(`${baseUrl}/api/plugins/upload`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ filename: 'hayaku_mock.js', script: hayakuMockScript, enabled: true }),
+        }).then((r) => assert.equal(r.status, 200));
+
+        await fetch(`${baseUrl}/api/plugins/upload`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ filename: 'flashback_mock.js', script: flashbackMockScript, enabled: true }),
+        }).then((r) => assert.equal(r.status, 200));
+
+        await fetch(`${baseUrl}/api/pc/poll`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                bridgeVersion: '2.0.0',
+                pluginVersion: '1.2.0',
+                catalog: {
+                    pcActiveCharIndex: 0,
+                    pcActiveChatIndex: 0,
+                    selectedPersona: 0,
+                    params: {},
+                    characters: [{ index: 0, name: '혜연', chats: [{ index: 0, name: 'Chat 1' }] }],
+                    modules: [],
+                    personas: [{ index: 0, name: '푸딩' }],
+                },
+                snapshot: {
+                    charIndex: 0,
+                    chatIndex: 0,
+                    charName: '혜연',
+                    chatName: 'Chat 1',
+                    chatUuid,
+                    isPcActive: false,
+                    totalMessages: 0,
+                    chatModules: [],
+                    chatVariables: {},
+                    assetMap: {},
+                    messages: [],
+                },
+            }),
+        }).then((r) => assert.equal(r.status, 200));
+
+        await fetch(`${baseUrl}/api/chat/send`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ charIndex: 0, chatIndex: 0, text: '우산 정류장에서 뭐 해?' }),
+        }).then((r) => assert.equal(r.status, 200));
+
+        for (let i = 0; i < 60; i += 1) {
+            if (bridge.dbState.chat.message.length >= 2) break;
+            await new Promise((r) => setTimeout(r, 30));
+        }
+        assert.ok(bridge.dbState.chat.message.length >= 2, 'Assistant reply must be committed');
+        await new Promise((r) => setTimeout(r, 100));
+
+        const hayakuRes = await fetch(
+            `${baseUrl}/api/plugins/runtime-recall?name=hayaku_mock&chatUuid=${encodeURIComponent(chatUuid)}`,
+            { headers }
+        ).then((r) => r.json());
+        assert.equal(hayakuRes.ok, true);
+        assert.ok(hayakuRes.recall.beforeRequestRuns >= 1);
+        assert.ok(hayakuRes.recall.afterRequestRuns >= 1);
+        assert.ok(hayakuRes.recall.outputRuns >= 1);
+        assert.equal(hayakuRes.recall.history.length, 1);
+        assert.equal(hayakuRes.recall.history[0].matchesCurrentChat, true);
+        assert.ok(hayakuRes.recall.history[0].userPreview.includes('우산 정류장에서 뭐 해?'));
+        assert.equal(hayakuRes.recall.history[0].injectedBlocks.length, 1);
+        assert.equal(hayakuRes.recall.history[0].injectedBlocks[0].kind, 'added');
+        assert.ok(hayakuRes.recall.history[0].injectedBlocks[0].text.includes('[HAYAKU_MEMORY_PACKET]'));
+        assert.ok(!hayakuRes.recall.history[0].injectedBlocks[0].text.includes('[FLASHBACK_RECALLED]'));
+
+        const fbRes = await fetch(
+            `${baseUrl}/api/plugins/runtime-recall?name=flashback_mock&chatUuid=${encodeURIComponent(chatUuid)}`,
+            { headers }
+        ).then((r) => r.json());
+        assert.equal(fbRes.ok, true);
+        assert.ok(fbRes.recall.beforeRequestRuns >= 1);
+        assert.equal(fbRes.recall.history[0].injectedBlocks.length, 1);
+        assert.equal(fbRes.recall.history[0].injectedBlocks[0].kind, 'modified');
+        assert.ok(fbRes.recall.history[0].injectedBlocks[0].text.includes('[FLASHBACK_RECALLED]'));
+        assert.ok(!fbRes.recall.history[0].injectedBlocks[0].text.includes('[HAYAKU_MEMORY_PACKET]'));
+        assert.ok(!fbRes.recall.history[0].injectedBlocks[0].text.includes('우산 정류장에서 뭐 해?'));
+
+        const allRes = await fetch(`${baseUrl}/api/plugins/runtime-recall?chatUuid=${encodeURIComponent(chatUuid)}`, { headers }).then((r) => r.json());
+        assert.equal(allRes.ok, true);
+        assert.ok(Array.isArray(allRes.plugins) && allRes.plugins.length >= 2);
+        assert.ok(allRes.plugins.some((p) => p.pluginName === 'hayaku_mock' && p.latestInjectedCount === 1 && p.matchesCurrentChat));
+
+        const uiHtml = await fetch(`${baseUrl}/`).then((r) => r.text());
+        assert.ok(uiHtml.includes('id="pluginGuiRecallPane"'));
+        assert.ok(uiHtml.includes('data-plg-gui-recall-toggle="1"'));
+        assert.ok(uiHtml.includes('/api/plugins/runtime-recall'));
+        assert.ok(/\.plg-gui-recall-pane\s*>\s*\*\s*\{[^}]*flex-shrink:\s*0/i.test(uiHtml), 'recall pane children must not flex-shrink collapse');
+        assert.ok(/\.plg-recall-block\s*\{[^}]*flex-shrink:\s*0/i.test(uiHtml), 'recall block cards must not flex-shrink collapse');
+        assert.ok(uiHtml.includes('data-plg-recall-toggle-block'));
+        const scriptMatch = uiHtml.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
+        assert.ok(scriptMatch && scriptMatch[1]);
+        assert.doesNotThrow(() => new Function(scriptMatch[1]));
+    } finally {
+        await bridge.stop();
+        if (typeof relay.closeAllConnections === 'function') relay.closeAllConnections();
+        await closeServer(relay);
+        await closeServer(mockLLM);
+        try { fs.rmSync(tmpCfgPath, { force: true }); } catch (_) {}
+        try { fs.rmSync(tmpPluginsPath, { force: true }); } catch (_) {}
+    }
+});
+
+test('Leave preset templateDefaultVariables are exposed in /api/router/config and synced on modules tab', async () => {
+    const tmpCfgPath = path.join(os.tmpdir(), `rs-leave-def-cfg-${Date.now()}.json`);
+    const tmpPluginsPath = path.join(os.tmpdir(), `rs-leave-def-plug-${Date.now()}.json`);
+    const token = 'tok-leave-defs';
+    const relay = createRelayServer({
+        token,
+        pluginsPath: tmpPluginsPath,
+        configPath: tmpCfgPath,
+        configOverride: {
+            directPresetId: 'bundled:leave',
+            remoteToggleValues: {},
+        },
+    });
+    const baseUrl = await listenServer(relay);
+    try {
+        const cfg = await fetch(`${baseUrl}/api/router/config`, {
+            headers: { 'X-RisuStand-Token': token },
+        }).then((r) => r.json());
+        assert.ok(cfg && cfg.presetDefaultToggleValues && typeof cfg.presetDefaultToggleValues === 'object');
+        assert.equal(cfg.presetDefaultToggleValues.toggle_aide_core_continuity, '1');
+        assert.equal(cfg.presetDefaultToggleValues.toggle_aide_prose_polish, '1');
+        assert.equal(cfg.presetDefaultToggleValues.toggle_pipeline_mode, '1');
+        assert.equal(cfg.presetDefaultToggleValues.toggle_next_turn_seed, '1');
+        assert.equal(cfg.presetDefaultToggleValues.toggle_sub_knowledge_boundary, '1');
+        assert.equal(cfg.presetDefaultToggleValues.toggle_ooc_mode, '0');
+
+        const uiHtml = await fetch(`${baseUrl}/`).then((r) => r.text());
+        assert.ok(uiHtml.includes('presetDefaultToggleValues'));
+        assert.ok(uiHtml.includes('function mergeNonEmptyToggles'));
+        assert.ok(uiHtml.includes("if (typeof renderCustomToggles === 'function') renderCustomToggles(true);"));
+        assert.ok(uiHtml.includes("if (tab === 'modules') {") && uiHtml.includes('loadRouterConfig()'));
+        const scriptMatch = uiHtml.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
+        assert.ok(scriptMatch && scriptMatch[1]);
+        assert.doesNotThrow(() => new Function(scriptMatch[1]));
+    } finally {
+        if (typeof relay.closeAllConnections === 'function') relay.closeAllConnections();
+        await closeServer(relay);
+        try { fs.rmSync(tmpCfgPath, { force: true }); } catch (_) {}
+        try { fs.rmSync(tmpPluginsPath, { force: true }); } catch (_) {}
+    }
+});
+
+test('Translator supports saved profile selection, per-profile model override, standalone custom model, and cache isolation', async () => {
+    const trCalls = [];
+    const mockLLM = http.createServer(async (req, res) => {
+        let raw = '';
+        for await (const c of req) raw += c;
+        const body = JSON.parse(raw || '{}');
+        const auth = String(req.headers.authorization || '');
+        trCalls.push({ model: body.model, auth });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+            id: `cmpl-tr-${trCalls.length}`,
+            choices: [{ index: 0, message: { role: 'assistant', content: `TRANSLATED[${body.model}|${auth}]` }, finish_reason: 'stop' }],
+            usage: { completion_tokens: 8 },
+        }));
+    });
+    const llmUrl = await listenServer(mockLLM);
+
+    const tmpCfgPath = path.join(os.tmpdir(), `rs-tr-model-cfg-${Date.now()}.json`);
+    const tmpPluginsPath = path.join(os.tmpdir(), `rs-tr-model-plug-${Date.now()}.json`);
+    const token = 'tok-tr-models';
+    const relay = createRelayServer({
+        token,
+        pluginsPath: tmpPluginsPath,
+        configPath: tmpCfgPath,
+        configOverride: {
+            activeProfileId: 'prof-main',
+            profiles: [
+                {
+                    id: 'prof-main',
+                    name: 'Main Profile',
+                    provider: 'custom',
+                    providerType: 'openai_compat',
+                    baseUrl: `${llmUrl}/v1/chat/completions`,
+                    apiKey: 'key-main',
+                    model: 'main-model',
+                },
+                {
+                    id: 'prof-tr',
+                    name: 'Saved Translator Profile',
+                    provider: 'custom',
+                    providerType: 'openai_compat',
+                    baseUrl: `${llmUrl}/v1/chat/completions`,
+                    apiKey: 'key-tr',
+                    model: 'saved-tr-model',
+                },
+            ],
+            translator: {
+                useActiveProfile: true,
+                profileId: 'active',
+                profileModelOverride: '',
+            },
+        },
+    });
+    const baseUrl = await listenServer(relay);
+    const headers = { 'Content-Type': 'application/json', 'X-RisuStand-Token': token };
+
+    try {
+        // 1) Secondary saved profile selection
+        await fetch(`${baseUrl}/api/router/config`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                translator: { useActiveProfile: false, profileId: 'prof-tr', profileModelOverride: '' },
+            }),
+        }).then((r) => assert.equal(r.status, 200));
+        const r1 = await fetch(`${baseUrl}/api/translate`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ text: 'Hello world', direction: 'to_target' }),
+        }).then((r) => r.json());
+        assert.equal(r1.ok, true);
+        assert.equal(r1.translated, 'TRANSLATED[saved-tr-model|Bearer key-tr]');
+
+        // 2) Active profile with separate model override + same input text must bypass old model cache
+        await fetch(`${baseUrl}/api/router/config`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                translator: { useActiveProfile: true, profileId: 'active', profileModelOverride: 'fast-override-model' },
+            }),
+        }).then((r) => assert.equal(r.status, 200));
+        const r2 = await fetch(`${baseUrl}/api/translate`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ text: 'Hello world', direction: 'to_target' }),
+        }).then((r) => r.json());
+        assert.equal(r2.ok, true);
+        assert.equal(r2.translated, 'TRANSLATED[fast-override-model|Bearer key-main]');
+
+        // 3) Standalone custom translator configuration
+        await fetch(`${baseUrl}/api/router/config`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                translator: {
+                    useActiveProfile: false,
+                    profileId: 'custom',
+                    profileModelOverride: '',
+                    providerType: 'openai_compat',
+                    baseUrl: `${llmUrl}/v1/chat/completions`,
+                    apiKey: 'key-custom',
+                    model: 'custom-tr-model',
+                },
+            }),
+        }).then((r) => assert.equal(r.status, 200));
+        const r3 = await fetch(`${baseUrl}/api/translate`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ text: 'Hello world', direction: 'to_target' }),
+        }).then((r) => r.json());
+        assert.equal(r3.ok, true);
+        assert.equal(r3.translated, 'TRANSLATED[custom-tr-model|Bearer key-custom]');
+
+        // 4) UI markup & embedded JS compilation
+        const uiHtml = await fetch(`${baseUrl}/`).then((r) => r.text());
+        assert.ok(uiHtml.includes('id="trProfileSel"'));
+        assert.ok(uiHtml.includes('id="trProfileModelOverride"'));
+        assert.ok(uiHtml.includes('id="trProfLoadModelsBtn"'));
+        assert.ok(uiHtml.includes('id="trCustomBox"'));
+        assert.ok(!uiHtml.includes('trUseActive'));
+        const scriptMatch = uiHtml.match(/<script>([\s\S]*?)<\/script>\s*<\/body>/);
+        assert.ok(scriptMatch && scriptMatch[1]);
+        assert.doesNotThrow(() => new Function(scriptMatch[1]));
+    } finally {
+        if (typeof relay.closeAllConnections === 'function') relay.closeAllConnections();
+        await closeServer(relay);
+        await closeServer(mockLLM);
+        try { fs.rmSync(tmpCfgPath, { force: true }); } catch (_) {}
+        try { fs.rmSync(tmpPluginsPath, { force: true }); } catch (_) {}
+    }
+});
+
+test('buildDirectPromptMessages strips history <Thoughts>/<thinking> while preserving HUD, and Leave preset/Two-Pass protect living voice & natural physical transitions', () => {
+    const relay = require('../risustand-relay-server.js');
+    const leave = relay.loadBundledLeavePreset();
+    assert.ok(leave && Array.isArray(leave.promptTemplate) && leave.promptTemplate.length === 21);
+
+    const built = relay.buildDirectPromptMessages({
+        preset: leave,
+        snap: {
+            charName: '클로젬 여행동아리',
+            useLocallySetGlobalVariables: false,
+            globalToggleValues: {},
+            localToggleValues: {},
+            charContext: {
+                name: '클로젬 여행동아리',
+                personaName: '푸딩',
+                loreEntries: [],
+            },
+        },
+        historyMessages: [
+            { role: 'user', raw: '"일단 같이 씻으러 가자."' },
+            {
+                role: 'char',
+                raw: '<Thoughts>\n하연은 차가운 실무 계산기...\n</Thoughts>\n<thinking>internal note</thinking>\n\n"어머~ 이제 와서 같이 씻자고?"\n\n<statusdata>\n📖 Leave HUD · 07:46\n</statusdata>',
+            },
+        ],
+        userText: '욕실로 들어가자 하연과 소연도 들어왔다.',
+        remoteToggleValues: {
+            toggle_aide_core_continuity: '1',
+            toggle_aide_prose_polish: '1',
+            toggle_sub_dialogue: '1',
+        },
+    });
+
+    assert.ok(Array.isArray(built));
+    const allSys = built.filter((m) => m.role === 'system').map((m) => m.content).join('\n');
+    assert.ok(allSys.includes('Living Character Voice (Anti-Robotic Dialogue)'));
+    assert.ok(allSys.includes('Restraint applies ONLY to redundant narrator commentary'));
+    assert.ok(allSys.includes('show them naturally undressing rather than stepping in clothed'));
+
+    const histAsst = built.find((m) => m.role === 'assistant');
+    assert.ok(histAsst, 'Assistant turn must be preserved in history');
+    assert.ok(!histAsst.content.includes('<Thoughts>') && !histAsst.content.includes('차가운 실무 계산기'));
+    assert.ok(!histAsst.content.includes('<thinking>') && !histAsst.content.includes('internal note'));
+    assert.ok(histAsst.content.includes('어머~ 이제 와서 같이 씻자고?'));
+    assert.ok(histAsst.content.includes('<statusdata>'));
+
+    const relaySrc = fs.readFileSync(path.join(__dirname, '..', 'risustand-relay-server.js'), 'utf8');
+    assert.ok(relaySrc.includes('CHARACTER VOICE FIDELITY'));
+    assert.ok(relaySrc.includes('NATURAL PHYSICAL TRANSITIONS'));
+    assert.ok(relaySrc.includes("Protect each speaker\\'s living voice"));
+});
+
+test('Librarian-Suite cross-plugin IPC: LIBRA/HAYAKU/Flashback <-> GRADIA, multi-listener, 2-arg removal, allowed-ipc, and GUI cursor sync', async () => {
+    const { createPluginAdapter, parsePluginHeader } = require('../risustand-plugin-adapter.cjs');
+
+    const libraHeader = parsePluginHeader('//@name libra\n//@api 3.0\n//@allowed-ipc serial_gradation_agents_for_rp, hayaku_locator_continuity');
+    assert.deepEqual(libraHeader.allowedIPC, ['serial_gradation_agents_for_rp', 'hayaku_locator_continuity']);
+
+    const tmpPluginsPath = path.join(os.tmpdir(), `rs-ipc-suite-${Date.now()}-${Math.random().toString(36).slice(2)}.json`);
+    const backendCfg = { pluginConfigs: {} };
+    const adapter = createPluginAdapter({
+        pluginsPath: tmpPluginsPath,
+        persistDisabled: true,
+        getBackendConfig: () => backendCfg,
+    });
+
+    try {
+        // Install LIBRA, HAYAKU, FLASHBACK, GRADIA, and an unauthorized rogue plugin
+        await adapter.addCustomPlugin({ filename: 'LIBRA.js', script: `//@name libra\n//@api 3.0\n//@allowed-ipc serial_gradation_agents_for_rp\n(async()=>{
+          const api=window.Risuai||window.risuai;
+          const ok=await api.addPluginChannelListener('libra_gradia_unified_read_request_v1', async (msg, meta) => {
+            if (meta.sender !== 'serial_gradation_agents_for_rp') return;
+            await api.postPluginChannelMessage(meta.sender, 'libra_gradia_unified_read_response_v1', {
+              schema: msg.schema, kind: 'response', requestId: msg.requestId, ok: true, result: { source: 'libra', items: ['리브라 정본 기억'] }
+            });
+          });
+          if (ok === false) throw new Error('expected truthy addPluginChannelListener');
+          let l1 = 0, l2 = 0;
+          const fn1 = async (m, meta) => {
+            l1 += 1;
+            await api.postPluginChannelMessage(meta.sender, 'multi_res_v1', { who: 'fn1', count: l1, tag: m && m.tag });
+          };
+          const fn2 = async (m, meta) => {
+            l2 += 1;
+            await api.postPluginChannelMessage(meta.sender, 'multi_res_v1', { who: 'fn2', count: l2, tag: m && m.tag });
+          };
+          await api.addPluginChannelListener('memory_suite_source_rules_v1', fn1);
+          await api.addPluginChannelListener('memory_suite_source_rules_v1', fn2);
+          await api.addPluginChannelListener('multi_ctrl_v1', async (m) => {
+            if (m && m.removeFn1) await api.removePluginChannelListener('memory_suite_source_rules_v1', fn1);
+          });
+          await api.addPluginChannelListener('gui_sync_req_v1', async (msg, meta) => {
+            await api.postPluginChannelMessage(meta.sender, 'gui_sync_res_v1', { echo: msg.ping, from: 'libra' });
+          });
+        })();` });
+
+        await adapter.addCustomPlugin({ filename: 'HAYAKU.js', script: `//@name hayaku_locator_continuity\n//@api 3.0\n//@allowed-ipc serial_gradation_agents_for_rp\n(async()=>{
+          const api=window.Risuai||window.risuai;
+          await api.addPluginChannelListener('gradia_memory_read_request_v1', async (msg, meta) => {
+            if (meta.sender !== 'serial_gradation_agents_for_rp') return;
+            await api.postPluginChannelMessage(meta.sender, 'gradia_memory_read_response_v1', {
+              schema: msg.schema, kind: 'response', id: msg.id, action: msg.action, result: { owner: 'hayaku', items: ['하야쿠 연속성 패킷'] }
+            });
+          });
+        })();` });
+
+        await adapter.addCustomPlugin({ filename: 'Flashback.js', script: `//@name flashback_memory\n//@api 3.0\n//@allowed-ipc serial_gradation_agents_for_rp\n(async()=>{
+          const api=window.Risuai||window.risuai;
+          await api.addPluginChannelListener('gradia_memory_read_request_v1', async (msg, meta) => {
+            if (meta.sender !== 'serial_gradation_agents_for_rp') return;
+            await api.postPluginChannelMessage(meta.sender, 'gradia_memory_read_response_v1', {
+              schema: msg.schema, kind: 'response', id: msg.id, action: msg.action, result: { owner: 'flashback', items: ['플래시백 회상 조각'] }
+            });
+          });
+        })();` });
+
+        await adapter.addCustomPlugin({ filename: 'GRADIA.js', script: `//@name serial_gradation_agents_for_rp\n//@api 3.0\n//@allowed-ipc libra\n//@allowed-ipc hayaku_locator_continuity\n//@allowed-ipc flashback_memory\n(async()=>{
+          const api=window.Risuai||window.risuai;
+          const pending=new Map();
+          const rpc=(target, reqCh, resCh, reqObj)=>new Promise(async (resolve, reject)=>{
+            const k=reqObj.requestId||reqObj.id;
+            const timer=setTimeout(()=>reject(new Error('IPC timeout '+target)), 2000);
+            pending.set(k, (payload)=>{ clearTimeout(timer); resolve(payload); });
+            await api.postPluginChannelMessage(target, reqCh, reqObj);
+          });
+          await api.addPluginChannelListener('libra_gradia_unified_read_response_v1', (msg)=>{ const fn=pending.get(msg.requestId); if(fn){ pending.delete(msg.requestId); fn(msg.result); } });
+          await api.addPluginChannelListener('gradia_memory_read_response_v1', (msg)=>{ const fn=pending.get(msg.id); if(fn){ pending.delete(msg.id); fn(msg.result); } });
+          api.addRisuReplacer('beforeRequest', async (msgs)=>{
+            const [libraRes, hayakuRes, fbRes] = await Promise.all([
+              rpc('libra', 'libra_gradia_unified_read_request_v1', 'libra_gradia_unified_read_response_v1', { schema:'u', requestId:'r-libra' }),
+              rpc('hayaku_locator_continuity', 'gradia_memory_read_request_v1', 'gradia_memory_read_response_v1', { schema:'g', id:'r-hayaku', action:'capture' }),
+              rpc('flashback_memory', 'gradia_memory_read_request_v1', 'gradia_memory_read_response_v1', { schema:'g', id:'r-fb', action:'capture' }),
+            ]);
+            const merged = [...libraRes.items, ...hayakuRes.items, ...fbRes.items].join(' | ');
+            return [{ role: 'system', content: '[GRADIA_IPC_COMBINED] ' + merged }, ...msgs];
+          });
+        })();` });
+
+        await adapter.addCustomPlugin({ filename: 'Rogue.js', script: `//@name rogue_plugin\n//@api 3.0\n// unauthorized\n` });
+
+        await new Promise((r) => setTimeout(r, 30));
+
+        // 1) Rogue plugin without mutual allowed-ipc is blocked
+        const roguePostResult = await adapter.handleGuiRpc({
+            pluginName: 'rogue_plugin',
+            method: 'ipc.post',
+            args: ['libra', 'libra_gradia_unified_read_request_v1', { requestId: 'bad' }],
+        });
+        assert.equal(roguePostResult, false);
+
+        // 2) GRADIA collects memories from LIBRA, HAYAKU, and FLASHBACK concurrently via IPC
+        const outMsgs = await adapter.runBeforeRequest([{ role: 'user', content: '테스트' }], 'model');
+        assert.ok(outMsgs[0].content.includes('[GRADIA_IPC_COMBINED]'));
+        assert.ok(outMsgs[0].content.includes('리브라 정본 기억'));
+        assert.ok(outMsgs[0].content.includes('하야쿠 연속성 패킷'));
+        assert.ok(outMsgs[0].content.includes('플래시백 회상 조각'));
+
+        // 3) Multi-listener & 2-arg removePluginChannelListener preserves sibling listeners
+        const initCursor = await adapter.handleGuiRpc({ pluginName: 'serial_gradation_agents_for_rp', method: 'ipc.poll', args: [0, true] });
+        assert.deepEqual(initCursor.events, []);
+        await adapter.handleGuiRpc({ pluginName: 'serial_gradation_agents_for_rp', method: 'ipc.post', args: ['libra', 'memory_suite_source_rules_v1', { tag: 'first' }] });
+        await new Promise((r) => setTimeout(r, 25));
+        const poll1 = await adapter.handleGuiRpc({ pluginName: 'serial_gradation_agents_for_rp', method: 'ipc.poll', args: [initCursor.latestSeq] });
+        const multi1 = poll1.events.filter((e) => e.channel === 'multi_res_v1').map((e) => e.message.who).sort();
+        assert.deepEqual(multi1, ['fn1', 'fn2']);
+
+        // Remove only fn1 via 2-arg removePluginChannelListener
+        await adapter.handleGuiRpc({ pluginName: 'serial_gradation_agents_for_rp', method: 'ipc.post', args: ['libra', 'multi_ctrl_v1', { removeFn1: true }] });
+        await new Promise((r) => setTimeout(r, 25));
+        await adapter.handleGuiRpc({ pluginName: 'serial_gradation_agents_for_rp', method: 'ipc.post', args: ['libra', 'memory_suite_source_rules_v1', { tag: 'second' }] });
+        await new Promise((r) => setTimeout(r, 25));
+        const poll2 = await adapter.handleGuiRpc({ pluginName: 'serial_gradation_agents_for_rp', method: 'ipc.poll', args: [poll1.latestSeq] });
+        const multi2 = poll2.events.filter((e) => e.channel === 'multi_res_v1');
+        assert.equal(multi2.length, 1);
+        assert.equal(multi2[0].message.who, 'fn2');
+        assert.equal(multi2[0].message.count, 2);
+
+        // 4) GUI iframe cursor init ignores past events, then sees fresh reply from backend LIBRA
+        const cursorInit = await adapter.handleGuiRpc({ pluginName: 'serial_gradation_agents_for_rp', method: 'ipc.poll', args: [0, true] });
+        assert.deepEqual(cursorInit.events, []);
+        assert.ok(cursorInit.latestSeq > 0);
+
+        const guiPosted = await adapter.handleGuiRpc({ pluginName: 'serial_gradation_agents_for_rp', method: 'ipc.post', args: ['libra', 'gui_sync_req_v1', { ping: 'hello-gui' }] });
+        assert.equal(guiPosted, true);
+        await new Promise((r) => setTimeout(r, 25));
+
+        const guiPolled = await adapter.handleGuiRpc({ pluginName: 'serial_gradation_agents_for_rp', method: 'ipc.poll', args: [cursorInit.latestSeq] });
+        assert.equal(guiPolled.events.length, 1);
+        assert.equal(guiPolled.events[0].channel, 'gui_sync_res_v1');
+        assert.equal(guiPolled.events[0].message.echo, 'hello-gui');
+        assert.equal(guiPolled.events[0].sender, 'libra');
+    } finally {
+        await adapter.dispose();
+        delete globalThis.__l1;
+        delete globalThis.__l2;
+        delete globalThis.__libraRemoveFn1;
+        delete globalThis.__roguePostResult;
         try { fs.rmSync(tmpPluginsPath, { force: true }); } catch (_) {}
     }
 });

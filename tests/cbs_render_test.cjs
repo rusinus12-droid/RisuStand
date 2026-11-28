@@ -1138,3 +1138,580 @@ test('buildSnapshot emits full loreEntries (beyond 6000 chars), localLore, repla
         await harness.cleanup();
     }
 });
+
+test('buildSnapshot preserves firstMessage <style> blocks into backgroundHtml when chat exceeds 36 messages', async () => {
+    const db = {
+        enabledModules: [],
+        modules: [],
+        personas: [{ name: 'User', personaPrompt: '' }],
+        selectedPersona: 0,
+        customscript: [],
+        globalChatVariables: {},
+        characters: [],
+    };
+    const manyMsgs = [];
+    for (let i = 0; i < 40; i++) {
+        manyMsgs.push({ role: i % 2 === 0 ? 'user' : 'char', data: `turn ${i}` });
+    }
+    const characters = [{
+        chaId: 'long-chat-style-char',
+        name: 'StyleBot',
+        firstMessage: '<style>.cg-card{display:flex}</style>\n프롤로그 본문',
+        alternateGreetings: [],
+        customscript: [],
+        chats: [{
+            id: 'c-style-40',
+            name: 'Chat Long Style',
+            fmIndex: -1,
+            scriptstate: {},
+            message: manyMsgs,
+        }],
+    }];
+    const harness = await bootPluginWithMockRisu({ db, characters });
+    try {
+        const snap = [...harness.polls].reverse().find((p) => p.snapshot)?.snapshot;
+        assert.ok(snap);
+        assert.equal(snap.messages.length, 36);
+        assert.ok(snap.backgroundHtml.includes('.cg-card{display:flex}'));
+    } finally {
+        await harness.cleanup();
+    }
+});
+
+test('buildSnapshot resolves >2.5MB and older-turn assets via pcpath:, and {{raw::}}/{{path::}} never emit <img>', async () => {
+    const modAssets = [
+        ['big_portrait.png', 'assets/big_portrait.png'],
+        ['small_icon.png', 'assets/small_icon.png'],
+        ['older_only.png', 'assets/older_only.png'],
+    ];
+    const db = {
+        enabledModules: ['asset-edge-mod'],
+        modules: [{ id: 'asset-edge-mod', name: 'AEM', namespace: 'AEM', assets: modAssets, regex: [] }],
+        personas: [{ name: 'User', personaPrompt: '' }],
+        selectedPersona: 0,
+        customscript: [],
+        globalChatVariables: {},
+        characters: [],
+    };
+    const msgs = [
+        { role: 'char', data: '<img src="older_only.png">' },
+    ];
+    for (let i = 1; i < 11; i++) {
+        msgs.push({ role: i % 2 === 1 ? 'user' : 'char', data: `turn ${i}` });
+    }
+    msgs.push({
+        role: 'char',
+        data: '<div style="background-image:url(\'{{raw::big_portrait}}\')"></div>\n{{raw::small_icon}}\n{{path::big_portrait}}',
+    });
+    const characters = [{
+        chaId: 'asset-edge-char',
+        name: 'AssetEdgeBot',
+        firstMessage: '',
+        alternateGreetings: [],
+        customscript: [],
+        chats: [{
+            id: 'c-edge',
+            name: 'Chat Edge',
+            fmIndex: -1,
+            scriptstate: {},
+            message: msgs,
+        }],
+    }];
+    const bigBuf = new Uint8Array(3 * 1024 * 1024);
+    bigBuf.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+
+    const harness = await bootPluginWithMockRisu({
+        db,
+        characters,
+        onReadImage: (p, basePng) => {
+            if (p === 'assets/big_portrait.png') return bigBuf;
+            if (p === 'assets/small_icon.png' || p === 'assets/older_only.png') return basePng;
+            return null;
+        },
+    });
+    try {
+        const snap = [...harness.polls].reverse().find((p) => p.snapshot)?.snapshot;
+        assert.ok(snap);
+        const mapVals = Object.values(snap.assetMap);
+        assert.ok(mapVals.includes('pcpath:assets/big_portrait.png'), '>2.5MB asset must fall back to pcpath:');
+        assert.ok(mapVals.includes('pcpath:assets/older_only.png'), 'older-turn asset must resolve via lazyView pcpath:');
+        assert.ok(mapVals.some((v) => v.startsWith('data:image/png;base64,')), 'small recent asset remains inline data URI');
+
+        const m0 = snap.messages.find((m) => m.index === 0);
+        assert.equal(m0.images.length, 1, 'older message keeps image token');
+        assert.equal(snap.assetMap[m0.images[0].slice(10, -2)], 'pcpath:assets/older_only.png');
+
+        const mLast = snap.messages[snap.messages.length - 1];
+        assert.ok(!mLast.html.includes('<img class="msg-img"'), '{{raw::}} and {{path::}} must never emit <img> tags');
+    } finally {
+        await harness.cleanup();
+    }
+});
+
+test('editdisplay regexes sort by <move_top>, descending <order N>, and <move_bottom>', async () => {
+    const db = {
+        enabledModules: [],
+        modules: [],
+        personas: [{ name: 'User', personaPrompt: '' }],
+        selectedPersona: 0,
+        customscript: [],
+        globalChatVariables: {},
+        characters: [],
+    };
+    const characters = [{
+        chaId: 'order-char',
+        name: 'OrderBot',
+        firstMessage: '',
+        alternateGreetings: [],
+        customscript: [
+            { comment: 'bottom', type: 'editdisplay', in: '\\[TAG\\]', out: '[TAG]|bottom', ableFlag: true, flag: '<move_bottom><order 999>' },
+            { comment: 'low', type: 'editdisplay', in: '\\[TAG\\]', out: '[TAG]|order1', ableFlag: true, flag: '<order 1>' },
+            { comment: 'high', type: 'editdisplay', in: '\\[TAG\\]', out: '[TAG]|order10', ableFlag: true, flag: '<order 10>' },
+            { comment: 'top', type: 'editdisplay', in: '\\[TAG\\]', out: '[TAG]|top', ableFlag: true, flag: '<move_top>' },
+        ],
+        chats: [{
+            id: 'c-ord',
+            name: 'Order Chat',
+            fmIndex: -1,
+            scriptstate: {},
+            message: [{ role: 'char', data: '[TAG]' }],
+        }],
+    }];
+    const harness = await bootPluginWithMockRisu({ db, characters });
+    try {
+        const snap = [...harness.polls].reverse().find((p) => p.snapshot)?.snapshot;
+        assert.ok(snap);
+        // Execution order: top -> order10 -> order1 -> bottom
+        // Each step replaces [TAG] with [TAG]|<label>, so the resulting suffix order is:
+        // top: [TAG]|top -> order10: [TAG]|order10|top -> order1: [TAG]|order1|order10|top -> bottom: [TAG]|bottom|order1|order10|top
+        assert.equal(snap.messages[0].text, '[TAG]|bottom|order1|order10|top');
+    } finally {
+        await harness.cleanup();
+    }
+});
+
+test('PC Host RPC db.getChat skips getCharacterFromIndex when chat.id/charIdByIndex exists and getMany ops return all keys', async () => {
+    const storage = new Map([
+        ['risustand_perms_prompted_v3', `${CURRENT_VERSION}:${Date.now()}`],
+        ['risustand_remote_bridge_v2', JSON.stringify({
+            enabled: true,
+            relayUrl: 'http://127.0.0.1:8788',
+            token: 'rpc-fast-token',
+            includeImages: false,
+            pollIntervalMs: 1800,
+        })],
+        ['hayaku:a', { step: 1 }],
+        ['hayaku:b', { step: 2 }],
+    ]);
+    const localPluginData = new Map([['lk1', 'lv1'], ['lk2', 'lv2']]);
+    const safeLocalData = new Map([['sk1', 'sv1'], ['sk2', 'sv2']]);
+    const characters = [{
+        chaId: 'fast-char-0',
+        name: 'FastBot',
+        firstMessage: 'hi',
+        alternateGreetings: [],
+        chats: [{
+            id: 'fast-chat-0',
+            name: 'Main',
+            fmIndex: -1,
+            scriptstate: {},
+            message: [{ role: 'char', data: 'ready' }],
+        }],
+    }];
+    let getCharCalls = 0;
+    let pollCount = 0;
+    let postedRpcResults = null;
+    const timers = new Set();
+    let unloadCb = null;
+    const trackTimer = (id) => { timers.add(id); return id; };
+    const untrackTimer = (id) => { timers.delete(id); clearTimeout(id); clearInterval(id); };
+
+    const risuai = {
+        pluginStorage: {
+            getItem: async (k) => (storage.has(k) ? storage.get(k) : null),
+            setItem: async (k, v) => { storage.set(k, v); },
+        },
+        safeLocalStorage: {
+            getItem: async (k) => (safeLocalData.has(k) ? safeLocalData.get(k) : null),
+            setItem: async (k, v) => { safeLocalData.set(k, v); },
+        },
+        getLocalPluginStorage: async () => ({
+            getItem: async (k) => (localPluginData.has(k) ? localPluginData.get(k) : null),
+            setItem: async (k, v) => { localPluginData.set(k, v); },
+        }),
+        getRootDocument: async () => null,
+        changeColorScheme: async () => {},
+        changeTextTheme: async () => {},
+        setColorScheme: async () => {},
+        setCustomTextTheme: async () => {},
+        registerButton: async () => {},
+        registerSetting: async () => {},
+        addRisuChatListener: async () => {},
+        removeRisuChatListener: async () => {},
+        createMutationObserver: async () => ({ observe: async () => {}, disconnect: async () => {} }),
+        onUnload: async (fn) => { unloadCb = fn; },
+        getDatabase: async () => ({ enabledModules: [], modules: [], personas: [], selectedPersona: 0, customscript: [], globalChatVariables: {}, characters }),
+        setDatabaseLite: async () => {},
+        getCurrentCharacterIndex: async () => 0,
+        getCurrentChatIndex: async () => 0,
+        getCharacter: async () => characters[0],
+        getCharacterFromIndex: async (i) => {
+            getCharCalls += 1;
+            return characters[i] || null;
+        },
+        setCharacterToIndex: async (i, c) => { characters[i] = c; },
+        getChatFromIndex: async (cIdx, chIdx) => (characters[cIdx] && characters[cIdx].chats[chIdx]) || null,
+        setChatToIndex: async (cIdx, chIdx, chatObj) => { characters[cIdx].chats[chIdx] = chatObj; },
+        readImage: async () => null,
+        readInlay: async () => null,
+        sendChat: async () => {},
+        nativeFetch: async (url, opts) => {
+            if (String(url).endsWith('/api/pc/poll')) {
+                pollCount += 1;
+                if (pollCount === 1) {
+                    return {
+                        ok: true,
+                        status: 200,
+                        json: async () => ({
+                            ok: true,
+                            relayVersion: '1.0.0',
+                            supportsHostRpc: false,
+                            commands: [],
+                            rpcCalls: [
+                                { id: 'c1', op: 'db.getChat', args: [0, 0] },
+                                { id: 'c2', op: 'pluginStorage.getMany', args: [['hayaku:a', 'hayaku:b', 'hayaku:a']] },
+                                { id: 'c3', op: 'localPluginStorage.getMany', args: [['lk1', 'lk2']] },
+                                { id: 'c4', op: 'safeLocalStorage.getMany', args: [['sk1', 'sk2']] },
+                            ],
+                        }),
+                    };
+                }
+                return { ok: true, status: 200, json: async () => ({ ok: true, relayVersion: '1.0.0', commands: [] }) };
+            }
+            if (String(url).endsWith('/api/pc/rpc-result')) {
+                postedRpcResults = JSON.parse(opts.body).results;
+                return { ok: true, status: 200, json: async () => ({ ok: true }) };
+            }
+            return { ok: true, status: 200, json: async () => ({ ok: true, calls: [] }) };
+        },
+    };
+
+    const context = {
+        risuai,
+        console,
+        crypto,
+        btoa: (bin) => Buffer.from(bin, 'binary').toString('base64'),
+        Uint8Array,
+        ArrayBuffer,
+        structuredClone,
+        Blob,
+        URL,
+        setTimeout: (fn, ms) => trackTimer(setTimeout(fn, ms)),
+        clearTimeout: (id) => untrackTimer(id),
+        setInterval: (fn, ms) => trackTimer(setInterval(fn, ms)),
+        clearInterval: (id) => untrackTimer(id),
+    };
+    context.globalThis = context;
+
+    const getCharCallsBeforeRpc = () => getCharCalls;
+    try {
+        const src = fs.readFileSync(path.join(REPO, 'risustand.js'), 'utf8');
+        vm.runInNewContext(src, context, { filename: 'risustand.js' });
+        for (let i = 0; i < 60 && !postedRpcResults; i++) {
+            await new Promise((r) => setTimeout(r, 20));
+        }
+        assert.ok(Array.isArray(postedRpcResults), 'PC bridge should post RPC batch results');
+        const byId = Object.fromEntries(postedRpcResults.map((r) => [r.id, r]));
+        assert.equal(byId.c1.ok, true);
+        assert.equal(byId.c1.value.id, 'fast-chat-0');
+        assert.deepEqual(byId.c2.value, { 'hayaku:a': { step: 1 }, 'hayaku:b': { step: 2 } });
+        assert.deepEqual(byId.c3.value, { lk1: 'lv1', lk2: 'lv2' });
+        assert.deepEqual(byId.c4.value, { sk1: 'sv1', sk2: 'sv2' });
+        // buildSnapshot warms charIdByIndex once via getCharacterFromIndex; db.getChat must NOT trigger extra calls
+        assert.equal(getCharCallsBeforeRpc(), 1, 'db.getChat must not invoke getCharacterFromIndex again');
+    } finally {
+        if (unloadCb) await unloadCb();
+        for (const id of timers) { clearTimeout(id); clearInterval(id); }
+        timers.clear();
+    }
+});
+
+test('buildSnapshot omits dead pcpath: entries for missing recent assets while preserving >2.5MB pcpath: fallback', async () => {
+    const bigBuf = new Uint8Array(3 * 1024 * 1024);
+    bigBuf.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+    const db = {
+        enabledModules: ['m1'],
+        modules: [{
+            id: 'm1',
+            name: 'M1',
+            assets: [
+                ['missing_img.png', 'assets/missing_img.png'],
+                ['huge_img.png', 'assets/huge_img.png'],
+            ],
+            regex: [],
+        }],
+        personas: [{ name: 'User', personaPrompt: '' }],
+        selectedPersona: 0,
+        customscript: [],
+        globalChatVariables: {},
+        characters: [],
+    };
+    const characters = [{
+        chaId: 'missing-asset-char',
+        name: 'MissingAssetBot',
+        firstMessage: '',
+        alternateGreetings: [],
+        customscript: [],
+        chats: [{
+            id: 'c-miss',
+            name: 'Chat Miss',
+            fmIndex: -1,
+            scriptstate: {},
+            message: [{ role: 'char', data: '<img src="missing_img.png">\n<img src="huge_img.png">' }],
+        }],
+    }];
+    const harness = await bootPluginWithMockRisu({
+        db,
+        characters,
+        onReadImage: (p) => (p === 'assets/huge_img.png' ? bigBuf : null),
+    });
+    try {
+        const snap = [...harness.polls].reverse().find((p) => p.snapshot)?.snapshot;
+        assert.ok(snap);
+        const vals = Object.values(snap.assetMap);
+        assert.ok(!vals.includes('pcpath:assets/missing_img.png'), 'missing recent asset must not emit dead pcpath:');
+        assert.ok(vals.includes('pcpath:assets/huge_img.png'), 'oversized (>2.5MB) existing asset still uses pcpath:');
+    } finally {
+        await harness.cleanup();
+    }
+});
+
+test('buildSnapshot supports assetlist/string-array CBS, bare CSS url() assets, and 12MB cliff pcpath: fallback', async () => {
+    const makeDistinctPng = (idx) => {
+        const b = new Uint8Array(1.65 * 1024 * 1024);
+        b.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a], 0);
+        for (let j = 8; j < 64; j++) b[j] = (j + idx * 17) & 0xff;
+        return b;
+    };
+
+    const additionalAssets = [];
+    for (let i = 1; i <= 6; i++) {
+        additionalAssets.push([`portrait_${i}.png`, `assets/portrait_${i}.png`, 'png']);
+    }
+    const db = {
+        enabledModules: [],
+        modules: [],
+        personas: [{ name: 'User', personaPrompt: '' }],
+        selectedPersona: 0,
+        customscript: [
+            {
+                type: 'editdisplay',
+                comment: 'cbs_asset_and_css_url',
+                in: '\\[SHOW_PORTRAIT:([^\\]]+)\\]',
+                out: '{{#if {{includes::{{assetlist}}::{{trim::$1}}}}}}<div class="cg-photo" data-em="{{upper::{{array_element::{{emotionlist}}::0}}}}" data-ok="{{startswith::{{lowercase::{{trim::$1}}}}::portrait_}}/{{endswith::{{trim::$1}}::.png}}/{{join::{{split::a,b::,}}::-}}/{{index_of::{{assetlist}}::portrait_1.png}}" style="background-image: url(\'{{trim::$1}}\')"></div>{{/if}}',
+                ableFlag: false,
+            },
+        ],
+        globalChatVariables: {},
+        characters: [],
+    };
+    const characters = [{
+        chaId: 'cliff-asset-char',
+        name: 'ClaugemBot',
+        firstMessage: '',
+        alternateGreetings: [],
+        additionalAssets,
+        emotionImages: [['happy', 'assets/happy.png']],
+        customscript: [],
+        chats: [{
+            id: 'c-cliff',
+            name: 'Chat Cliff',
+            fmIndex: -1,
+            scriptstate: {},
+            message: [{
+                role: 'char',
+                data: additionalAssets.map((a) => `[SHOW_PORTRAIT:${a[0]}]`).join('\n'),
+            }],
+        }],
+    }];
+    const harness = await bootPluginWithMockRisu({
+        db,
+        characters,
+        onReadImage: (p) => {
+            const m = String(p || '').match(/assets\/portrait_(\d+)\.png$/);
+            return m ? makeDistinctPng(Number(m[1])) : null;
+        },
+    });
+    try {
+        const snap = [...harness.polls].reverse().find((p) => p.snapshot)?.snapshot;
+        assert.ok(snap);
+        const msg = snap.messages[0];
+        assert.ok(msg.html.includes('data-em="HAPPY"'));
+        assert.ok(msg.html.includes('data-ok="1/1/a-b/0"'));
+        const bgMatches = [...msg.html.matchAll(/background-image:\s*url\('([^']+)'\)/g)].map((m) => m[1]);
+        assert.equal(bgMatches.length, 6, 'all 6 polaroid portraits must resolve even past 12MB inline cap');
+        const resolvedValues = bgMatches.map((tok) => snap.assetMap[tok.replace('[[RSASSET:', '').replace(']]', '')]);
+        assert.ok(resolvedValues.some((v) => String(v).startsWith('data:image/png')), 'early portraits inline as data URI');
+        assert.ok(resolvedValues.includes('pcpath:assets/portrait_6.png'), 'portrait past 12MB cap falls back to pcpath: instead of dropping');
+    } finally {
+        await harness.cleanup();
+    }
+});
+
+test('buildSnapshot supports RisuAI named capture groups, <no_end_nl>, CRLF normalization, {{#escape}}, and extended CBS', async () => {
+    const db = {
+        enabledModules: [],
+        modules: [],
+        personas: [{ name: 'Tester', personaPrompt: 'Calm observer' }],
+        selectedPersona: 0,
+        customscript: [],
+        globalChatVariables: { toggle_hud: 'on' },
+        characters: [],
+    };
+    const characters = [{
+        chaId: 'regex-cbs-parity-char',
+        name: 'HyeyeonBot',
+        firstMessage: '첫 인사',
+        alternateGreetings: [],
+        customScripts: [
+            {
+                type: 'editdisplay',
+                comment: 'named_group_and_no_end_nl',
+                in: '\\[FLAG:(?<kind>[a-z]+):(?<val>\\d+)\\]',
+                out: '<span class="hy-flag" data-k="$<kind>">$<val></span>\n',
+                ableFlag: true,
+                flag: 'g<no_end_nl>',
+            },
+        ],
+        chats: [{
+            id: 'c-parity',
+            name: 'Chat Parity',
+            fmIndex: -1,
+            scriptstate: { $json_map: '{"hp":90,"mp":"full"}' },
+            message: [
+                { role: 'user', data: '이전 질문' },
+                {
+                    role: 'char',
+                    data: '줄1\r\n[FLAG:luck:6]\r\n{{#escape}}{{raw_literal_cbs}}{{/escape}}\r\n{{#when::is_last_msg}}LAST:{{/when}}{{#when::toggle::hud::is::on}}{{role}}|{{dictelement::{{getvar::json_map}}::hp}}|{{round::3.6}}|{{substr::abcdef::1::4}}|{{previous_chat_log::0}}{{/when}}',
+                },
+            ],
+        }],
+    }];
+    const harness = await bootPluginWithMockRisu({ db, characters });
+    try {
+        const snap = [...harness.polls].reverse().find((p) => p.snapshot)?.snapshot;
+        assert.ok(snap);
+        const msg = snap.messages.find((m) => m.index === 1);
+        assert.ok(msg);
+        assert.ok(msg.html.includes('<span class="hy-flag" data-k="luck">6</span>'), 'named capture group $<kind>/$<val> resolves');
+        assert.ok(!msg.html.includes('<span class="hy-flag" data-k="luck">6</span>\n\n'), '<no_end_nl> strips trailing newline');
+        assert.ok(msg.html.includes('{{raw_literal_cbs}}'), '{{#escape}} preserves literal CBS');
+        assert.ok(msg.html.includes('LAST:char|90|4|bcd|이전 질문'), 'is_last_msg, toggle::is, role, dictelement, round, substr, previous_chat_log work');
+    } finally {
+        await harness.cleanup();
+    }
+});
+
+test('select_target switches chat immediately via pollOnce without blocking on setCharacterToIndex', async () => {
+    const db = {
+        enabledModules: [],
+        modules: [],
+        personas: [{ name: 'User', personaPrompt: '' }],
+        selectedPersona: 0,
+        customscript: [],
+        globalChatVariables: {},
+        characters: [],
+    };
+    const characters = [
+        {
+            chaId: 'char-a',
+            name: 'Alpha',
+            chatPage: 0,
+            chats: [
+                { id: 'a-c0', name: 'Room A0', message: [{ role: 'char', data: '방 A0 인사말' }] },
+                { id: 'a-c1', name: 'Room A1', message: [{ role: 'char', data: '방 A1 인사말' }] },
+            ],
+        },
+        {
+            chaId: 'char-b',
+            name: 'Beta',
+            chatPage: 0,
+            chats: [
+                { id: 'b-c0', name: 'Room B0', message: [{ role: 'char', data: '방 B0 인사말' }] },
+            ],
+        },
+    ];
+    const harness = await bootPluginWithMockRisu({ db, characters });
+    const origPoll0 = harness.polls[0];
+    assert.equal(origPoll0.snapshot.charIndex, 0);
+    assert.equal(origPoll0.snapshot.chatIndex, 0);
+    try {
+        await harness.triggerNextPoll({ type: 'select_target', payload: { charIndex: 0, chatIndex: 1 } });
+        let switchedA1 = null;
+        for (let i = 0; i < 40; i += 1) {
+            switchedA1 = [...harness.polls].reverse().find((p) => p.snapshot && p.snapshot.charIndex === 0 && p.snapshot.chatIndex === 1);
+            if (switchedA1) break;
+            await new Promise((r) => setTimeout(r, 25));
+        }
+        assert.ok(switchedA1, 'select_target should switch to (0, 1)');
+        assert.equal(switchedA1.snapshot.chatName, 'Room A1');
+
+        await harness.triggerNextPoll({ type: 'select_target', payload: { charIndex: 1, chatIndex: 0 } });
+        let switchedB0 = null;
+        for (let i = 0; i < 40; i += 1) {
+            switchedB0 = [...harness.polls].reverse().find((p) => p.snapshot && p.snapshot.charIndex === 1 && p.snapshot.chatIndex === 0);
+            if (switchedB0) break;
+            await new Promise((r) => setTimeout(r, 25));
+        }
+        assert.ok(switchedB0, 'select_target should switch to (1, 0)');
+        assert.equal(switchedB0.snapshot.charName, 'Beta');
+        assert.equal(switchedB0.snapshot.chatName, 'Room B0');
+    } finally {
+        await harness.cleanup();
+    }
+});
+
+test('risustand.js evalCBS supports {{source::user/char}}, comparison aliases, tonumber, and metadata macros', async () => {
+    const db = {
+        enabledModules: [],
+        modules: [],
+        personas: [{ name: '푸딩', personaPrompt: '', icon: 'assets/pudding_avatar.png' }],
+        selectedPersona: 0,
+        customscript: [],
+        globalChatVariables: {},
+        characters: [],
+    };
+    const characters = [{
+        chaId: 'char-cbs-parity2',
+        name: '혜연',
+        image: 'assets/hy_main.png',
+        chatPage: 0,
+        chats: [{
+            id: 'c-cbs2',
+            name: 'Chat CBS 2',
+            note: '메모테스트',
+            scriptstate: {},
+            message: [
+                { role: 'user', data: '안녕' },
+                {
+                    role: 'char',
+                    data: 'U:{{source::user}}|C:{{source::char}}|CMP:{{gt::5::3}}:{{lte::2::2}}:{{eq::01::1}}:{{neq::a::b}}|N:{{tonumber::42}}|NOTE:{{authorsnote}}|LAST:{{lastusermessage}}',
+                },
+            ],
+        }],
+    }];
+    const harness = await bootPluginWithMockRisu({ db, characters });
+    try {
+        const snap = [...harness.polls].reverse().find((p) => p.snapshot)?.snapshot;
+        assert.ok(snap);
+        assert.equal(snap.charContext.personaIcon, 'assets/pudding_avatar.png');
+        assert.equal(snap.charContext.charImage, 'assets/hy_main.png');
+        const msg = snap.messages.find((m) => m.index === 1);
+        assert.ok(msg);
+        assert.ok(msg.html.includes('CMP:1:1:1:1|N:42|NOTE:메모테스트|LAST:안녕'), `got: ${msg.html}`);
+        assert.ok(!msg.html.includes('{{source::'), 'source macros must be evaluated');
+        assert.ok(msg.html.includes('U:[[RSASSET:') && msg.html.includes('C:[[RSASSET:'), 'asset source paths must resolve into RSASSET tokens');
+    } finally {
+        await harness.cleanup();
+    }
+});

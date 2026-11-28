@@ -232,6 +232,13 @@ function extractOrderFlag(flagStr) {
     return m ? Number(m[1]) : 0;
 }
 
+function getRegexBucket(flagStr) {
+    const f = String(flagStr || '');
+    if (f.includes('<move_top>')) return 0;
+    if (f.includes('<move_bottom>')) return 2;
+    return 1;
+}
+
 function assignBothToggleKeys(out, rawKey, rawVal) {
     const k = String(rawKey || '').trim();
     if (!k) return;
@@ -270,7 +277,7 @@ function applyToggleSyntaxDefaults(toggleSyntax = '', defaultVariablesText = '',
 }
 
 function runRegexScripts(mode, text, scripts, cbsFn) {
-    let cur = String(text ?? '');
+    let cur = String(text ?? '').replace(/\r\n/g, '\n');
     if (!Array.isArray(scripts) || !scripts.length) return cur;
 
     const matching = [];
@@ -278,9 +285,9 @@ function runRegexScripts(mode, text, scripts, cbsFn) {
         const s = scripts[i];
         if (!s || s.type !== mode) continue;
         if (!s.in || typeof s.in !== 'string') continue;
-        matching.push({ script: s, order: extractOrderFlag(s.flag), idx: i });
+        matching.push({ script: s, bucket: getRegexBucket(s.flag), order: extractOrderFlag(s.flag), idx: i });
     }
-    matching.sort((a, b) => (b.order - a.order) || (a.idx - b.idx));
+    matching.sort((a, b) => (a.bucket - b.bucket) || (b.order - a.order) || (a.idx - b.idx));
 
     for (const item of matching) {
         const s = item.script;
@@ -290,21 +297,36 @@ function runRegexScripts(mode, text, scripts, cbsFn) {
             const inPattern = inHasCbs ? String(cbsFn(s.in)) : s.in;
             if (!inPattern) continue;
 
+            const metaAdded = (flagText.includes('<ignore_case>') ? 'i' : '')
+                + (flagText.includes('<multiline>') ? 'm' : '')
+                + (flagText.includes('<dotall>') ? 's' : '')
+                + (flagText.includes('<global>') ? 'g' : '');
             const strippedFlags = flagText.replace(/<[^>]+>/g, '');
-            let regexFlags = strippedFlags.replace(/[^dgimsuvy]/g, '');
+            let regexFlags = Array.from(new Set((strippedFlags.replace(/[^dgimsuvy]/g, '') + metaAdded).split(''))).join('');
             if (!regexFlags && !flagText.includes('<no_g>')) regexFlags = 'g';
+            else if (!regexFlags.includes('g') && !flagText.includes('<no_g>')) regexFlags += 'g';
             const re = new RegExp(inPattern, regexFlags);
             if (!re.test(cur)) continue;
             re.lastIndex = 0;
 
-            const rawOut = String(s.out ?? '').replace(/\\n/g, '\n');
+            let rawOut = String(s.out ?? '').replace(/\\n/g, '\n');
+            if (flagText.includes('<no_end_nl>') && rawOut.endsWith('\n')) {
+                rawOut = rawOut.slice(0, -1);
+            }
             cur = cur.replace(re, (...args) => {
                 const whole = args[0];
-                const caps = args.slice(1, -2);
-                const substituted = rawOut.replace(/\$(\$|&|\d{1,2})/g, (_, tok) => {
-                    if (tok === '$') return '$';
-                    if (tok === '&') return whole;
-                    const n = parseInt(tok, 10);
+                const hasGroups = args.length >= 4 && typeof args[args.length - 1] === 'object' && args[args.length - 1] !== null && typeof args[args.length - 2] === 'string';
+                const groups = hasGroups ? args[args.length - 1] : null;
+                const inputStr = hasGroups ? args[args.length - 2] : args[args.length - 1];
+                const offset = hasGroups ? args[args.length - 3] : args[args.length - 2];
+                const caps = hasGroups ? args.slice(1, -3) : args.slice(1, -2);
+                const substituted = rawOut.replace(/\$(?:\$|&|`|'|<([^>]+)>|(\d{1,2}))/g, (tok, groupName, numStr) => {
+                    if (tok === '$$') return '$';
+                    if (tok === '$&') return whole;
+                    if (tok === '$`') return typeof inputStr === 'string' && typeof offset === 'number' ? inputStr.slice(0, offset) : '';
+                    if (tok === "$'") return typeof inputStr === 'string' && typeof offset === 'number' ? inputStr.slice(offset + whole.length) : '';
+                    if (groupName !== undefined) return groups && groups[groupName] !== undefined ? String(groups[groupName]) : '';
+                    const n = parseInt(numStr, 10);
                     if (n === 0) return whole;
                     if (n >= 1 && n <= caps.length && caps[n - 1] !== undefined) return String(caps[n - 1]);
                     return '';
@@ -455,7 +477,8 @@ function createModuleAdapter({
         if (activeCtx.chatObj && activeCtx.chatObj.scriptstate && typeof activeCtx.chatObj.scriptstate === 'object') {
             for (const [k, v] of Object.entries(activeCtx.chatObj.scriptstate)) {
                 const clean = k.startsWith('$') ? k.slice(1) : k;
-                if (clean) cVars[clean] = String(v ?? '');
+                if (!clean) continue;
+                cVars[clean] = typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v ?? '');
             }
         }
         const rawMsgs = activeCtx.chatObj && Array.isArray(activeCtx.chatObj.message) ? activeCtx.chatObj.message : [];
@@ -479,14 +502,17 @@ function createModuleAdapter({
     function runCbs(text, msgIndex = undefined, lastMsgId = undefined) {
         try {
             const ctx = buildCbsContext(msgIndex, lastMsgId);
+            const prevVars = { ...ctx.chatVars };
             const result = String(evalCbs(String(text ?? ''), ctx));
             if (activeCtx.chatObj && ctx.chatVars && typeof ctx.chatVars === 'object') {
                 if (!activeCtx.chatObj.scriptstate || typeof activeCtx.chatObj.scriptstate !== 'object') {
                     activeCtx.chatObj.scriptstate = {};
                 }
                 for (const [k, v] of Object.entries(ctx.chatVars)) {
+                    const nextVal = String(v ?? '');
+                    if (prevVars[k] === nextVal) continue;
                     const keyName = k.startsWith('$') ? k : `$${k}`;
-                    activeCtx.chatObj.scriptstate[keyName] = String(v ?? '');
+                    activeCtx.chatObj.scriptstate[keyName] = nextVal;
                 }
             }
             return result;
@@ -842,9 +868,12 @@ function createModuleAdapter({
             else activeCtx.chatObj.localLore.push(entryObj);
         });
 
-        // CBS, Hashing & UI alerts/controls
-        engine.global.set('cbs', (_id, text) => runCbs(text));
-        engine.global.set('hash', (_id, text) => crypto.createHash('sha256').update(String(text ?? '')).digest('hex'));
+        // CBS, Hashing, Logging & UI alerts/controls
+        engine.global.set('log', (...args) => {
+            console.log(`[Module:${entry.sourceName}]`, ...args);
+        });
+        engine.global.set('cbs', (a, b) => runCbs(b !== undefined ? b : a));
+        engine.global.set('hash', (a, b) => crypto.createHash('sha256').update(String((b !== undefined ? b : a) ?? '')).digest('hex'));
         engine.global.set('stopChat', () => {
             activeCtx.stopSending = true;
         });
@@ -854,11 +883,14 @@ function createModuleAdapter({
         engine.global.set('reloadChat', () => {
             activeCtx.needsDisplayRefresh = true;
         });
-        engine.global.set('alertNormal', (_id, msg) => {
-            onTriggerNotice({ kind: 'notice', title: entry.sourceName, message: String(msg ?? '') });
+        engine.global.set('alert', (a, b) => {
+            onTriggerNotice({ kind: 'notice', title: entry.sourceName, message: String((b !== undefined ? b : a) ?? '') });
         });
-        engine.global.set('alertError', (_id, msg) => {
-            onTriggerNotice({ kind: 'alert_error', title: entry.sourceName, message: String(msg ?? '') });
+        engine.global.set('alertNormal', (a, b) => {
+            onTriggerNotice({ kind: 'notice', title: entry.sourceName, message: String((b !== undefined ? b : a) ?? '') });
+        });
+        engine.global.set('alertError', (a, b) => {
+            onTriggerNotice({ kind: 'alert_error', title: entry.sourceName, message: String((b !== undefined ? b : a) ?? '') });
         });
         engine.global.set('alertConfirm', async (_id, msg) => {
             const ps = activeCtx.promptState;
@@ -1064,6 +1096,7 @@ function createModuleAdapter({
     }
 
     function endTurn() {
+        invalidateDisplayCache();
         activeCtx.active = false;
         activeCtx.syncToSharedTurn = null;
     }
@@ -1148,7 +1181,7 @@ function createModuleAdapter({
         };
     }
 
-    async function runEditPhase(phase, data, meta = {}) {
+    async function runEditPhase(phase, data, meta = {}, { skipRegex = false } = {}) {
         const regexModeMap = {
             editInput: 'editinput',
             editRequest: 'editprocess',
@@ -1160,7 +1193,7 @@ function createModuleAdapter({
         let current = data;
 
         // 1) Custom regex scripts
-        if (regexMode && scripts.length) {
+        if (!skipRegex && regexMode && scripts.length) {
             const hasMatchingRegex = scripts.some((s) => s && s.type === regexMode && s.in);
             const runRegex = () => {
                 if (phase === 'editRequest' && Array.isArray(current)) {
@@ -1371,9 +1404,9 @@ function createModuleAdapter({
         }
     }
 
-    async function runInteraction({ charIndex, chatIndex, charObj, chatObj, modulesOverride = null, kind = 'button', code = '', key = '', formValues = {} } = {}) {
+    async function runInteraction({ charIndex, chatIndex, charObj, chatObj, modulesOverride = null, personaName = undefined, kind = 'button', code = '', key = '', formValues = {} } = {}) {
         const wasActive = activeCtx.active;
-        await prepareTurn({ charIndex, chatIndex, charObj, chatObj, modulesOverride });
+        await prepareTurn({ charIndex, chatIndex, charObj, chatObj, modulesOverride, ...(personaName ? { personaName } : {}) });
         try {
             const res = kind === 'form'
                 ? await runTriggerMode('onFormSubmit', { meta: { key, formValues } })
@@ -1388,7 +1421,215 @@ function createModuleAdapter({
         }
     }
 
+    let displayCtxCache = null;
+
+    function invalidateDisplayCache() {
+        displayCtxCache = null;
+    }
+
+    function buildAssetPathIndex(charObj, modulesList) {
+        const assetPathsByName = Object.create(null);
+        const addEntry = (rawName, rawPath, ext = '') => {
+            const name = String(rawName || '').trim();
+            const p = String(rawPath || '').trim();
+            if (!name || !p) return;
+            if (!assetPathsByName[name]) assetPathsByName[name] = p;
+            const lower = name.toLowerCase();
+            if (!assetPathsByName[lower]) assetPathsByName[lower] = p;
+            const noExt = lower.replace(/\.[a-z0-9]{2,5}$/i, '');
+            if (noExt && !assetPathsByName[noExt]) assetPathsByName[noExt] = p;
+            if (ext && !lower.includes('.')) {
+                const withExt = `${lower}.${String(ext).toLowerCase()}`;
+                if (!assetPathsByName[withExt]) assetPathsByName[withExt] = p;
+            }
+        };
+        const pushList = (arr) => {
+            if (!Array.isArray(arr)) return;
+            for (const item of arr) {
+                if (Array.isArray(item) && item[0] && item[1]) addEntry(item[0], item[1], item[2]);
+                else if (item && typeof item === 'object' && item.name && (item.key || item.path)) {
+                    addEntry(item.name, item.key || item.path, item.ext);
+                }
+            }
+        };
+        if (charObj) {
+            pushList(charObj.additionalAssets);
+            pushList(charObj.emotionImages);
+        }
+        for (const m of modulesList || []) {
+            if (m && Array.isArray(m.assets)) pushList(m.assets);
+        }
+        return assetPathsByName;
+    }
+
+    async function runDisplayLuaForSnapshot(baseSnap, messages = null, opts = {}) {
+        if (!isRpcConnected() || activeCtx.active || !baseSnap || typeof baseSnap !== 'object') return null;
+        const msgList = Array.isArray(messages) ? messages : baseSnap.messages;
+        if (!Array.isArray(msgList) || !msgList.length) return null;
+        const cIdx = Number(baseSnap.charIndex ?? -1);
+        const chIdx = Number(baseSnap.chatIndex ?? 0);
+        if (!Number.isInteger(cIdx) || cIdx < 0) return null;
+
+        const modSig = Array.isArray(baseSnap.chatModules)
+            ? baseSnap.chatModules.map((m) => `${m && m.id}:${m && m.enabled ? 1 : 0}`).join(',')
+            : '';
+        const cacheKey = `${cIdx}:${chIdx}:${modSig}`;
+        const now = Date.now();
+        let cached = displayCtxCache && displayCtxCache.key === cacheKey && (now - displayCtxCache.at) < 5000
+            ? displayCtxCache
+            : null;
+
+        let bundledChat = null;
+        const fetchCharDisplayMeta = async () => {
+            try {
+                const meta = await hostRpc.invoke('db.getCharacterDisplayMeta', [cIdx], 6000);
+                if (meta && typeof meta === 'object') return meta;
+            } catch (_) {}
+            return await hostRpc.invoke('db.getCharacter', [cIdx], 10000);
+        };
+
+        if (!cached) {
+            try {
+                let charObj = null;
+                let mods = [];
+                let globalChatVariables = {};
+                let bundle = null;
+                try {
+                    bundle = await hostRpc.invoke('db.getDisplayLuaBundle', [cIdx, chIdx], 10000);
+                } catch (_) {}
+                if (bundle && typeof bundle === 'object' && bundle.charObj) {
+                    charObj = bundle.charObj;
+                    mods = Array.isArray(bundle.modules) ? bundle.modules : [];
+                    globalChatVariables = (bundle.globalChatVariables && typeof bundle.globalChatVariables === 'object') ? bundle.globalChatVariables : {};
+                    bundledChat = bundle.chatObj || null;
+                } else {
+                    const [modPayload, fetchedChar] = await Promise.all([
+                        hostRpc.invoke('db.getActiveModules', [cIdx, chIdx], 10000),
+                        fetchCharDisplayMeta(),
+                    ]);
+                    charObj = fetchedChar || null;
+                    mods = modPayload && Array.isArray(modPayload.modules) ? modPayload.modules : [];
+                    globalChatVariables = (modPayload && modPayload.globalChatVariables) || {};
+                }
+                const entries = collectTriggerLuaEntries(charObj, mods);
+                const hasLuaEditDisplay = entries.some((e) => /listenEdit/i.test(String((e && e.code) || '')));
+                cached = {
+                    key: cacheKey,
+                    at: now,
+                    charObj,
+                    modules: mods,
+                    globalChatVariables,
+                    assetPathsByName: buildAssetPathIndex(charObj, mods),
+                    hasLuaEditDisplay,
+                };
+                displayCtxCache = cached;
+            } catch (err) {
+                console.warn('[ModuleAdapter] runDisplayLuaForSnapshot metadata error:', err && err.message ? err.message : err);
+                return null;
+            }
+        }
+        if (!cached || !cached.hasLuaEditDisplay) return null;
+
+        const entries = collectTriggerLuaEntries(cached.charObj, cached.modules);
+        if (!entries.length) return null;
+
+        let freshChat = bundledChat;
+        if (!freshChat) {
+            try {
+                freshChat = await hostRpc.invoke('db.getChat', [cIdx, chIdx], 8000);
+            } catch (err) {
+                console.warn('[ModuleAdapter] runDisplayLuaForSnapshot db.getChat error:', err && err.message ? err.message : err);
+            }
+        }
+        if (!freshChat && cached.charObj && Array.isArray(cached.charObj.chats)) {
+            freshChat = cached.charObj.chats[chIdx] || null;
+        }
+        const chatClone = freshChat
+            ? { ...freshChat, scriptstate: { ...(freshChat.scriptstate || {}) } }
+            : { message: [], scriptstate: {} };
+        if (!Array.isArray(chatClone.message) || !chatClone.message.length) {
+            const synthLen = Math.max(
+                Number(baseSnap.totalMessages) || 0,
+                msgList.reduce((acc, m) => Math.max(acc, Number(m && m.index) >= 0 ? Number(m.index) + 1 : 0), 0)
+            );
+            const synthMsgs = Array.from({ length: synthLen }, () => ({ role: 'char', data: '', chatId: '' }));
+            for (const m of msgList) {
+                const idx = Number(m && m.index);
+                if (Number.isInteger(idx) && idx >= 0) {
+                    synthMsgs[idx] = {
+                        role: m.role === 'user' ? 'user' : 'char',
+                        data: String(m.raw || m.text || m.html || ''),
+                        chatId: String(m.chatId || ''),
+                    };
+                }
+            }
+            chatClone.message = synthMsgs;
+        }
+        if (baseSnap.chatVariables && typeof baseSnap.chatVariables === 'object') {
+            for (const [k, v] of Object.entries(baseSnap.chatVariables)) {
+                const key = String(k).startsWith('$') ? String(k) : `$${k}`;
+                if (!Object.prototype.hasOwnProperty.call(chatClone.scriptstate, key) && v !== undefined && v !== null) {
+                    chatClone.scriptstate[key] = String(v);
+                }
+            }
+        }
+
+        const prevCtx = activeCtx;
+        try {
+            await prepareTurn({
+                charIndex: cIdx,
+                chatIndex: chIdx,
+                charObj: cached.charObj,
+                chatObj: chatClone,
+                modulesOverride: cached.modules,
+                globalVarsOverride: cached.globalChatVariables,
+                personaName: (opts && opts.personaName) || (baseSnap.charContext && baseSnap.charContext.personaName) || baseSnap.personaName || 'User',
+            });
+            let anyHandler = false;
+            for (const entry of entries) {
+                if (!/listenEdit/i.test(String(entry.code || ''))) continue;
+                try {
+                    const holder = await createOrGetEngine(entry);
+                    const check = await runThreadCall(holder.engine, (t) => {
+                        t.lua.lua_getglobal(t.address, '__rsHasEditHandler');
+                    }, ['editDisplay']);
+                    if (check) {
+                        anyHandler = true;
+                        break;
+                    }
+                } catch (err) {
+                    console.warn('[ModuleAdapter] editDisplay init error:', entry.sourceName, err && err.message ? err.message : err);
+                }
+            }
+            if (!anyHandler) {
+                cached.hasLuaEditDisplay = false;
+                return null;
+            }
+
+            const htmlByIndex = Object.create(null);
+            let changedCount = 0;
+            for (const m of msgList) {
+                if (!m || typeof m !== 'object') continue;
+                const baseHtml = String(m.html || m.raw || m.text || '');
+                if (!baseHtml) continue;
+                const transformed = await runEditPhase('editDisplay', baseHtml, {
+                    index: Number(m.index ?? 0),
+                    role: m.role || 'char',
+                    chatId: m.chatId || '',
+                }, { skipRegex: true });
+                if (typeof transformed === 'string' && transformed !== baseHtml) {
+                    htmlByIndex[m.index] = transformed;
+                    changedCount += 1;
+                }
+            }
+            return changedCount > 0 ? { htmlByIndex, assetPathsByName: cached.assetPathsByName || {} } : null;
+        } finally {
+            activeCtx = prevCtx;
+        }
+    }
+
     function dispose() {
+        displayCtxCache = null;
         for (const holder of engineCache.values()) {
             try { holder.engine.global.close(); } catch (_) {}
         }
@@ -1400,6 +1641,8 @@ function createModuleAdapter({
         endTurn,
         runTriggerMode,
         runEditPhase,
+        runDisplayLuaForSnapshot,
+        invalidateDisplayCache,
         runManualTrigger,
         runInteraction,
         dispose,
